@@ -1,0 +1,201 @@
+﻿cargo :     Checking flowio v0.1.0 (D:\projects\flowio\src-tauri)
+所在位置 行:1 字符: 1
++ cargo check 2>&1 | Out-File -FilePath check_log2.txt -Encoding utf8
++ ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking fl...owio\src-tauri):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+error[E0428]: the name `__tauri_command_name_get_ai_config` is defined multiple times
+   --> src\ai\commands.rs:117:1
+    |
+117 | #[tauri::command]
+    | ^^^^^^^^^^^^^^^^^ `__tauri_command_name_get_ai_config` redefined here
+    |
+   ::: src\settings\commands.rs:7:1
+    |
+  7 | #[tauri::command]
+    | ----------------- previous definition of the macro `__tauri_command_name_get_ai_config` here
+    |
+    = note: `__tauri_command_name_get_ai_config` must be defined only once in the macro namespace of this module
+    = note: this error originates in the attribute macro `tauri::command` (in Nightly builds, run with -Z macro-backtra
+ce for more info)
+
+error[E0428]: the name `__cmd__get_ai_config` is defined multiple times
+   --> src\ai\commands.rs:117:1
+    |
+117 | #[tauri::command]
+    | ^^^^^^^^^^^^^^^^^ `__cmd__get_ai_config` redefined here
+    |
+   ::: src\settings\commands.rs:7:1
+    |
+  7 | #[tauri::command]
+    | ----------------- previous definition of the macro `__cmd__get_ai_config` here
+    |
+    = note: `__cmd__get_ai_config` must be defined only once in the macro namespace of this module
+    = note: this error originates in the attribute macro `tauri::command` (in Nightly builds, run with -Z macro-backtra
+ce for more info)
+
+error[E0428]: the name `__tauri_command_name_set_ai_config` is defined multiple times
+   --> src\ai\commands.rs:136:1
+    |
+136 | #[tauri::command]
+    | ^^^^^^^^^^^^^^^^^ `__tauri_command_name_set_ai_config` redefined here
+    |
+   ::: src\settings\commands.rs:12:1
+    |
+ 12 | #[tauri::command]
+    | ----------------- previous definition of the macro `__tauri_command_name_set_ai_config` here
+    |
+    = note: `__tauri_command_name_set_ai_config` must be defined only once in the macro namespace of this module
+    = note: this error originates in the attribute macro `tauri::command` (in Nightly builds, run with -Z macro-backtra
+ce for more info)
+
+error[E0428]: the name `__cmd__set_ai_config` is defined multiple times
+   --> src\ai\commands.rs:136:1
+    |
+136 | #[tauri::command]
+    | ^^^^^^^^^^^^^^^^^ `__cmd__set_ai_config` redefined here
+    |
+   ::: src\settings\commands.rs:12:1
+    |
+ 12 | #[tauri::command]
+    | ----------------- previous definition of the macro `__cmd__set_ai_config` here
+    |
+    = note: `__cmd__set_ai_config` must be defined only once in the macro namespace of this module
+    = note: this error originates in the attribute macro `tauri::command` (in Nightly builds, run with -Z macro-backtra
+ce for more info)
+
+warning: unused import: `pipeline::run_pipeline as AiPipeline`
+ --> src\ai\mod.rs:9:9
+  |
+9 | pub use pipeline::run_pipeline as AiPipeline;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+   --> src\ai\commands.rs:105:39
+    |
+105 |                 apply_pipeline_result(&db_clone, &recording_id, &result);
+    |                 --------------------- ^^^^^^^^^ expected `&Arc<DbState>`, found `&&DbState`
+    |                 |
+    |                 arguments to this function are incorrect
+    |
+    = note: expected reference `&Arc<DbState>`
+               found reference `&&DbState`
+note: function defined here
+   --> src\ai\commands.rs:153:4
+    |
+153 | fn apply_pipeline_result(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+154 |     db_state: &std::sync::Arc<DbState>,
+    |     ----------------------------------
+
+error[E0308]: mismatched types
+   --> src\export\commands.rs:348:13
+    |
+348 |             points,
+    |             ^^^^^^ expected `Vec<(Point, bool)>`, found `Vec<(Mm, Mm)>`
+    |
+    = note: expected struct `Vec<(Point, bool)>`
+               found struct `Vec<(printpdf::Mm, printpdf::Mm)>`
+
+warning: unused variable: `app`
+ --> src\hotkey\mod.rs:5:21
+  |
+5 | pub fn init_hotkeys(app: &AppHandle) {
+  |                     ^^^ help: if this is intentional, prefix it with an underscore: `_app`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `db`
+ --> src\settings\commands.rs:8:22
+  |
+8 | pub fn get_ai_config(db: State<DbState>) -> Result<serde_json::Value, String> {
+  |                      ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `db`
+  --> src\settings\commands.rs:13:22
+   |
+13 | pub fn set_ai_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                      ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `config`
+  --> src\settings\commands.rs:13:42
+   |
+13 | pub fn set_ai_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                                          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_conf
+ig`
+
+warning: unused variable: `db`
+  --> src\settings\commands.rs:20:26
+   |
+20 | pub fn get_hotkey_config(db: State<DbState>) -> Result<serde_json::Value, String> {
+   |                          ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `db`
+  --> src\settings\commands.rs:25:26
+   |
+25 | pub fn set_hotkey_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                          ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `config`
+  --> src\settings\commands.rs:25:46
+   |
+25 | pub fn set_hotkey_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                                              ^^^^^^ help: if this is intentional, prefix it with an underscore: `_
+config`
+
+warning: unused variable: `db`
+  --> src\settings\commands.rs:32:30
+   |
+32 | pub fn get_appearance_config(db: State<DbState>) -> Result<serde_json::Value, String> {
+   |                              ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `db`
+  --> src\settings\commands.rs:37:30
+   |
+37 | pub fn set_appearance_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                              ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `config`
+  --> src\settings\commands.rs:37:50
+   |
+37 | pub fn set_appearance_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                                                  ^^^^^^ help: if this is intentional, prefix it with an underscore
+: `_config`
+
+error[E0597]: `stmt` does not live long enough
+   --> src\ai\commands.rs:178:15
+    |
+168 |         let mut stmt = match conn.prepare(
+    |             -------- binding `stmt` declared here
+...
+178 |         match stmt.query_map(params![recording_id], |row| row.get::<_, String>(0)) {
+    |               ^^^^----------------------------------------------------------------
+    |               |
+    |               borrowed value does not live long enough
+    |               a temporary with access to the borrow is created here ...
+...
+185 |     };
+    |     -- ... and the borrow might be used here, when that temporary is dropped and runs the destructor for type `Re
+sult<MappedRows<'_, {closure@src\ai\commands.rs:178:53: 178:58}>, rusqlite::Error>`
+    |     |
+    |     `stmt` dropped here while still borrowed
+    |
+    = note: the temporary is part of an expression at the end of a block;
+            consider forcing this temporary to be dropped sooner, before the block's local variables are dropped
+help: for example, you could save the expression's value in a new local variable `x` and then make `x` be the expressio
+n at the end of the block
+    |
+178 ~         let x = match stmt.query_map(params![recording_id], |row| row.get::<_, String>(0)) {
+179 |             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+...
+183 |             }
+184 ~         }; x
+    |
+
+Some errors have detailed explanations: E0308, E0428, E0597.
+For more information about an error, try `rustc --explain E0308`.
+warning: `flowio` (lib) generated 11 warnings
+error: could not compile `flowio` (lib) due to 7 previous errors; 11 warnings emitted

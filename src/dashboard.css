@@ -1,0 +1,446 @@
+/* ============================================================
+   Dashboard
+   ============================================================ */
+
+.dashboard-action-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 16px 20px;
+  margin-bottom: 24px;
+  background: #f5f7fa;
+  border-radius: 12px;
+}
+
+.dashboard-action-text {
+  flex: 1;
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #333;
+}
+
+.dashboard-action-btn {
+  flex-shrink: 0;
+  font-size: 15px;
+  padding: 10px 22px;
+  border-radius: 8px;
+}
+
+.dashboard-search {
+  position: relative;
+  width: 240px;
+}
+
+.dashboard-search .search-box-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.dashboard-search .search-box-input {
+  width: 100%;
+  padding: 6px 12px 6px 34px;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  outline: none;
+  transition: border-color var(--transition);
+}
+
+.dashboard-search .search-box-input:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.1);
+}
+
+.dashboard-table-section {
+  margin-top: 8px;
+}
+
+.dashboard-table-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.dashboard-table-bar h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.dashboard-table-count {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.dashboard-title-link {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--blue);
+  cursor: pointer;
+}
+
+.dashboard-title-link:hover {
+  text-decoration: underline;
+}
+
+.dashboard-rename-input {
+  width: 100%;
+  padding: 4px 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #333;
+  background: #fff;
+  border: 2px solid var(--blue);
+  border-radius: 6px;
+  outline: none;
+  font-family: inherit;
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.15);
+}
+
+.dark .dashboard-rename-input {
+  color: #c9d1d9;
+  background: #0d1117;
+  border-color: #58a6ff;
+}
+
+.dark .dashboard-appname-input {
+  color: #c9d1d9;
+  background: #0d1117;
+  border-color: #58a6ff;
+}
+
+.dashboard-app-name {
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  transition: border-color 0.15s, background 0.15s;
+  display: inline-block;
+}
+
+.dashboard-app-name:hover {
+  border-color: var(--border);
+  background: var(--bg-secondary);
+}
+
+.dashboard-appname-input {
+  width: 100%;
+  max-width: 140px;
+  padding: 4px 8px;
+  font-size: 13px;
+  font-weight: 400;
+  color: #333;
+  background: #fff;
+  border: 2px solid var(--blue);
+  border-radius: 6px;
+  outline: none;
+  font-family: inherit;
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.15);
+}
+
+.dashboard-time {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-done {
+  color: #00a87d;
+}
+
+.status-done .status-dot {
+  background: #00a87d;
+}
+
+.status-pending {
+  color: #999;
+}
+
+.status-pending .status-dot {
+  background: #999;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 20px 0 8px;
+}
+
+.pagination-btn {
+  padding: 5px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--blue);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all var(--transition);
+  font-family: inherit;
+}
+
+.pagination-btn:hover:not(:disabled) {
+  background: var(--bg-secondary);
+  border-color: var(--blue);
+}
+
+.pagination-btn:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.pagination-num {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all var(--transition);
+  font-family: inherit;
+}
+
+.pagination-num:hover {
+  background: var(--bg-secondary);
+  border-color: var(--blue);
+}
+
+.pagination-num.active {
+  background: var(--blue);
+  color: #fff;
+  border-color: var(--blue);
+}
+
+.dark .dashboard-action-card {
+  background: var(--bg-secondary);
+}
+
+.dark .dashboard-action-text {
+  color: var(--text);
+}
+
+.dark .dashboard-search .search-box-input {
+  background: var(--bg-tertiary);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.dark .dashboard-app-name {
+  color: var(--text-secondary);
+}
+
+.dark .dashboard-time {
+  color: var(--text-muted);
+}
+
+.dark .status-pending {
+  color: var(--text-muted);
+}
+
+.dark .status-pending .status-dot {
+  background: var(--text-muted);
+}
+
+/* ============================================================
+   Empty State
+   ============================================================ */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+}
+
+.empty-state-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  margin-bottom: 24px;
+  background: #f5f7fa;
+  border-radius: 16px;
+  color: #bdbdbd;
+}
+
+.empty-state h3 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  font-weight: 600;
+  color: #212121;
+}
+
+.empty-state p {
+  margin: 0 0 24px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #8c8c8c;
+  max-width: 400px;
+}
+
+.empty-state-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 24px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #fff;
+  background: #28a745;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s;
+  font-family: inherit;
+}
+
+.empty-state-btn:hover {
+  background: #218838;
+}
+
+.dark .empty-state h3 {
+  color: var(--text);
+}
+
+.dark .empty-state p {
+  color: var(--text-secondary);
+}
+
+.dark .empty-state-icon {
+  background: #21262d;
+  color: var(--text-muted);
+}
+
+/* ============================================================
+   Dropdown Menu
+   ============================================================ */
+
+.dropdown-menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  z-index: 100;
+  min-width: 160px;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+  padding: 4px;
+  margin-top: 4px;
+}
+
+.dropdown-fixed {
+  position: fixed;
+  right: auto;
+  top: auto;
+  margin-top: 0;
+}
+
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #333;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  transition: background 0.12s;
+}
+
+.dropdown-item:hover {
+  background: #f0f2f5;
+}
+
+.dropdown-divider {
+  height: 1px;
+  margin: 4px 8px;
+  background: #eee;
+}
+
+.dropdown-rename {
+  padding: 6px 8px;
+}
+
+.dropdown-rename input {
+  width: 100%;
+  padding: 6px 10px;
+  font-size: 13px;
+  color: #333;
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  outline: none;
+  font-family: inherit;
+}
+
+.dropdown-rename input:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.1);
+}
+
+.dark .dropdown-menu {
+  background: #1c2128;
+  border-color: #30363d;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.dark .dropdown-item {
+  color: #c9d1d9;
+}
+
+.dark .dropdown-item:hover {
+  background: #21262d;
+}
+
+.dark .dropdown-divider {
+  background: #30363d;
+}
+
+.dark .dropdown-rename input {
+  color: #c9d1d9;
+  background: #0d1117;
+  border-color: #30363d;
+}

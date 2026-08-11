@@ -1,0 +1,197 @@
+warning: function `try_get_known_folder_item` is never used
+  --> D:\projects\flowio\patches\rfd\src\backend\win_cid\file_dialog\dialog_ffi.rs:51:11
+   |
+51 | unsafe fn try_get_known_folder_item(path: &str) -> Option<IShellItem> {
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `clear_client_data`, `set_client_guid`, and `set_default_folder` are never used
+   --> D:\projects\flowio\patches\rfd\src\backend\win_cid\file_dialog\dialog_ffi.rs:182:15
+    |
+114 | impl DialogInner {
+    | ---------------- methods in this implementation
+...
+182 |     unsafe fn clear_client_data(&self) -> Result<()> {
+    |               ^^^^^^^^^^^^^^^^^
+...
+188 |     unsafe fn set_client_guid(&self, guid: &GUID) -> Result<()> {
+    |               ^^^^^^^^^^^^^^^
+...
+212 |     unsafe fn set_default_folder(&self, folder: &IShellItem) -> Result<()> {
+    |               ^^^^^^^^^^^^^^^^^^
+
+warning: function `SHGetKnownFolderIDList` is never used
+  --> D:\projects\flowio\patches\rfd\src\backend\win_cid\file_dialog\dialog_ffi.rs:23:8
+   |
+23 |     fn SHGetKnownFolderIDList(
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `SHCreateItemFromIDList` is never used
+  --> D:\projects\flowio\patches\rfd\src\backend\win_cid\file_dialog\dialog_ffi.rs:31:8
+   |
+31 |     fn SHCreateItemFromIDList(
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `rfd` (lib) generated 4 warnings
+    Checking flowio v0.1.0 (D:\projects\flowio\src-tauri)
+warning: unused import: `pipeline::run_pipeline as AiPipeline`
+ --> src\ai\mod.rs:9:9
+  |
+9 | pub use pipeline::run_pipeline as AiPipeline;
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `app`
+ --> src\hotkey\mod.rs:5:21
+  |
+5 | pub fn init_hotkeys(app: &AppHandle) {
+  |                     ^^^ help: if this is intentional, prefix it with an underscore: `_app`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `db`
+ --> src\settings\commands.rs:8:26
+  |
+8 | pub fn get_hotkey_config(db: State<DbState>) -> Result<serde_json::Value, String> {
+  |                          ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `db`
+  --> src\settings\commands.rs:13:26
+   |
+13 | pub fn set_hotkey_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                          ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `config`
+  --> src\settings\commands.rs:13:46
+   |
+13 | pub fn set_hotkey_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                                              ^^^^^^ help: if this is intentional, prefix it with an underscore: `_config`
+
+warning: unused variable: `db`
+  --> src\settings\commands.rs:20:30
+   |
+20 | pub fn get_appearance_config(db: State<DbState>) -> Result<serde_json::Value, String> {
+   |                              ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `db`
+  --> src\settings\commands.rs:25:30
+   |
+25 | pub fn set_appearance_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                              ^^ help: if this is intentional, prefix it with an underscore: `_db`
+
+warning: unused variable: `config`
+  --> src\settings\commands.rs:25:50
+   |
+25 | pub fn set_appearance_config(db: State<DbState>, config: serde_json::Value) -> Result<(), String> {
+   |                                                  ^^^^^^ help: if this is intentional, prefix it with an underscore: `_config`
+
+warning: unused variable: `card_bottom_y`
+   --> src\export\commands.rs:823:13
+    |
+823 |         let card_bottom_y = page_y - sh + CARD_GAP; // bottom of card = top - height + card_gap
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_card_bottom_y`
+
+warning: value assigned to `cur_y` is never read
+   --> src\export\commands.rs:792:13
+    |
+792 |             cur_y = tip_y - GAP_ELEM;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `init_db_file` is never used
+   --> src\db\mod.rs:145:8
+    |
+145 | pub fn init_db_file() -> Connection {
+    |        ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `init_db_managed` is never used
+   --> src\db\mod.rs:151:8
+    |
+151 | pub fn init_db_managed() -> Connection {
+    |        ^^^^^^^^^^^^^^^
+
+warning: method `latest` is never used
+  --> src\recorder\capture.rs:49:12
+   |
+32 | impl FrameRing {
+   | -------------- method in this implementation
+...
+49 |     pub fn latest(&self) -> Option<&CapturedFrame> {
+   |            ^^^^^^
+
+warning: function `is_ime_composing` is never used
+  --> src\recorder\ime.rs:24:8
+   |
+24 | pub fn is_ime_composing() -> bool {
+   |        ^^^^^^^^^^^^^^^^
+
+warning: function `images_differ_significantly` is never used
+  --> src\recorder\screenshot.rs:51:8
+   |
+51 | pub fn images_differ_significantly(a: &DynamicImage, b: &DynamicImage, threshold: u8) -> bool {
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `MouseEvent` is never used
+ --> src\recorder\mouse.rs:2:10
+  |
+2 | pub enum MouseEvent {
+  |          ^^^^^^^^^^
+
+warning: function `init_hotkeys` is never used
+ --> src\hotkey\mod.rs:5:8
+  |
+5 | pub fn init_hotkeys(app: &AppHandle) {
+  |        ^^^^^^^^^^^^
+
+warning: fields `id` and `after_screenshot_path` are never read
+   --> src\ai\commands.rs:97:9
+    |
+ 96 |     struct StepRow {
+    |            ------- fields in this struct
+ 97 |         id: String,
+    |         ^^
+...
+102 |         after_screenshot_path: String,
+    |         ^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `order_index` is never read
+  --> src\editor\commands.rs:54:9
+   |
+53 | pub struct StepData {
+   |            -------- field in this struct
+54 |     pub order_index: i32,
+   |         ^^^^^^^^^^^
+   |
+   = note: `StepData` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `orig_w_mm` and `orig_h_mm` are never read
+   --> src\export\commands.rs:511:9
+    |
+506 |     struct ImgInfo {
+    |            ------- fields in this struct
+...
+511 |         orig_w_mm: f32,
+    |         ^^^^^^^^^
+512 |         orig_h_mm: f32,
+    |         ^^^^^^^^^
+
+warning: unused `BOOL` that must be used
+  --> src\recorder\ime.rs:39:9
+   |
+39 |         ImmReleaseContext(hwnd, himc);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+   |
+39 |         let _ = ImmReleaseContext(hwnd, himc);
+   |         +++++++
+
+warning: `flowio` (lib) generated 21 warnings (run `cargo fix --lib -p flowio` to apply 9 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.39s
