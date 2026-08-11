@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>录步 Flowio — 操作即文档</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #ffffff;
+      color: #24292e;
+      line-height: 1.6;
+    }
+    .hero {
+      background: linear-gradient(135deg, #0969da 0%, #24292e 100%);
+      color: white;
+      padding: 100px 24px 80px;
+      text-align: center;
+    }
+    .hero h1 { font-size: 48px; font-weight: 700; margin-bottom: 16px; }
+    .hero p { font-size: 20px; opacity: 0.9; max-width: 600px; margin: 0 auto 32px; }
+    .hero .cta {
+      display: inline-block;
+      background: #1f883d;
+      color: white;
+      padding: 14px 36px;
+      border-radius: 6px;
+      font-size: 18px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
+    .hero .cta:hover { background: #176f32; }
+    .features {
+      max-width: 960px;
+      margin: 80px auto;
+      padding: 0 24px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 32px;
+    }
+    .feature {
+      padding: 32px;
+      border: 1px solid #d0d7de;
+      border-radius: 8px;
+    }
+    .feature h3 { font-size: 18px; margin-bottom: 8px; color: #0969da; }
+    .feature p { color: #57606a; font-size: 15px; }
+    .section {
+      max-width: 960px;
+      margin: 80px auto;
+      padding: 0 24px;
+    }
+    .section h2 { font-size: 28px; margin-bottom: 24px; }
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 24px;
+      text-align: center;
+    }
+    .step {
+      padding: 32px 16px;
+      border: 2px dashed #d0d7de;
+      border-radius: 8px;
+    }
+    .step-num {
+      width: 40px; height: 40px;
+      background: #0969da; color: white;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center; justify-content: center;
+      font-weight: 700; font-size: 18px;
+      margin-bottom: 12px;
+    }
+    .step h3 { font-size: 16px; margin-bottom: 4px; }
+    .step p { color: #57606a; font-size: 14px; }
+    footer {
+      max-width: 960px;
+      margin: 80px auto 40px;
+      padding: 0 24px;
+      text-align: center;
+      color: #8b949e;
+      font-size: 14px;
+      border-top: 1px solid #d0d7de;
+      padding-top: 32px;
+    }
+    footer a { color: #0969da; text-decoration: none; }
+    @media (max-width: 640px) {
+      .hero h1 { font-size: 32px; }
+      .steps { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <section class="hero">
+    <h1>录步 Flowio</h1>
+    <p>操作即文档。录制任意桌面软件的操作过程，AI 自动生成操作指南，一键导出分享。</p>
+    <a class="cta" href="https://github.com/zhang-ruo-xuan/flowio/releases">免费下载 Windows 版</a>
+  </section>
+
+  <section class="features">
+    <div class="feature">
+      <h3>全局录制</h3>
+      <p>录制任何 Windows 桌面应用的操作过程，自动截图每一步。</p>
+    </div>
+    <div class="feature">
+      <h3>AI 智能标注</h3>
+      <p>接入国产大模型，自动生成步骤标题和操作描述，告别手动写教程。</p>
+    </div>
+    <div class="feature">
+      <h3>多格式导出</h3>
+      <p>一键导出 PDF / HTML / Markdown / 微信长图，适配各种分享场景。</p>
+    </div>
+    <div class="feature">
+      <h3>隐私脱敏</h3>
+      <p>自动模糊身份证、手机号、银行卡等敏感信息，安全无忧。</p>
+    </div>
+    <div class="feature">
+      <h3>可视化编辑器</h3>
+      <p>Before/After 双截图对比，拖拽排序，内联编辑，所见即所得。</p>
+    </div>
+    <div class="feature">
+      <h3>完全离线</h3>
+      <p>数据不上传云端，本地 AI 引擎，断网也能用。</p>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>三步上手</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <h3>录制</h3>
+        <p>点击录制，正常操作你的软件</p>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <h3>AI 生成</h3>
+        <p>录制结束，AI 自动标注每一步</p>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <h3>导出分享</h3>
+        <p>导出 PDF / 长图，发给同事</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>&copy; 2026 Flowio &nbsp;|&nbsp; <a href="https://github.com/zhang-ruo-xuan/flowio">GitHub</a></p>
+  </footer>
+
+</body>
+</html>
