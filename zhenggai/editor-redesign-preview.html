@@ -1,0 +1,1471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flowio 编辑器整改预览</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f0f2f5;
+    color: #111827;
+    padding: 32px;
+  }
+
+  .page-header {
+    max-width: 1200px;
+    margin: 0 auto 24px;
+  }
+  .page-header h1 { font-size: 24px; font-weight: 700; }
+  .page-header p { font-size: 14px; color: #6b7280; margin-top: 4px; line-height: 1.6; }
+
+  /* ---- Comparison layout ---- */
+  .comparison-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    max-width: 1200px;
+    margin: 0 auto 40px;
+  }
+  @media (max-width: 900px) {
+    .comparison-row { grid-template-columns: 1fr; }
+  }
+  .comparison-card {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    overflow: hidden;
+  }
+  .comparison-card-header {
+    padding: 14px 20px;
+    border-bottom: 1px solid #e5e7eb;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .comparison-card-header h2 { font-size: 15px; font-weight: 600; }
+  .comparison-card-header .badge {
+    font-size: 11px; padding: 3px 10px; border-radius: 999px; font-weight: 600;
+  }
+  .badge-before { background: #fef2f2; color: #dc2626; }
+  .badge-after { background: #f0fdf4; color: #16a34a; }
+
+  .card-body {
+    padding: 0;
+  }
+
+  /* ---- Editor mockup ---- */
+  .editor-mockup {
+    display: flex;
+    height: 560px;
+    position: relative;
+  }
+  .editor-mockup.small {
+    height: 380px;
+  }
+  .editor-mockup.maximized {
+    height: 780px;
+  }
+  .mockup-sidebar {
+    width: 36%;
+    min-width: 240px;
+    border-right: 1px solid #e5e7eb;
+    background: #f9fafb;
+    padding: 12px;
+    overflow-y: auto;
+  }
+  .mockup-sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 4px 10px;
+    font-size: 12px;
+    color: #6b7280;
+  }
+  .mockup-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    margin-bottom: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .mockup-step.active {
+    border-color: #ff6b35;
+    box-shadow: 0 0 0 1px #ff6b35;
+  }
+  .mockup-step-num {
+    width: 24px; height: 24px; border-radius: 50%;
+    background: #f3f4f6; color: #6b7280;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 600; flex-shrink: 0;
+  }
+  .mockup-step.active .mockup-step-num {
+    background: #ff6b35; color: #fff;
+  }
+  .mockup-step-body { flex: 1; min-width: 0; }
+  .mockup-step-title { font-size: 12px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mockup-step-type { font-size: 10px; color: #9ca3af; margin-top: 1px; }
+  .mockup-step-thumb {
+    width: 48px; height: 28px; border-radius: 4px;
+    border: 1px solid #e5e7eb; overflow: hidden; flex-shrink: 0;
+    background: #f3f4f6;
+  }
+  .mockup-step-thumb img { width: 100%; height: 100%; object-fit: cover; }
+
+  .mockup-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px 24px;
+    overflow-y: auto;
+  }
+
+  /* ---- Screenshot area (BEFORE) ---- */
+  .screenshot-before {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    min-height: 200px;
+    max-height: 420px;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #e8eaed;
+    position: relative;
+    flex-shrink: 0;
+  }
+  .screenshot-before img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .screenshot-before .small-img {
+    width: 60%;
+    height: auto;
+    max-height: 100%;
+    margin: 0 auto;
+    display: block;
+    object-fit: contain;
+  }
+  .screenshot-before .wide-img {
+    width: 100%;
+    height: auto;
+    max-height: 100%;
+    display: block;
+    object-fit: contain;
+  }
+
+  /* Problem annotations on BEFORE */
+  .problem-annotation {
+    position: absolute;
+    font-size: 10px;
+    color: #dc2626;
+    font-weight: 600;
+    pointer-events: none;
+  }
+  .problem-annotation .arrow {
+    display: block;
+    width: 0; height: 0;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-top: 8px solid #dc2626;
+    margin: 0 auto 2px;
+  }
+  .problem-annotation.top { top: 4px; left: 50%; transform: translateX(-50%); }
+  .problem-annotation.bottom { bottom: 4px; left: 50%; transform: translateX(-50%); }
+  .problem-annotation .arrow.down { border-top: none; border-bottom: 8px solid #dc2626; }
+
+  /* ---- Screenshot area (AFTER - redesign) ---- */
+  .screenshot-after {
+    width: 100%;
+    min-height: 180px;
+    max-height: calc(100vh - 420px);
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #f9fafb;
+    position: relative;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .screenshot-after .img-wrap {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+  .screenshot-after img {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+  }
+  .screenshot-after .adapt-img {
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 100%;
+  }
+  .screenshot-after .small-fit {
+    /* for small images, let them be natural size, centered */
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+  }
+
+  /* No-image placeholder (AFTER) */
+  .no-image-after {
+    width: 100%;
+    height: 200px;
+    border: 1px dashed #d1d5db;
+    border-radius: 8px;
+    background: #f9fafb;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: #9ca3af;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .no-image-after:hover {
+    border-color: #ff6b35;
+    background: #fff7ed;
+    color: #ff6b35;
+  }
+  .no-image-after svg { opacity: 0.5; }
+  .no-image-after:hover svg { opacity: 0.8; }
+  .no-image-after .hint-text { font-size: 13px; }
+  .no-image-after .sub-text { font-size: 11px; }
+
+  /* ---- Form area ---- */
+  .form-area {
+    padding-top: 16px;
+  }
+  .form-group {
+    margin-bottom: 12px;
+  }
+  .form-group label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: #374151;
+    margin-bottom: 4px;
+  }
+  .form-group input,
+  .form-group textarea {
+    width: 100%;
+    padding: 6px 10px;
+    font-size: 13px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    outline: none;
+    font-family: inherit;
+    transition: border-color 0.15s;
+  }
+  .form-group input:focus,
+  .form-group textarea:focus {
+    border-color: #ff6b35;
+    box-shadow: 0 0 0 3px rgba(255,107,53,0.1);
+  }
+  .form-group textarea { resize: vertical; min-height: 60px; }
+  .form-group .char-count {
+    text-align: right; font-size: 11px; color: #9ca3af; margin-top: 2px;
+  }
+
+  /* ---- Button bar (AFTER) ---- */
+  .action-bar-after {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 12px 0 4px;
+    border-top: 1px solid #e5e7eb;
+    margin-top: 8px;
+  }
+  .action-bar-after .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #374151;
+    transition: all 0.12s;
+    white-space: nowrap;
+    font-family: inherit;
+  }
+  .action-bar-after .btn:hover { background: #f3f4f6; }
+  .action-bar-after .btn-primary {
+    background: #ff6b35;
+    color: #fff;
+    border-color: #ff6b35;
+  }
+  .action-bar-after .btn-primary:hover { background: #f0521a; }
+  .action-bar-after .btn-group {
+    display: flex;
+    gap: 0;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .action-bar-after .btn-group .btn {
+    border: none;
+    border-radius: 0;
+    border-right: 1px solid #d1d5db;
+  }
+  .action-bar-after .btn-group .btn:last-child { border-right: none; }
+  .action-bar-after .btn-group .btn.active {
+    background: #ff6b35;
+    color: #fff;
+  }
+  .action-bar-after .spacer { flex: 1; }
+
+  /* BAD button bar (BEFORE) */
+  .action-bar-before {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: nowrap;
+    padding: 12px 0 4px;
+    border-top: 1px solid #e5e7eb;
+    margin-top: 8px;
+    overflow: hidden;
+  }
+  .action-bar-before .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 10px;
+    font-size: 12px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    background: #fff;
+    color: #374151;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .action-bar-before .btn-primary {
+    background: #ff6b35;
+    color: #fff;
+    border-color: #ff6b35;
+  }
+
+  /* ---- Titlebar mock ---- */
+  .titlebar-mock {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 40px;
+    background: #1a1d21;
+    padding: 0 8px;
+    color: #e6edf3;
+    font-size: 13px;
+  }
+  .titlebar-mock-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+  .titlebar-mock-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .titlebar-mock-right .btn {
+    background: transparent;
+    border: none;
+    color: #e6edf3;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+  }
+
+  /* ════════════════════════════════════════════════
+     Analysis section
+     ════════════════════════════════════════════════ */
+  .analysis-section {
+    max-width: 1200px;
+    margin: 0 auto 32px;
+  }
+  .analysis-card {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+  .analysis-card-header {
+    padding: 16px 24px;
+    border-bottom: 1px solid #e5e7eb;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .analysis-card-header .icon {
+    width: 32px; height: 32px; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+  }
+  .analysis-card-header h2 { font-size: 16px; font-weight: 600; }
+  .analysis-card-body { padding: 20px 24px; }
+
+  .issue-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  @media (max-width: 700px) { .issue-grid { grid-template-columns: 1fr; } }
+  .issue-item {
+    padding: 16px;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+  }
+  .issue-item h3 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .issue-item .problem {
+    font-size: 13px;
+    color: #dc2626;
+    margin-bottom: 8px;
+    line-height: 1.6;
+  }
+  .issue-item .solution {
+    font-size: 13px;
+    color: #16a34a;
+    line-height: 1.6;
+  }
+  .issue-item .code-snippet {
+    margin-top: 8px;
+    padding: 8px 12px;
+    background: #f3f4f6;
+    border-radius: 6px;
+    font-family: 'SF Mono', 'Cascadia Code', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #374151;
+    overflow-x: auto;
+  }
+
+  /* ---- Full-page mockup ---- */
+  .full-mockup {
+    max-width: 1200px;
+    margin: 0 auto;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    overflow: hidden;
+  }
+  .full-mockup-body {
+    display: flex;
+    height: 600px;
+  }
+  .full-mockup-sidebar {
+    width: 300px;
+    border-right: 1px solid #e5e7eb;
+    background: #f9fafb;
+    display: flex;
+    flex-direction: column;
+  }
+  .full-mockup-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ---- New screenshot area ---- */
+  .new-screenshot-area {
+    flex: 0 0 auto;
+    max-height: 55%;
+    min-height: 180px;
+    border-bottom: 1px solid #e5e7eb;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px;
+    background: #f9fafb;
+    position: relative;
+  }
+  .new-screenshot-area img {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border-radius: 4px;
+  }
+  .new-screenshot-area .float-buttons {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    display: flex;
+    gap: 4px;
+  }
+  .new-screenshot-area .float-buttons button {
+    padding: 4px 10px;
+    font-size: 11px;
+    border-radius: 4px;
+    border: 1px solid rgba(0,0,0,0.15);
+    background: rgba(255,255,255,0.95);
+    color: #374151;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.12s;
+  }
+  .new-screenshot-area .float-buttons button:hover {
+    background: #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+  }
+  .new-scroll-area {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 24px;
+  }
+  .new-scroll-area .form-group {
+    margin-bottom: 14px;
+  }
+  .new-scroll-area .form-group label {
+    font-size: 12px;
+    font-weight: 600;
+    color: #374151;
+    margin-bottom: 4px;
+    display: block;
+  }
+  .new-scroll-area .form-group input,
+  .new-scroll-area .form-group textarea {
+    width: 100%;
+    padding: 7px 10px;
+    font-size: 13px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    outline: none;
+    font-family: inherit;
+  }
+  .new-scroll-area .form-group input:focus,
+  .new-scroll-area .form-group textarea:focus {
+    border-color: #ff6b35;
+    box-shadow: 0 0 0 3px rgba(255,107,53,0.1);
+  }
+  .new-bottom-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 24px;
+    border-top: 1px solid #e5e7eb;
+    background: #fff;
+    flex-wrap: wrap;
+  }
+  .new-bottom-bar .btn {
+    padding: 6px 16px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #374151;
+    font-family: inherit;
+    white-space: nowrap;
+    transition: all 0.12s;
+  }
+  .new-bottom-bar .btn:hover { background: #f3f4f6; }
+  .new-bottom-bar .btn-primary {
+    background: #ff6b35;
+    color: #fff;
+    border-color: #ff6b35;
+  }
+  .new-bottom-bar .btn-primary:hover { background: #f0521a; }
+  .new-bottom-bar .spacer { flex: 1; }
+
+  /* ---- Render comparison scenarios ---- */
+  .scenario-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid #e5e7eb;
+    margin-bottom: 16px;
+  }
+  .scenario-tab {
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    color: #6b7280;
+    cursor: pointer;
+    border: none;
+    background: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -2px;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  .scenario-tab:hover { color: #374151; }
+  .scenario-tab.active { color: #ff6b35; border-bottom-color: #ff6b35; }
+
+  .scenario-content { display: none; }
+  .scenario-content.active { display: block; }
+
+  .side-by-side {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 800px) { .side-by-side { grid-template-columns: 1fr; } }
+  .side-label {
+    text-align: center;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px;
+    border-radius: 6px 6px 0 0;
+  }
+  .side-label.before { background: #fef2f2; color: #dc2626; }
+  .side-label.after { background: #f0fdf4; color: #16a34a; }
+
+  .mock-viewport {
+    border: 1px solid #e5e7eb;
+    border-radius: 0 0 8px 8px;
+    overflow: hidden;
+  }
+  .mock-viewport .vp-content {
+    display: flex;
+    height: 400px;
+  }
+  .mock-viewport .vp-sidebar {
+    width: 35%;
+    border-right: 1px solid #e5e7eb;
+    background: #f9fafb;
+    padding: 8px;
+  }
+  .mock-viewport .vp-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+  .mock-viewport .vp-screenshot {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px;
+    position: relative;
+  }
+  .mock-viewport .vp-form {
+    padding: 8px 12px;
+    border-top: 1px solid #e5e7eb;
+  }
+  .mock-viewport .vp-form .mini-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .mock-viewport .vp-form .mini-row .mini-label {
+    font-size: 10px;
+    color: #6b7280;
+    width: 40px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+  }
+  .mock-viewport .vp-form .mini-row .mini-input {
+    flex: 1;
+    height: 22px;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    background: #f9fafb;
+  }
+
+  .mock-viewport.vp-before .vp-screenshot {
+    background: #e8eaed;
+  }
+  .mock-viewport.vp-before .vp-screenshot img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+  }
+
+  .mock-viewport.vp-after .vp-screenshot {
+    background: #f9fafb;
+  }
+  .mock-viewport.vp-after .vp-screenshot img {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+  }
+  .mock-viewport.vp-after .vp-screenshot.large {
+    min-height: 200px;
+  }
+
+  .mock-viewport .vp-buttons {
+    display: flex;
+    gap: 4px;
+    padding: 8px 12px;
+    border-top: 1px solid #e5e7eb;
+    flex-wrap: wrap;
+  }
+  .mock-viewport .vp-buttons .pill {
+    padding: 3px 10px;
+    font-size: 11px;
+    border-radius: 4px;
+    border: 1px solid #d1d5db;
+    background: #fff;
+    color: #374151;
+    cursor: default;
+  }
+  .mock-viewport .vp-buttons .pill.primary {
+    background: #ff6b35;
+    color: #fff;
+    border-color: #ff6b35;
+  }
+  .mock-viewport .vp-buttons .pill.pill-active {
+    background: #ff6b35;
+    color: #fff;
+    border-color: #ff6b35;
+  }
+
+  /* Tailwind-like spacing */
+  .mt-2 { margin-top: 8px; }
+  .mt-4 { margin-top: 16px; }
+  .mb-2 { margin-bottom: 8px; }
+  .mb-4 { margin-bottom: 16px; }
+  .gap-2 { gap: 8px; }
+  .flex { display: flex; }
+  .items-center { align-items: center; }
+  .text-sm { font-size: 12px; color: #6b7280; }
+  .text-xs { font-size: 11px; color: #9ca3af; }
+  .font-semibold { font-weight: 600; }
+
+  /* Responsive image scenarios */
+  .img-scenario {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 12px;
+  }
+  .img-scenario .img-container {
+    width: 100%;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    overflow: hidden;
+    position: relative;
+  }
+  .img-scenario .img-container.before {
+    background: #e8eaed;
+    aspect-ratio: 16/9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .img-scenario .img-container.after {
+    background: #f9fafb;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 120px;
+  }
+  .img-scenario .img-label {
+    font-size: 11px;
+    color: #6b7280;
+    font-weight: 500;
+  }
+  .img-scenario .verdict {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 4px;
+  }
+  .verdict.good { background: #f0fdf4; color: #16a34a; }
+  .verdict.bad { background: #fef2f2; color: #dc2626; }
+
+  /* Badge for floating */
+  .badge-float {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+  .badge-float.before { background: rgba(220,38,38,0.1); color: #dc2626; }
+  .badge-float.after { background: rgba(22,163,74,0.1); color: #16a34a; }
+
+  .mock-vp-wrap {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .mock-vp-wrap .vp-header {
+    height: 36px;
+    background: #1a1d21;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 8px;
+  }
+  .mock-vp-wrap .vp-header .vp-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+  }
+  .mock-vp-wrap .vp-header .vp-dot.r { background: #ef4444; }
+  .mock-vp-wrap .vp-header .vp-dot.y { background: #eab308; }
+  .mock-vp-wrap .vp-header .vp-dot.g { background: #22c55e; }
+  .mock-vp-wrap .vp-header .vp-title {
+    font-size: 12px; color: rgba(255,255,255,0.7); margin-left: 8px; flex: 1;
+  }
+  .mock-vp-wrap .vp-body {
+    display: flex;
+    height: 500px;
+  }
+</style>
+</head>
+<body>
+
+<div class="page-header">
+  <h1>Flowio 编辑器页面深度整改方案</h1>
+  <p>针对截图区域填充/变形、最大化后页面变形、按钮排列不满等问题，逐一分析根因并提供前后对比方案。</p>
+</div>
+
+<!-- ════════════ 问题分析 ════════════ -->
+<div class="analysis-section">
+  <div class="analysis-card">
+    <div class="analysis-card-header">
+      <div class="icon" style="background:#fef2f2;color:#dc2626;">!</div>
+      <h2>问题根因深度分析</h2>
+    </div>
+    <div class="analysis-card-body">
+      <div class="issue-grid">
+        <div class="issue-item">
+          <h3>1. 截图区域填充/变形</h3>
+          <div class="problem">
+            <strong>根因：</strong>当前使用 <code>aspect-ratio: 16/9</code> + <code>max-height: 420px</code> 固定容器，图片用 <code>object-fit: contain</code> 居中。<br>
+            小截图 → 容器大，图片四周大量灰色填充区域，视觉丑陋。<br>
+            宽截图 → 容器高度不够，被裁切或缩放变形。<br>
+            无截图 → 灰色背景空荡荡。
+          </div>
+          <div class="solution">
+            <strong>方案：</strong>移除固定宽高比，改用 <code>max-height: 55%</code> 相对视口高度，<code>object-fit: contain</code> 让图片自适应。图片本身决定高度，容器仅做最大高度限制。小图居中显示，大图等比缩放不溢出。
+          </div>
+          <div class="code-snippet">
+            /* 当前（问题代码） */<br>
+            .step-detail-image {<br>
+            &nbsp;&nbsp;aspect-ratio: 16 / 9;<br>
+            &nbsp;&nbsp;max-height: 420px;<br>
+            &nbsp;&nbsp;background: #e8eaed;<br>
+            }<br><br>
+            /* 整改后 */<br>
+            .step-detail-image {<br>
+            &nbsp;&nbsp;flex: 0 0 auto;<br>
+            &nbsp;&nbsp;max-height: 55%;<br>
+            &nbsp;&nbsp;min-height: 180px;<br>
+            &nbsp;&nbsp;background: #f9fafb;<br>
+            &nbsp;&nbsp;display: flex;<br>
+            &nbsp;&nbsp;align-items: center;<br>
+            &nbsp;&nbsp;justify-content: center;<br>
+            }<br>
+            .step-detail-image img {<br>
+            &nbsp;&nbsp;max-width: 100%;<br>
+            &nbsp;&nbsp;max-height: 100%;<br>
+            &nbsp;&nbsp;width: auto;<br>
+            &nbsp;&nbsp;height: auto;<br>
+            &nbsp;&nbsp;object-fit: contain;<br>
+            }
+          </div>
+        </div>
+        <div class="issue-item">
+          <h3>2. 最大化后页面变形</h3>
+          <div class="problem">
+            <strong>根因：</strong>截图区域 <code>max-height: 420px</code> 是固定像素值，最大化窗口后图片被限制无法扩展。侧边栏 <code>width: 320px</code> 固定，主区域无法充分利用空间。同时 <code>editor-preview-body</code> 的 <code>padding: 16px 40px</code> 在宽屏下浪费大量空间。
+          </div>
+          <div class="solution">
+            <strong>方案：</strong>截图区域改用 <code>max-height: 55%</code>（相对视口），最大化时自动扩展。侧边栏改为 <code>min-width: 280px</code> + <code>max-width: 35%</code> 弹性范围。主区域 padding 缩小为 <code>16px 24px</code>，充分利用宽屏空间。
+          </div>
+          <div class="code-snippet">
+            /* 当前 */<br>
+            .editor-sidebar { width: 320px; min-width: 280px; }<br>
+            .editor-preview-body { padding: 16px 40px; }<br><br>
+            /* 整改后 */<br>
+            .editor-sidebar {<br>
+            &nbsp;&nbsp;width: 300px;<br>
+            &nbsp;&nbsp;min-width: 260px;<br>
+            &nbsp;&nbsp;max-width: 35%;<br>
+            }<br>
+            .editor-preview-body { padding: 16px 24px; }
+          </div>
+        </div>
+        <div class="issue-item">
+          <h3>3. 按钮排列不饱满</h3>
+          <div class="problem">
+            <strong>根因：</strong>标题栏操作按钮过多（导出、发布、扫描脱敏、文本脱敏、AI生成、预览、全图/裁图），全部在一行内 <code>flex-shrink: 0</code> 不换行，空间不足时被截断或溢出。主编辑区的"保存修改"按钮单独一行，视觉上松散。
+          </div>
+          <div class="solution">
+            <strong>方案：</strong>标题栏按钮分组，次要用折叠菜单收纳（如脱敏/AI 移到"更多"下拉）。主编辑区按钮固定在底部 bar，与表单区域分离，使用 <code>flex-wrap: wrap</code> 自适应换行。
+          </div>
+          <div class="code-snippet">
+            /* 标题栏按钮折叠 */<br>
+            .titlebar-more-dropdown { position: relative; }<br>
+            .titlebar-more-btn:hover + .dropdown,<br>
+            .dropdown:hover { display: flex; }<br><br>
+            /* 底部按钮栏 */<br>
+            .step-detail-actions {<br>
+            &nbsp;&nbsp;display: flex;<br>
+            &nbsp;&nbsp;align-items: center;<br>
+            &nbsp;&nbsp;gap: 8px;<br>
+            &nbsp;&nbsp;flex-wrap: wrap;<br>
+            &nbsp;&nbsp;padding: 12px 24px;<br>
+            &nbsp;&nbsp;border-top: 1px solid var(--border);<br>
+            }
+          </div>
+        </div>
+        <div class="issue-item">
+          <h3>4. 无截图占位区丑陋</h3>
+          <div class="problem">
+            <strong>根因：</strong>无截图时显示纯灰色背景 + 一个 SVG 图标，文字提示"点击或拖拽上传步骤截图"，颜色和样式与整体设计不协调，且区域固定高度导致空荡荡。
+          </div>
+          <div class="solution">
+            <strong>方案：</strong>无截图时使用虚线边框 + 更柔和背景色，图标更精致，文字区分主次。hover 时高亮橙色提示。高度自适应，不超过 200px。
+          </div>
+          <div class="code-snippet">
+            .step-detail-no-image {<br>
+            &nbsp;&nbsp;border: 1px dashed #d1d5db;<br>
+            &nbsp;&nbsp;background: #f9fafb;<br>
+            &nbsp;&nbsp;min-height: 160px;<br>
+            &nbsp;&nbsp;max-height: 200px;<br>
+            &nbsp;&nbsp;transition: all 0.15s;<br>
+            }<br>
+            .step-detail-no-image:hover {<br>
+            &nbsp;&nbsp;border-color: var(--blue);<br>
+            &nbsp;&nbsp;background: #fff7ed;<br>
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════ 场景对比 ─ 截图区域 ════════════ -->
+<div class="analysis-section">
+  <div class="analysis-card">
+    <div class="analysis-card-header">
+      <div class="icon" style="background:#f0fdf4;color:#16a34a;">A</div>
+      <h2>截图区域前后对比（三种常见场景）</h2>
+    </div>
+    <div class="analysis-card-body">
+
+      <div class="scenario-tabs">
+        <button class="scenario-tab active" onclick="switchScenario('small')">小截图（< 容器）</button>
+        <button class="scenario-tab" onclick="switchScenario('wide')">宽截图（16:9）</button>
+        <button class="scenario-tab" onclick="switchScenario('empty')">无截图</button>
+      </div>
+
+      <!-- 场景：小截图 -->
+      <div id="scenario-small" class="scenario-content active">
+        <div class="side-by-side">
+          <div>
+            <div class="side-label before">BEFORE</div>
+            <div class="img-scenario">
+              <div class="img-container before">
+                <div style="padding:20px;text-align:center;">
+                  <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='280' height='180' viewBox='0 0 280 180'%3E%3Crect width='280' height='180' fill='%23f0f0f0'/%3E%3Crect x='60' y='40' width='160' height='100' fill='%23fff' stroke='%23ccc' stroke-width='1'/%3E%3Ctext x='140' y='95' text-anchor='middle' fill='%23999' font-size='12' font-family='sans-serif'%3E小截图%3C/text%3E%3C/svg%3E"
+                       style="max-width:100%;height:auto;display:block;margin:0 auto;">
+                </div>
+                <span class="badge-float before">16:9 容器</span>
+              </div>
+              <span class="verdict bad">✗ 四周大量灰色填充，图片很小</span>
+            </div>
+          </div>
+          <div>
+            <div class="side-label after">AFTER</div>
+            <div class="img-scenario">
+              <div class="img-container after" style="min-height:130px;justify-content:center;">
+                <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='280' height='180' viewBox='0 0 280 180'%3E%3Crect width='280' height='180' fill='%23f0f0f0'/%3E%3Crect x='60' y='40' width='160' height='100' fill='%23fff' stroke='%23ccc' stroke-width='1'/%3E%3Ctext x='140' y='95' text-anchor='middle' fill='%23999' font-size='12' font-family='sans-serif'%3E小截图%3C/text%3E%3C/svg%3E"
+                     style="max-width:100%;max-height:100%;width:auto;height:auto;border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,0.1);">
+                <span class="badge-float after">自适应高度</span>
+              </div>
+              <span class="verdict good">✓ 容器跟随图片大小，无多余填充</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 场景：宽截图 -->
+      <div id="scenario-wide" class="scenario-content">
+        <div class="side-by-side">
+          <div>
+            <div class="side-label before">BEFORE</div>
+            <div class="img-scenario">
+              <div class="img-container before">
+                <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='400' height='225' viewBox='0 0 400 225'%3E%3Crect width='400' height='225' fill='%23e8f0fe'/%3E%3Crect x='40' y='30' width='320' height='165' fill='%23fff' stroke='%234285f4' stroke-width='2'/%3E%3Ctext x='200' y='115' text-anchor='middle' fill='%234285f4' font-size='14' font-family='sans-serif'%3E16:9 截图%3C/text%3E%3C/svg%3E"
+                     style="width:100%;height:100%;object-fit:contain;">
+                <span class="badge-float before">max-height:420px</span>
+              </div>
+              <span class="verdict bad">✗ 最大化时无法扩展，高度受限</span>
+            </div>
+          </div>
+          <div>
+            <div class="side-label after">AFTER（最大化窗口）</div>
+            <div class="img-scenario">
+              <div class="img-container after" style="min-height:260px;justify-content:center;">
+                <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='500' height='281' viewBox='0 0 500 281'%3E%3Crect width='500' height='281' fill='%23e8f0fe'/%3E%3Crect x='50' y='38' width='400' height='206' fill='%23fff' stroke='%234285f4' stroke-width='2'/%3E%3Ctext x='250' y='145' text-anchor='middle' fill='%234285f4' font-size='16' font-family='sans-serif'%3E16:9 截图%3C/text%3E%3C/svg%3E"
+                     style="max-width:100%;max-height:100%;width:auto;height:auto;">
+                <span class="badge-float after">max-height:55% 相对视口</span>
+              </div>
+              <span class="verdict good">✓ 最大化时自动扩展，充分利用空间</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 场景：无截图 -->
+      <div id="scenario-empty" class="scenario-content">
+        <div class="side-by-side">
+          <div>
+            <div class="side-label before">BEFORE</div>
+            <div class="img-scenario">
+              <div class="img-container before" style="display:flex;align-items:center;justify-content:center;">
+                <div style="text-align:center;color:#9aa0a6;">
+                  <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:0.6;display:block;margin:0 auto 8px;">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
+                  </svg>
+                  <span style="font-size:14px;">上传截图</span>
+                  <span style="font-size:12px;display:block;margin-top:4px;">点击或拖拽上传步骤截图</span>
+                </div>
+              </div>
+              <span class="verdict bad">✗ 灰色区域生硬，视觉空洞</span>
+            </div>
+          </div>
+          <div>
+            <div class="side-label after">AFTER</div>
+            <div class="img-scenario">
+              <div class="no-image-after" style="height:160px;">
+                <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                  <circle cx="8.5" cy="8.5" r="1.5"/>
+                  <polyline points="21 15 16 10 5 21"/>
+                </svg>
+                <span class="hint-text">上传截图</span>
+                <span class="sub-text">点击选择图片，或 Ctrl+V 粘贴剪贴板截图</span>
+              </div>
+              <span class="verdict good">✓ 虚线边框更柔和，hover 高亮提示</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ════════════ 完整编辑器布局对比 ════════════ -->
+<div class="analysis-section">
+  <div class="analysis-card">
+    <div class="analysis-card-header">
+      <div class="icon" style="background:#eff6ff;color:#2563eb;">B</div>
+      <h2>完整编辑器布局对比（宽屏/最大化场景）</h2>
+    </div>
+    <div class="analysis-card-body">
+
+      <div class="side-by-side">
+        <!-- BEFORE -->
+        <div>
+          <div class="side-label before">BEFORE（最大化窗口）</div>
+          <div class="mock-vp-wrap">
+            <div class="vp-header">
+              <div class="vp-dot r"></div><div class="vp-dot y"></div><div class="vp-dot g"></div>
+              <span class="vp-title">录步 — 编辑器</span>
+            </div>
+            <div class="vp-body">
+              <div class="vp-sidebar" style="width:35%;border-right:1px solid #e5e7eb;background:#f9fafb;padding:8px;">
+                <div class="text-xs mb-2" style="padding:0 4px;">5 个步骤</div>
+                <div class="mockup-step active"><span class="mockup-step-num">1</span><div class="mockup-step-body"><div class="mockup-step-title">打开应用</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+                <div class="mockup-step"><span class="mockup-step-num">2</span><div class="mockup-step-body"><div class="mockup-step-title">点击设置</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+                <div class="mockup-step"><span class="mockup-step-num">3</span><div class="mockup-step-body"><div class="mockup-step-title">修改配置</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+                <div class="mockup-step"><span class="mockup-step-num">4</span><div class="mockup-step-body"><div class="mockup-step-title">保存更改</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+                <div class="mockup-step"><span class="mockup-step-num">5</span><div class="mockup-step-body"><div class="mockup-step-title">退出应用</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+              </div>
+              <div style="flex:1;display:flex;flex-direction:column;">
+                <div style="flex:0 0 420px;background:#e8eaed;display:flex;align-items:center;justify-content:center;border-bottom:1px solid #e5e7eb;">
+                  <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='400' height='225' viewBox='0 0 400 225'%3E%3Crect width='400' height='225' fill='%23e8f0fe'/%3E%3Crect x='40' y='30' width='320' height='165' fill='%23fff' stroke='%234285f4' stroke-width='2'/%3E%3Ctext x='200' y='115' text-anchor='middle' fill='%234285f4' font-size='14' font-family='sans-serif'%3E截图%3C/text%3E%3C/svg%3E"
+                       style="max-width:100%;max-height:100%;object-fit:contain;">
+                </div>
+                <div style="flex:1;padding:12px 20px;overflow-y:auto;">
+                  <div style="margin-bottom:10px;"><div style="font-size:11px;color:#6b7280;margin-bottom:2px;">标题</div><div style="height:24px;background:#f3f4f6;border-radius:4px;border:1px solid #e5e7eb;"></div></div>
+                  <div style="margin-bottom:10px;"><div style="font-size:11px;color:#6b7280;margin-bottom:2px;">描述</div><div style="height:52px;background:#f3f4f6;border-radius:4px;border:1px solid #e5e7eb;"></div></div>
+                </div>
+                <div style="padding:10px 20px;border-top:1px solid #e5e7eb;display:flex;">
+                  <div style="padding:6px 16px;background:#ff6b35;color:#fff;border-radius:6px;font-size:12px;width:100%;text-align:center;">保存修改</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style="margin-top:8px;font-size:12px;color:#dc2626;line-height:1.6;">
+            <strong>问题：</strong>截图区域 max-height:420px 固定，最大化后大量空间浪费；侧边栏宽度固定，右侧 padding 过大（40px）。
+          </div>
+        </div>
+
+        <!-- AFTER -->
+        <div>
+          <div class="side-label after">AFTER（最大化窗口）</div>
+          <div class="mock-vp-wrap">
+            <div class="vp-header">
+              <div class="vp-dot r"></div><div class="vp-dot y"></div><div class="vp-dot g"></div>
+              <span class="vp-title">录步 — 编辑器</span>
+            </div>
+            <div class="vp-body">
+              <div class="vp-sidebar" style="width:30%;min-width:240px;max-width:35%;border-right:1px solid #e5e7eb;background:#f9fafb;padding:8px;">
+                <div class="text-xs mb-2" style="padding:0 4px;">5 个步骤</div>
+                <div class="mockup-step active"><span class="mockup-step-num">1</span><div class="mockup-step-body"><div class="mockup-step-title">打开应用</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+                <div class="mockup-step"><span class="mockup-step-num">2</span><div class="mockup-step-body"><div class="mockup-step-title">点击设置</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+                <div class="mockup-step"><span class="mockup-step-num">3</span><div class="mockup-step-body"><div class="mockup-step-title">修改配置</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+                <div class="mockup-step"><span class="mockup-step-num">4</span><div class="mockup-step-body"><div class="mockup-step-title">保存更改</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+                <div class="mockup-step"><span class="mockup-step-num">5</span><div class="mockup-step-body"><div class="mockup-step-title">退出应用</div><div class="mockup-step-type">click</div></div><div class="mockup-step-thumb"></div></div>
+              </div>
+              <div style="flex:1;display:flex;flex-direction:column;">
+                <div style="flex:0 0 auto;max-height:55%;min-height:200px;background:#f9fafb;display:flex;align-items:center;justify-content:center;padding:8px;border-bottom:1px solid #e5e7eb;">
+                  <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='500' height='281' viewBox='0 0 500 281'%3E%3Crect width='500' height='281' fill='%23e8f0fe'/%3E%3Crect x='50' y='38' width='400' height='206' fill='%23fff' stroke='%234285f4' stroke-width='2'/%3E%3Ctext x='250' y='145' text-anchor='middle' fill='%234285f4' font-size='16' font-family='sans-serif'%3E截图 - 自适应扩展 %3C/text%3E%3C/svg%3E"
+                       style="max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;">
+                </div>
+                <div style="flex:1;overflow-y:auto;padding:12px 20px;">
+                  <div style="margin-bottom:10px;"><div style="font-size:11px;color:#6b7280;margin-bottom:2px;">标题</div><div style="height:24px;border:1px solid #d1d5db;border-radius:4px;padding:0 8px;display:flex;align-items:center;font-size:12px;color:#374151;">打开应用</div></div>
+                  <div style="margin-bottom:10px;"><div style="font-size:11px;color:#6b7280;margin-bottom:2px;">描述</div><textarea style="width:100%;height:60px;border:1px solid #d1d5db;border-radius:4px;padding:6px 8px;font-size:12px;font-family:inherit;resize:vertical;" placeholder="输入步骤描述"></textarea></div>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;padding:10px 20px;border-top:1px solid #e5e7eb;flex-wrap:wrap;">
+                  <div style="padding:5px 16px;background:#ff6b35;color:#fff;border-radius:6px;font-size:12px;cursor:default;">保存修改</div>
+                  <div style="padding:5px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:11px;color:#6b7280;cursor:default;">标注</div>
+                  <div class="spacer" style="flex:1;"></div>
+                  <div style="font-size:10px;color:#9ca3af;">Ctrl+S 保存</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style="margin-top:8px;font-size:12px;color:#16a34a;line-height:1.6;">
+            <strong>改进：</strong>截图区域 max-height:55%，最大化时自动扩展；侧边栏 max-width:35% 弹性宽度；padding 缩小；底部按钮栏紧凑排列。
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ════════════ 标题栏按钮优化 ════════════ -->
+<div class="analysis-section">
+  <div class="analysis-card">
+    <div class="analysis-card-header">
+      <div class="icon" style="background:#fefce8;color:#ca8a04;">C</div>
+      <h2>标题栏按钮布局优化</h2>
+    </div>
+    <div class="analysis-card-body">
+
+      <div class="side-by-side">
+        <div>
+          <div class="side-label before">BEFORE</div>
+          <div class="titlebar-mock" style="padding:0 8px;overflow:hidden;">
+            <div class="titlebar-mock-left">
+              <span style="font-size:12px;cursor:default;">← 返回</span>
+              <span style="font-size:13px;font-weight:600;color:#e6edf3;">录制标题</span>
+            </div>
+            <div class="titlebar-mock-right" style="flex-wrap:nowrap;overflow:hidden;gap:2px;">
+              <span class="btn" style="font-size:11px;padding:3px 6px;">导出 ▼</span>
+              <span class="btn" style="font-size:11px;padding:3px 6px;background:#3366CC;color:#fff;border-color:#3366CC;">发布</span>
+              <span class="btn" style="font-size:11px;padding:3px 6px;">扫描脱敏</span>
+              <span class="btn" style="font-size:11px;padding:3px 6px;">文本脱敏</span>
+              <span class="btn" style="font-size:11px;padding:3px 6px;">AI生成</span>
+              <span class="btn" style="font-size:11px;padding:3px 6px;">预览</span>
+              <span class="btn" style="font-size:11px;padding:3px 6px;">全图</span>
+              <span class="btn" style="font-size:11px;padding:3px 6px;">裁图</span>
+            </div>
+          </div>
+          <div style="margin-top:6px;font-size:12px;color:#dc2626;line-height:1.5;">
+            ⚠ 按钮过多，空间不足时被截断或溢出，无法显示完整。
+          </div>
+        </div>
+
+        <div>
+          <div class="side-label after">AFTER</div>
+          <div class="titlebar-mock" style="padding:0 8px;">
+            <div class="titlebar-mock-left">
+              <span style="font-size:12px;cursor:default;display:flex;align-items:center;gap:4px;">← 返回</span>
+              <span style="font-size:13px;font-weight:600;color:#e6edf3;">录制标题</span>
+            </div>
+            <div class="titlebar-mock-right" style="gap:2px;flex-wrap:wrap;">
+              <span class="btn" style="font-size:11px;padding:3px 8px;gap:2px;">导出 ▼</span>
+              <span class="btn" style="font-size:11px;padding:3px 8px;background:#3366CC;color:#fff;border-color:#3366CC;">发布</span>
+              <span class="btn" style="font-size:11px;padding:3px 8px;">预览</span>
+              <span style="position:relative;display:inline-flex;">
+                <span class="btn" style="font-size:11px;padding:3px 8px;gap:2px;">更多 ▼</span>
+                <div style="display:none;position:absolute;top:100%;right:0;background:#1a1e26;border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:4px;min-width:140px;z-index:10;flex-direction:column;">
+                  <div style="padding:6px 10px;font-size:11px;color:#c9cdd4;cursor:default;border-radius:4px;white-space:nowrap;">扫描脱敏</div>
+                  <div style="padding:6px 10px;font-size:11px;color:#c9cdd4;cursor:default;border-radius:4px;white-space:nowrap;">文本脱敏</div>
+                  <div style="padding:6px 10px;font-size:11px;color:#c9cdd4;cursor:default;border-radius:4px;white-space:nowrap;">AI 生成</div>
+                  <div style="border-top:1px solid rgba(255,255,255,0.08);margin:4px 0;"></div>
+                  <div style="display:flex;gap:4px;padding:4px 6px;">
+                    <span style="padding:2px 8px;font-size:10px;border-radius:4px;background:rgba(255,255,255,0.1);color:#c9cdd4;cursor:default;">全图</span>
+                    <span style="padding:2px 8px;font-size:10px;border-radius:4px;background:rgba(255,255,255,0.1);color:#c9cdd4;cursor:default;">裁图</span>
+                  </div>
+                </div>
+              </span>
+            </div>
+          </div>
+          <div style="margin-top:6px;font-size:12px;color:#16a34a;line-height:1.5;">
+            ✓ 次要功能（脱敏、AI）折叠到"更多"菜单，标题栏清爽，且支持换行。
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ════════════ 底部按钮栏优化 ════════════ -->
+<div class="analysis-section">
+  <div class="analysis-card">
+    <div class="analysis-card-header">
+      <div class="icon" style="background:#f0fdf4;color:#16a34a;">D</div>
+      <h2>编辑区底部按钮栏优化</h2>
+    </div>
+    <div class="analysis-card-body">
+      <div class="side-by-side">
+        <div>
+          <div class="side-label before">BEFORE</div>
+          <div style="padding:16px;background:#fff;border:1px solid #e5e7eb;border-radius:8px;">
+            <div style="margin-bottom:12px;">
+              <div style="height:24px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:4px;margin-bottom:8px;"></div>
+              <div style="height:60px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:4px;margin-bottom:8px;"></div>
+            </div>
+            <div style="border-top:1px solid #e5e7eb;padding-top:8px;">
+              <div style="padding:6px 16px;background:#ff6b35;color:#fff;border-radius:6px;font-size:12px;text-align:center;">保存修改</div>
+            </div>
+          </div>
+          <div style="margin-top:6px;font-size:12px;color:#dc2626;">
+            ⚠ 保存按钮单独一行，视觉上孤立松散，功能单一。
+          </div>
+        </div>
+        <div>
+          <div class="side-label after">AFTER</div>
+          <div style="padding:16px;background:#fff;border:1px solid #e5e7eb;border-radius:8px;">
+            <div style="margin-bottom:12px;">
+              <div style="height:24px;border:1px solid #d1d5db;border-radius:4px;padding:0 8px;display:flex;align-items:center;font-size:12px;margin-bottom:8px;">步骤标题</div>
+              <textarea style="width:100%;height:56px;border:1px solid #d1d5db;border-radius:4px;padding:6px 8px;font-size:12px;font-family:inherit;resize:none;margin-bottom:8px;" placeholder="输入步骤描述"></textarea>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;padding-top:8px;border-top:1px solid #e5e7eb;flex-wrap:wrap;">
+              <div style="padding:5px 16px;background:#ff6b35;color:#fff;border-radius:6px;font-size:12px;cursor:default;white-space:nowrap;">保存修改</div>
+              <div style="padding:5px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:11px;color:#6b7280;cursor:default;white-space:nowrap;">标注</div>
+              <div style="padding:5px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:11px;color:#6b7280;cursor:default;white-space:nowrap;">上传截图</div>
+              <div class="spacer" style="flex:1;min-width:0;"></div>
+              <div style="font-size:10px;color:#9ca3af;white-space:nowrap;">Ctrl+S</div>
+            </div>
+          </div>
+          <div style="margin-top:6px;font-size:12px;color:#16a34a;">
+            ✓ 按钮栏与表单区域分离，操作按钮平铺一行，快捷操作（标注、上传）并列，视觉饱满。
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════ 完整截图区域替换方案代码 ════════════ -->
+<div class="analysis-section">
+  <div class="analysis-card">
+    <div class="analysis-card-header">
+      <div class="icon" style="background:#f0f9ff;color:#0284c7;">{ }</div>
+      <h2>核心代码修改方案</h2>
+    </div>
+    <div class="analysis-card-body">
+      <div style="margin-bottom:16px;font-size:14px;font-weight:600;">修改文件：<code>src/styles.css</code> 和 <code>src/pages/StepEditor.tsx</code></div>
+
+      <div style="margin-bottom:20px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:6px;">1. CSS 截图区域（替换原有 .step-detail-image 规则）</div>
+        <div class="code-snippet" style="font-size:12px;line-height:1.6;">
+/* 移除固定宽高比，改为自适应容器 */
+.step-detail-image {
+  position: relative;
+  width: 100%;
+  flex: 0 0 auto;          /* 不自伸缩 */
+  max-height: 55%;          /* 相对视口高度，最大化时自动扩展 */
+  min-height: 180px;        /* 最小高度保障 */
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #f9fafb;      /* 更柔和的背景色 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.step-detail-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;              /* 图片自身宽度 */
+  height: auto;             /* 图片自身高度 */
+  object-fit: contain;
+}
+
+/* 无截图占位区 */
+.step-detail-no-image {
+  width: 100%;
+  min-height: 160px;
+  max-height: 200px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: #f9fafb;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.step-detail-no-image:hover {
+  border-color: var(--blue);
+  background: #fff7ed;
+}
+        </div>
+      </div>
+
+      <div style="margin-bottom:20px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:6px;">2. 侧边栏弹性宽度（替换原有 .editor-sidebar 规则）</div>
+        <div class="code-snippet" style="font-size:12px;line-height:1.6;">
+.editor-sidebar {
+  width: 300px;
+  min-width: 260px;
+  max-width: 35%;          /* 宽屏时不超过 35% */
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  overflow-y: auto;
+}
+
+.editor-preview-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 24px;       /* 缩小 padding */
+}
+        </div>
+      </div>
+
+      <div style="margin-bottom:20px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:6px;">3. 移除 useLayoutEffect 中的固定高度计算（StepEditor.tsx）</div>
+        <div class="code-snippet" style="font-size:12px;line-height:1.6;">
+// 删除或注释掉以下代码（约第 309-322 行）
+/*
+useLayoutEffect(() => {
+  const el = stepDetailImageRef.current;
+  if (!el) return;
+  const setHeight = () => {
+    const w = el.clientWidth;
+    if (w > 0) {
+      el.style.height = `${Math.min(Math.max(w * 9 / 16, 200), 520)}px`;
+    }
+  };
+  setHeight();
+  const ro = new ResizeObserver(setHeight);
+  ro.observe(el);
+  return () => ro.disconnect();
+}, []);
+*/
+
+// 图片高度由 CSS 的 max-height + object-fit 控制，不再需要 JS 强制固定宽高比
+        </div>
+      </div>
+
+      <div>
+        <div style="font-size:13px;font-weight:600;margin-bottom:6px;">4. 按钮栏改为 flex-wrap 布局</div>
+        <div class="code-snippet" style="font-size:12px;line-height:1.6;">
+/* 编辑区底部按钮栏 */
+.step-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;          /* 允许换行 */
+  padding: 12px 24px;       /* 与主区域对齐 */
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+}
+
+.step-detail-actions .btn {
+  width: auto;              /* 取消 100% 宽度 */
+  padding: 6px 16px;
+}
+
+/* 标题栏按钮 - 次要功能折叠到"更多" */
+.titlebar-more-dropdown {
+  position: relative;
+}
+.titlebar-more-dropdown .dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  background: #1a1e26;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  padding: 6px;
+  min-width: 160px;
+  z-index: 50;
+  flex-direction: column;
+}
+.titlebar-more-dropdown:hover .dropdown {
+  display: flex;
+}
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+function switchScenario(id) {
+  document.querySelectorAll('.scenario-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.scenario-tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('scenario-' + id).classList.add('active');
+  document.querySelector(`.scenario-tab[onclick*="${id}"]`).classList.add('active');
+}
+</script>
+
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+  "identifier": "store-capability",
+  "description": "Capability for the store plugin",
+  "windows": ["main"],
+  "permissions": [
+    "store:default"
+  ]
+}

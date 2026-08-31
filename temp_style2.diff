@@ -1,0 +1,1102 @@
+﻿commit 72e9ec5e47155d27ea3399a2b762de824fe383f1
+Author: zhang-ruo-xuan <zhang-ruo-xuan@users.noreply.github.com>
+Date:   Tue Aug 25 22:52:58 2026 +0800
+
+    feat: 截图标注/自适应裁剪/AI配置/登录发布系列改造
+
+diff --git a/src/styles.css b/src/styles.css
+index ba33b2c..5f0bf89 100644
+--- a/src/styles.css
++++ b/src/styles.css
+@@ -152,6 +152,175 @@ a:hover {
+   -webkit-app-region: no-drag;
+ }
+ 
++.titlebar-btn {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  font-size: 12px;
++  font-weight: 600;
++  font-family: inherit;
++  border: none;
++  border-radius: 4px;
++  cursor: pointer;
++  padding: 4px 10px;
++  color: #fff;
++  transition: background 0.12s;
++  -webkit-app-region: no-drag;
++}
++
++.titlebar-btn-pause {
++  background: #f0883e;
++}
++.titlebar-btn-pause:hover {
++  background: #e0782e;
++}
++.titlebar-btn-resume {
++  background: var(--orange);
++}
++.titlebar-btn-resume:hover {
++  background: var(--blue-hover);
++}
++.titlebar-btn-stop {
++  background: #ef4444;
++}
++.titlebar-btn-stop:hover {
++  background: #dc2626;
++}
++
++.titlebar-btn-login {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  background: transparent;
++  border: none;
++  border-radius: 4px;
++  padding: 6px 8px;
++  cursor: pointer;
++  color: #e6edf3;
++  font-size: 12px;
++  font-family: inherit;
++  transition: background 0.12s;
++  -webkit-app-region: no-drag;
++}
++.titlebar-btn-login:hover {
++  background: #ffffff14;
++}
++
++.titlebar-avatar {
++  width: 22px;
++  height: 22px;
++  border-radius: 50%;
++  background: #4ade80;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-size: 11px;
++  color: #000;
++  font-weight: 600;
++}
++
++.titlebar-login-text {
++  font-size: 12px;
++}
++
++.titlebar-win-btn {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  background: transparent;
++  border: none;
++  border-radius: 4px;
++  padding: 6px 8px;
++  cursor: pointer;
++  color: #e6edf3;
++  transition: background 0.12s;
++  -webkit-app-region: no-drag;
++}
++.titlebar-win-btn:hover {
++  background: #ffffff14;
++}
++.titlebar-close-btn:hover {
++  background: #ef4444;
++}
++
++.titlebar-rec-badge {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  font-size: 11px;
++  font-weight: 600;
++  padding: 2px 8px;
++  border-radius: 4px;
++  -webkit-app-region: no-drag;
++}
++.titlebar-rec-badge.recording {
++  color: #f85149;
++  background: #f8514926;
++}
++.titlebar-rec-badge.paused {
++  color: #f0883e;
++  background: #f0883e26;
++}
++.titlebar-rec-dot {
++  width: 6px;
++  height: 6px;
++  border-radius: 50%;
++  background: currentColor;
++}
++
++.titlebar-editor-left {
++  flex: 1;
++  height: 100%;
++  display: flex;
++  align-items: center;
++  padding-left: 8px;
++  -webkit-app-region: no-drag;
++}
++
++.titlebar-editor-actions {
++  display: flex;
++  align-items: center;
++  gap: 4px;
++  margin-right: -6px;
++  -webkit-app-region: no-drag;
++}
++
++/* 顶部 全图/裁图 统一切换（选择教程主要截图风格） */
++.titlebar-view-segmented {
++  display: inline-flex;
++  align-items: center;
++  border: 1px solid rgba(255, 255, 255, 0.18);
++  border-radius: 5px;
++  overflow: hidden;
++  margin-left: 2px;
++  height: 24px;
++}
++.titlebar-view-segmented-btn {
++  padding: 0 10px;
++  height: 100%;
++  font-size: 12px;
++  border: none;
++  background: transparent;
++  color: #b8c0cc;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s;
++  line-height: 24px;
++  font-weight: 400;
++  font-family: inherit;
++}
++.titlebar-view-segmented-btn:not(:last-child) {
++  border-right: 1px solid rgba(255, 255, 255, 0.18);
++}
++.titlebar-view-segmented-btn:hover {
++  background: #ffffff14;
++  color: #e6edf3;
++}
++.titlebar-view-segmented-btn.active {
++  background: #ffffff29;
++  color: #fff;
++  font-weight: 600;
++}
++
+ /* ---- Buttons ---- */
+ .btn {
+   display: inline-flex;
+@@ -413,6 +582,49 @@ select {
+   overflow: hidden;
+ }
+ 
++/* ---- Sidebar ---- */
++.sidebar {
++  width: 48px;
++  min-width: 48px;
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: 4px;
++  padding: 8px 4px;
++  background: var(--bg-secondary);
++  border-right: 1px solid var(--border);
++}
++
++.sidebar-item {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  width: 36px;
++  height: 36px;
++  border: none;
++  border-radius: 8px;
++  background: transparent;
++  color: var(--text-muted);
++  cursor: pointer;
++  transition: all 0.12s;
++}
++.sidebar-item:hover {
++  background: var(--bg-tertiary);
++  color: var(--text-secondary);
++}
++.sidebar-item.active {
++  background: var(--brand-light);
++  color: var(--brand);
++}
++
++/* ---- Body ---- */
++.body {
++  flex: 1;
++  overflow: hidden;
++  display: flex;
++  flex-direction: column;
++}
++
+ /* ---- Main Content ---- */
+ .main-content {
+   flex: 1;
+@@ -810,11 +1022,11 @@ select {
+   position: absolute;
+   top: calc(100% + 6px);
+   right: 0;
+-  min-width: 175px;
+-  padding: 6px;
++  width: max-content;
++  padding: 4px;
+   background: #1a1e26;
+   border: 1px solid rgba(255, 255, 255, 0.08);
+-  border-radius: 10px;
++  border-radius: 8px;
+   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+   z-index: 50;
+   animation: exportDropdownIn 0.15s ease-out;
+@@ -829,13 +1041,13 @@ select {
+ .export-dropdown-item {
+   display: flex;
+   align-items: center;
+-  gap: 10px;
++  gap: 6px;
+   width: 100%;
+-  padding: 8px 10px;
+-  font-size: 13px;
++  padding: 5px 8px;
++  font-size: 12px;
+   text-align: left;
+   border: none;
+-  border-radius: 6px;
++  border-radius: 5px;
+   background: none;
+   color: #c9cdd4;
+   cursor: pointer;
+@@ -847,7 +1059,7 @@ select {
+   display: flex;
+   align-items: center;
+   justify-content: center;
+-  width: 20px;
++  width: 16px;
+   flex-shrink: 0;
+   color: #6b7280;
+   transition: color 0.12s;
+@@ -855,13 +1067,7 @@ select {
+ 
+ .export-dropdown-item-label {
+   flex: 1;
+-}
+-
+-.export-dropdown-item-ext {
+-  font-size: 11px;
+-  font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+-  color: #484f58;
+-  transition: color 0.12s;
++  white-space: nowrap;
+ }
+ 
+ .export-dropdown-item:hover {
+@@ -873,10 +1079,6 @@ select {
+   color: #c9cdd4;
+ }
+ 
+-.export-dropdown-item:hover .export-dropdown-item-ext {
+-  color: #6e7681;
+-}
+-
+ /* ── dark mode ── */
+ 
+ .dark .export-dropdown {
+@@ -897,18 +1099,10 @@ select {
+   color: var(--text-muted);
+ }
+ 
+-.dark .export-dropdown-item-ext {
+-  color: var(--text-muted);
+-}
+-
+ .dark .export-dropdown-item:hover .export-dropdown-item-icon {
+   color: var(--text-secondary);
+ }
+ 
+-.dark .export-dropdown-item:hover .export-dropdown-item-ext {
+-  color: var(--text-secondary);
+-}
+-
+ /* ---- Step list ---- */
+ .step-list {
+   padding: 0 16px 16px;
+@@ -1556,14 +1750,68 @@ select {
+   line-height: 1;
+ }
+ 
+-.step-detail-image:hover .screenshot-delete-btn {
++.step-detail-image:hover .screenshot-delete-btn,
++.step-detail-image:hover .screenshot-annotate-btn {
+   opacity: 1;
+ }
+ 
+-.screenshot-delete-btn:hover {
++.screenshot-delete-btn:hover,
++.screenshot-annotate-btn:hover {
+   background: rgba(0, 0, 0, 0.75);
+ }
+ 
++.screenshot-annotate-btn {
++  position: absolute;
++  top: 8px;
++  right: 40px;
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  padding: 3px 10px;
++  font-size: 12px;
++  border-radius: 14px;
++  background: rgba(0, 0, 0, 0.5);
++  color: #fff;
++  border: none;
++  cursor: pointer;
++  opacity: 0;
++  transition: opacity 0.15s, background 0.15s;
++  z-index: 10;
++  font-family: inherit;
++}
++.screenshot-annotate-btn svg {
++  width: 12px;
++  height: 12px;
++}
++
++/* 主截图模式悬浮胶囊：右下角切换 全图/裁图 */
++.step-detail-view-pill {
++  position: absolute;
++  right: 20px;
++  bottom: 15px;
++  padding: 6px 16px;
++  font-size: 13px;
++  font-weight: 500;
++  line-height: 1;
++  color: #fff;
++  background: #2a2a2a;
++  border: none;
++  border-radius: 999px;
++  cursor: pointer;
++  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
++  z-index: 10;
++  transition: background 0.15s, box-shadow 0.15s, transform 0.1s;
++  user-select: none;
++  font-family: inherit;
++}
++.step-detail-view-pill:hover {
++  background: #3a3a3a;
++  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
++}
++.step-detail-view-pill:active {
++  transform: scale(0.97);
++}
++
+ .image-overlay-toolbar {
+   display: flex;
+   gap: 8px;
+@@ -1803,15 +2051,73 @@ select {
+   position: sticky;
+   bottom: 0;
+   margin-top: 8px;
+-  padding-top: 8px;
+-  padding-bottom: 6px;
++  padding: 10px 20px;
+   border-top: 1px solid var(--border);
+   background: var(--bg);
+   z-index: 10;
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: 8px;
+ }
+ 
+ .step-detail-actions .btn {
++  flex: 0 0 auto;
++}
++
++/* ═══ 更多 dropdown ═══ */
++
++.more-dropdown-wrap {
++  position: relative;
++}
++
++.more-dropdown {
++  position: absolute;
++  top: 100%;
++  right: 0;
++  margin-top: 4px;
++  background: #fff;
++  border: 1px solid #e5e7eb;
++  border-radius: 8px;
++  box-shadow: 0 4px 16px rgba(0,0,0,0.15);
++  z-index: 100;
++  min-width: 160px;
++  padding: 4px;
++}
++.more-dropdown button {
++  display: flex;
++  align-items: center;
++  gap: 8px;
+   width: 100%;
++  padding: 7px 12px;
++  font-size: 13px;
++  color: #374151;
++  background: none;
++  border: none;
++  border-radius: 4px;
++  cursor: pointer;
++  font-family: inherit;
++  transition: background 0.1s;
++}
++.more-dropdown button:hover {
++  background: #f3f4f6;
++}
++.more-dropdown button:disabled {
++  color: #9ca3af;
++  cursor: default;
++}
++.more-dropdown button:disabled:hover {
++  background: none;
++}
++.more-dropdown button svg {
++  width: 14px;
++  height: 14px;
++  flex-shrink: 0;
++}
++.more-dropdown-divider {
++  height: 1px;
++  background: #e5e7eb;
++  margin: 4px 0;
+ }
+ 
+ /* ============================================================
+@@ -1846,10 +2152,17 @@ select {
+   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+ }
+ 
++.lightbox-topbar {
++  position: fixed;
++  top: 16px;
++  right: 16px;
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  z-index: 3;
++}
++
+ .lightbox-close {
+-  position: absolute;
+-  top: -40px;
+-  right: 0;
+   background: rgba(255, 255, 255, 0.12);
+   border: 1px solid rgba(255, 255, 255, 0.2);
+   color: #fff;
+@@ -1861,6 +2174,7 @@ select {
+   justify-content: center;
+   cursor: pointer;
+   transition: background 0.15s;
++  z-index: 2;
+ }
+ 
+ .lightbox-close:hover {
+@@ -1868,7 +2182,7 @@ select {
+ }
+ 
+ .lightbox-nav {
+-  position: absolute;
++  position: fixed;
+   top: 50%;
+   transform: translateY(-50%);
+   background: rgba(255, 255, 255, 0.12);
+@@ -1882,7 +2196,7 @@ select {
+   justify-content: center;
+   cursor: pointer;
+   transition: background 0.15s;
+-  z-index: 1;
++  z-index: 2;
+ }
+ 
+ .lightbox-nav:hover:not(:disabled) {
+@@ -1895,11 +2209,11 @@ select {
+ }
+ 
+ .lightbox-prev {
+-  left: -60px;
++  left: 12px;
+ }
+ 
+ .lightbox-next {
+-  right: -60px;
++  right: 12px;
+ }
+ 
+ .lightbox-footer {
+@@ -2242,3 +2556,570 @@ select {
+   background: rgba(207, 34, 46, 0.1);
+   border-color: rgba(207, 34, 46, 0.5);
+ }
++
++/* ===== 截图标注编辑器（网站编辑页同款样式，从 flowio-site-next/globals.css 移植） ===== */
++.annotation-overlay {
++  position: fixed;
++  inset: 0;
++  z-index: 9999;
++  background: #18191C;
++  display: flex;
++  flex-direction: column;
++}
++
++.annotation-toolbar {
++  height: 56px;
++  background: #24292E;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  padding: 0 16px;
++  flex-shrink: 0;
++  border-bottom: 1px solid #333840;
++}
++
++.annotation-tools {
++  display: flex;
++  align-items: center;
++  gap: 0;
++  background: #333840;
++  border-radius: 8px;
++  padding: 4px;
++}
++
++.annotation-tool {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  width: 36px;
++  height: 36px;
++  border: none;
++  border-radius: 6px;
++  background: transparent;
++  color: #828B94;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s;
++  position: relative;
++}
++
++.annotation-tool:hover {
++  background: rgba(255, 255, 255, 0.08);
++}
++
++.annotation-tool-active {
++  background: #FF6B35 !important;
++  color: #fff !important;
++}
++
++.annotation-tool-icon {
++  font-size: 16px;
++  font-weight: 500;
++  line-height: 1;
++}
++
++.annotation-tool-label {
++  display: none;
++}
++
++.annotation-tool::after {
++  content: attr(title);
++  position: absolute;
++  bottom: -24px;
++  left: 50%;
++  transform: translateX(-50%);
++  font-size: 11px;
++  color: #828B94;
++  white-space: nowrap;
++  opacity: 0;
++  pointer-events: none;
++  transition: opacity 0.15s;
++}
++
++.annotation-tool:hover::after {
++  opacity: 1;
++}
++
++.annotation-actions {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.annotation-undo-btn,
++.annotation-redo-btn {
++  padding: 6px 12px;
++  font-size: 13px;
++  font-weight: 500;
++  color: #828B94;
++  background: #333840;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s;
++}
++
++.annotation-undo-btn:hover:not(:disabled),
++.annotation-redo-btn:hover:not(:disabled) {
++  background: #3d444d;
++  color: #fff;
++}
++
++.annotation-undo-btn:disabled,
++.annotation-redo-btn:disabled {
++  opacity: 0.4;
++  cursor: not-allowed;
++}
++
++.annotation-save-btn {
++  padding: 8px 20px;
++  font-size: 13px;
++  font-weight: 600;
++  color: #fff;
++  background: #FF6B35;
++  border: none;
++  border-radius: 8px;
++  cursor: pointer;
++  transition: background 0.15s;
++}
++
++.annotation-save-btn:hover {
++  background: #e85d2c;
++}
++
++.annotation-close-btn {
++  width: 36px;
++  height: 36px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-size: 16px;
++  color: #828B94;
++  background: transparent;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s;
++}
++
++.annotation-close-btn:hover {
++  background: rgba(255, 255, 255, 0.08);
++  color: #fff;
++}
++
++.annotation-canvas-area {
++  flex: 1;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  overflow: hidden;
++  padding: 40px;
++  position: relative;
++}
++
++.annotation-canvas-area canvas {
++  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
++  border-radius: 4px;
++}
++
++.annotation-canvas-wrapper {
++  position: relative;
++  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
++  border-radius: 4px;
++  overflow: visible;
++  flex-shrink: 0;
++}
++
++/* 图片放大查看弹层 */
++.img-lightbox {
++  position: fixed;
++  inset: 0;
++  z-index: 10000;
++  background: rgba(0, 0, 0, 0.9);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  cursor: zoom-out;
++}
++.img-lightbox img {
++  max-width: 90vw;
++  max-height: 90vh;
++  object-fit: contain;
++  border-radius: 4px;
++}
++.img-lightbox-close {
++  position: absolute;
++  top: 20px;
++  right: 20px;
++  width: 40px;
++  height: 40px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-size: 20px;
++  color: #fff;
++  background: rgba(255, 255, 255, 0.15);
++  border: none;
++  border-radius: 50%;
++  cursor: pointer;
++  transition: background 0.15s;
++}
++.img-lightbox-close:hover {
++  background: rgba(255, 255, 255, 0.3);
++}
++
++.edit-step-shot-img {
++  cursor: zoom-in;
++}
++.edit-step-shot-img > img {
++  cursor: zoom-in;
++}
++
++.annotation-text-input {
++  position: absolute;
++  z-index: 10;
++}
++
++.annotation-text-input input {
++  min-width: 120px;
++  padding: 8px 12px;
++  font-size: 14px;
++  font-family: 'Noto Sans SC', sans-serif;
++  color: #24292e;
++  background: rgba(255, 255, 255, 0.95);
++  border: 1px solid #e7e8ea;
++  border-radius: 6px;
++  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
++  outline: none;
++}
++
++.annotation-text-input input:focus {
++  border-color: #FF6B35;
++}
++
++/* 历史按钮（上一步/下一步） */
++.annotation-history-btn {
++  padding: 6px 14px;
++  font-size: 14px;
++  font-weight: 500;
++  color: #828B94;
++  background: #333840;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s;
++}
++
++.annotation-history-btn:hover:not(:disabled) {
++  background: #3d444d;
++  color: #fff;
++}
++
++.annotation-history-btn:disabled {
++  opacity: 0.4;
++  cursor: not-allowed;
++}
++
++/* 裁剪应用按钮 */
++.annotation-crop-apply-btn {
++  padding: 6px 14px;
++  font-size: 13px;
++  font-weight: 500;
++  color: #fff;
++  background: #22C55E;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s;
++}
++
++.annotation-crop-apply-btn:hover {
++  background: #16A34A;
++}
++
++/* 裁剪取消按钮 */
++.annotation-crop-cancel-btn {
++  padding: 6px 14px;
++  font-size: 13px;
++  font-weight: 500;
++  color: #828B94;
++  background: #333840;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s;
++}
++
++.annotation-crop-cancel-btn:hover {
++  background: #3d444d;
++  color: #fff;
++}
++
++/* 文字输入条（选择文字工具并点击截图后出现在工具栏） */
++.annotation-text-bar {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  background: #333840;
++  border-radius: 8px;
++  padding: 4px 8px;
++  margin-left: 8px;
++}
++
++.annotation-text-bar-label {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  width: 24px;
++  height: 24px;
++  font-size: 14px;
++  font-weight: 700;
++  color: #fff;
++  background: #FF6B35;
++  border-radius: 6px;
++  flex-shrink: 0;
++}
++
++.annotation-text-bar-input {
++  width: 220px;
++  height: 30px;
++  padding: 0 10px;
++  font-size: 13px;
++  color: #fff;
++  background: #232830;
++  border: 1px solid #3d444d;
++  border-radius: 6px;
++  outline: none;
++  transition: border-color 0.15s;
++}
++
++.annotation-text-bar-input:focus {
++  border-color: #FF6B35;
++  outline: 2px solid #FF6B35;
++  outline-offset: -2px;
++}
++
++.annotation-text-bar-input::placeholder {
++  color: #6e7681;
++}
++
++.annotation-text-bar-confirm {
++  padding: 5px 14px;
++  font-size: 13px;
++  font-weight: 600;
++  color: #fff;
++  background: #FF6B35;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s;
++}
++
++.annotation-text-bar-confirm:hover {
++  background: #e85d2c;
++}
++
++.annotation-text-bar-cancel {
++  padding: 5px 10px;
++  font-size: 13px;
++  font-weight: 500;
++  color: #828B94;
++  background: transparent;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s;
++}
++
++.annotation-text-bar-cancel:hover {
++  background: rgba(255, 255, 255, 0.08);
++  color: #fff;
++}
++
++/* 文字工具提示：点击截图放置文字 */
++.annotation-text-hint {
++  margin-left: 8px;
++  padding: 6px 12px;
++  font-size: 12px;
++  color: #828B94;
++  background: #333840;
++  border-radius: 6px;
++  white-space: nowrap;
++}
++
++/* 标注颜色 / 大小设置 */
++.annotation-settings {
++  display: flex;
++  align-items: center;
++  gap: 16px;
++  margin-left: 8px;
++  padding-left: 16px;
++  border-left: 1px solid #333840;
++}
++
++.annotation-setting-group {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.annotation-setting-label {
++  font-size: 12px;
++  color: #828B94;
++  white-space: nowrap;
++}
++
++.annotation-colors {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++}
++
++.annotation-color-swatch {
++  width: 20px;
++  height: 20px;
++  border-radius: 50%;
++  border: 2px solid transparent;
++  cursor: pointer;
++  padding: 0;
++  transition: transform 0.12s, border-color 0.12s;
++}
++
++.annotation-color-swatch:hover {
++  transform: scale(1.15);
++}
++
++.annotation-color-swatch.active {
++  border-color: #fff;
++  box-shadow: 0 0 0 2px #FF6B35;
++}
++
++.annotation-sizes {
++  display: flex;
++  align-items: center;
++  gap: 4px;
++}
++
++.annotation-size-btn {
++  min-width: 28px;
++  height: 28px;
++  padding: 0 8px;
++  font-size: 12px;
++  font-weight: 500;
++  color: #828B94;
++  background: #333840;
++  border: 1px solid transparent;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s, border-color 0.15s;
++}
++
++.annotation-size-btn:hover {
++  background: #3d444d;
++  color: #fff;
++}
++
++.annotation-size-btn.active {
++  color: #fff;
++  background: #FF6B35;
++  border-color: #FF6B35;
++}
++
++/* ===== 文字浮层（桌面端：点击图片位置弹出，含字号+输入+确认/取消） ===== */
++.annotation-text-popover {
++  position: absolute;
++  z-index: 20;
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  min-width: 240px;
++  padding: 10px;
++  background: #24292E;
++  border: 1px solid #333840;
++  border-radius: 10px;
++  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
++}
++.annotation-text-popover-fonts {
++  display: flex;
++  align-items: center;
++  gap: 4px;
++  flex-wrap: wrap;
++}
++.annotation-text-popover-fonts button {
++  min-width: 32px;
++  height: 28px;
++  padding: 0 6px;
++  font-size: 12px;
++  font-weight: 500;
++  color: #828B94;
++  background: #333840;
++  border: 1px solid transparent;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s, border-color 0.15s;
++}
++.annotation-text-popover-fonts button:hover {
++  background: #3d444d;
++  color: #fff;
++}
++.annotation-text-popover-fonts button.active {
++  color: #fff;
++  background: #FF6B35;
++  border-color: #FF6B35;
++}
++.annotation-text-popover-row {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++}
++.annotation-text-popover-input {
++  flex: 1;
++  min-width: 0;
++  height: 32px;
++  padding: 0 10px;
++  font-size: 13px;
++  color: #fff;
++  background: #232830;
++  border: 1px solid #3d444d;
++  border-radius: 6px;
++  outline: none;
++  transition: border-color 0.15s;
++}
++.annotation-text-popover-input:focus {
++  border-color: #FF6B35;
++}
++.annotation-text-popover-confirm {
++  width: 32px;
++  height: 32px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-size: 14px;
++  font-weight: 600;
++  color: #fff;
++  background: #FF6B35;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s;
++}
++.annotation-text-popover-confirm:hover {
++  background: #e85d2c;
++}
++.annotation-text-popover-cancel {
++  width: 32px;
++  height: 32px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-size: 14px;
++  color: #828B94;
++  background: transparent;
++  border: none;
++  border-radius: 6px;
++  cursor: pointer;
++  transition: background 0.15s, color 0.15s;
++}
++.annotation-text-popover-cancel:hover {
++  background: rgba(255, 255, 255, 0.08);
++  color: #fff;
++}

@@ -1,0 +1,261 @@
+import { BrowserRouter, Routes, Route, useNavigate } from "react-router-dom";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { LayoutDashboard, Video, Settings, Minus, Square, X, Circle } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
+import Dashboard from "./pages/Dashboard";
+import SettingsPage from "./pages/Settings";
+import StepEditor from "./pages/StepEditor";
+
+function App() {
+  const [darkMode, setDarkMode] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [recordingId, setRecordingId] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [stepCount, setStepCount] = useState(0);
+  const navigate = useNavigate();
+
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const appWindow = getCurrentWindow();
+
+  /* ---- Recording timer ---- */
+  useEffect(() => {
+    if (recording) {
+      timerRef.current = setInterval(() => {
+        setElapsed((prev) => prev + 1);
+      }, 1000);
+    }
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, [recording]);
+
+  /* ---- Window-focus listener: recover recording state after minimize/restore ---- */
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    (async () => {
+      try {
+        unlisten = await appWindow.onFocusChanged(({ payload: focused }) => {
+          if (focused) {
+            // When the window regains focus (e.g. restored from minimize),
+            // query the backend to check whether a recording is still active.
+            invoke<string | null>("get_active_recording")
+              .then((activeId) => {
+                if (activeId) {
+                  setRecordingId(activeId);
+                  setRecording(true);
+                }
+              })
+              .catch((err) =>
+                console.error("get_active_recording failed:", err)
+              );
+          }
+        });
+      } catch (err) {
+        console.error("onFocusChanged registration failed:", err);
+      }
+    })();
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  const toggleDark = useCallback(() => {
+    setDarkMode((prev) => !prev);
+  }, []);
+
+  const handleStartRecording = useCallback(async () => {
+    try {
+      const id = await invoke<string>("start_recording");
+      setRecordingId(id);
+      setRecording(true);
+      setElapsed(0);
+      setStepCount(0);
+    } catch (err) {
+      console.error("Failed to start recording:", err);
+    }
+  }, []);
+
+  const handleStopRecording = useCallback(async () => {
+    if (!recordingId) return;
+    try {
+      await invoke("finish_recording", { id: recordingId });
+      setRecording(false);
+      navigate(`/editor/${recordingId}`);
+    } catch (err) {
+      console.error("Failed to finish recording:", err);
+    }
+  }, [recordingId, navigate]);
+
+  const handleEdit = useCallback(
+    (id: string) => {
+      navigate(`/editor/${id}`);
+    },
+    [navigate]
+  );
+
+  return (
+    <div className={`app-layout ${darkMode ? "dark" : ""}`}>
+      {/* Titlebar */}
+      <div
+        className="titlebar"
+        style={{
+          height: 40,
+          background: "#24292e",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "0 8px",
+        }}
+      >
+        <div
+          data-tauri-drag-region
+          style={{ flex: 1, height: "100%", display: "flex", alignItems: "center", paddingLeft: 8, gap: 10 }}
+        >
+          <span style={{ color: "#e6edf3", fontSize: 14, fontWeight: 600, userSelect: "none" }}>
+            录步
+          </span>
+          {recording && (
+            <span style={{ color: "#f85149", fontSize: 12, display: "flex", alignItems: "center", gap: 4 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#f85149", display: "inline-block" }}></span>
+              录制中 · {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")} · {stepCount} 步
+            </span>
+          )}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          {recording ? (
+            <button
+              onClick={handleStopRecording}
+              title="停止录制"
+              style={{
+                background: "#cf222e",
+                border: "none",
+                color: "#fff",
+                cursor: "pointer",
+                padding: "4px 10px",
+                borderRadius: 4,
+                fontSize: 12,
+                fontWeight: 600,
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+              }}
+            >
+              <Square size={12} fill="currentColor" />
+              停止
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={() => navigate("/settings")}
+                title="设置"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "#e6edf3",
+                  cursor: "pointer",
+                  padding: "6px 8px",
+                  borderRadius: 4,
+                  display: "flex",
+                  alignItems: "center",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.1)")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              >
+                <Settings size={16} />
+              </button>
+            </>
+          )}
+          <button
+            onClick={() => appWindow.minimize()}
+            title="最小化"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#e6edf3",
+              cursor: "pointer",
+              padding: "6px 8px",
+              borderRadius: 4,
+              display: "flex",
+              alignItems: "center",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.1)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            <Minus size={16} />
+          </button>
+          <button
+            onClick={() => appWindow.toggleMaximize()}
+            title="最大化"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#e6edf3",
+              cursor: "pointer",
+              padding: "6px 8px",
+              borderRadius: 4,
+              display: "flex",
+              alignItems: "center",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.1)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            <Square size={16} />
+          </button>
+          <button
+            onClick={() => appWindow.close()}
+            title="关闭"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#e6edf3",
+              cursor: "pointer",
+              padding: "6px 8px",
+              borderRadius: 4,
+              display: "flex",
+              alignItems: "center",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = "#cf222e";
+            }}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div className="app-body">
+        <main className="main-content">
+          <Routes>
+            <Route path="/" element={<Dashboard onEdit={handleEdit} onStartRecording={handleStartRecording} />} />
+            <Route path="/settings" element={<SettingsPage darkMode={darkMode} onToggleDark={toggleDark} />} />
+            <Route path="/editor/:id" element={<StepEditor />} />
+          </Routes>
+        </main>
+      </div>
+
+      {/* Statusbar */}
+      <div className="statusbar">
+        <div className="statusbar-left">
+          <span>Flowio v2.0</span>
+        </div>
+        <div className="statusbar-right">
+          <span className={recording ? "status-dot" : "status-dot inactive"}></span>
+          <span>{recording ? "录制中" : "就绪"}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function AppWrapper() {
+  return (
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  );
+}

@@ -1,0 +1,1250 @@
+// v2: per-provider config with default provider
+use base64::Engine;
+use rusqlite::params;
+use std::time::Duration;
+use tauri::State;
+
+use crate::ai::pipeline;
+use crate::ai::types::{AiConfig, AiJob, AiProvider, AiResult, StepInput};
+use crate::DbState;
+
+// ── Data structures ──────────────────────────────────────────
+
+struct StepRow {
+    id: String,
+    title: String,
+    description: String,
+    screenshot_path: String,
+    before_screenshot_path: String,
+    after_screenshot_path: String,
+    action_type: String,
+    window_title: String,
+    x: Option<i32>,
+    y: Option<i32>,
+    crop_w: Option<i32>,
+    crop_h: Option<i32>,
+}
+
+/// 读取文件并编码为 base64；空路径或读取失败返回空字符串。
+fn read_file_base64(path: &str) -> String {
+    if path.is_empty() {
+        String::new()
+    } else {
+        std::fs::read(path)
+            .ok()
+            .map(|data| base64::engine::general_purpose::STANDARD.encode(&data))
+            .unwrap_or_default()
+    }
+}
+
+/// 将数据库行转换为 AI 管道的步骤输入。
+fn row_to_step_input(row: &StepRow) -> StepInput {
+    StepInput {
+        title: row.title.clone(),
+        screenshot_base64: read_file_base64(&row.screenshot_path),
+        before_screenshot_base64: read_file_base64(&row.before_screenshot_path),
+        description: row.description.clone(),
+        click_x: row.x,
+        click_y: row.y,
+        crop_w: row.crop_w,
+        crop_h: row.crop_h,
+        action_type: row.action_type.clone(),
+        window_title: row.window_title.clone(),
+    }
+}
+
+/// Run the AI pipeline on a blocking thread.
+/// Does CPU-heavy base64 encoding of screenshots and network I/O.
+fn run_ai_pipeline_sync(
+    config: &AiConfig,
+    step_rows: &[StepRow],
+    recording_id: String,
+) -> Result<AiResult, String> {
+    let step_inputs: Vec<StepInput> = step_rows.iter().map(row_to_step_input).collect();
+
+    let job = AiJob {
+        recording_id,
+        steps: step_inputs,
+    };
+
+    pipeline::run_pipeline(config, job)
+}
+
+// ── Tauri Commands ────────────────────────────────────────────
+
+/// 汇总 AI 生成结果，返回面向用户的状态提示语。
+/// - 全部失败：去重（最多 3 条）并截断（120 字符）后返回 Err
+/// - 未生成任何步骤：返回固定 Err
+/// - 部分失败 / 全部成功：返回 Ok 摘要
+fn summarize_generate_result(
+    generated: usize,
+    total_steps: usize,
+    error_count: usize,
+    errors: &[String],
+) -> Result<String, String> {
+    if generated == 0 && error_count > 0 {
+        let mut unique_errors: Vec<&str> = Vec::new();
+        for err in errors {
+            let msg = err.as_str();
+            if !unique_errors.contains(&msg) && unique_errors.len() < 3 {
+                unique_errors.push(msg);
+            }
+        }
+        let detail = unique_errors.join("；");
+        let trunc_detail = if detail.len() > 120 {
+            format!(
+                "{}...",
+                detail.chars().take(117).collect::<String>()
+            )
+        } else {
+            detail
+        };
+        Err(format!(
+            "{} 个步骤全部失败。原因：{}",
+            error_count, trunc_detail
+        ))
+    } else if generated == 0 {
+        Err("未生成任何步骤。请检查 AI 服务商配置".to_string())
+    } else if error_count > 0 {
+        Ok(format!(
+            "AI 生成完成：{} / {} 个步骤已生成（{} 个失败）",
+            generated, total_steps, error_count
+        ))
+    } else {
+        Ok(format!("AI 生成完成：全部 {} 个步骤已生成", generated))
+    }
+}
+
+/// Set the default AI provider in the settings table.
+#[tauri::command]
+pub fn set_default_provider(db: State<DbState>, provider_id: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('default_ai_provider', ?1)",
+        params![provider_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Get the default AI provider from the settings table.
+/// Returns 'zhipu' if no default is set.
+#[tauri::command]
+pub fn get_default_provider(db: State<DbState>) -> Result<String, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM settings WHERE key = 'default_ai_provider'")
+        .map_err(|e| e.to_string())?;
+    let result: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
+    Ok(result.unwrap_or_else(|| "zhipu".to_string()))
+}
+
+/// Trigger AI-powered step generation for a recording.
+///
+/// Reads all steps from the database for the given `recording_id`,
+/// builds an [`AiJob`], and runs the AI pipeline on a background
+/// thread to keep the UI responsive. When the pipeline completes,
+/// step titles, descriptions, action types, and tips are written
+/// back to the database.
+#[tauri::command]
+pub async fn generate_ai_steps(
+    db: State<'_, DbState>,
+    recording_id: String,
+) -> Result<String, String> {
+    // ── Phase 1: Load config and steps from DB (main thread) ──
+    let config: AiConfig = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+        let default_id: Option<String> = conn
+            .prepare("SELECT value FROM settings WHERE key = 'default_ai_provider'")
+            .ok()
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+
+        let mut maybe_cfg: Option<AiConfig> = None;
+        if let Some(ref id) = default_id {
+            let key = format!("ai_config_{}", id);
+            if let Ok(mut stmt) = conn.prepare("SELECT value FROM settings WHERE key = ?1") {
+                if let Ok(json) = stmt.query_row(params![key], |row| row.get::<_, String>(0)) {
+                    if !json.is_empty() {
+                        maybe_cfg = serde_json::from_str::<AiConfig>(&json).ok();
+                    }
+                }
+            }
+        }
+
+        if let Some(cfg) = maybe_cfg {
+            cfg
+        } else {
+            let rows: Vec<(String, String)> = conn
+                .prepare("SELECT key, value FROM settings WHERE key LIKE 'ai_config_%'")
+                .map_err(|e| e.to_string())?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            match rows.into_iter().next() {
+                Some((_, json)) if !json.is_empty() => {
+                    serde_json::from_str::<AiConfig>(&json).map_err(|e| e.to_string())?
+                }
+                _ => {
+                    return Err(
+                        "AI 配置未设置，请先在设置中配置 AI 服务商。".to_string(),
+                    );
+                }
+            }
+        }
+    };
+
+    let step_rows: Vec<StepRow> = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, description, screenshot_path, \
+                 before_screenshot_path, after_screenshot_path, action_type, window_title, x, y, \
+                 crop_w, crop_h \
+                 FROM steps WHERE recording_id = ?1 ORDER BY order_index",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let rows = stmt
+            .query_map(params![recording_id], |row| {
+                Ok(StepRow {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    screenshot_path: row.get(3)?,
+                    before_screenshot_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    after_screenshot_path: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    action_type: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    window_title: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    x: row.get::<_, Option<i32>>(8)?,
+                    y: row.get::<_, Option<i32>>(9)?,
+                    crop_w: row.get::<_, Option<i32>>(10)?,
+                    crop_h: row.get::<_, Option<i32>>(11)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| e.to_string())?);
+        }
+        result
+    };
+
+    if step_rows.is_empty() {
+        return Err("No steps found for this recording".to_string());
+    }
+
+    let total_steps = step_rows.len();
+
+    // ── Phase 2: Run pipeline on background thread ──────────
+    let rid = recording_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_ai_pipeline_sync(&config, &step_rows, rid)
+    })
+    .await
+    .map_err(|e| format!("AI 生成任务异常: {}", e))?
+    .map_err(|e| e)?;
+
+    let generated = result.steps.len();
+    let error_count = result.errors.len();
+
+    // ── Phase 3: Persist results to DB (back on main thread) ──
+    apply_pipeline_result(db.inner(), &recording_id, &result);
+
+    summarize_generate_result(generated, total_steps, error_count, &result.errors)
+}
+
+/// Retrieve the stored AI configuration for a specific provider.
+#[tauri::command]
+pub fn get_ai_config(db: State<DbState>, provider_id: String) -> Result<Option<AiConfig>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let key = format!("ai_config_{}", provider_id);
+    let mut stmt = conn
+        .prepare("SELECT value FROM settings WHERE key = ?1")
+        .map_err(|e| e.to_string())?;
+
+    let json: Option<String> = stmt.query_row(params![key], |row| row.get(0)).ok();
+
+    match json {
+        Some(s) if !s.is_empty() => {
+            let config: AiConfig = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+            Ok(Some(config))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Retrieve the first available AI configuration across all providers.
+#[tauri::command]
+pub fn get_first_ai_config(db: State<DbState>) -> Result<Option<AiConfig>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM settings WHERE key LIKE 'ai_config_%'")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    match rows.into_iter().next() {
+        Some((_, json)) if !json.is_empty() => {
+            let config: AiConfig = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            Ok(Some(config))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Persist the AI configuration into the settings table.
+/// The key is scoped by provider ID so each provider has its own config.
+#[tauri::command]
+pub fn set_ai_config(db: State<DbState>, config: AiConfig) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(&config).map_err(|e| e.to_string())?;
+    let key = format!("ai_config_{}", config.provider.id);
+
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        params![key, json],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Remove AI configuration for a provider from the settings table.
+#[tauri::command]
+pub fn remove_ai_config(db: State<DbState>, provider_id: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let key = format!("ai_config_{}", provider_id);
+    conn.execute("DELETE FROM settings WHERE key = ?1", params![key])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── Test endpoint / error classification helpers ────────────
+
+/// 解析内置服务商的 API 测试端点；未知服务商返回 None（由调用方走自定义 provider 查找）。
+/// 返回 (url, is_post)，qianfan 使用 chat/completions POST，其余为 GET /models。
+fn resolve_provider_test_endpoint(provider_id: &str, api_key: &str) -> Option<(String, bool)> {
+    match provider_id {
+        "openai" => Some(("https://api.openai.com/v1/models".to_string(), false)),
+        "deepseek" => Some(("https://api.deepseek.com/v1/models".to_string(), false)),
+        "moonshot" => Some(("https://api.moonshot.cn/v1/models".to_string(), false)),
+        "zhipu" => Some(("https://open.bigmodel.cn/api/paas/v4/models".to_string(), false)),
+        "anthropic" => Some(("https://api.anthropic.com/v1/models".to_string(), false)),
+        "gemini" => Some((
+            format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                api_key
+            ),
+            false,
+        )),
+        "qianfan" => Some((
+            "https://qianfan.baidubce.com/v2/chat/completions".to_string(),
+            true,
+        )),
+        "qwen" => Some(("https://dashscope.aliyuncs.com/compatible-mode/v1/models".to_string(), false)),
+        "doubao" => Some(("https://ark.cn-beijing.volces.com/api/v3/models".to_string(), false)),
+        "minimax" => Some(("https://api.minimax.chat/v1/models".to_string(), false)),
+        "yi" => Some(("https://api.lingyiwanwu.com/v1/models".to_string(), false)),
+        "baichuan" => Some(("https://api.baichuan-ai.com/v1/models".to_string(), false)),
+        _ => None,
+    }
+}
+
+/// 测试请求的认证方案：Bearer（默认）/ ApiKey（anthropic）/ None（gemini，key 在 URL 中）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestAuth {
+    Bearer,
+    ApiKey,
+    None,
+}
+
+fn test_auth_scheme(provider_id: &str) -> TestAuth {
+    match provider_id {
+        "anthropic" => TestAuth::ApiKey,
+        "gemini" => TestAuth::None,
+        _ => TestAuth::Bearer,
+    }
+}
+
+/// 自定义服务商测试端点：{base_url}/models（去掉尾部斜杠）。
+fn custom_test_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+/// 聊天补全端点：{base_url}/chat/completions（去掉尾部斜杠）。
+fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+/// 将 test_api_key 的失败响应分类为面向用户的错误信息（仅非 2xx 时调用）。
+fn classify_test_api_error(status_code: u16, body: &str) -> String {
+    if status_code == 401 || status_code == 403 {
+        let lower = body.to_lowercase();
+        if lower.contains("access denied")
+            || lower.contains("accessdenied")
+            || lower.contains("forbidden")
+            || lower.contains("arrears")
+            || lower.contains("欠费")
+            || lower.contains("account")
+        {
+            format!(
+                "账户或权限异常（HTTP {}）：{}",
+                status_code,
+                extract_error_message(body)
+            )
+        } else if lower.contains("invalid")
+            || lower.contains("incorrect")
+            || lower.contains("unauthorized")
+            || lower.contains("authentication")
+            || lower.contains("auth")
+        {
+            "API Key 无效，请检查后重试".to_string()
+        } else {
+            format!(
+                "API 验证失败（HTTP {}）：{}",
+                status_code,
+                extract_error_message(body)
+            )
+        }
+    } else {
+        format!("连接失败 (HTTP {}): {}", status_code, body)
+    }
+}
+
+/// 将 validate_custom_api 的响应分类为 Result（200 成功，其余为面向用户的错误）。
+fn classify_validate_api_error(
+    status_code: u16,
+    body: &str,
+    model_name: &str,
+) -> Result<String, String> {
+    match status_code {
+        200..=299 => Ok("连接成功".to_string()),
+        400 | 401 | 403 | 404 => {
+            let lower = body.to_lowercase();
+
+            // 模型类错误（不存在 / 未购买 / 无权限）：优先识别，避免误报成 Key 问题
+            const MODEL_ERR_KEYWORDS: [&str; 19] = [
+                "model not found", "model does not exist", "model not exist", "modelerror",
+                "not supported", "no such model", "access to model denied", "accessdenied",
+                "unpurchased", "not purchased", "not eligible", "model access denied",
+                "model permission", "not allowed to access model", "model unavailable",
+                "does not exist", "not_found_error", "模型不存在", "do not have access",
+            ];
+            // Key 类错误
+            const KEY_ERR_KEYWORDS: [&str; 9] = [
+                "invalid api key", "invalid api-key", "incorrect api key", "incorrect api-key",
+                "api key not valid", "invalid key", "autherror", "authentication", "unauthorized",
+            ];
+            // 账户类错误（欠费 / 被禁用 / 配额）
+            const ACCOUNT_ERR_KEYWORDS: [&str; 8] = [
+                "access denied", "forbidden", "arrears", "欠费", "quota",
+                "account", "被禁用", "insufficient",
+            ];
+
+            if MODEL_ERR_KEYWORDS.iter().any(|k| lower.contains(k)) {
+                Err(format!(
+                    "模型错误：{}——{}",
+                    model_name,
+                    extract_error_message(body)
+                ))
+            } else if KEY_ERR_KEYWORDS.iter().any(|k| lower.contains(k)) {
+                Err("API Key 无效，请检查后重试".to_string())
+            } else if ACCOUNT_ERR_KEYWORDS.iter().any(|k| lower.contains(k)) {
+                Err(format!(
+                    "账户或权限异常（HTTP {}）：{}",
+                    status_code,
+                    extract_error_message(body)
+                ))
+            } else if status_code == 404 {
+                Err("接口地址或路径错误（HTTP 404），请检查 base_url 是否填写正确（应为基础地址，不含 /chat/completions）".to_string())
+            } else {
+                Err(format!(
+                    "API 验证失败（HTTP {}）：{}",
+                    status_code,
+                    extract_error_message(body)
+                ))
+            }
+        }
+        s => Err(format!(
+            "服务器返回异常状态码 {}，请检查 API 地址是否正确",
+            s
+        )),
+    }
+}
+
+/// Test API key validity by sending a lightweight request to the provider.
+///
+/// For most providers this is a GET to the /models endpoint with Bearer auth.
+/// Custom providers pass `base_url` explicitly; built-in providers are resolved by id.
+/// Returns `"连接成功"` on 2xx, or a `String` error describing the failure.
+#[tauri::command]
+pub fn test_api_key(
+    db: State<DbState>,
+    provider_id: String,
+    api_key: String,
+) -> Result<String, String> {
+    // Determine base_url: try built-in first, then look up custom provider
+    let (test_url, is_post) = match resolve_provider_test_endpoint(&provider_id, &api_key) {
+        Some(ep) => ep,
+        None => {
+            let custom = get_custom_provider_inner(&db, &provider_id)
+                .map_err(|e| format!("Unknown provider: {} ({})", provider_id, e))?;
+            (custom_test_url(&custom.base_url), false)
+        }
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let mut request = if is_post {
+        let body = serde_json::json!({
+            "model": "ernie-4.0-turbo-8k",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        });
+        client.post(&test_url).json(&body)
+    } else {
+        client.get(&test_url)
+    };
+
+    // Set auth header per provider convention
+    match test_auth_scheme(&provider_id) {
+        TestAuth::ApiKey => {
+            request = request
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01");
+        }
+        TestAuth::None => {
+            // API key is already in the URL query string
+        }
+        TestAuth::Bearer => {
+            request = request.header("Authorization", format!("Bearer {}", api_key));
+        }
+    }
+
+    let response = request
+        .send()
+        .map_err(|e| format!("Connection failed: {}", e))?;
+
+    let status = response.status();
+    if status.is_success() {
+        Ok("连接成功".to_string())
+    } else {
+        let status_code = status.as_u16();
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "<unable to read body>".to_string());
+        Err(classify_test_api_error(status_code, &body))
+    }
+}
+
+/// Validate a custom provider's API key by sending a minimal POST to
+/// {base_url}/chat/completions.  Many providers don't enforce auth on
+/// the /models endpoint, so a chat request catches bad keys reliably.
+///
+/// Takes `base_url` and `api_key` directly (no DB lookup needed).
+/// Returns `"连接成功"` on 2xx, or an error describing the failure.
+#[tauri::command]
+pub fn validate_custom_api(
+    base_url: String,
+    api_key: String,
+    model: Option<String>,
+) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let model_name = model.unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+    let url = chat_completions_url(&base_url);
+    let body = serde_json::json!({
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .map_err(|e| format!("网络请求失败: {}", e))?;
+
+    let code = resp.status().as_u16();
+    let text = resp.text().unwrap_or_default();
+    classify_validate_api_error(code, &text, &model_name)
+}
+
+/// Extract a friendly error message from a provider error body.
+/// Prefers `error.message`, then `error`, then `message` JSON fields.
+fn extract_error_message(text: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(msg) = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+        {
+            return msg.to_string();
+        }
+        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+            return err.to_string();
+        }
+        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+    }
+    text.chars().take(200).collect()
+}
+
+// ── Custom Provider Management ────────────────────────────────
+
+const CUSTOM_PROVIDERS_KEY: &str = "custom_providers";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CustomProvider {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub models: Vec<String>,
+}
+
+/// Read the custom providers list from the settings table.
+fn read_custom_providers(db: &DbState) -> Result<Vec<CustomProvider>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM settings WHERE key = ?1")
+        .map_err(|e| e.to_string())?;
+    let json: Option<String> = stmt.query_row(params![CUSTOM_PROVIDERS_KEY], |row| row.get(0)).ok();
+    match json {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| e.to_string()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Write the custom providers list back to the settings table.
+fn write_custom_providers(db: &DbState, providers: &[CustomProvider]) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(providers).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        params![CUSTOM_PROVIDERS_KEY, json],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Look up a single custom provider by id (internal helper).
+fn get_custom_provider_inner(db: &DbState, provider_id: &str) -> Result<CustomProvider, String> {
+    let providers = read_custom_providers(db)?;
+    providers
+        .into_iter()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("Custom provider not found: {}", provider_id))
+}
+
+/// 由自定义服务商构造 AiConfig：model 取 models 列表第一个，空列表回退 "default"。
+fn build_custom_provider_config(provider: &CustomProvider, api_key: String) -> AiConfig {
+    let model = provider
+        .models
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+    AiConfig {
+        provider: AiProvider {
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            base_url: provider.base_url.clone(),
+            model,
+        },
+        api_key,
+    }
+}
+
+/// List all custom providers.
+#[tauri::command]
+pub fn list_custom_providers(db: State<DbState>) -> Result<Vec<CustomProvider>, String> {
+    read_custom_providers(&db)
+}
+
+/// Add a custom provider.
+#[tauri::command]
+pub fn add_custom_provider(
+    db: State<DbState>,
+    provider: CustomProvider,
+    api_key: String,
+) -> Result<(), String> {
+    let mut providers = read_custom_providers(&db)?;
+    // Check for duplicate name (case-insensitive)
+    if providers
+        .iter()
+        .any(|p| p.name.to_lowercase() == provider.name.to_lowercase())
+    {
+        return Err("服务商名称已存在".to_string());
+    }
+    providers.push(provider.clone());
+
+    // Use a single mutex lock to persist both the provider list AND the API key config atomically
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let providers_json = serde_json::to_string(&providers).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        params![CUSTOM_PROVIDERS_KEY, providers_json],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let ai_config = build_custom_provider_config(&provider, api_key);
+    let config_json = serde_json::to_string(&ai_config).map_err(|e| e.to_string())?;
+    let config_key = format!("ai_config_{}", provider.id);
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        params![config_key, config_json],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Remove a custom provider by id.
+#[tauri::command]
+pub fn remove_custom_provider(
+    db: State<DbState>,
+    provider_id: String,
+) -> Result<(), String> {
+    let providers = read_custom_providers(&db)?;
+    let filtered: Vec<CustomProvider> = providers
+        .into_iter()
+        .filter(|p| p.id != provider_id)
+        .collect();
+    write_custom_providers(&db, &filtered)
+}
+
+// ── Internal helpers ──────────────────────────────────────────
+
+/// Write pipeline results back to the database.
+fn apply_pipeline_result(
+    db_state: &DbState,
+    recording_id: &str,
+    result: &AiResult,
+) {
+    let conn = match db_state.0.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[ai] Failed to lock DB for persisting results: {}", e);
+            return;
+        }
+    };
+
+    // Collect step IDs in order
+    let step_ids: Vec<String> = {
+        let mut stmt = match conn.prepare(
+            "SELECT id FROM steps WHERE recording_id = ?1 ORDER BY order_index",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[ai] Failed to query step IDs: {}", e);
+                return;
+            }
+        };
+
+        let rows = match stmt.query_map(params![recording_id], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[ai] Failed to map step IDs: {}", e);
+                return;
+            }
+        };
+
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    for (i, output) in result.steps.iter().enumerate() {
+        if i >= step_ids.len() {
+            break;
+        }
+
+        if let Err(e) = conn.execute(
+            "UPDATE steps SET title = ?1, description = ?2, \
+             action_type = ?3, tip = ?4 WHERE id = ?5",
+            params![
+                output.title,
+                output.description,
+                output.action_type,
+                output.tip,
+                step_ids[i],
+            ],
+        ) {
+            eprintln!(
+                "[ai] Failed to update step {} ({}): {}",
+                i + 1,
+                step_ids[i],
+                e
+            );
+        }
+    }
+
+    // Update recording status
+    if let Err(e) = conn.execute(
+        "UPDATE recordings SET status = 'completed', ai_generated = 1 WHERE id = ?1",
+        params![recording_id],
+    ) {
+        eprintln!("[ai] Failed to update recording status: {}", e);
+    }
+
+    if !result.errors.is_empty() {
+        eprintln!(
+            "[ai] Pipeline completed with {} error(s):",
+            result.errors.len()
+        );
+        for err in &result.errors {
+            eprintln!("  - {}", err);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ai_commands_tests {
+    use super::*;
+    use crate::ai::types::AiProvider;
+
+    fn text_provider() -> AiProvider {
+        AiProvider {
+            id: "zhipu".into(),
+            name: "智谱".into(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions".into(),
+            model: "glm-4".into(),
+        }
+    }
+
+    fn step_row_with_screenshot(path: String) -> StepRow {
+        StepRow {
+            id: "st1".into(),
+            title: "点击".into(),
+            description: "描述".into(),
+            screenshot_path: path,
+            before_screenshot_path: String::new(),
+            after_screenshot_path: String::new(),
+            action_type: "click".into(),
+            window_title: "窗口".into(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
+        }
+    }
+
+    #[test]
+    fn run_ai_pipeline_sync_empty_steps_returns_empty() {
+        let cfg = AiConfig { provider: text_provider(), api_key: "sk-test".into() };
+        let result = run_ai_pipeline_sync(&cfg, &[], "rec-1".into()).unwrap();
+        assert!(result.steps.is_empty());
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn run_ai_pipeline_sync_screenshot_with_text_model_errors_early() {
+        // 真实 PNG + 非视觉模型 → 应在发起网络请求前直接报错
+        let dir = std::env::temp_dir().join("flowio_ai_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        image::DynamicImage::new_rgb8(8, 8).save(&png).unwrap();
+        let cfg = AiConfig { provider: text_provider(), api_key: "sk-test".into() };
+        let rows = vec![step_row_with_screenshot(png.to_string_lossy().to_string())];
+        let err = run_ai_pipeline_sync(&cfg, &rows, "rec-1".into()).unwrap_err();
+        assert!(err.contains("不支持图片识别"), "err: {}", err);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_ai_pipeline_sync_before_screenshot_triggers_vision_check() {
+        let dir = std::env::temp_dir().join("flowio_ai_test2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("before.png");
+        image::DynamicImage::new_rgb8(8, 8).save(&png).unwrap();
+        let cfg = AiConfig { provider: text_provider(), api_key: "sk-test".into() };
+        let mut row = step_row_with_screenshot(String::new());
+        row.before_screenshot_path = png.to_string_lossy().to_string();
+        let err = run_ai_pipeline_sync(&cfg, &[row], "rec-1".into()).unwrap_err();
+        assert!(err.contains("不支持图片识别"), "err: {}", err);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_provider_sql_roundtrip_and_fallback() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn);
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('default_ai_provider', ?1)", params!["deepseek"]).unwrap();
+        let v: String = conn.query_row("SELECT value FROM settings WHERE key = 'default_ai_provider'", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "deepseek");
+        let conn2 = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn2);
+        let d: Option<String> = conn2.query_row("SELECT value FROM settings WHERE key = 'default_ai_provider'", [], |r| r.get(0)).ok();
+        assert_eq!(d, None, "缺省时无默认 provider 行（命令层回退 zhipu）");
+    }
+
+    #[test]
+    fn ai_config_invalid_json_rejected() {
+        let bad = "not-json{";
+        assert!(serde_json::from_str::<AiConfig>(bad).is_err());
+        let empty = "";
+        assert!(serde_json::from_str::<AiConfig>(empty).is_err());
+    }
+
+    // ── read_file_base64 / row_to_step_input ─────────────────
+
+    #[test]
+    fn read_file_base64_empty_path_returns_empty() {
+        assert_eq!(read_file_base64(""), "");
+    }
+
+    #[test]
+    fn read_file_base64_missing_file_returns_empty() {
+        assert_eq!(read_file_base64("Z:/definitely/not/a/file.png"), "");
+    }
+
+    #[test]
+    fn read_file_base64_encodes_file_content() {
+        let dir = std::env::temp_dir().join("flowio_ai_b64");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("data.bin");
+        let bytes: Vec<u8> = (0..64u8).collect();
+        std::fs::write(&f, &bytes).unwrap();
+        let expected = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(read_file_base64(&f.to_string_lossy()), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn row_to_step_input_maps_fields_and_base64() {
+        let dir = std::env::temp_dir().join("flowio_ai_row");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("shot.png");
+        std::fs::write(&f, b"abc").unwrap();
+        let row = StepRow {
+            id: "st9".into(),
+            title: "标题".into(),
+            description: "描述".into(),
+            screenshot_path: f.to_string_lossy().to_string(),
+            before_screenshot_path: String::new(),
+            after_screenshot_path: "after.png".into(),
+            action_type: "click".into(),
+            window_title: "窗口".into(),
+            x: Some(12),
+            y: Some(-3),
+            crop_w: Some(180),
+            crop_h: Some(60),
+        };
+        let input = row_to_step_input(&row);
+        assert_eq!(input.title, "标题");
+        assert_eq!(input.description, "描述");
+        assert_eq!(
+            input.screenshot_base64,
+            base64::engine::general_purpose::STANDARD.encode(b"abc")
+        );
+        assert_eq!(input.before_screenshot_base64, "");
+        assert_eq!(input.action_type, "click");
+        assert_eq!(input.window_title, "窗口");
+        assert_eq!(input.click_x, Some(12));
+        assert_eq!(input.click_y, Some(-3));
+        assert_eq!(input.crop_w, Some(180));
+        assert_eq!(input.crop_h, Some(60));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── resolve_provider_test_endpoint ───────────────────────
+
+    #[test]
+    fn resolve_provider_test_endpoint_builtin() {
+        let (url, is_post) = resolve_provider_test_endpoint("openai", "k").unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/models");
+        assert!(!is_post);
+
+        let (url, is_post) = resolve_provider_test_endpoint("qianfan", "k").unwrap();
+        assert_eq!(url, "https://qianfan.baidubce.com/v2/chat/completions");
+        assert!(is_post);
+
+        for p in ["deepseek", "moonshot", "zhipu", "anthropic", "qwen", "doubao", "minimax", "yi", "baichuan"] {
+            assert!(resolve_provider_test_endpoint(p, "k").is_some(), "{}", p);
+        }
+    }
+
+    #[test]
+    fn resolve_provider_test_endpoint_gemini_embeds_key() {
+        let (url, is_post) = resolve_provider_test_endpoint("gemini", "sk-abc").unwrap();
+        assert!(url.contains("sk-abc"));
+        assert!(url.starts_with("https://generativelanguage.googleapis.com/v1beta/models?key="));
+        assert!(!is_post);
+    }
+
+    #[test]
+    fn resolve_provider_test_endpoint_unknown_is_none() {
+        assert!(resolve_provider_test_endpoint("my-custom", "k").is_none());
+        assert!(resolve_provider_test_endpoint("", "k").is_none());
+    }
+
+    // ── test_auth_scheme ─────────────────────────────────────
+
+    #[test]
+    fn test_auth_scheme_variants() {
+        assert_eq!(test_auth_scheme("anthropic"), TestAuth::ApiKey);
+        assert_eq!(test_auth_scheme("gemini"), TestAuth::None);
+        assert_eq!(test_auth_scheme("openai"), TestAuth::Bearer);
+        assert_eq!(test_auth_scheme("whatever"), TestAuth::Bearer);
+    }
+
+    // ── URL builders ─────────────────────────────────────────
+
+    #[test]
+    fn custom_test_url_trims_trailing_slash() {
+        assert_eq!(
+            custom_test_url("https://api.example.com"),
+            "https://api.example.com/models"
+        );
+        assert_eq!(
+            custom_test_url("https://api.example.com/"),
+            "https://api.example.com/models"
+        );
+        assert_eq!(custom_test_url(""), "/models");
+    }
+
+    #[test]
+    fn chat_completions_url_trims_trailing_slash() {
+        assert_eq!(
+            chat_completions_url("https://api.example.com/v1"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://api.example.com/v1/"),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    // ── classify_test_api_error ──────────────────────────────
+
+    #[test]
+    fn classify_test_api_error_401_account_keyword() {
+        let msg = classify_test_api_error(401, r#"{"error":{"message":"access denied"}}"#);
+        assert!(msg.starts_with("账户或权限异常（HTTP 401）"), "{}", msg);
+        assert!(msg.contains("access denied"));
+    }
+
+    #[test]
+    fn classify_test_api_error_401_invalid_key() {
+        let msg = classify_test_api_error(401, "invalid api key");
+        assert_eq!(msg, "API Key 无效，请检查后重试");
+    }
+
+    #[test]
+    fn classify_test_api_error_403_forbidden_body() {
+        let msg = classify_test_api_error(403, "Forbidden: quota exceeded");
+        assert!(msg.starts_with("账户或权限异常（HTTP 403）"), "{}", msg);
+    }
+
+    #[test]
+    fn classify_test_api_error_401_unknown_body() {
+        let msg = classify_test_api_error(401, "something else happened");
+        assert!(msg.starts_with("API 验证失败（HTTP 401）"), "{}", msg);
+    }
+
+    #[test]
+    fn classify_test_api_error_500_returns_connection_failed() {
+        let msg = classify_test_api_error(500, "boom");
+        assert_eq!(msg, "连接失败 (HTTP 500): boom");
+    }
+
+    #[test]
+    fn classify_test_api_error_priority_account_over_invalid() {
+        // 同时命中 account 与 invalid 关键词时，优先 account 分支
+        let msg = classify_test_api_error(403, "forbidden: invalid api key");
+        assert!(msg.starts_with("账户或权限异常"), "{}", msg);
+    }
+
+    // ── classify_validate_api_error ──────────────────────────
+
+    #[test]
+    fn classify_validate_api_error_success() {
+        assert_eq!(
+            classify_validate_api_error(200, "{}", "gpt-3.5-turbo").unwrap(),
+            "连接成功"
+        );
+        assert_eq!(
+            classify_validate_api_error(204, "", "m").unwrap(),
+            "连接成功"
+        );
+    }
+
+    #[test]
+    fn classify_validate_api_error_model_error() {
+        let msg = classify_validate_api_error(400, r#"{"error":{"message":"model not found"}}"#, "my-model").unwrap_err();
+        assert!(msg.starts_with("模型错误：my-model——"), "{}", msg);
+    }
+
+    #[test]
+    fn classify_validate_api_error_key_error() {
+        let msg = classify_validate_api_error(401, "invalid api key", "m").unwrap_err();
+        assert_eq!(msg, "API Key 无效，请检查后重试");
+    }
+
+    #[test]
+    fn classify_validate_api_error_account_error() {
+        let msg = classify_validate_api_error(403, "insufficient quota", "m").unwrap_err();
+        assert!(msg.starts_with("账户或权限异常（HTTP 403）"), "{}", msg);
+    }
+
+    #[test]
+    fn classify_validate_api_error_404_without_keyword_is_path_error() {
+        let msg = classify_validate_api_error(404, "not found", "m").unwrap_err();
+        assert!(msg.contains("接口地址或路径错误（HTTP 404）"), "{}", msg);
+    }
+
+    #[test]
+    fn classify_validate_api_error_404_with_account_keyword_prioritizes_account() {
+        let msg = classify_validate_api_error(404, "access denied", "m").unwrap_err();
+        assert!(msg.starts_with("账户或权限异常"), "{}", msg);
+    }
+
+    #[test]
+    fn classify_validate_api_error_400_unknown_body() {
+        let msg = classify_validate_api_error(400, "weird error", "m").unwrap_err();
+        assert!(msg.starts_with("API 验证失败（HTTP 400）"), "{}", msg);
+    }
+
+    #[test]
+    fn classify_validate_api_error_other_status() {
+        let msg = classify_validate_api_error(500, "oops", "m").unwrap_err();
+        assert!(msg.contains("服务器返回异常状态码 500"), "{}", msg);
+        let msg = classify_validate_api_error(429, "rate limited", "m").unwrap_err();
+        assert!(msg.contains("服务器返回异常状态码 429"), "{}", msg);
+    }
+
+    // ── extract_error_message ────────────────────────────────
+
+    #[test]
+    fn extract_error_message_nested_message() {
+        let s = r#"{"error":{"message":"bad key"}}"#;
+        assert_eq!(extract_error_message(s), "bad key");
+    }
+
+    #[test]
+    fn extract_error_message_error_string() {
+        let s = r#"{"error":"direct error"}"#;
+        assert_eq!(extract_error_message(s), "direct error");
+    }
+
+    #[test]
+    fn extract_error_message_top_message() {
+        let s = r#"{"message":"top level"}"#;
+        assert_eq!(extract_error_message(s), "top level");
+    }
+
+    #[test]
+    fn extract_error_message_non_json_truncated_to_200() {
+        let s = "x".repeat(500);
+        let out = extract_error_message(&s);
+        assert_eq!(out.len(), 200);
+        assert_eq!(out, s[..200]);
+    }
+
+    #[test]
+    fn extract_error_message_json_without_known_fields_falls_back_to_raw() {
+        let s = r#"{"code":42}"#;
+        assert_eq!(extract_error_message(s), s);
+    }
+
+    // ── summarize_generate_result ────────────────────────────
+
+    #[test]
+    fn summarize_generate_result_all_failed_dedup() {
+        let err = summarize_generate_result(
+            0,
+            5,
+            3,
+            &["网络错误".to_string(), "网络错误".to_string(), "超时".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.starts_with("3 个步骤全部失败。原因："), "{}", err);
+        assert!(err.contains("网络错误"));
+        assert!(err.contains("超时"));
+        // 去重后只有 2 条
+        assert_eq!(err.matches("；").count(), 1);
+    }
+
+    #[test]
+    fn summarize_generate_result_all_failed_truncated() {
+        let long: String = "e".repeat(100);
+        let errors: Vec<String> = (0..5).map(|i| format!("{}#{}", long, i)).collect();
+        let err = summarize_generate_result(0, 5, 5, &errors).unwrap_err();
+        assert!(err.ends_with("..."));
+        // 原因段：去重 3 条 + 分隔符；截断到 117 + "..."
+        assert!(err.contains("120") || err.contains("..."));
+    }
+
+    #[test]
+    fn summarize_generate_result_all_failed_multibyte_truncate_no_panic() {
+        // 中文错误信息 + 长度超 120：按字符安全截断，不能 panic
+        let long: String = "错误".repeat(80); // 240 字符
+        let errors: Vec<String> = vec![long, "网络超时".into(), "连接失败".into()];
+        let err = summarize_generate_result(0, 3, 3, &errors).unwrap_err();
+        assert!(err.ends_with("..."));
+        assert!(err.contains("错误"));
+        // 截断段应为合法 UTF-8（构造即合法），且不出现非法字符截断
+        assert!(err.is_char_boundary(err.len()));
+    }
+
+    #[test]
+    fn summarize_generate_result_none_generated_no_errors() {
+        let err = summarize_generate_result(0, 3, 0, &[]).unwrap_err();
+        assert_eq!(err, "未生成任何步骤。请检查 AI 服务商配置");
+    }
+
+    #[test]
+    fn summarize_generate_result_partial() {
+        let ok = summarize_generate_result(3, 5, 2, &["x".to_string()]).unwrap();
+        assert_eq!(ok, "AI 生成完成：3 / 5 个步骤已生成（2 个失败）");
+    }
+
+    #[test]
+    fn summarize_generate_result_all_success() {
+        let ok = summarize_generate_result(5, 5, 0, &[]).unwrap();
+        assert_eq!(ok, "AI 生成完成：全部 5 个步骤已生成");
+    }
+
+    // ── build_custom_provider_config ─────────────────────────
+
+    #[test]
+    fn build_custom_provider_config_uses_first_model() {
+        let p = CustomProvider {
+            id: "cp1".into(),
+            name: "自定义".into(),
+            base_url: "https://api.cp1.com/v1".into(),
+            models: vec!["m1".into(), "m2".into()],
+        };
+        let cfg = build_custom_provider_config(&p, "sk-1".into());
+        assert_eq!(cfg.provider.id, "cp1");
+        assert_eq!(cfg.provider.name, "自定义");
+        assert_eq!(cfg.provider.base_url, "https://api.cp1.com/v1");
+        assert_eq!(cfg.provider.model, "m1");
+        assert_eq!(cfg.api_key, "sk-1");
+    }
+
+    #[test]
+    fn build_custom_provider_config_empty_models_default() {
+        let p = CustomProvider {
+            id: "cp2".into(),
+            name: "空模型".into(),
+            base_url: "https://api.cp2.com".into(),
+            models: vec![],
+        };
+        let cfg = build_custom_provider_config(&p, "sk-2".into());
+        assert_eq!(cfg.provider.model, "default");
+    }
+}
+
