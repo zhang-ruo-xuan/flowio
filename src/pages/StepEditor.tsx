@@ -430,6 +430,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
   /* 裁剪图（400×400 @点击坐标）缓存：key=step.id，为所有步骤异步预生成，避免预览/缩略图重复计算 */
   const [cropCache, setCropCache] = useState<Record<string, string>>({});
+  // 首屏视图恢复完成后才允许持久化，避免挂载瞬间用默认值 {} / 'full' 覆盖已保存的偏好
+  const viewLoadedRef = useRef(false);
 
   /* Annotation (手动标注编辑器) */
   const [annotateOpen, setAnnotateOpen] = useState(false);
@@ -492,6 +494,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         }
         setStepViewCropped(initialView);
         setGlobalView(initialGlobal);
+        viewLoadedRef.current = true;
         setCropCache({});
       } catch (err) {
         if (!cancelled) setError(String(err));
@@ -550,6 +553,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   /* 持久化裁图/全图视图偏好到 localStorage */
   useEffect(() => {
     if (!recordingId) return;
+    // 首屏视图恢复前不写，防止挂载瞬间用默认值覆盖已保存偏好
+    if (!viewLoadedRef.current) return;
     try {
       localStorage.setItem(`flowio_view_${recordingId}`, JSON.stringify({
         stepViewCropped,

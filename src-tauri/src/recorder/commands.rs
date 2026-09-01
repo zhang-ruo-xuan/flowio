@@ -528,6 +528,12 @@ fn flush_shortcut_step(
         // 这是最可靠的"大概在哪"信号。比 200ms 后再读（可能已移开）、
         // 比活动窗口中心（整个浏览器）、比屏幕中心都靠谱得多。
         let cursor_at_capture = screenshot::get_cursor_pos();
+        // 截图时刻的 UIA 选区矩形（被复制文本的精确屏幕矩形）。
+        // 必须在事件此刻抓取：200ms 后用户可能已粘贴到别处，焦点转移会让
+        // GetFocusedElement 指向粘贴目标而拿错矩形。浏览器选区是 CSS 高亮色、
+        // 长 URL 又让 OCR 必误识别，UIA GetSelection 是唯一稳定拿到
+        // "复制发生在哪"的几何答案。
+        let sel_rect_at_capture = screenshot::get_selected_text_rect();
         std::thread::spawn(move || {
             // 剪贴板 / 焦点选区可能尚未刷新，等一小段时间再读。
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -574,9 +580,47 @@ fn flush_shortcut_step(
             //  鼠标在任意位置），所以 COPY 必须以 OCR 为 L1。
 
             let is_copy_op = matches!(source, BackfillSource::Clipboard);
-            let anchor_found = {
+
+            // ── COPY L1: UIA 选区矩形（被复制文本的精确几何，浏览器/CSS 高亮/长 URL 都稳）──
+            let mut anchor_found = false;
+            if is_copy_op {
+                if let Some((sl, st, sw, sh)) = sel_rect_at_capture {
+                    let rx = (sl - ox_i32).clamp(0, win_w_i32);
+                    let ry = (st - oy_i32).clamp(0, win_h_i32);
+                    let rw = sw.clamp(0, win_w_i32 - rx);
+                    let rh = sh.clamp(0, win_h_i32 - ry);
+                    if rw > 4 && rh > 4 {
+                        // 以选区中心为裁图中心、选区外扩 24px 留边 → 文本居中且完整显示
+                        let pad = 24i32;
+                        let desired_w = (rw + pad * 2).max(200).min(win_w_i32);
+                        let desired_h = (rh + pad * 2).max(80).min(win_h_i32);
+                        let cx = rx + rw / 2;
+                        let cy = ry + rh / 2;
+                        let (bx, by, bw, bh) = screenshot::centered_crop_box(
+                            cx, cy, desired_w, desired_h,
+                            win_w_i32, win_h_i32, desired_w, desired_h,
+                        );
+                        if let Ok(mut st) = cs.lock() {
+                            if let Some(s) = st.get_mut(idx) {
+                                s.x = Some(bx);
+                                s.y = Some(by);
+                                s.crop_w = Some(bw);
+                                s.crop_h = Some(bh);
+                            }
+                        }
+                        screenshot::ocr_debug(&format!(
+                            "crop: COPY-L1 sel_rect HIT ({},{}) sel {}x{} box {}x{}",
+                            cx, cy, rw, rh, bw, bh
+                        ));
+                        anchor_found = true;
+                    }
+                }
+            }
+
+            if !anchor_found {
+                anchor_found = {
                 if is_copy_op {
-                    // ── COPY L1: OCR（主力策略）──
+                    // ── COPY L2: OCR（主力策略，长 URL 仍可能失败）──
                     match screenshot::locate_text_in_image(&ss_path, &text) {
                         Some((raw_x, raw_y, raw_w, raw_h)) => {
                             screenshot::ocr_debug(&format!(
@@ -650,6 +694,7 @@ fn flush_shortcut_step(
                         false
                     }
                 }
+            }
             };
 
             if !anchor_found {
