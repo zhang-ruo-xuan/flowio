@@ -687,7 +687,37 @@ fn flush_shortcut_step(
                     }
 
                     if !copy_fallback_used {
-                        // ── COPY L3: 活动窗口正中心（50% 高度）──
+                        // ── COPY L3: 截图时刻鼠标位置（最接近用户复制动作处）──
+                        // 复制时长 URL 的 OCR 易误识别、应用又常用自定高亮色，
+                        // 此时鼠标位置比"窗口死中心"更贴近被复制内容。
+                        if let Some((mx, my)) = cursor_at_capture {
+                            let rx = (mx - ox_i32).clamp(0, win_w_i32);
+                            let ry = (my - oy_i32).clamp(0, win_h_i32);
+                            let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
+                            let desired_w = (text_len as i32 * 9 + 120).max(800).min(win_w_i32);
+                            let desired_h = 260.min(win_h_i32);
+                            let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                                rx, ry, desired_w, desired_h,
+                                win_w_i32, win_h_i32, desired_w, desired_h,
+                            );
+                            if let Ok(mut st) = cs.lock() {
+                                if let Some(s) = st.get_mut(idx) {
+                                    s.x = Some(cx);
+                                    s.y = Some(cy);
+                                    s.crop_w = Some(cw);
+                                    s.crop_h = Some(ch);
+                                }
+                            }
+                            screenshot::ocr_debug(&format!(
+                                "crop: COPY-L3 cursor_at_capture ({},{}) box {}x{}",
+                                mx, my, desired_w, desired_h
+                            ));
+                            copy_fallback_used = true;
+                        }
+                    }
+
+                    if !copy_fallback_used {
+                        // ── COPY L4: 活动窗口正中心（50% 高度）──
                         // 35% 对长页面太偏上，改用 50% 更可能命中内容区
                         if let Some((wx, wy, ww, wh)) = crate::recorder::activity::get_active_window_rect()
                             .and_then(|r| screenshot::screen_rect_in_image(r, ox_i32, oy_i32, win_w_i32, win_h_i32))
@@ -710,7 +740,7 @@ fn flush_shortcut_step(
                                 }
                             }
                             screenshot::ocr_debug(&format!(
-                                "crop: COPY-L3 window_center ({},{}) box {}x{}",
+                                "crop: COPY-L4 window_center ({},{}) box {}x{}",
                                 anchor_x, anchor_y, desired_w, desired_h
                             ));
                             copy_fallback_used = true;
@@ -718,8 +748,8 @@ fn flush_shortcut_step(
                     }
 
                     if !copy_fallback_used {
-                        // ── COPY L4: 屏幕中心最终兜底 ──
-                        screenshot::ocr_debug("crop: COPY-L4 screen_center fallback");
+                        // ── COPY L5: 屏幕中心最终兜底 ──
+                        screenshot::ocr_debug("crop: COPY-L5 screen_center fallback");
                         let (cx, cy, cw, ch) = screenshot::centered_crop_box(
                             win_w_i32 / 2, win_h_i32 / 2,
                             (win_w_i32 as f64 * 0.6) as i32,

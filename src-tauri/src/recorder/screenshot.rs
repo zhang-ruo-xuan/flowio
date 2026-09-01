@@ -669,7 +669,7 @@ pub fn find_selection_highlight(img: &DynamicImage) -> Option<(i32, i32, i32, i3
                 let dr = (bytes[idx] as i32 - hl.0 as i32).abs();
                 let dg = (bytes[idx + 1] as i32 - hl.1 as i32).abs();
                 let db = (bytes[idx + 2] as i32 - hl.2 as i32).abs();
-                let hit = dr < 40 && dg < 40 && db < 40;
+                let hit = dr < 45 && dg < 45 && db < 45;
                 mask[my * mw + mx] = hit;
                 if hit {
                     match_count += 1;
@@ -679,7 +679,7 @@ pub fn find_selection_highlight(img: &DynamicImage) -> Option<(i32, i32, i32, i3
     }
 
     // Too few highlight pixels → no meaningful selection.
-    if match_count < 30 {
+    if match_count < 25 {
         ocr_debug(&format!(
             "sel_highlight: only {} highlight pixels found, skipping",
             match_count
@@ -733,7 +733,7 @@ pub fn find_selection_highlight(img: &DynamicImage) -> Option<(i32, i32, i32, i3
 
         // Filter: must look like a text selection (wide strip, not a square icon).
         // Real selections are typically: width >> height, height 18-120 px (after ×3 coarsening → 6-40 mask units).
-        if bw >= 20 && bh >= 6 && bh <= bw && area >= 40 {
+        if bw >= 15 && bh >= 4 && bh <= bw * 3 && area >= 25 {
             if area > best_area {
                 best_area = area;
                 best_rect = Some((min_x, min_y, bw, bh));
