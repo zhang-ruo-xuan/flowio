@@ -644,6 +644,10 @@ pub fn find_selection_highlight(img: &DynamicImage) -> Option<(i32, i32, i32, i3
     let buf = img.to_rgb8();
     let w = img.width() as usize;
     let h = img.height() as usize;
+    ocr_debug(&format!(
+        "sel_highlight: start image {}x{} target=({},{},{})",
+        w, h, hl.0, hl.1, hl.2
+    ));
     if w == 0 || h == 0 {
         return None;
     }
@@ -737,18 +741,26 @@ pub fn find_selection_highlight(img: &DynamicImage) -> Option<(i32, i32, i32, i3
         }
     }
 
-    let (mx, my, mw, bh) = best_rect?;
-    // Convert mask coordinates back to image coordinates (×step).
-    let ix = (mx * step) as i32;
-    let iy = (my * step) as i32;
-    let iw = (mw * step).min(w) as i32;
-    let ih = (bh * step).min(h) as i32;
+    if let Some((mx, my, mw, bh)) = best_rect {
+        // Convert mask coordinates back to image coordinates (×step).
+        let ix = (mx * step) as i32;
+        let iy = (my * step) as i32;
+        let iw = (mw * step).min(w) as i32;
+        let ih = (bh * step).min(h) as i32;
 
-    ocr_debug(&format!(
-        "sel_highlight: HIT at ({},{}) {}x{} (area {})",
-        ix, iy, iw, ih, best_area
-    ));
-    Some((ix, iy, iw, ih))
+        ocr_debug(&format!(
+            "sel_highlight: HIT at ({},{}) {}x{} (area {})",
+            ix, iy, iw, ih, best_area
+        ));
+        Some((ix, iy, iw, ih))
+    } else {
+        // best_rect is None — no component passed the filter
+        ocr_debug(&format!(
+            "sel_highlight: NO COMPONENT PASSED FILTER (best_area={})",
+            best_area
+        ));
+        None
+    }
 }
 
 // ── OCR-based text locator ──────────────────────────────────────────

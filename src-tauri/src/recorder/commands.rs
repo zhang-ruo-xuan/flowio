@@ -434,7 +434,7 @@ fn flush_shortcut_step(
     // 所在的位置，**和"复制的文本"毫无关系**。删掉。
     let anchor = if settle.crop == CropSource::FocusAtKeystroke {
         let cursor_box = screenshot::get_cursor_pos()
-            .map(|(cx, cy)| (cx - 220, cy - 100, 440, 200));
+            .map(|(cx, cy)| (cx - 400, cy - 130, 800, 260));
         let sel = screenshot::get_selected_text_rect();
         let raw = sel
             .or(cursor_box);
@@ -524,6 +524,10 @@ fn flush_shortcut_step(
         let win_h_i32 = win_h;
         let ox_i32 = ox;
         let oy_i32 = oy;
+        // 截图时刻的鼠标位置——用户复制时鼠标通常就在被复制的文字附近，
+        // 这是最可靠的"大概在哪"信号。比 200ms 后再读（可能已移开）、
+        // 比活动窗口中心（整个浏览器）、比屏幕中心都靠谱得多。
+        let cursor_at_capture = screenshot::get_cursor_pos();
         std::thread::spawn(move || {
             // 剪贴板 / 焦点选区可能尚未刷新，等一小段时间再读。
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -591,9 +595,18 @@ fn flush_shortcut_step(
                                 }
                             }
                             true  // ← L1 成功，跳过后续层
-                        } else { false }
-                    } else { false }
-                } else { false }
+                        } else {
+                            screenshot::ocr_debug("crop: L1 sel_highlight returned None");
+                            false
+                        }
+                    } else {
+                        screenshot::ocr_debug("crop: L1 image load_from_memory failed");
+                        false
+                    }
+                } else {
+                    screenshot::ocr_debug("crop: L1 fs::read jpeg failed");
+                    false
+                }
             };
 
             if !anchor_found {
@@ -627,27 +640,26 @@ fn flush_shortcut_step(
                         }
                     }
                     None => {
-                        // ── Layer 3: 活动窗口（替代旧的鼠标位置兜底）──
-                        // 鼠标位置对复制操作毫无意义（用户可能鼠标在屏幕角落）。
-                        // 活动窗口至少保证"裁的是正确的应用"。
-                        screenshot::ocr_debug(&format!(
-                            "crop: L3 active_window fallback for '{}' (len {})",
-                            text.chars().take(40).collect::<String>(),
-                            text.chars().count()
-                        ));
+                        // ── Layer 3: 截图时刻鼠标位置（最靠谱的兜底）──
+                        // 用户复制时鼠标通常就在/靠近被复制的文字（刚用鼠标选中
+                        // 或键盘焦点就在那）。这比活动窗口中心（=整个浏览器）和
+                        // 屏幕中心都精确得多。
+                        //
+                        // 注意：这里的 cursor_at_capture 是截图瞬间同步读取的，
+                        // 不是 200ms 后异步读的——那时用户可能已经移开鼠标了。
+                        let mut fallback_used = false;
 
-                        // 尝试获取活动窗口矩形，转换到图片坐标
-                        let win_rect = crate::recorder::activity::get_active_window_rect()
-                            .and_then(|r| screenshot::screen_rect_in_image(r, ox_i32, oy_i32, win_w_i32, win_h_i32));
-
-                        if let Some((wx, wy, ww, wh)) = win_rect {
-                            // 窗口矩形本身可能很大（最大化窗口=整屏），缩小到 80% 宽度居中
+                        if let Some((mx, my)) = cursor_at_capture {
+                            let rx = (mx - ox_i32).clamp(0, win_w_i32);
+                            let ry = (my - oy_i32).clamp(0, win_h_i32);
+                            let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
+                            // 框宽按文本长度估算，至少 800px（长 URL 需要更宽）
+                            let desired_w = (text_len as i32 * 9 + 120).max(800).min(win_w_i32);
+                            let desired_h = 260.min(win_h_i32);
                             let (cx, cy, cw, ch) = screenshot::centered_crop_box(
-                                wx + ww / 2, wy + wh / 2,
-                                (ww as f64 * 0.8) as i32,
-                                (wh as f64 * 0.7).max(300.0) as i32,
+                                rx, ry, desired_w, desired_h,
                                 win_w_i32, win_h_i32,
-                                600, 300,
+                                desired_w, desired_h,
                             );
                             if let Ok(mut st) = cs.lock() {
                                 if let Some(s) = st.get_mut(idx) {
@@ -657,22 +669,58 @@ fn flush_shortcut_step(
                                     s.crop_h = Some(ch);
                                 }
                             }
-                        } else {
-                            // ── Layer 4: 屏幕中心（最终兜底）──
-                            screenshot::ocr_debug("crop: L4 screen_center final fallback");
-                            let (cx, cy, cw, ch) = screenshot::centered_crop_box(
-                                win_w_i32 / 2, win_h_i32 / 2,
-                                (win_w_i32 as f64 * 0.6) as i32,
-                                (win_h_i32 as f64 * 0.5) as i32,
-                                win_w_i32, win_h_i32,
-                                600, 300,
-                            );
-                            if let Ok(mut st) = cs.lock() {
-                                if let Some(s) = st.get_mut(idx) {
-                                    s.x = Some(cx);
-                                    s.y = Some(cy);
-                                    s.crop_w = Some(cw);
-                                    s.crop_h = Some(ch);
+                            screenshot::ocr_debug(&format!(
+                                "crop: L3 cursor_at_capture ({},{}) box {}x{} for '{}' (len {})",
+                                mx, my, desired_w, desired_h,
+                                text.chars().take(30).collect::<String>(),
+                                text.chars().count()
+                            ));
+                            fallback_used = true;
+                        }
+
+                        if !fallback_used {
+                            // ── Layer 4: 活动窗口 ──
+                            screenshot::ocr_debug(&format!(
+                                "crop: L4 active_window fallback for '{}' (len {})",
+                                text.chars().take(40).collect::<String>(),
+                                text.chars().count()
+                            ));
+                            let win_rect = crate::recorder::activity::get_active_window_rect()
+                                .and_then(|r| screenshot::screen_rect_in_image(r, ox_i32, oy_i32, win_w_i32, win_h_i32));
+
+                            if let Some((wx, wy, ww, wh)) = win_rect {
+                                let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                                    wx + ww / 2, wy + wh / 2,
+                                    (ww as f64 * 0.8) as i32,
+                                    (wh as f64 * 0.7).max(300.0) as i32,
+                                    win_w_i32, win_h_i32,
+                                    600, 300,
+                                );
+                                if let Ok(mut st) = cs.lock() {
+                                    if let Some(s) = st.get_mut(idx) {
+                                        s.x = Some(cx);
+                                        s.y = Some(cy);
+                                        s.crop_w = Some(cw);
+                                        s.crop_h = Some(ch);
+                                    }
+                                }
+                            } else {
+                                // ── Layer 5: 屏幕中心（最终兜底）──
+                                screenshot::ocr_debug("crop: L5 screen_center final fallback");
+                                let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                                    win_w_i32 / 2, win_h_i32 / 2,
+                                    (win_w_i32 as f64 * 0.6) as i32,
+                                    (win_h_i32 as f64 * 0.5) as i32,
+                                    win_w_i32, win_h_i32,
+                                    600, 300,
+                                );
+                                if let Ok(mut st) = cs.lock() {
+                                    if let Some(s) = st.get_mut(idx) {
+                                        s.x = Some(cx);
+                                        s.y = Some(cy);
+                                        s.crop_w = Some(cw);
+                                        s.crop_h = Some(ch);
+                                    }
                                 }
                             }
                         }
