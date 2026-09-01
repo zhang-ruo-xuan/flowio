@@ -47,12 +47,27 @@ interface DashboardProps {
 }
 
 const PAGE_SIZE = 10;
+const PAGE_STORAGE_KEY = "flowio_dashboard_page";
 
 export default function Dashboard({ onEdit, onStartRecording, locationKey }: DashboardProps) {
   const { siteUser } = useAuthStore();
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [search, setSearch] = useState("");
-  const [page, setPage] = useState(1);
+  // 翻页状态需要跨 mount 持久化：用户翻到第 2 页点进教程，编辑器里改完
+  // 返回时希望仍在第 2 页，否则每次都被打回第 1 页体感很差。sessionStorage
+  // 在程序退出/重开时自动失效（→ 回到第 1 页），不需要额外清理。
+  const [page, setPageState] = useState<number>(() => {
+    const raw = sessionStorage.getItem(PAGE_STORAGE_KEY);
+    const n = raw ? parseInt(raw, 10) : 1;
+    return Number.isFinite(n) && n >= 1 ? n : 1;
+  });
+  const setPage = (updater: number | ((prev: number) => number)) => {
+    setPageState((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      sessionStorage.setItem(PAGE_STORAGE_KEY, String(next));
+      return next;
+    });
+  };
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -191,8 +206,20 @@ export default function Dashboard({ onEdit, onStartRecording, locationKey }: Das
     setPage(1);
   }, [search]);
 
+  // 换账号 → 重置页码，避免 A 用户的"第 2 页"被 B 用户看到
+  useEffect(() => {
+    setPage(1);
+  }, [siteUser?.id]);
+
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const paged = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  // 删除录制 / 搜索后总页数可能少于当前页：自动回弹到合法页码
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
 
   const recStatus = (r: Recording) => {
     const parts: string[] = [];

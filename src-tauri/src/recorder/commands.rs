@@ -323,17 +323,31 @@ struct ShortcutSettle {
 }
 
 impl ShortcutSettle {
-    /// Shortcut whose effect is a visible UI change worth cropping.
+    /// Re-capture after the keystroke so the step's screenshot reflects what
+    /// the screen looks like *now* (the find-in-page bar after Ctrl+F, the
+    /// inserted text after Ctrl+V, ...).
     const fn visual(ms: u64) -> Self {
         Self { wait: SettleWait::Fixed(ms), source: None, crop: CropSource::Changed }
     }
-    /// Copy / cut / paste: description from the clipboard, crop anchored to
-    /// the selection read at keystroke time.
-    const fn clipboard(ms: u64) -> Self {
+    /// Copy / cut: clip-board-driven step. The screen does NOT change when the
+    /// user copies, so re-shooting at settle time only captures the *next*
+    /// action the user has already performed (typically Ctrl+V) and overwrites
+    /// the original frame. The crop anchor is read at keystroke time
+    /// (selection rect or cursor box) and never touched again.
+    const fn copy() -> Self {
         Self {
-            wait: SettleWait::Fixed(ms),
+            wait: SettleWait::Skip,
             source: Some(BackfillSource::Clipboard),
             crop: CropSource::FocusAtKeystroke,
+        }
+    }
+    /// Paste: screen DOES change (inserted text). Re-shoot at settle, anchor
+    /// on the focused element then (the paste target is the focus).
+    const fn paste() -> Self {
+        Self {
+            wait: SettleWait::Fixed(450),
+            source: Some(BackfillSource::Clipboard),
+            crop: CropSource::Changed,
         }
     }
     /// Select-all: capture the frame where the highlight appeared, not the
@@ -404,11 +418,32 @@ fn flush_shortcut_step(
     // 复制/粘贴：锚点必须现在读。这类操作画面几乎不变（没法靠像素差定位），
     // 而等到 settle 线程再去问 UIA「焦点在哪」时，Ctrl+A→C→V 早已把焦点带到
     // 粘贴目标上了 —— 复制步骤于是裁到了查找框。
+    //
+    // 锚点优先级（从可信到兜底）：
+    //   1. UIA 选中文本矩形 —— 唯一能直接回答"复制发生在哪"的信息；可惜
+    //      chromium 不暴露 text range 给 MSAA 桥接，常常返回 None。
+    //   2. 鼠标位置周围一个窗口 —— 用户复制时鼠标通常悬停在被复制的元素
+    //      上（链接/单元格/输入框），比 UIA 焦点可靠得多。
+    //   3. 屏幕中心 60% 区域 —— 兜底，至少能看到核心内容；不裁是错全屏，
+    //      裁成"贴一个角"也是错，居中是错得最少的默认。
+    //
+    // 旧的 fallback `get_focused_element_rect` 在 chromium 下返回整渲染树根
+    // 的 bbox，screen_rect_in_image 算出来 = (0, 0, image_w, image_h)——但
+    // 当 chromium 窗口没占满屏幕时（侧边栏/任务栏可见），裁出来的图偏向窗口
+    // 所在的位置，**和"复制的文本"毫无关系**。删掉。
     let anchor = if settle.crop == CropSource::FocusAtKeystroke {
-        // 选中文本的矩形就是"复制发生的地方"；没有选中态时退回焦点元素。
-        screenshot::get_selected_text_rect()
-            .or_else(|| screenshot::get_focused_element_rect())
-            .and_then(|r| screenshot::screen_rect_in_image(r, ox, oy, pre_w, pre_h))
+        let cursor_box = screenshot::get_cursor_pos()
+            .map(|(cx, cy)| (cx - 220, cy - 100, 440, 200));
+        let sel = screenshot::get_selected_text_rect();
+        let raw = sel
+            .or(cursor_box);
+        raw.and_then(|r| screenshot::screen_rect_in_image(r, ox, oy, pre_w, pre_h))
+            .or_else(|| {
+                // 兜底：屏幕中心 60% 区域，居中显示
+                let (bx, by) = (pre_w / 5, pre_h / 5);
+                let (bw, bh) = (pre_w * 3 / 5, pre_h * 3 / 5);
+                Some((bx, by, bw, bh))
+            })
     } else {
         None
     };
@@ -478,6 +513,36 @@ fn flush_shortcut_step(
             before_full,
             FrameGeom { origin_x: ox, origin_y: oy, pre_w, pre_h, watermark_cut },
         );
+    } else if let Some(source) = settle.source {
+        // Wait=Skip 但仍要回填 description（剪贴板 / 焦点选中文本）。
+        // 重截图会捕获用户已经按下的下一步操作，所以只起一个轻量线程读 text。
+        let epoch = current_settle_epoch();
+        let cs = Arc::clone(captured);
+        std::thread::spawn(move || {
+            // 剪贴板 / 焦点选区可能尚未刷新，等一小段时间再读。
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if current_settle_epoch() != epoch {
+                return;
+            }
+            let text = match source {
+                BackfillSource::Clipboard => {
+                    screenshot::get_clipboard_text().unwrap_or_default()
+                }
+                BackfillSource::FocusedSelection => {
+                    screenshot::get_focused_selected_text().unwrap_or_default()
+                }
+            };
+            if text.is_empty() {
+                return;
+            }
+            if let Ok(mut st) = cs.lock() {
+                if let Some(s) = st.get_mut(idx) {
+                    if s.description.is_empty() {
+                        s.description = text;
+                    }
+                }
+            }
+        });
     }
     Some(idx)
 }
@@ -1087,7 +1152,7 @@ fn spawn_event_thread(
                                 // 改为轮询"画面一变就拍"，拍到的正是高亮选区。
                                 "KeyA" => flush_shortcut_step(
                                     "hotkey",
-                                    "全选".to_string(),
+                                    "Ctrl+A 全选".to_string(),
                                     String::new(),
                                     &cs_for_thread,
                                     ShortcutSettle::select_all(
@@ -1097,49 +1162,54 @@ fn spawn_event_thread(
                                     &ring,
                                     combo_ts,
                                 ),
-                                // 复制/粘贴/剪切：剪贴板更新需要时间，450ms 后读。
-                                // 裁剪锚点在按键那一刻就读好（见 CropSource::
-                                // FocusAtKeystroke），否则会裁到粘贴目标上。
+                                // 复制：剪贴板更新需要时间，但屏幕不会变。
+                                // settle 阶段**不再重截**（否则 450ms 后截到的是
+                                // 用户已按下的 Ctrl+V 的目标区域），只读剪贴板
+                                // 文字填 description；截图保留按键时刻那一帧。
                                 "KeyC" => flush_shortcut_step(
                                     "copy",
-                                    "复制".to_string(),
+                                    "Ctrl+C 复制".to_string(),
                                     String::new(),
                                     &cs_for_thread,
-                                    ShortcutSettle::clipboard(450),
+                                    ShortcutSettle::copy(),
                                     &ring,
                                     combo_ts,
                                 ),
+                                // 粘贴：屏幕会变（粘进去的文字），需要 settle
+                                // 重截。锚点由 settle 时的焦点元素决定（焦点还
+                                // 在粘贴目标上）。
                                 "KeyV" => flush_shortcut_step(
                                     "paste",
-                                    "粘贴".to_string(),
+                                    "Ctrl+V 粘贴".to_string(),
                                     String::new(),
                                     &cs_for_thread,
-                                    ShortcutSettle::clipboard(450),
+                                    ShortcutSettle::paste(),
                                     &ring,
                                     combo_ts,
                                 ),
+                                // 剪切：屏幕不会变（剪贴板变了），同 Ctrl+C 逻辑。
                                 "KeyX" => flush_shortcut_step(
                                     "hotkey",
-                                    "剪切".to_string(),
+                                    "Ctrl+X 剪切".to_string(),
                                     String::new(),
                                     &cs_for_thread,
-                                    ShortcutSettle::clipboard(450),
+                                    ShortcutSettle::copy(),
                                     &ring,
                                     combo_ts,
                                 ),
                                 // 查找：浏览器搜索框是滑入动画，500ms 后重拍才拍得到。
                                 "KeyF" => flush_shortcut_step(
                                     "hotkey",
-                                    "查找".to_string(),
+                                    "Ctrl+F 查找".to_string(),
                                     String::new(),
                                     &cs_for_thread,
                                     ShortcutSettle::visual(500),
                                     &ring,
                                     combo_ts,
                                 ),
-                                "KeyZ" => flush_shortcut_step("hotkey", "撤销".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
-                                "KeyY" => flush_shortcut_step("hotkey", "重做".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
-                                "KeyS" => flush_shortcut_step("hotkey", "保存".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
+                                "KeyZ" => flush_shortcut_step("hotkey", "Ctrl+Z 撤销".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
+                                "KeyY" => flush_shortcut_step("hotkey", "Ctrl+Y 重做".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
+                                "KeyS" => flush_shortcut_step("hotkey", "Ctrl+S 保存".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
                                 _ => {
                                     let title = format!("快捷键 Ctrl+{}", display_shortcut_key(&key_name));
                                     flush_shortcut_step("hotkey", title, String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts)
