@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const _MARKER: &str = "[FLOWIO_CMDS_MARKER_20260825]";
@@ -479,7 +480,7 @@ fn flush_shortcut_step(
         screenshot_path: ss_str.clone(),
         screenshot_base64: None,
         annotated_path: String::new(),
-        before_screenshot_path: ss_str,
+        before_screenshot_path: ss_str.clone(),
         x: crop_x,
         y: crop_y,
         crop_w,
@@ -518,6 +519,11 @@ fn flush_shortcut_step(
         // 重截图会捕获用户已经按下的下一步操作，所以只起一个轻量线程读 text。
         let epoch = current_settle_epoch();
         let cs = Arc::clone(captured);
+        let ss_path = PathBuf::from(ss_str.clone());
+        let win_w_i32 = win_w;
+        let win_h_i32 = win_h;
+        let ox_i32 = ox;
+        let oy_i32 = oy;
         std::thread::spawn(move || {
             // 剪贴板 / 焦点选区可能尚未刷新，等一小段时间再读。
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -535,10 +541,47 @@ fn flush_shortcut_step(
             if text.is_empty() {
                 return;
             }
+
+            // 1) description 必须写回（之前已经做）
             if let Ok(mut st) = cs.lock() {
                 if let Some(s) = st.get_mut(idx) {
                     if s.description.is_empty() {
-                        s.description = text;
+                        s.description = text.clone();
+                    }
+                }
+            }
+
+            // 2) 在已经保存好的 JPEG 上 OCR，按 description 文字重写裁剪锚点。
+            //    chromium 下 UIA / focused element 都不可靠（见 screenshot.rs
+            //    OCR 段注释），OCR 是这一步唯一的精准定位手段。
+            if let Some((raw_x, raw_y, raw_w, raw_h)) =
+                screenshot::locate_text_in_image(&ss_path, &text)
+            {
+                if let Ok(mut st) = cs.lock() {
+                    if let Some(s) = st.get_mut(idx) {
+                        // OCR 返回的是"原图"坐标（save JPEG 时已含水印?不，
+                        // save 之前已经用 clean_img 去水印后写盘，所以 OCR 坐标
+                        // 已经是干净的截图坐标）。
+                        // 但 anchored rect 往往是选中行/列的小高度，按 description
+                        // 真实宽度（按字符串长度推算）放大裁剪框，保证完整可见。
+                        let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
+                        let desired_w = (text_len as i32 * 9 + 80).max(800).min(win_w_i32);
+                        let desired_h = (raw_h + 60).max(160).min(win_h_i32);
+                        let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                            raw_x + raw_w / 2,
+                            raw_y + raw_h / 2,
+                            desired_w,
+                            desired_h,
+                            win_w_i32,
+                            win_h_i32,
+                            desired_w,
+                            desired_h,
+                        );
+                        let _ = (ox_i32, oy_i32); // 当前锚点已是图片坐标，不再减
+                        s.x = Some(cx);
+                        s.y = Some(cy);
+                        s.crop_w = Some(cw);
+                        s.crop_h = Some(ch);
                     }
                 }
             }

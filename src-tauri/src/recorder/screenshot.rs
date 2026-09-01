@@ -605,6 +605,153 @@ pub fn screen_rect_in_image(
     Some((x0 - origin_x, y0 - origin_y, x1 - x0, y1 - y0))
 }
 
+// ── OCR-based text locator ──────────────────────────────────────────
+//
+// `get_selected_text_rect` and `get_focused_element_rect` both fail on
+// Chromium. The fallback we tried before (cursor_pos padded into a 440×200
+// box) is only a rough heuristic and routinely clips long URLs in half. The
+// reliable answer is to OCR the already-captured screenshot and locate
+// `description` inside it.
+
+/// Bounding rectangle of the OCR-detected words whose concatenated text
+/// contains a key fragment of `needle`.
+///
+/// Used for copy / select-all / find steps where the description tells us
+/// exactly what the user did; the cropped screenshot must therefore be
+/// centered on that text — not on the focused element, not on the cursor,
+/// not on the screen center.
+pub fn locate_text_in_image(jpeg_path: &Path, needle: &str) -> Option<(i32, i32, i32, i32)> {
+    let words = ocr_words(jpeg_path)?;
+    if words.is_empty() {
+        return None;
+    }
+    let key = pick_query_substring(needle);
+    if key.len() < 4 {
+        return None;
+    }
+
+    let mut best: Option<(usize, usize)> = None;
+    for start in 0..words.len() {
+        let mut joined = String::new();
+        let end_cap = (start + 16).min(words.len());
+        for end in (start + 1)..=end_cap {
+            joined.push_str(&words[end - 1].text);
+            if joined.contains(&key) {
+                match best {
+                    Some((bs, be)) if (be - bs) <= (end - start) => {}
+                    _ => best = Some((start, end)),
+                }
+                break;
+            }
+            if joined.len() > needle.len() + key.len() + 32 {
+                break;
+            }
+        }
+    }
+
+    let (s, e) = best?;
+    let mut x0 = i32::MAX;
+    let mut y0 = i32::MAX;
+    let mut x1 = i32::MIN;
+    let mut y1 = i32::MIN;
+    for w in &words[s..e] {
+        let l = w.rect.x;
+        let t = w.rect.y;
+        let r = l + w.rect.w;
+        let b = t + w.rect.h;
+        if l < x0 { x0 = l; }
+        if t < y0 { y0 = t; }
+        if r > x1 { x1 = r; }
+        if b > y1 { y1 = b; }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0, y0, x1 - x0, y1 - y0))
+}
+
+fn pick_query_substring(needle: &str) -> String {
+    let compact: String = needle.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.len() <= 24 {
+        return compact;
+    }
+    let s = compact.len() / 4;
+    let l = compact.len() / 2;
+    let mid: String = compact.chars().skip(s).take(l).collect();
+    if !mid.is_empty() {
+        return mid;
+    }
+    compact
+}
+
+struct OcrItem {
+    text: String,
+    rect: Rect2i,
+}
+
+#[derive(Clone, Copy)]
+struct Rect2i {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+fn ocr_words(jpeg_path: &Path) -> Option<Vec<OcrItem>> {
+    use windows::Graphics::Imaging::BitmapDecoder;
+    use windows::Media::Ocr::{OcrEngine, OcrLine};
+    use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+
+    let bytes = std::fs::read(jpeg_path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let stream: InMemoryRandomAccessStream = InMemoryRandomAccessStream::new().ok()?;
+    let writer = DataWriter::CreateDataWriter(&stream).ok()?;
+    writer.WriteBytes(bytes.as_slice()).ok()?;
+    writer.StoreAsync().ok()?.get().ok()?;
+    let _ = writer.Close();
+    stream.Seek(0).ok()?;
+
+    let decoder = BitmapDecoder::CreateAsync(&stream).ok()?.get().ok()?;
+    let bitmap = decoder.GetSoftwareBitmapAsync().ok()?.get().ok()?;
+
+    let engine: OcrEngine = OcrEngine::TryCreateFromUserProfileLanguages().ok()?;
+    let result = engine.RecognizeAsync(&bitmap).ok()?.get().ok()?;
+
+    // OcrResult.Lines() → 每行 OcrLine，OcrLine.Words() → 每词 OcrWord。
+    // 先按行聚合，再把每行所有 word 入桶：行信息未来可复用，但当前只展开成扁平列表。
+    let lines_view = result.Lines().ok()?;
+    let line_count = lines_view.Size().ok()?;
+    let mut out: Vec<OcrItem> = Vec::new();
+    for li in 0..line_count {
+        let line = lines_view.GetAt(li).ok()?;
+        // 把行级信息一并给出来（后续如果要按行处理已有）
+        let _ = (li, &line);
+        let words_view = OcrLine::Words(&line).ok()?;
+        let word_count = words_view.Size().ok()?;
+        for wi in 0..word_count {
+            let word = words_view.GetAt(wi).ok()?;
+            let text = word.Text().ok()?.to_string();
+            let rect = word.BoundingRect().ok()?;
+            out.push(OcrItem {
+                text,
+                rect: Rect2i {
+                    x: rect.X as i32,
+                    y: rect.Y as i32,
+                    w: rect.Width as i32,
+                    h: rect.Height as i32,
+                },
+            });
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
 /// Bounding box of the pixels that differ between two same-sized images.
 ///
 /// This is the key to "crop exactly what the shortcut changed": comparing the
