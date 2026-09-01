@@ -70,7 +70,8 @@ pub(crate) fn export_recording_inner(
     progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
 ) -> Result<String, String> {
     let (recording, steps) = load_export_data(db, id)?;
-    // Phase C: 导出前强制自动脱敏（开关键 redact_before_export 默认开启）——
+    // Phase C: 导出前自动脱敏（开关键 redact_before_export 默认关闭）——
+    // 仅当用户在「设置 → 脱敏」中开启「导出前自动脱敏」时才执行；
     // 文本替换 + 截图生成脱敏副本，原图与数据库数据保持不动。
     let steps = prepare_export_steps(db, steps, progress)?;
 
@@ -248,17 +249,19 @@ fn generate_export_path(
 // ── Phase C: 导出前强制自动脱敏 ───────────────────────────────
 
 /// 读取 redaction_config 中的导出前脱敏开关与覆盖方式。
-/// 开关 `redact_before_export` 默认开启（合规优先）；`mode` 默认高斯模糊。
+/// 开关 `redact_before_export` 默认关闭（首次安装即关闭，与设置页/默认配置一致）；
+/// `mode` 默认高斯模糊。
 pub(crate) fn read_export_redact_policy(
     db: &State<DbState>,
 ) -> (bool, RedactMode) {
     let conn = match db.0.try_lock() {
         Ok(c) => c,
-        Err(_) => return (true, RedactMode::Blur),
+        // 取不到锁：保守地不脱敏（默认关闭），避免导出时强行改造截图
+        Err(_) => return (false, RedactMode::Blur),
     };
     let mut stmt = match conn.prepare("SELECT value FROM settings WHERE key = ?1") {
         Ok(s) => s,
-        Err(_) => return (true, RedactMode::Blur),
+        Err(_) => return (false, RedactMode::Blur),
     };
     let json: Option<String> = stmt
         .query_row(params!["redaction_config"], |row| row.get(0))
@@ -266,15 +269,16 @@ pub(crate) fn read_export_redact_policy(
     drop(stmt);
     drop(conn);
     let Some(s) = json else {
-        return (true, RedactMode::Blur);
+        // 首次安装：settings 表中尚无 redaction_config 行 → 默认关闭
+        return (false, RedactMode::Blur);
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
-        return (true, RedactMode::Blur);
+        return (false, RedactMode::Blur);
     };
     let enabled = v
         .get("redact_before_export")
         .and_then(|x| x.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
     let mode = RedactMode::from_key(
         v.get("mode").and_then(|x| x.as_str()),
     );

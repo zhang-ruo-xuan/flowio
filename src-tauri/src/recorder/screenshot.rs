@@ -605,13 +605,165 @@ pub fn screen_rect_in_image(
     Some((x0 - origin_x, y0 - origin_y, x1 - x0, y1 - y0))
 }
 
+// ── Selection-highlight detector ──────────────────────────────────
+//
+// When text is selected (Ctrl+A, drag-select, double-click, or just before
+// Ctrl+C), Windows paints it with the system highlight colour (default
+// RGB(51,153,255) for the blue theme).  This is a *visual* signal that does
+// not depend on OCR accuracy or UIA cooperation — it directly answers "where
+// is the selected text?".
+//
+// We read the actual system highlight colour so dark-mode / high-contrast /
+// custom themes are handled automatically.
+
+/// Read the current Windows system highlight (selection background) colour
+/// via raw FFI (avoids pulling in the Win32_UI_HiDpi feature).
+fn get_system_highlight_color() -> (u8, u8, u8) {
+    // COLOR_HIGHLIGHT = 13
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetSysColor(index: i32) -> u32;
+    }
+    const COLOR_HIGHLIGHT: i32 = 13;
+    let c = unsafe { GetSysColor(COLOR_HIGHLIGHT) };
+    ((c & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, ((c >> 16) & 0xFF) as u8)
+}
+
+/// Find the bounding box of the largest text-selection highlight region in
+/// a screenshot.
+///
+/// Scans the image for contiguous regions whose pixels match the system
+/// highlight colour (per-channel tolerance ±40).  Returns the largest
+/// region that looks like a text selection: wider than tall, at least
+/// 60 px wide, between 18–120 px tall.
+///
+/// Returns `None` when no plausible selection region is found (no highlight
+/// pixels, or only tiny specks).
+pub fn find_selection_highlight(img: &DynamicImage) -> Option<(i32, i32, i32, i32)> {
+    let hl = get_system_highlight_color();
+    let buf = img.to_rgb8();
+    let w = img.width() as usize;
+    let h = img.height() as usize;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let bytes = buf.as_raw();
+
+    // Build a coarse binary mask (sample every 3rd pixel for speed).
+    // A pixel "matches" if all three channels are within ±40 of the target.
+    let step = 3usize;
+    let mw = (w + step - 1) / step;
+    let mh = (h + step - 1) / step;
+    let mut mask = vec![false; mw * mh];
+    let mut match_count = 0usize;
+    for my in 0..mh {
+        for mx in 0..mw {
+            let px = (my * step).min(h - 1);
+            let py = (mx * step).min(w - 1);
+            let idx = (px * w + py) * 3;
+            if idx + 2 < bytes.len() {
+                let dr = (bytes[idx] as i32 - hl.0 as i32).abs();
+                let dg = (bytes[idx + 1] as i32 - hl.1 as i32).abs();
+                let db = (bytes[idx + 2] as i32 - hl.2 as i32).abs();
+                let hit = dr < 40 && dg < 40 && db < 40;
+                mask[my * mw + mx] = hit;
+                if hit {
+                    match_count += 1;
+                }
+            }
+        }
+    }
+
+    // Too few highlight pixels → no meaningful selection.
+    if match_count < 30 {
+        ocr_debug(&format!(
+            "sel_highlight: only {} highlight pixels found, skipping",
+            match_count
+        ));
+        return None;
+    }
+
+    // Flood-fill connected components on the coarse mask (4-neighbourhood).
+    // Track each component's bounding box and area.
+    let mut visited = vec![false; mw * mh];
+    let mut best_area = 0usize;
+    let mut best_rect: Option<(usize, usize, usize, usize)> = None; // (x,y,w,h) in mask coords
+
+    for start in 0..mw * mh {
+        if !mask[start] || visited[start] {
+            continue;
+        }
+        // BFS flood fill
+        let mut stack = Vec::with_capacity(256);
+        stack.push(start);
+        visited[start] = true;
+        let mut min_x = mw;
+        let mut min_y = mh;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        let mut area = 0usize;
+
+        while let Some(idx) = stack.pop() {
+            area += 1;
+            let cy = idx / mw;
+            let cx = idx % mw;
+            if cx < min_x { min_x = cx; }
+            if cy < min_y { min_y = cy; }
+            if cx > max_x { max_x = cx; }
+            if cy > max_y { max_y = cy; }
+
+            // 4 neighbours
+            for &(ny, nx) in &[(cy.wrapping_sub(1), cx), (cy + 1, cx), (cy, cx.wrapping_sub(1)), (cy, cx + 1)] {
+                if ny < mh && nx < mw {
+                    let nidx = ny * mw + nx;
+                    if mask[nidx] && !visited[nidx] {
+                        visited[nidx] = true;
+                        stack.push(nidx);
+                    }
+                }
+            }
+        }
+
+        let bw = max_x.saturating_sub(min_x) + 1;
+        let bh = max_y.saturating_sub(min_y) + 1;
+
+        // Filter: must look like a text selection (wide strip, not a square icon).
+        // Real selections are typically: width >> height, height 18-120 px (after ×3 coarsening → 6-40 mask units).
+        if bw >= 20 && bh >= 6 && bh <= bw && area >= 40 {
+            if area > best_area {
+                best_area = area;
+                best_rect = Some((min_x, min_y, bw, bh));
+            }
+        }
+    }
+
+    let (mx, my, mw, bh) = best_rect?;
+    // Convert mask coordinates back to image coordinates (×step).
+    let ix = (mx * step) as i32;
+    let iy = (my * step) as i32;
+    let iw = (mw * step).min(w) as i32;
+    let ih = (bh * step).min(h) as i32;
+
+    ocr_debug(&format!(
+        "sel_highlight: HIT at ({},{}) {}x{} (area {})",
+        ix, iy, iw, ih, best_area
+    ));
+    Some((ix, iy, iw, ih))
+}
+
 // ── OCR-based text locator ──────────────────────────────────────────
 //
 // `get_selected_text_rect` and `get_focused_element_rect` both fail on
-// Chromium. The fallback we tried before (cursor_pos padded into a 440×200
-// box) is only a rough heuristic and routinely clips long URLs in half. The
-// reliable answer is to OCR the already-captured screenshot and locate
+// Chromium.  The fallback we tried before (cursor_pos padded into a 440×200
+// box) is only a rough heuristic and routinely clips long URLs in half.
+// The reliable answer is to OCR the already-captured screenshot and locate
 // `description` inside it.
+//
+// IMPORTANT: for long strings (URLs, paths) OCR full-match is fragile — one
+// misrecognised character breaks the whole substring test.  The matching
+// strategy therefore uses **distinctive short fragments** (domain name,
+// query-parameter values) that OCR handles reliably, and prefers the **longest**
+// match (most text covered = most likely the real copied content).
 
 /// Append-only debug log for the OCR copy-crop path. Enabled by default while
 /// we stabilise OCR on real machines; writes a few lines per copy step to
@@ -638,6 +790,20 @@ pub(crate) fn ocr_debug(msg: &str) {
 /// exactly what the user did; the cropped screenshot must therefore be
 /// centered on that text — not on the focused element, not on the cursor,
 /// not on the screen center.
+///
+/// ## Matching strategy (v3 — fragment-based, longest-match)
+///
+/// Full-string matching fails for URLs and long paths because a single OCR
+/// error (0↔O, 1↔l↔I) breaks the whole substring test.  Instead we:
+///
+/// 1. Extract **distinctive short fragments** from the needle that are likely
+///    to survive OCR intact: domain names (`baidu.com`), query values
+///    (`pwd=s36z`), path segments.
+/// 2. Try each fragment against the concatenated OCR output.
+/// 3. **Prefer the LONGEST word-span match** (most text covered = most likely
+///    the actual copied content).  The previous version preferred the SHORTEST
+///    span, which meant a 3-word fragment beat a 15-word full-URL match —
+///    exactly the bug that produced tiny "pwd=s36z" crops.
 pub fn locate_text_in_image(jpeg_path: &Path, needle: &str) -> Option<(i32, i32, i32, i32)> {
     let words = ocr_words(jpeg_path)?;
     if words.is_empty() {
@@ -649,34 +815,75 @@ pub fn locate_text_in_image(jpeg_path: &Path, needle: &str) -> Option<(i32, i32,
         return None;
     }
 
-    // Candidate keys: the full normalized string plus several interior slices.
-    // OCR is least reliable at the very start/end of a line, so we also try a
-    // few middle fragments — whichever matches with the shortest word span wins.
-    let candidates: Vec<String> = if n_full.len() <= 16 {
-        vec![n_full.clone()]
-    } else {
-        vec![
-            n_full.clone(),
-            n_full[4..].to_string(),
-            n_full[..n_full.len() - 4].to_string(),
-            n_full[n_full.len() / 4..3 * n_full.len() / 4].to_string(),
-        ]
-    };
+    // ── Build candidate keys ──────────────────────────────────────
+    // Each candidate is a short, OCR-friendly fragment of the needle.
+    // Order matters: earlier candidates are tried first, but the LONGEST
+    // matching word-span always wins regardless of candidate order.
 
-    let mut best: Option<(usize, usize)> = None;
-    for key in &candidates {
-        if key.len() < 4 {
-            continue;
+    let mut candidates: Vec<String> = Vec::new();
+
+    // 1. Domain name (highest signal-to-noise for URLs)
+    if let Some(domain) = extract_domain_fragment(&needle) {
+        let d = ocr_norm(&domain);
+        if d.len() >= 4 {
+            candidates.push(d);
         }
+    }
+
+    // 2. Query-parameter values (e.g. "pwd=s36z" from "?pwd=s36z")
+    for qv in extract_query_fragments(&needle) {
+        let q = ocr_norm(&qv);
+        if q.len() >= 4 {
+            candidates.push(q);
+        }
+    }
+
+    // 3. Full string (for short needles that might match as-is)
+    if n_full.len() <= 24 {
+        candidates.push(n_full.clone());
+    }
+
+    // 4. Head/tail/middle fragments of the full normalized string
+    if n_full.len() > 24 {
+        let len = n_full.len();
+        candidates.push(n_full[2..len.min(20)].to_string());          // after scheme
+        candidates.push(n_full[len.saturating_sub(18)..].to_string()); // tail end
+        let q = len / 4;
+        candidates.push(n_full[q..3 * q].to_string());                // middle half
+    }
+
+    if candidates.is_empty() {
+        ocr_debug("locate: no usable candidate fragments");
+        return None;
+    }
+
+    ocr_debug(&format!(
+        "locate: {} candidates (first: '{}', needle norm len {})",
+        candidates.len(),
+        candidates.first().map_or("", |s| s.as_str()),
+        n_full.len()
+    ));
+
+    // ── Search: find the LONGEST word span that contains any candidate ──
+    let mut best: Option<(usize, usize)> = None; // (start_word, end_word) exclusive
+    let mut best_span_len = 0isize;
+
+    for key in &candidates {
+        if key.len() < 4 { continue; }
         for start in 0..words.len() {
             let mut joined = String::new();
             let end_cap = (start + 28).min(words.len());
             for end in (start + 1)..=end_cap {
                 joined.push_str(&ocr_norm(&words[end - 1].text));
                 if joined.contains(key) {
+                    let span = (end - start) as isize;
+                    // KEY FIX: prefer LONGEST span (previously preferred shortest)
                     match best {
-                        Some((bs, be)) if (be - bs) <= (end - start) => {}
-                        _ => best = Some((start, end)),
+                        Some((_, _)) if best_span_len >= span => {}
+                        _ => {
+                            best = Some((start, end));
+                            best_span_len = span;
+                        }
                     }
                     break;
                 }
@@ -688,6 +895,12 @@ pub fn locate_text_in_image(jpeg_path: &Path, needle: &str) -> Option<(i32, i32,
     }
 
     let (s, e) = best?;
+    ocr_debug(&format!(
+        "locate: HIT words[{}..{}] (span={})",
+        s, e, best_span_len
+    ));
+
+    // Compute bounding box of the matched words
     let mut x0 = i32::MAX;
     let mut y0 = i32::MAX;
     let mut x1 = i32::MIN;
@@ -706,6 +919,50 @@ pub fn locate_text_in_image(jpeg_path: &Path, needle: &str) -> Option<(i32, i32,
         return None;
     }
     Some((x0, y0, x1 - x0, y1 - y0))
+}
+
+/// Extract a domain-like fragment from a URL or path string.
+/// For "https://pan.baidu.com/s/xxx?pwd=yy" returns "baidu.com".
+/// For non-URL strings returns None.
+fn extract_domain_fragment(s: &str) -> Option<String> {
+    // Strip leading whitespace / common prefixes
+    let trimmed = s.trim_start_matches(|c: char| c.is_whitespace() || c == '：' || c == ':');
+    // Find :// then take the next segment
+    if let Some(rest) = trimmed.find("://").and_then(|i| trimmed.get(i + 3..)) {
+        // Take everything up to the first /
+        let domain_part = rest.split('/').next().unwrap_or(rest);
+        if domain_part.contains('.') && domain_part.len() >= 5 {
+            return Some(domain_part.to_string());
+        }
+    }
+    // Also try bare "xxx.yyy" pattern (without scheme)
+    for part in trimmed.split_whitespace() {
+        if part.contains('.') && !part.starts_with(['/', '?', '#']) {
+            let candidate = part.split(&['/', '?', '#'][..]).next().unwrap_or(part);
+            if candidate.matches('.').count() >= 1 && candidate.len() >= 5 {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract query-parameter value fragments like "pwd=s36z" from a URL.
+fn extract_query_fragments(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(qpos) = s.find('?') {
+        let query = &s[qpos + 1..];
+        for pair in query.split('&') {
+            // Take pairs that have = with a value ≥ 3 chars
+            if let Some((_, v)) = pair.split_once('=') {
+                let v_trim = v.trim_end_matches('#');
+                if v_trim.len() >= 3 {
+                    out.push(format!("{}={}", pair.split('=').next().unwrap_or(""), v_trim));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Normalise a string for OCR-safe substring matching.

@@ -551,67 +551,129 @@ fn flush_shortcut_step(
                 }
             }
 
-            // 2) 在已经保存好的 JPEG 上 OCR，按 description 文字重写裁剪锚点。
-            //    chromium 下 UIA / focused element 都不可靠（见 screenshot.rs
-            //    OCR 段注释），OCR 是这一步唯一的精准定位手段。
-            match screenshot::locate_text_in_image(&ss_path, &text) {
-                Some((raw_x, raw_y, raw_w, raw_h)) => {
-                    screenshot::ocr_debug(&format!(
-                        "locate: HIT at ({},{}) {}x{} for '{}'",
-                        raw_x, raw_y, raw_w, raw_h,
-                        text.chars().take(30).collect::<String>()
-                    ));
-                    if let Ok(mut st) = cs.lock() {
-                        if let Some(s) = st.get_mut(idx) {
-                            // OCR 返回的是 clean_img（已去水印、已写盘）的坐标。
-                            let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
-                            // 框宽至少保证 OCR 识别出的文本框本体完整（×1.3 留边），
-                            // 再结合文本长度估算；取较大值，避免长 URL 被切一半。
-                            let by_text = text_len as i32 * 9 + 80;
-                            let by_ocr = (raw_w as f64 * 1.3) as i32;
-                            let desired_w = by_ocr.max(by_text).max(800).min(win_w_i32);
-                            let desired_h = ((raw_h as f64 * 2.2) as i32).max(160).min(win_h_i32);
+            // 2) 重写裁剪锚点——四层策略（按优先级）：
+            //
+            //   Layer 1: 选区高亮检测  → 直接找截图上的蓝色选中背景（最可靠）
+            //   Layer 2: OCR 文字定位  → 域名/短片段匹配 + 最长匹配偏好
+            //   Layer 3: 活动窗口      → 至少裁到正确的应用窗口
+            //   Layer 4: 屏幕中心      → 最终兜底
+            //
+            // 旧代码的致命问题：OCR 对长 URL 全串匹配几乎必失败（日志已确认
+            // NO MATCH），然后退化到鼠标位置兜底——鼠标在哪完全随机，所以裁图
+            // 也是随机的。
+
+            let anchor_found = {
+                // ── Layer 1: 选区高亮检测 ──
+                // 需要重新加载 JPEG 为 DynamicImage（spawn 线程拿不到 clean_img）
+                if let Ok(img_bytes) = std::fs::read(&ss_path) {
+                    if let Ok(img) = image::load_from_memory_with_format(
+                        &img_bytes,
+                        image::ImageFormat::Jpeg,
+                    ) {
+                        if let Some((hx, hy, hw, hh)) = screenshot::find_selection_highlight(&img) {
+                            screenshot::ocr_debug(&format!(
+                                "crop: L1 sel_highlight ({},{}) {}x{}",
+                                hx, hy, hw, hh
+                            ));
                             let (cx, cy, cw, ch) = screenshot::centered_crop_box(
-                                raw_x + raw_w / 2,
-                                raw_y + raw_h / 2,
-                                desired_w,
-                                desired_h,
-                                win_w_i32,
-                                win_h_i32,
-                                desired_w,
-                                desired_h,
+                                hx + hw / 2, hy + hh / 2,
+                                (hw as f64 * 1.5).max(400.0) as i32,
+                                (hh as f64 * 2.5).max(160.0) as i32,
+                                win_w_i32, win_h_i32,
+                                400, 160,
                             );
-                            s.x = Some(cx);
-                            s.y = Some(cy);
-                            s.crop_w = Some(cw);
-                            s.crop_h = Some(ch);
-                        }
-                    }
-                }
-                None => {
-                    // OCR 没匹配到（引擎缺失 / 文字被识别错 / 截图上没有该文本）。
-                    // 兜底：以复制发生时的鼠标位置为中心，按文本长度估算框宽，
-                    // 至少让复制内容大概率落在框内，而不是退回屏幕中心 60%。
-                    screenshot::ocr_debug(&format!(
-                        "locate: NO MATCH for '{}' (len {})",
-                        text.chars().take(40).collect::<String>(),
-                        text.chars().count()
-                    ));
-                    if let Some((mx, my)) = screenshot::get_cursor_pos() {
-                        let rx = (mx - ox_i32).clamp(0, win_w_i32);
-                        let ry = (my - oy_i32).clamp(0, win_h_i32);
-                        let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
-                        let desired_w = (text_len as i32 * 9 + 80).max(800).min(win_w_i32);
-                        let desired_h = 200.min(win_h_i32);
-                        let (cx, cy, cw, ch) = screenshot::centered_crop_box(
-                            rx, ry, desired_w, desired_h, win_w_i32, win_h_i32, desired_w, desired_h,
-                        );
+                            if let Ok(mut st) = cs.lock() {
+                                if let Some(s) = st.get_mut(idx) {
+                                    s.x = Some(cx);
+                                    s.y = Some(cy);
+                                    s.crop_w = Some(cw);
+                                    s.crop_h = Some(ch);
+                                }
+                            }
+                            true  // ← L1 成功，跳过后续层
+                        } else { false }
+                    } else { false }
+                } else { false }
+            };
+
+            if !anchor_found {
+                // ── Layer 2: OCR 文字定位（改进版：短片段 + 最长匹配）──
+                match screenshot::locate_text_in_image(&ss_path, &text) {
+                    Some((raw_x, raw_y, raw_w, raw_h)) => {
+                        screenshot::ocr_debug(&format!(
+                            "crop: L2 OCR HIT at ({},{}) {}x{} for '{}'",
+                            raw_x, raw_y, raw_w, raw_h,
+                            text.chars().take(30).collect::<String>()
+                        ));
                         if let Ok(mut st) = cs.lock() {
                             if let Some(s) = st.get_mut(idx) {
+                                let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
+                                let by_text = text_len as i32 * 9 + 80;
+                                let by_ocr = (raw_w as f64 * 1.3) as i32;
+                                let desired_w = by_ocr.max(by_text).max(800).min(win_w_i32);
+                                let desired_h = ((raw_h as f64 * 2.2) as i32).max(160).min(win_h_i32);
+                                let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                                    raw_x + raw_w / 2,
+                                    raw_y + raw_h / 2,
+                                    desired_w, desired_h,
+                                    win_w_i32, win_h_i32,
+                                    desired_w, desired_h,
+                                );
                                 s.x = Some(cx);
                                 s.y = Some(cy);
                                 s.crop_w = Some(cw);
                                 s.crop_h = Some(ch);
+                            }
+                        }
+                    }
+                    None => {
+                        // ── Layer 3: 活动窗口（替代旧的鼠标位置兜底）──
+                        // 鼠标位置对复制操作毫无意义（用户可能鼠标在屏幕角落）。
+                        // 活动窗口至少保证"裁的是正确的应用"。
+                        screenshot::ocr_debug(&format!(
+                            "crop: L3 active_window fallback for '{}' (len {})",
+                            text.chars().take(40).collect::<String>(),
+                            text.chars().count()
+                        ));
+
+                        // 尝试获取活动窗口矩形，转换到图片坐标
+                        let win_rect = crate::recorder::activity::get_active_window_rect()
+                            .and_then(|r| screenshot::screen_rect_in_image(r, ox_i32, oy_i32, win_w_i32, win_h_i32));
+
+                        if let Some((wx, wy, ww, wh)) = win_rect {
+                            // 窗口矩形本身可能很大（最大化窗口=整屏），缩小到 80% 宽度居中
+                            let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                                wx + ww / 2, wy + wh / 2,
+                                (ww as f64 * 0.8) as i32,
+                                (wh as f64 * 0.7).max(300.0) as i32,
+                                win_w_i32, win_h_i32,
+                                600, 300,
+                            );
+                            if let Ok(mut st) = cs.lock() {
+                                if let Some(s) = st.get_mut(idx) {
+                                    s.x = Some(cx);
+                                    s.y = Some(cy);
+                                    s.crop_w = Some(cw);
+                                    s.crop_h = Some(ch);
+                                }
+                            }
+                        } else {
+                            // ── Layer 4: 屏幕中心（最终兜底）──
+                            screenshot::ocr_debug("crop: L4 screen_center final fallback");
+                            let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                                win_w_i32 / 2, win_h_i32 / 2,
+                                (win_w_i32 as f64 * 0.6) as i32,
+                                (win_h_i32 as f64 * 0.5) as i32,
+                                win_w_i32, win_h_i32,
+                                600, 300,
+                            );
+                            if let Ok(mut st) = cs.lock() {
+                                if let Some(s) = st.get_mut(idx) {
+                                    s.x = Some(cx);
+                                    s.y = Some(cy);
+                                    s.crop_w = Some(cw);
+                                    s.crop_h = Some(ch);
+                                }
                             }
                         }
                     }

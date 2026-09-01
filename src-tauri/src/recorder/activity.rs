@@ -5,6 +5,7 @@ extern "system" {
     fn GetForegroundWindow() -> isize;
     fn GetWindowTextLengthW(hwnd: isize) -> i32;
     fn GetWindowTextW(hwnd: isize, buf: *mut u16, max_count: i32) -> i32;
+    fn GetWindowRect(hwnd: isize, rect: *mut i32) -> i32;  // (left, top, right, bottom)
 }
 
 /// Retrieve the caption of the currently focused foreground window.
@@ -27,6 +28,30 @@ pub fn get_active_window_title() -> Option<String> {
         }
         buf.truncate(actual as usize);
         Some(String::from_utf16_lossy(&buf))
+    }
+}
+
+/// Bounding rectangle of the currently focused foreground window.
+///
+/// Returns `(left, top, width, height)` in virtual-screen coordinates.
+/// Returns `None` when there is no foreground window or the call fails.
+pub fn get_active_window_rect() -> Option<(i32, i32, i32, i32)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd == 0 {
+            return None;
+        }
+        let mut rect = [0i32; 4]; // left, top, right, bottom
+        if GetWindowRect(hwnd, rect.as_mut_ptr()) == 0 {
+            return None;
+        }
+        let (l, t, r, b) = (rect[0], rect[1], rect[2], rect[3]);
+        let w = r - l;
+        let h = b - t;
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        Some((l, t, w, h))
     }
 }
 
