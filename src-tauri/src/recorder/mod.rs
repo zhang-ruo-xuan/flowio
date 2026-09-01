@@ -77,6 +77,11 @@ pub struct Recorder {
     /// Default `false`: Flowio's own window is self-filtered.
     #[serde(default)]
     pub record_self: bool,
+
+    /// 录制开始时识别到的前台应用显示名（如「微信」「Edge 浏览器」），
+    /// 保存时写入 `recordings.app_name`；未识别到已知应用时为空串。
+    #[serde(default)]
+    pub app_name: String,
 }
 
 #[cfg(test)]
@@ -191,6 +196,7 @@ mod tests {
             running_flag: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true))),
             captured_steps: Some(std::sync::Arc::new(Mutex::new(vec![step_data("s2", 2)]))),
             record_self: false,
+            app_name: "微信".into(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("running_flag"));
@@ -198,6 +204,28 @@ mod tests {
         let back: Recorder = serde_json::from_str(&json).unwrap();
         assert_eq!(back.state, RecordingState::Paused);
         assert_eq!(back.paused_at.as_deref(), Some("2026-08-20T11:00:00+08:00"));
+        assert_eq!(back.app_name, "微信");
+    }
+
+    #[test]
+    fn app_display_name_known_processes() {
+        assert_eq!(
+            crate::recorder::recorder::app_display_name("chrome.exe"),
+            Some("Chrome 浏览器")
+        );
+        assert_eq!(
+            crate::recorder::recorder::app_display_name("WeChat.exe"),
+            Some("微信")
+        );
+        assert_eq!(
+            crate::recorder::recorder::app_display_name("OBS64.EXE"),
+            Some("OBS 录屏/直播")
+        );
+        assert_eq!(
+            crate::recorder::recorder::app_display_name("explorer.exe"),
+            Some("文件资源管理器（桌面/文件夹窗口）")
+        );
+        assert_eq!(crate::recorder::recorder::app_display_name("unknownapp.exe"), None);
     }
 
     #[test]

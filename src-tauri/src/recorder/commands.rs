@@ -1253,7 +1253,13 @@ fn build_click_step(
     let now_ms = current_time_millis();
 
     let window_title = activity::get_active_window_title();
-    let title = activity::make_click_title(window_title.as_deref());
+    let title = if window_title.as_deref().map(|t| !t.is_empty()).unwrap_or(false) {
+        activity::make_click_title(window_title.as_deref())
+    } else {
+        // 空标题（开始菜单/任务管理器等系统 UI）回退为前台应用显示名
+        let app = crate::recorder::recorder::get_foreground_app_display_name();
+        activity::make_click_title_with_app(window_title.as_deref(), app.as_deref())
+    };
 
     Some(StepData {
         id: Uuid::new_v4().to_string(),
@@ -1802,6 +1808,7 @@ fn recording_title_or_default(title: &str) -> String {
 fn build_recording_save(
     id: String,
     title: &str,
+    app_name: &str,
     steps: &[StepData],
 ) -> (crate::db::RecordingSave, String) {
     let saves = steps_to_step_saves(steps);
@@ -1809,7 +1816,7 @@ fn build_recording_save(
     let save = crate::db::RecordingSave {
         id: id.clone(),
         title: recording_title_or_default(title),
-        app_name: String::new(),
+        app_name: app_name.to_string(),
         steps: saves,
     };
     (save, format!("{} ({} steps)", id, step_count))
@@ -1869,6 +1876,11 @@ pub fn start_recording(
     // --- Create recorder ---
     let mut recorder = crate::recorder::Recorder::new(id.clone(), String::new());
     recorder.record_self = record_self;
+    // 识别启动录制时的前台应用（用户快捷键起录时所在的应用即录制目标）。
+    // Flowio 自身或未识别进程 → 空串，前端回退「网页应用」。
+    recorder.app_name = crate::recorder::recorder::get_foreground_app_display_name()
+        .unwrap_or_default();
+    eprintln!("[start] detected foreground app: {:?}", recorder.app_name);
     recorder.start()?;
 
     // --- Shared captured-steps buffer ---
@@ -2095,7 +2107,7 @@ pub fn finish_recording(
             msg
         })?;
 
-        build_recording_save(recorder.id.clone(), &recorder.title, &recorder.steps)
+        build_recording_save(recorder.id.clone(), &recorder.title, &recorder.app_name, &recorder.steps)
     };
 
     let conn = db.0.lock().map_err(|e| {
@@ -2578,10 +2590,10 @@ mod commands_tests {
     #[test]
     fn build_recording_save_basic() {
         let steps = vec![make_step(0), make_step(1), make_step(2)];
-        let (save, rec_id) = build_recording_save("rec-1".into(), "标题", &steps);
+        let (save, rec_id) = build_recording_save("rec-1".into(), "标题", "微信", &steps);
         assert_eq!(save.id, "rec-1");
         assert_eq!(save.title, "标题");
-        assert_eq!(save.app_name, "");
+        assert_eq!(save.app_name, "微信");
         assert_eq!(save.steps.len(), 3);
         assert_eq!(rec_id, "rec-1 (3 steps)");
     }
@@ -2589,14 +2601,15 @@ mod commands_tests {
     #[test]
     fn build_recording_save_empty_title_fallback() {
         let steps = vec![make_step(0)];
-        let (save, rec_id) = build_recording_save("rec-2".into(), "", &steps);
+        let (save, rec_id) = build_recording_save("rec-2".into(), "", "", &steps);
         assert!(save.title.starts_with("录制 "));
+        assert_eq!(save.app_name, "");
         assert_eq!(rec_id, "rec-2 (1 steps)");
     }
 
     #[test]
     fn build_recording_save_zero_steps() {
-        let (save, rec_id) = build_recording_save("rec-0".into(), "空", &[]);
+        let (save, rec_id) = build_recording_save("rec-0".into(), "空", "", &[]);
         assert_eq!(save.steps.len(), 0);
         assert_eq!(rec_id, "rec-0 (0 steps)");
     }

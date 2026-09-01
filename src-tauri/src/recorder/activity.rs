@@ -58,9 +58,18 @@ pub fn get_active_window_rect() -> Option<(i32, i32, i32, i32)> {
 /// Generate a natural-language step title from a window title.
 /// Format: "在「{title}」中点击", fallback: "点击".
 pub fn make_click_title(window_title: Option<&str>) -> String {
+    make_click_title_with_app(window_title, None)
+}
+
+/// [`make_click_title`] 的可注入版本：窗口标题为空（开始菜单、任务管理器
+/// 等无标题系统 UI）时，回退为前台应用的显示名（如「Windows 开始菜单」）。
+pub fn make_click_title_with_app(window_title: Option<&str>, app: Option<&str>) -> String {
     match window_title {
         Some(title) if !title.is_empty() => format!("在「{}」中点击", title),
-        _ => "点击".to_string(),
+        _ => match app.filter(|a| !a.is_empty()) {
+            Some(a) => format!("在「{}」中点击", a),
+            None => "点击".to_string(),
+        },
     }
 }
 
@@ -84,5 +93,21 @@ mod activity_tests {
     #[test]
     fn click_title_none_falls_back() {
         assert_eq!(make_click_title(None), "点击");
+    }
+
+    #[test]
+    fn click_title_empty_title_falls_back_to_app() {
+        assert_eq!(
+            make_click_title_with_app(Some(""), Some("Windows 开始菜单")),
+            "在「Windows 开始菜单」中点击"
+        );
+        // 应用名也为空时仍回退「点击」
+        assert_eq!(make_click_title_with_app(None, Some("")), "点击");
+        assert_eq!(make_click_title_with_app(None, None), "点击");
+        // 有窗口标题时优先用标题
+        assert_eq!(
+            make_click_title_with_app(Some("微信"), Some("QQ")),
+            "在「微信」中点击"
+        );
     }
 }

@@ -1032,6 +1032,10 @@ mod tests {
                 description: "这是第一步描述".into(),
                 tip: "".into(),
                 screenshot_path: "".into(),
+                x: None,
+                y: None,
+                crop_w: None,
+                crop_h: None,
             },
             ExportStep {
                 id: "test-step".into(),
@@ -1042,10 +1046,15 @@ mod tests {
                 description: "这是第二步描述\n包含换行".into(),
                 tip: "一个提示".into(),
                 screenshot_path: "".into(),
+                x: None,
+                y: None,
+                crop_w: None,
+                crop_h: None,
             },
         ];
         let out = std::env::temp_dir().join("flowio_test_no_ss.pdf");
-        let result = export_pdf(&rec, &steps, &out);
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let result = export_pdf(&rec, &steps, &out, &crop_set);
         assert!(result.is_ok(), "export_pdf failed: {:?}", result.err());
         assert!(out.exists(), "PDF file not created");
         let size = std::fs::metadata(&out).unwrap().len();
@@ -1062,7 +1071,8 @@ mod tests {
             total_steps: 0,
             created_at: "2026-08-09".into(),
         };
-        let result = export_pdf(&rec, &[], std::path::Path::new("unused.pdf"));
+        let empty: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let result = export_pdf(&rec, &[], std::path::Path::new("unused.pdf"), &empty);
         assert!(result.is_err());
     }
 
@@ -1113,8 +1123,13 @@ mod tests {
             description: "描述 <b>加粗</b> \"引号\"".into(),
             tip: "提示 '单引号'".into(),
             screenshot_path: "".into(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
         }];
-        let html = gen_html_body(&rec, &steps);
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let html = gen_html_body(&rec, &steps, &crop_set);
         assert!(html.contains("No screenshot"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("&amp;"));
@@ -1143,6 +1158,10 @@ mod tests {
                 description: "描述".into(),
                 tip: "".into(),
                 screenshot_path: "".into(),
+                x: None,
+                y: None,
+                crop_w: None,
+                crop_h: None,
             },
             ExportStep {
                 id: "test-step".into(),
@@ -1153,10 +1172,15 @@ mod tests {
                 description: "".into(),
                 tip: "提示".into(),
                 screenshot_path: "".into(),
+                x: None,
+                y: None,
+                crop_w: None,
+                crop_h: None,
             },
         ];
         let ss_dir = std::env::temp_dir().join("flowio_test_md_ss");
-        let md = export_markdown(&rec, &steps, &ss_dir);
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let md = export_markdown(&rec, &steps, &ss_dir, &crop_set);
         assert!(md.contains("# 标题"));
         assert!(md.contains("**App:** App"));
         assert!(md.contains("## Step 1"));
@@ -1184,9 +1208,14 @@ mod tests {
             description: "".into(),
             tip: "".into(),
             screenshot_path: "C:/definitely/not/exists/xx.png".into(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
         }];
         let ss_dir = std::env::temp_dir().join("flowio_test_md_ss2");
-        let md = export_markdown(&rec, &steps, &ss_dir);
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let md = export_markdown(&rec, &steps, &ss_dir, &crop_set);
         assert!(md.contains("Screenshot not found"));
     }
 
@@ -1208,9 +1237,14 @@ mod tests {
             description: "描述".into(),
             tip: "提示".into(),
             screenshot_path: "".into(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
         }];
         let out = std::env::temp_dir().join("flowio_test_export.docx");
-        export_docx(&rec, &steps, &out).unwrap();
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        export_docx(&rec, &steps, &out, &crop_set).unwrap();
         assert!(out.exists());
         let size = std::fs::metadata(&out).unwrap().len();
         assert!(size > 100);
@@ -1276,8 +1310,13 @@ mod tests {
             description: "".into(),
             tip: "".into(),
             screenshot_path: png.to_string_lossy().to_string(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
         }];
-        let html = gen_html_body(&rec, &steps);
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let html = gen_html_body(&rec, &steps, &crop_set);
         assert!(html.contains("data:image/png;base64,"));
         assert!(html.contains("Step 1"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1304,10 +1343,15 @@ mod tests {
             description: "".into(),
             tip: "".into(),
             screenshot_path: png.to_string_lossy().to_string(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
         }];
         let ss_dir = dir.join("screenshots");
         std::fs::create_dir_all(&ss_dir).unwrap();
-        let md = export_markdown(&rec, &steps, &ss_dir);
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let md = export_markdown(&rec, &steps, &ss_dir, &crop_set);
         assert!(md.contains("![Screenshot](./screenshots/step_1.png)"));
         assert!(ss_dir.join("step_1.png").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1334,9 +1378,14 @@ mod tests {
             description: "".into(),
             tip: "".into(),
             screenshot_path: png.to_string_lossy().to_string(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
         }];
         let out = dir.join("out.docx");
-        export_docx(&rec, &steps, &out).unwrap();
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        export_docx(&rec, &steps, &out, &crop_set).unwrap();
         assert!(out.exists());
         let size = std::fs::metadata(&out).unwrap().len();
         assert!(size > 100);
@@ -1361,9 +1410,14 @@ mod tests {
             description: "line1\nline2".into(),
             tip: "> quote".into(),
             screenshot_path: "".into(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
         }];
         let ss_dir = std::env::temp_dir().join("flowio_test_md4");
-        let md = export_markdown(&rec, &steps, &ss_dir);
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let md = export_markdown(&rec, &steps, &ss_dir, &crop_set);
         // 特殊字符原样输出（Markdown 语法由查看器渲染），不转义也不崩溃
         assert!(md.contains("**bold** `code`"));
         assert!(md.contains("click|a"));
