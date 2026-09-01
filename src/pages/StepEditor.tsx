@@ -413,15 +413,33 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [lightboxMarked, setLightboxMarked] = useState(false);
+  /* 首屏同步读取已保存的裁图/全图偏好，避免先全图再闪跳到裁图 */
+  const readInitialView = (): { stepViewCropped: Record<string, boolean>; globalView: 'full' | 'crop' } => {
+    let stepViewCropped: Record<string, boolean> = {};
+    let globalView: 'full' | 'crop' = 'full';
+    try {
+      const savedView = localStorage.getItem(`flowio_view_${recordingId}`);
+      if (savedView) {
+        const parsed = JSON.parse(savedView);
+        stepViewCropped = parsed.stepViewCropped || {};
+        globalView = parsed.globalView || 'full';
+      }
+    } catch { /* ignore corrupt data */ }
+    return { stepViewCropped, globalView };
+  };
   /* 主图视图：false=全图（默认，screenshot_base64），true=裁剪图（点击坐标 400×400 裁剪） */
-  const [stepViewCropped, setStepViewCropped] = useState<Record<string, boolean>>({});
+  const [stepViewCropped, setStepViewCropped] = useState<Record<string, boolean>>(
+    () => (recordingId ? readInitialView().stepViewCropped : {})
+  );
   const getViewCropped = (stepId: string) => stepViewCropped[stepId] ?? false;
   const setViewCropped = (stepId: string, value: boolean) => setStepViewCropped(prev => ({ ...prev, [stepId]: value }));
   /* 裁剪图是否已被用户删除（true=该步骤裁剪图视为不存在，仅影响裁图视图，全图不受影响） */
   const [deletedCrop, setDeletedCrop] = useState<Record<string, boolean>>({});
   const isCropDeleted = (stepId: string) => !!deletedCrop[stepId];
   /* 全局视图风格：'full'=全图，'crop'=裁剪图（顶部统一切换按钮高亮当前教程主要风格） */
-  const [globalView, setGlobalView] = useState<'full' | 'crop'>('full');
+  const [globalView, setGlobalView] = useState<'full' | 'crop'>(
+    () => (recordingId ? readInitialView().globalView : 'full')
+  );
 
   /* Tip expand */
   const [tipExpanded, setTipExpanded] = useState(false);
@@ -475,27 +493,39 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           id: recordingId,
         });
         if (cancelled) return;
+
+        // 关键：在 setSteps 之前预生成**所有步骤**的裁剪图缓存，然后单次提交。
+        // 这样首次渲染就是最终状态（spinner → 裁图/全图），不存在
+        // "灰框→裁图"或"全图→裁图"的任何中间帧。
+        // （此前是 setSteps 先渲染、cropCache 异步逐个填充 → 每步都跳一次。）
+        const cache: Record<string, string> = {};
+        await Promise.all(
+          data.steps
+            .filter((s) => s.screenshot_base64)
+            .map(async (s) => {
+              try {
+                cache[s.id] = await cropAdaptiveBase64(
+                  s.screenshot_base64 as string,
+                  s.x, s.y, s.crop_w, s.crop_h, s.action_type,
+                );
+              } catch {
+                cache[s.id] = "";
+              }
+            }),
+        );
+        if (cancelled) return;
+
+        setCropCache(cache);
         setRecording(data.recording);
         setSteps(data.steps);
         if (data.steps.length > 0) {
           setSelectedStepId(data.steps[0].id);
         }
 
-        // 从 localStorage 恢复视图状态（裁图/全图偏好）
-        const savedView = localStorage.getItem(`flowio_view_${recordingId}`);
-        let initialView: Record<string, boolean> = {};
-        let initialGlobal: 'full' | 'crop' = 'full';
-        if (savedView) {
-          try {
-            const parsed = JSON.parse(savedView);
-            initialView = parsed.stepViewCropped || {};
-            initialGlobal = parsed.globalView || 'full';
-          } catch { /* ignore corrupt data */ }
-        }
-        setStepViewCropped(initialView);
-        setGlobalView(initialGlobal);
+        // 视图状态（stepViewCropped / globalView）已由 useState 惰性初始化从 localStorage 同步恢复，
+        // 此处不再重复 setState（否则新对象引用触发重渲染会破坏首屏一致性）。
+        // 只需标记恢复完成以允许后续持久化写入。
         viewLoadedRef.current = true;
-        setCropCache({});
       } catch (err) {
         if (!cancelled) setError(String(err));
       } finally {
@@ -573,7 +603,11 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     if (useCrop && isCropDeleted(step.id)) return null;
     if (useCrop) {
       const cropped = cropCache[step.id];
-      if (cropped) return cropped;
+      // 裁图缓存已就绪：返回裁剪结果（空字符串=裁剪失败→返回null隐藏）
+      if (cropped !== undefined) return cropped || null;
+      // 裁图缓存尚未就绪（首次加载/cold start）：返回null而非全图，
+      // 避免"全图→裁图"闪跳。用户会看到短暂空白后裁图出现。
+      return null;
     }
     return base;
   };

@@ -379,26 +379,77 @@ pub(crate) fn prepare_export_steps(
 
 // ── Export image cropping helper ──────────────────────────────
 
-/// 如果步骤在裁剪模式且有有效坐标，对图片字节做裁剪；否则原样返回。
+/// 导出裁剪：**与前端 cropAdaptiveBase64 逻辑完全一致**，保证导出图 = 编辑器里看到的图。
+///
+/// 坐标语义（与录制端 centered_crop_box 一致）：x/y = 裁剪框**中心**，crop_w/h = 框尺寸。
+/// - 整窗类型（scroll/nav/screenshot）：不裁剪，原样返回；
+/// - 有坐标（中心+尺寸）：外扩 CROP_PAD(8px)，type 步骤再左扩 1/3 宽带出 label，
+///   贴边时整体平移进图内（不缩小裁剪框）；
+/// - 无坐标：与前端一致返回全图（前端此场景同样显示全图）。
+const EXPORT_CROP_PAD: i32 = 8;
+
 fn maybe_crop_screenshot_bytes(
     raw_bytes: Vec<u8>,
     x: Option<i32>,
     y: Option<i32>,
     crop_w: Option<i32>,
     crop_h: Option<i32>,
+    action_type: &str,
 ) -> Vec<u8> {
-    let (x, y, cw, ch) = match (x, y, crop_w, crop_h) {
-        (Some(a), Some(b), Some(c), Some(d)) if c > 0 && d > 0 => (a as u32, b as u32, c as u32, d as u32),
-        _ => return raw_bytes,
-    };
+    // 整窗类型不裁剪（与前端 Stage C 一致）
+    if matches!(action_type, "scroll" | "nav" | "screenshot") {
+        return raw_bytes;
+    }
+    // 前端逻辑：连坐标都没有才显示全图，这里保持一致
+    let has_point = matches!((x, y), (Some(a), Some(b)) if a >= 0 && b >= 0);
+    if !has_point {
+        return raw_bytes;
+    }
     let mut img = match image::load_from_memory(&raw_bytes) {
         Ok(i) => i,
         Err(_) => return raw_bytes,
     };
-    let cropped = img.crop(x, y, cw.min(img.width()), ch.min(img.height()));
+    let img_w = img.width() as i32;
+    let img_h = img.height() as i32;
+
+    // 分支选择（与前端 cropAdaptiveBase64 一致）：
+    // ① 有元素矩形（中心+尺寸）→ 按矩形外扩裁剪；② 只有坐标 → 点击点为中心裁 40%。
+    // 前端 40% 兜底不加 CROP_PAD，此处用 add_pad 区分。
+    let (cx, cy, rw0, rh0, add_pad) = match (x, y, crop_w, crop_h) {
+        (Some(a), Some(b), Some(c), Some(d)) if c > 0 && d > 0 => (a, b, c, d, true),
+        (Some(a), Some(b), _, _) => {
+            let fw = ((img_w as f64) * 0.4).round() as i32;
+            let fh = ((img_h as f64) * 0.4).round() as i32;
+            (a, b, fw, fh, false)
+        }
+        _ => return raw_bytes,
+    };
+
+    // ① 外扩 CROP_PAD；type 步骤左扩 1/3 宽（仅矩形分支，与前端一致）
+    let mut rw = if add_pad { rw0 + EXPORT_CROP_PAD * 2 } else { rw0 };
+    let rh = if add_pad { rh0 + EXPORT_CROP_PAD * 2 } else { rh0 };
+    let left;
+    let top;
+    if add_pad && action_type == "type" {
+        let extra = rw0 / 3;
+        rw += extra;
+        left = cx - rw / 2 - extra;
+    } else {
+        left = cx - rw / 2;
+    }
+    top = cy - rh / 2;
+
+    // 贴边平移进图内（不缩小裁剪框，避免内容被切掉一半）
+    let rw = rw.min(img_w).max(1);
+    let rh = rh.min(img_h).max(1);
+    let left = left.clamp(0, img_w - rw);
+    let top = top.clamp(0, img_h - rh);
+
+    let cropped = img.crop(left as u32, top as u32, rw as u32, rh as u32);
     let mut buf: Vec<u8> = Vec::new();
-    // 裁剪图输出 JPEG（与前端 cropAdaptiveBase64 一致）
-    if let Err(_) = cropped.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg) {
+    // 输出 JPEG 质量 85（与前端 canvas.toDataURL("image/jpeg", 0.85) 一致）
+    let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+    if cropped.write_with_encoder(enc).is_err() {
         return raw_bytes;
     }
     buf
@@ -422,7 +473,7 @@ fn gen_html_body(
                 let raw = std::fs::read(&s.screenshot_path).ok().unwrap_or_default();
                 let is_crop = crop_set.contains(s.id.as_str());
                 let data = if is_crop && !raw.is_empty() {
-                    maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h)
+                    maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type)
                 } else {
                     raw
                 };
@@ -509,7 +560,7 @@ fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], ss_dir: &s
                     // 裁剪模式：读取→裁剪→写入
                     match std::fs::read(src).ok().filter(|b| !b.is_empty()) {
                         Some(raw) => {
-                            let cropped = maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h);
+                            let cropped = maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type);
                             match std::fs::write(&dest, &cropped) {
                                 Ok(_) => format!("![Screenshot](./screenshots/{})", filename),
                                 Err(_) => format!("> *(Screenshot export failed)*"),
@@ -625,7 +676,7 @@ fn export_docx(
             if let Ok(img_bytes) = std::fs::read(&s.screenshot_path) {
                 let is_crop = crop_set.contains(s.id.as_str());
                 let final_bytes = if is_crop && !img_bytes.is_empty() {
-                    maybe_crop_screenshot_bytes(img_bytes, s.x, s.y, s.crop_w, s.crop_h)
+                    maybe_crop_screenshot_bytes(img_bytes, s.x, s.y, s.crop_w, s.crop_h, &s.action_type)
                 } else {
                     img_bytes
                 };

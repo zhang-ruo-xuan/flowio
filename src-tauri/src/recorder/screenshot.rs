@@ -35,6 +35,37 @@ pub fn get_cursor_pos() -> Option<(i32, i32)> {
     }
 }
 
+/// 前台窗口的内容区（client area）屏幕矩形，返回 `(left, top, width, height)`。
+///
+/// 与 `GetWindowRect` 不同，client area 排除了标题栏、工具栏、边框等
+/// 非客户区。对浏览器来说这就是「网页内容实际渲染的区域」——
+/// 复制的文本 99% 在这里。用这个矩形的中心做裁图锚点，
+/// 比窗口中心（含 chrome）准确得多。
+pub fn get_foreground_window_client_rect() -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetClientRect,
+    };
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut cr: RECT = std::mem::zeroed();
+        if GetClientRect(hwnd, &mut cr).is_err() || cr.right <= cr.left || cr.bottom <= cr.top {
+            return None;
+        }
+        let w = cr.right - cr.left;
+        let h = cr.bottom - cr.top;
+        // ClientToScreen: 把客户区左上角 (0,0) 映射到屏幕坐标
+        let mut pt: POINT = POINT { x: 0, y: 0 };
+        let _ = ClientToScreen(hwnd, &mut pt); // 几乎不可能失败
+        Some((pt.x, pt.y, w, h))
+    }
+}
+
 /// Capture the monitor the user is actually working on.
 ///
 /// Returns `(image, monitor_x, monitor_y)` where the origin is the monitor's
@@ -427,7 +458,49 @@ pub fn get_focused_selected_text() -> Option<String> {
 ///
 /// Returns `(left, top, width, height)`; `None` when there is no selection or
 /// the control does not expose text geometry.
+/// 规范化文本用于比对：去所有空白 + 小写。
+fn normalize_for_match(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 判定 UIA 选区文本是否就是剪贴板里被复制的内容。
+/// 双向包含（浏览器复制时可能在前后加换行/引号），最短边 ≥4 防止单字符误匹配。
+fn selection_matches_clipboard(sel_text: &str, clipboard: &str) -> bool {
+    let ns = normalize_for_match(sel_text);
+    let nc = normalize_for_match(clipboard);
+    if ns.is_empty() || nc.is_empty() {
+        return false;
+    }
+    if ns == nc {
+        return true;
+    }
+    if ns.chars().count() >= 4 && nc.contains(&ns) {
+        return true;
+    }
+    if nc.chars().count() >= 4 && ns.contains(&nc) {
+        return true;
+    }
+    false
+}
+
 pub fn get_selected_text_rect() -> Option<(i32, i32, i32, i32)> {
+    sel_rect_impl(None)
+}
+
+/// 带文本校验的选区矩形：只有当 UIA 选区中的文本与剪贴板内容一致时才返回矩形。
+///
+/// 为什么必须有这个校验：Chromium 会把**查找条(Ctrl+F)里残留的旧选区**、
+/// 或文档级历史 selection 当作 GetSelection 的结果返回——矩形真实存在、
+/// 里面甚至真有文本（v13 的像素验证因此被骗过），但那不是用户刚复制的内容。
+/// 终极判定：选区内文本 == 剪贴板文本，几何才可信。
+pub fn get_selected_text_rect_matching(expected_clipboard: &str) -> Option<(i32, i32, i32, i32)> {
+    sel_rect_impl(Some(expected_clipboard))
+}
+
+fn sel_rect_impl(expected_clipboard: Option<&str>) -> Option<(i32, i32, i32, i32)> {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
@@ -444,8 +517,11 @@ pub fn get_selected_text_rect() -> Option<(i32, i32, i32, i32)> {
         let automation: IUIAutomation =
             CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL).ok()?;
         let focused = automation.GetFocusedElement().ok()?;
-        let tp: IUIAutomationTextPattern =
-            focused.GetCurrentPatternAs(UIA_TextPattern2Id).ok()?;
+        // 先尝试 TextPattern2，失败再试 TextPattern（Chromium 可能只支持其中一个）
+        let tp: IUIAutomationTextPattern = focused
+            .GetCurrentPatternAs(UIA_TextPattern2Id)
+            .or_else(|_| focused.GetCurrentPatternAs(windows::Win32::UI::Accessibility::UIA_TextPatternId))
+            .ok()?;
         let selections = tp.GetSelection().ok()?;
         let len = selections.Length().ok()?;
         if len <= 0 {
@@ -458,6 +534,19 @@ pub fn get_selected_text_rect() -> Option<(i32, i32, i32, i32)> {
 
         for i in 0..len {
             let Ok(range) = selections.GetElement(i) else { continue };
+            // ── 文本校验：选区文本必须与剪贴板内容一致才采信这个 range 的几何 ──
+            if let Some(expected) = expected_clipboard {
+                let sel_text = range.GetText(-1).map(|t| t.to_string()).unwrap_or_default();
+                if !selection_matches_clipboard(&sel_text, expected) {
+                    ocr_debug(&format!(
+                        "sel_rect: range {} text mismatch (sel={:?} != clipboard={:?}) -> skip",
+                        i,
+                        sel_text.chars().take(60).collect::<String>(),
+                        expected.chars().take(60).collect::<String>()
+                    ));
+                    continue;
+                }
+            }
             let Ok(sa) = range.GetBoundingRectangles() else { continue };
             if sa.is_null() {
                 continue;
@@ -497,6 +586,36 @@ pub fn get_selected_text_rect() -> Option<(i32, i32, i32, i32)> {
         }
         Some((left, top, w, h))
     }
+}
+
+/// 带重试的选区矩形获取（UIA TextPattern → GetSelection → BoundingRectangles）。
+///
+/// 为什么需要重试：Chromium 的 UIA 无障碍树是**惰性激活**的——第一次 Ctrl+C 时
+/// 辅助功能树往往还没建好，GetFocusedElement 拿不到 TextPattern（返回 None）；
+/// 持续重复查询会促使 Chromium 激活无障碍支持，通常几百毫秒内即可命中。
+/// 一旦激活，后续所有复制步骤都能秒拿到精确选区矩形。
+///
+/// 只能在**后台线程**调用（总耗时最多 max_attempts × delay_ms，不能阻塞录制热路径）。
+/// 这才是"定位选中区域"本身，不依赖选区高亮颜色（深色主题/无高亮场景也能定位）。
+pub fn get_selected_text_rect_with_retry(
+    max_attempts: u32,
+    delay_ms: u64,
+    expected_clipboard: &str,
+) -> Option<(i32, i32, i32, i32)> {
+    for attempt in 0..max_attempts {
+        if let Some(r) = get_selected_text_rect_matching(expected_clipboard) {
+            if attempt > 0 {
+                ocr_debug(&format!(
+                    "sel_rect: HIT on attempt {} (a11y warmup took ~{}ms)",
+                    attempt + 1,
+                    (attempt as u64) * delay_ms
+                ));
+            }
+            return Some(r);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    None
 }
 
 /// Read the bounding rectangle (screen coordinates) of the currently focused
@@ -627,6 +746,109 @@ fn get_system_highlight_color() -> (u8, u8, u8) {
     const COLOR_HIGHLIGHT: i32 = 13;
     let c = unsafe { GetSysColor(COLOR_HIGHLIGHT) };
     ((c & 0xFF) as u8, ((c >> 8) & 0xFF) as u8, ((c >> 16) & 0xFF) as u8)
+}
+
+/// Verify that a UIA selection rectangle actually sits on top of a real
+/// on-screen selection: scan the rect (expanded 12px) for system-highlight
+/// pixels. Chromium occasionally reports stale / wrong-element rects (two
+/// different copies yielding nearly identical coordinates, or a rect pointing
+/// at an already-closed find bar) — such a rect must not be used as a crop
+/// anchor.
+pub fn rect_has_highlight(img: &DynamicImage, x: i32, y: i32, w: i32, h: i32) -> bool {
+    let hl = get_system_highlight_color();
+    let raw = img.to_rgb8().into_raw();
+    let iw = img.width() as i32;
+    let ih = img.height() as i32;
+    let x0 = (x - 12).max(0);
+    let y0 = (y - 12).max(0);
+    let x1 = (x + w + 12).min(iw);
+    let y1 = (y + h + 12).min(ih);
+    if x1 <= x0 || y1 <= y0 {
+        return false;
+    }
+    let mut hits = 0usize;
+    let step = 2i32;
+    let mut py = y0;
+    while py < y1 {
+        let mut px = x0;
+        while px < x1 {
+            let idx = ((py * iw + px) * 3) as usize;
+            if idx + 2 < raw.len() {
+                let dr = (raw[idx] as i32 - hl.0 as i32).abs();
+                let dg = (raw[idx + 1] as i32 - hl.1 as i32).abs();
+                let db = (raw[idx + 2] as i32 - hl.2 as i32).abs();
+                if dr < 45 && dg < 45 && db < 45 {
+                    hits += 1;
+                }
+            }
+            px += step;
+        }
+        py += step;
+    }
+    ocr_debug(&format!(
+        "rect_has_highlight ({},{},{},{})+12px -> {} highlight hits",
+        x, y, w, h, hits
+    ));
+    hits >= 6
+}
+
+/// Check whether a rect region contains text-like content (as opposed to a
+/// blank/uniform area). Used as a secondary trust signal when the selection
+/// has no visible highlight colour (user: "有时候选中没颜色复制").
+/// Returns `(looks_like_text, luma_stddev)`.
+pub fn rect_looks_like_text(img: &DynamicImage, x: i32, y: i32, w: i32, h: i32) -> (bool, f64) {
+    let raw = img.to_rgb8().into_raw();
+    let iw = img.width() as i32;
+    let ih = img.height() as i32;
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(iw);
+    let y1 = (y + h).min(ih);
+    if x1 - x0 < 8 || y1 - y0 < 4 {
+        return (false, 0.0);
+    }
+    let mut sum = 0f64;
+    let mut sum2 = 0f64;
+    let mut n = 0usize;
+    let mut edges = 0usize;
+    let mut prev: Option<u8> = None;
+    let step = 2i32;
+    let mut py = y0;
+    while py < y1 {
+        let mut px = x0;
+        while px < x1 {
+            let idx = ((py * iw + px) * 3) as usize;
+            if idx + 2 < raw.len() {
+                let luma = 0.299 * raw[idx] as f64 + 0.587 * raw[idx + 1] as f64
+                    + 0.114 * raw[idx + 2] as f64;
+                sum += luma;
+                sum2 += luma * luma;
+                n += 1;
+                let l8 = luma as u8;
+                if let Some(p) = prev {
+                    if (i32::from(p) - i32::from(l8)).abs() > 60 {
+                        edges += 1;
+                    }
+                }
+                prev = Some(l8);
+            }
+            px += step;
+        }
+        prev = None; // don't count edges across row breaks
+        py += step;
+    }
+    if n == 0 {
+        return (false, 0.0);
+    }
+    let mean = sum / n as f64;
+    let var = (sum2 / n as f64 - mean * mean).max(0.0);
+    let stddev = var.sqrt();
+    let looks = stddev >= 14.0 && edges >= 8;
+    ocr_debug(&format!(
+        "rect_looks_like_text ({},{},{},{}) -> stddev {:.1} edges {} text={}",
+        x, y, w, h, stddev, edges, looks
+    ));
+    (looks, stddev)
 }
 
 /// Find the bounding box of the largest text-selection highlight region in
