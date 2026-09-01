@@ -1,11 +1,14 @@
 #[derive(Debug, Clone)]
 pub enum KeyEvent {
-    /// Key press with modifier state (ctrl/shift/alt) captured at press time.
+    /// Key press with modifier state and the wall-clock Instant at which the
+    /// hook fired (used to pick the frame closest to the real key moment when
+    /// recording a shortcut step).
     Press {
         key: String,
         ctrl: bool,
         shift: bool,
         alt: bool,
+        ts: std::time::Instant,
     },
     Release,
 }

@@ -50,6 +50,10 @@ export default function ProfilePage() {
 
   const doLogout = () => {
     clearAuth();
+    // 清除本地 DB 隔离标记，列表回到未登录（__local__）视图
+    invoke("set_current_user", { userId: "" }).catch((e) =>
+      console.warn("[flowio] 清除 current_user 失败:", e)
+    );
     navigate("/");
   };
 
@@ -75,6 +79,22 @@ export default function ProfilePage() {
       <div className="page-header"><h1>个人中心</h1></div>
 
       <div className="content-area" style={{ marginTop: 16 }}>
+        {!siteUser && (
+          <div
+            style={{
+              border: "1px solid #fde68a",
+              background: "#fffbeb",
+              borderRadius: 8,
+              padding: "10px 14px",
+              marginBottom: 16,
+              fontSize: 13,
+              color: "#92400e",
+              lineHeight: 1.6,
+            }}
+          >
+            登录网站账号后会自动同步；如果一直没反应，点下方按钮手动同步。
+          </div>
+        )}
         {siteUser ? (
           <div style={{ maxWidth: 480 }}>
             <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 10 }}>当前登录账号</div>

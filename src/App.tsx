@@ -22,10 +22,44 @@ function App() {
   const isEditor = location.pathname.startsWith("/editor/");
   const appWindow = getCurrentWindow();
   const [isMaximized, setIsMaximized] = useState(false);
+  const [avatarLoadFailed, setAvatarLoadFailed] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const isPausedRef = useRef(false);
   const { setAuth, clearAuth, siteUser, siteToken } = useAuthStore();
+
+  // 网站用户换了头像 / token 刷新后，旧的 url 失效 → 重新尝试加载图片
+  useEffect(() => { setAvatarLoadFailed(false); }, [siteUser?.avatar, siteUser?.id]);
+
+  // 登录态同步到本地 DB：仅写 settings.current_user 隔离标记，不做批量迁移
+  const syncLocalUser = useCallback((userId: string) => {
+    invoke("set_current_user", { userId })
+      .then(() => console.log("[flowio] set_current_user 成功:", userId))
+      .catch((e) =>
+        console.warn("[flowio] set_current_user 失败:", e)
+      );
+  }, []);
+
+  // 登录态本地同步（不依赖网络）：只要 WebView 已有有效登录态，就把用户 ID
+  // 写入本地 DB。auth-refresh 走网络可能失败/超时，本地同步保证
+  // settings.current_user 隔离标记始终与登录态一致（修复"登录没同步"）。
+  useEffect(() => {
+    if (siteToken && siteUser?.id) {
+      syncLocalUser(siteUser.id);
+    }
+  }, [siteToken, siteUser?.id, syncLocalUser]);
+
+  // 兜底：persist rehydrate 完成后（或首次同步失败/未触发时）再补一次同步。
+  // 防止站点 token 存在但 effect 因依赖未变化而从未执行的情况。
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const { siteUser: u, siteToken: tok } = useAuthStore.getState();
+      if (tok && u?.id) {
+        syncLocalUser(u.id);
+      }
+    }, 800);
+    return () => clearTimeout(t);
+  }, [syncLocalUser]);
 
   useEffect(() => {
     const savedFontSize = localStorage.getItem("fontSize") || "14";
@@ -37,7 +71,7 @@ function App() {
     if (!siteToken) return;
     (async () => {
       try {
-        const res = await fetch("http://47.102.154.233/api/collections/users/auth-refresh", {
+        const res = await fetch("https://flowio.cn/api/collections/users/auth-refresh", {
           method: "POST",
           headers: { Authorization: siteToken },
         });
@@ -55,6 +89,7 @@ function App() {
             bio: data.record.bio || "",
             avatar: data.record.avatar || "",
           });
+          syncLocalUser(data.record.id);
           console.log("[flowio] 网站 token 刷新成功:", data.record.email);
         }
       } catch (err) {
@@ -71,6 +106,7 @@ function App() {
         if (dl) {
           console.log("[flowio] 启动时发现未处理的 deep-link:", dl);
           setAuth(dl.token, { id: dl.id, email: dl.email, display_name: dl.display_name, bio: dl.bio, avatar: dl.avatar });
+          syncLocalUser(dl.id);
         }
       } catch (err) {
         console.warn("[flowio] get_pending_deep_link 失败:", err);
@@ -86,6 +122,7 @@ function App() {
         console.log("[deep-link-auth] 收到事件:", event.payload);
         const { token, id, email, display_name, bio, avatar } = event.payload;
         setAuth(token, { id, email, display_name, bio, avatar });
+        syncLocalUser(id);
       });
     })();
     return () => { unlisten?.(); };
@@ -99,6 +136,7 @@ function App() {
         if (dl) {
           console.log("[flowio] 轮询发现未处理的 deep-link:", dl);
           setAuth(dl.token, { id: dl.id, email: dl.email, display_name: dl.display_name, bio: dl.bio, avatar: dl.avatar });
+          syncLocalUser(dl.id);
         }
       } catch {
         // 静默失败
@@ -234,6 +272,12 @@ function App() {
       setRecording(false);
       setIsPaused(false);
       isPausedRef.current = false;
+      // 未登录时记录"录制完成"标记，编辑页自动弹出登录引导弹窗（LoginSaveModal）
+      if (!siteToken) {
+        sessionStorage.setItem("flowio_show_login_prompt", "1");
+      } else {
+        sessionStorage.removeItem("flowio_show_login_prompt");
+      }
       // Window restore — best-effort, must not block navigation to editor
       try {
         await appWindow.unminimize();
@@ -252,9 +296,52 @@ function App() {
       alert("停止录制失败: " + (err?.message || err));
       console.error("Failed to finish recording:", err);
     }
-  }, [navigate]);
+  }, [navigate, siteToken]);
 
   const handleEdit = useCallback((id: string) => { navigate(`/editor/${id}`); }, [navigate]);
+
+  // 全局快捷键事件（Rust 侧 hotkey 模块 emit：shortcut-record / shortcut-pause / shortcut-stop）
+  useEffect(() => {
+    let unlisteners: Array<() => void> = [];
+    // 简单去抖：同一事件 300ms 内只处理一次，避免系统级重复触发
+    const lastTriggerAt: Record<string, number> = {};
+    const debounced = (name: string, fn: () => void) => {
+      const now = Date.now();
+      if (lastTriggerAt[name] && now - lastTriggerAt[name] < 300) return;
+      lastTriggerAt[name] = now;
+      fn();
+    };
+
+    (async () => {
+      unlisteners.push(await listen("shortcut-record", () => {
+        debounced("shortcut-record", () => {
+          if (recordingIdRef.current === null) {
+            handleStartRecording();
+          } else if (isPausedRef.current) {
+            handleResumeRecording();
+          }
+          // 录制中且未暂停：忽略，避免误停
+        });
+      }));
+      unlisteners.push(await listen("shortcut-pause", () => {
+        debounced("shortcut-pause", () => {
+          if (recordingIdRef.current === null) return;
+          if (isPausedRef.current) {
+            handleResumeRecording();
+          } else {
+            handlePauseRecording();
+          }
+        });
+      }));
+      unlisteners.push(await listen("shortcut-stop", () => {
+        debounced("shortcut-stop", () => {
+          if (recordingIdRef.current === null) return;
+          handleStopRecording();
+        });
+      }));
+    })();
+    return () => { unlisteners.forEach((u) => u()); };
+  }, [handleStartRecording, handlePauseRecording, handleResumeRecording, handleStopRecording]);
   const formatTime = (sec: number) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 
   return (
@@ -291,11 +378,22 @@ function App() {
           {!isEditor && (
             <button
               className="titlebar-btn titlebar-btn-login"
-              onClick={() => siteToken ? navigate("/profile") : invoke("open_external_url", { url: "http://47.102.154.233/author/login?redirect=flowio://auth" })}
+              onClick={() => siteToken ? navigate("/profile") : invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" })}
               title={siteToken ? `已登录 ${siteUser?.email}（点击进入个人中心）` : "登录网站账号"}
             >
               {siteToken ? (
-                <span className="titlebar-avatar">{((siteUser?.email) || "U")[0].toUpperCase()}</span>
+                siteUser?.avatar && !avatarLoadFailed ? (
+                  <img
+                    className="titlebar-avatar-img"
+                    src={`https://flowio.cn/api/files/users/${siteUser.id}/${siteUser.avatar}`}
+                    alt={siteUser.display_name || siteUser.email || "avatar"}
+                    onError={() => setAvatarLoadFailed(true)}
+                  />
+                ) : (
+                  <span className="titlebar-avatar">
+                    {(siteUser?.display_name || siteUser?.email || "U")[0].toUpperCase()}
+                  </span>
+                )
               ) : (
                 <><User size={15} /><span className="titlebar-login-text">登录</span></>
               )}

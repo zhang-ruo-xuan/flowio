@@ -91,9 +91,10 @@ pub fn read_recorder_bool(conn: &rusqlite::Connection, key: &str) -> Option<bool
 
 fn default_redaction_config() -> serde_json::Value {
     let mut v = crate::redaction::RedactionConfig::default_all().to_json();
-    // 导出前自动脱敏开关（默认开启，合规优先）
+    // 导出前自动脱敏默认关闭：日常导出通常就是给团队/客户看的原始录屏；
+    // 真要脱敏在编辑器用「文本脱敏」「扫描脱敏」按需手动触发。
     if let Some(obj) = v.as_object_mut() {
-        obj.insert("redact_before_export".to_string(), serde_json::json!(true));
+        obj.insert("redact_before_export".to_string(), serde_json::json!(false));
     }
     v
 }
@@ -268,7 +269,7 @@ mod tests {
     fn default_redaction_config_has_export_flag_and_all_kinds() {
         let v = default_redaction_config();
         assert!(v.is_object());
-        assert_eq!(v["redact_before_export"], serde_json::json!(true));
+        assert_eq!(v["redact_before_export"], serde_json::json!(false));
         let enabled = v
             .get("enabled")
             .and_then(|x| x.as_array())

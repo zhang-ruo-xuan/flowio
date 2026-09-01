@@ -4,6 +4,7 @@ import { Circle, Search, MoreVertical, Play, Pencil, FileText, Code, FileType, C
 import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import FileSaveDialog from "../components/FileSaveDialog";
+import { useAuthStore } from "../store/authStore";
 
 interface Recording {
   id: string;
@@ -48,6 +49,7 @@ interface DashboardProps {
 const PAGE_SIZE = 10;
 
 export default function Dashboard({ onEdit, onStartRecording, locationKey }: DashboardProps) {
+  const { siteUser } = useAuthStore();
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
@@ -70,11 +72,12 @@ export default function Dashboard({ onEdit, onStartRecording, locationKey }: Das
     return () => clearTimeout(timer);
   }, [toast]);
 
+  // 依赖登录态：登录/退出后按账号隔离刷新列表（Rust 端按 settings.current_user 过滤）
   useEffect(() => {
     invoke<Recording[]>("list_recordings")
       .then(setRecordings)
       .catch((err) => console.error("Failed to list recordings:", err));
-  }, [locationKey]);
+  }, [locationKey, siteUser?.id]);
 
   useEffect(() => {
     if (renamingId && renameInputRef.current) {

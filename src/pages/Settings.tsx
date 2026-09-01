@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Moon, Sun, Zap, Palette, ArrowLeft, Eye, EyeOff,
-  Star, Trash2, Check, Plus, Shield, Circle, User, LogOut, RefreshCw,
+  Star, Trash2, Check, Plus, Shield, Circle, User, LogOut, RefreshCw, Keyboard,
 } from "lucide-react";
 import { useAuthStore } from "../store/authStore";
 
@@ -37,11 +37,26 @@ const BUILTIN_PROVIDERS: ProviderDef[] = [
 ];
 
 const CUSTOM_PROVIDERS_KEY = "custom_providers";
-const PB_URL = "http://47.102.154.233";
+const PB_URL = "https://flowio.cn";
+
+const kbdStyle: React.CSSProperties = {
+  display: "inline-block",
+  padding: "2px 8px",
+  borderRadius: 5,
+  border: "1px solid var(--border)",
+  borderBottomWidth: 2,
+  background: "var(--bg)",
+  color: "var(--text)",
+  fontSize: 12.5,
+  fontWeight: 600,
+  fontFamily: "Consolas, monospace",
+  minWidth: 110,
+  textAlign: "center",
+};
 
 export default function SettingsPage({ darkMode, onToggleDark }: SettingsPageProps) {
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState<"ai" | "appearance" | "redaction" | "recording" | "profile">("ai");
+  const [activeTab, setActiveTab] = useState<"ai" | "appearance" | "redaction" | "recording" | "hotkeys" | "profile">("ai");
   const { siteUser, siteToken, clearAuth, setAuth } = useAuthStore();
 
   /* ---- AI Config State ---- */
@@ -257,11 +272,13 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
   }, [fontSize]);
 
   /* ---- Redaction Settings ---- */
+  // 导出前自动脱敏默认关闭：用户日常导出通常就是给团队/客户看的原始录屏；
+  // 真要脱敏用编辑器里的「文本脱敏」「扫描脱敏」按需手动触发。
   const [redactCfg, setRedactCfg] = useState<{ enabled: string[]; custom_patterns: string[]; mode: "blur" | "block"; redact_before_export: boolean }>({
     enabled: [],
     custom_patterns: [],
     mode: "blur",
-    redact_before_export: true,
+    redact_before_export: false,
   });
   const [redactSaved, setRedactSaved] = useState<string | null>(null);
 
@@ -330,7 +347,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
           enabled: cfg.enabled ?? cfg.enabled_kinds ?? [],
           custom_patterns: cfg.custom_patterns ?? [],
           mode: cfg.mode === "block" ? "block" : "blur",
-          redact_before_export: cfg.redact_before_export ?? true,
+          redact_before_export: cfg.redact_before_export ?? false,
         });
       } catch { /* fallback to defaults */ }
     })();
@@ -468,6 +485,9 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
         </button>
         <button className={`tab ${activeTab === "recording" ? "active" : ""}`} onClick={() => setActiveTab("recording")}>
           <Circle size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />录制
+        </button>
+        <button className={`tab ${activeTab === "hotkeys" ? "active" : ""}`} onClick={() => setActiveTab("hotkeys")}>
+          <Keyboard size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />快捷键
         </button>
         <button className={`tab ${activeTab === "profile" ? "active" : ""}`} onClick={() => setActiveTab("profile")}>
           <User size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />个人中心
@@ -758,6 +778,33 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
           </div>
         )}
 
+        {/* ── 快捷键 ── */}
+        {activeTab === "hotkeys" && (
+          <div>
+            <div style={{ padding: "16px 18px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--bg-secondary)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                <Keyboard size={15} style={{ color: "var(--blue)" }} />
+                <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>全局快捷键</span>
+                <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>（所有界面下均可使用）</span>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, fontSize: 13.5, color: "var(--text-secondary)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <kbd style={kbdStyle}>Alt + Shift + S</kbd>
+                  <span>开始录制 / 恢复录制</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <kbd style={kbdStyle}>Alt + Shift + P</kbd>
+                  <span>暂停 / 继续录制</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <kbd style={kbdStyle}>Alt + Shift + E</kbd>
+                  <span>停止录制并进入编辑器</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* ── 录制 ── */}
         {activeTab === "recording" && (
           <div>
@@ -771,7 +818,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   {recordSelf ? "开启" : "关闭"}
                 </span>
               </div>
-              <p className="hint">开启后，录制过程中也会捕获录步窗口自身的操作，用于制作「录步使用手册」等教程。已移除录制控制快捷键，开始/暂停/停止请通过界面按钮操作，按钮点击也会被如实录入。</p>
+              <p className="hint">开启后，录制过程中也会捕获录步窗口自身的操作，用于制作「录步使用手册」等教程。全局快捷键：Alt+Shift+S 开始/恢复录制，Alt+Shift+P 暂停/继续，Alt+Shift+E 停止录制。录制时窗口会自动最小化，按钮点击也会被如实录入。</p>
             </div>
           </div>
         )}
@@ -811,7 +858,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
             ) : (
               <div style={{ border: "1px dashed var(--border)", borderRadius: 12, padding: "28px 32px", maxWidth: 460, textAlign: "center" }}>
                 <div style={{ fontSize: 15, color: "var(--text-secondary)", marginBottom: 14 }}>未登录网站账号</div>
-                <button className="btn btn-primary" onClick={() => invoke("open_external_url", { url: "http://47.102.154.233/author/login?redirect=flowio://auth" })} style={{ background: "var(--green)" }}>
+                <button className="btn btn-primary" onClick={() => invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" })} style={{ background: "var(--green)" }}>
                   登录网站账号
                 </button>
               </div>

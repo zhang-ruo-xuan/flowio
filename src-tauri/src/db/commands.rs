@@ -2,7 +2,7 @@ use rusqlite::params;
 use serde::Serialize;
 use tauri::State;
 
-use crate::db::RecordingSave;
+use crate::db::{RecordingSave, LOCAL_USER};
 use crate::DbState;
 
 #[derive(Debug, Serialize)]
@@ -18,15 +18,29 @@ pub struct RecordingSummary {
     pub scan_redacted: bool,
 }
 
-#[tauri::command]
-pub fn list_recordings(db: State<DbState>) -> Result<Vec<RecordingSummary>, String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
+/// 读取 settings 表中的当前登录账号标记；空值/缺失视为未登录。
+fn get_current_user(conn: &rusqlite::Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = 'current_user'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .filter(|v| !v.is_empty())
+}
+
+/// 列表按登录态隔离：
+/// - 已登录（settings.current_user 非空）→ 只返回该账号的记录
+/// - 未登录（无 current_user 或为空）→ 只返回 __local__ 记录
+/// 保证不重复、不漏。
+fn list_recordings_inner(conn: &rusqlite::Connection) -> Result<Vec<RecordingSummary>, String> {
+    let filter = get_current_user(conn).unwrap_or_else(|| LOCAL_USER.to_string());
     let mut stmt = conn
-        .prepare("SELECT id, title, app_name, status, total_steps, created_at, ai_generated, text_redacted, scan_redacted FROM recordings ORDER BY created_at DESC")
+        .prepare("SELECT id, title, app_name, status, total_steps, created_at, ai_generated, text_redacted, scan_redacted FROM recordings WHERE user_id = ?1 ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params![filter], |row| {
             Ok(RecordingSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -46,6 +60,75 @@ pub fn list_recordings(db: State<DbState>) -> Result<Vec<RecordingSummary>, Stri
         result.push(row.map_err(|e| e.to_string())?);
     }
     Ok(result)
+}
+
+#[tauri::command]
+pub fn list_recordings(db: State<DbState>) -> Result<Vec<RecordingSummary>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    list_recordings_inner(&conn)
+}
+
+/// 同步登录态到本地 DB：仅写 settings.current_user 作为列表隔离标记。
+/// 不做任何批量迁移；user_id 为空字符串表示清除登录标记（退出登录）。
+fn set_current_user_inner(conn: &rusqlite::Connection, user_id: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('current_user', ?1)",
+        params![user_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_current_user(db: State<DbState>, user_id: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let res = set_current_user_inner(&conn, &user_id);
+    // 调试日志：验证前端 invoke 是否真正到达后端并写入 DB（定位"登录没同步"）
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"D:\录步\flowio_debug.log")
+        {
+            let _ = writeln!(
+                f,
+                "[set_current_user] user_id={:?} result={:?}",
+                user_id,
+                res.as_ref().map(|_| "ok").map_err(|e| e.clone())
+            );
+        }
+    }
+    res
+}
+
+/// 将当前编辑的教程精确归属到登录账号。
+/// - user_id 优先取前端传入值；为空/非法时回退 settings.current_user
+/// - 底层 claim_recording_to_user 保证仅 __local__ 记录可归属、不抢占其他账号
+/// - 返回 true 表示本次实际发生归属
+fn claim_recording_inner(
+    conn: &rusqlite::Connection,
+    recording_id: &str,
+    user_id: Option<&str>,
+) -> Result<bool, String> {
+    let uid = match user_id {
+        Some(u) if !u.is_empty() && u != LOCAL_USER => u.to_string(),
+        _ => get_current_user(conn).unwrap_or_default(),
+    };
+    if uid.is_empty() || uid == LOCAL_USER {
+        return Ok(false);
+    }
+    crate::db::claim_recording_to_user(conn, recording_id, &uid)
+}
+
+#[tauri::command]
+pub fn claim_recording(
+    db: State<DbState>,
+    recording_id: String,
+    user_id: Option<String>,
+) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    claim_recording_inner(&conn, &recording_id, user_id.as_deref())
 }
 
 /// Collect screenshot paths (main + optional after) from step rows,
@@ -377,5 +460,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ---------- 账号归属（set_current_user / claim_recording / 列表隔离） ----------
+
+    fn seed_rec(conn: &rusqlite::Connection, id: &str, user_id: &str) {
+        conn.execute(
+            "INSERT INTO recordings (id, title, app_name, status, total_steps, user_id) \
+             VALUES (?1, ?2, 'App', 'idle', 0, ?3)",
+            params![id, format!("T-{}", id), user_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_current_user_writes_settings_only() {
+        let conn = mem_db();
+        set_current_user_inner(&conn, "user-1").unwrap();
+        let v: String = conn
+            .query_row("SELECT value FROM settings WHERE key = 'current_user'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "user-1");
+        // 清空标记（退出登录）
+        set_current_user_inner(&conn, "").unwrap();
+        assert!(get_current_user(&conn).is_none());
+    }
+
+    #[test]
+    fn list_recordings_isolates_by_login_state() {
+        let conn = mem_db();
+        seed_rec(&conn, "a-local", LOCAL_USER);
+        seed_rec(&conn, "b-alice", "alice");
+        seed_rec(&conn, "c-alice", "alice");
+        seed_rec(&conn, "d-bob", "bob");
+
+        // 未登录：只看到 __local__
+        let ids: Vec<String> = list_recordings_inner(&conn).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["a-local"]);
+
+        // 登录 alice：只看到 alice 的记录，不重复、不漏
+        set_current_user_inner(&conn, "alice").unwrap();
+        let ids: Vec<String> = list_recordings_inner(&conn).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"b-alice".to_string()) && ids.contains(&"c-alice".to_string()));
+
+        // 登录 bob：只看到 bob 的记录
+        set_current_user_inner(&conn, "bob").unwrap();
+        let ids: Vec<String> = list_recordings_inner(&conn).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["d-bob"]);
+
+        // 退出登录：回到 __local__
+        set_current_user_inner(&conn, "").unwrap();
+        let ids: Vec<String> = list_recordings_inner(&conn).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["a-local"]);
+    }
+
+    #[test]
+    fn claim_recording_prefers_explicit_user_then_falls_back() {
+        let conn = mem_db();
+        seed_rec(&conn, "r1", LOCAL_USER);
+        seed_rec(&conn, "r2", LOCAL_USER);
+
+        // 显式 user_id 优先
+        assert!(claim_recording_inner(&conn, "r1", Some("alice")).unwrap());
+        let uid: String = conn.query_row("SELECT user_id FROM recordings WHERE id = 'r1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(uid, "alice");
+
+        // user_id 非法时回退 settings.current_user
+        set_current_user_inner(&conn, "bob").unwrap();
+        assert!(claim_recording_inner(&conn, "r2", Some("")).unwrap());
+        let uid: String = conn.query_row("SELECT user_id FROM recordings WHERE id = 'r2'", [], |r| r.get(0)).unwrap();
+        assert_eq!(uid, "bob");
+
+        // 无显式 user_id 且未登录：拒绝
+        set_current_user_inner(&conn, "").unwrap();
+        seed_rec(&conn, "r3", LOCAL_USER);
+        assert!(!claim_recording_inner(&conn, "r3", None).unwrap());
+    }
+
+    #[test]
+    fn claim_recording_does_not_steal_or_double_claim() {
+        let conn = mem_db();
+        seed_rec(&conn, "r1", "alice");
+        // 已属 alice 的记录不可被 bob 抢占
+        assert!(!claim_recording_inner(&conn, "r1", Some("bob")).unwrap());
+        let uid: String = conn.query_row("SELECT user_id FROM recordings WHERE id = 'r1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(uid, "alice");
+
+        // 重复归属同一记录：幂等
+        seed_rec(&conn, "r2", LOCAL_USER);
+        assert!(claim_recording_inner(&conn, "r2", Some("bob")).unwrap());
+        assert!(!claim_recording_inner(&conn, "r2", Some("bob")).unwrap());
     }
 }

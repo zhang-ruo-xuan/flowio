@@ -217,6 +217,16 @@ a:hover {
   font-size: 11px;
   color: #000;
   font-weight: 600;
+  overflow: hidden;
+}
+
+.titlebar-avatar-img {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+  background: #4ade80;
 }
 
 .titlebar-login-text {
@@ -635,6 +645,12 @@ select {
 .page {
   padding: 24px;
   max-width: 100%;
+  /* Routes 直接挂在 .body 下（不走 .main-content），页面必须自己成为
+     可滚动容器，否则 .body 的 overflow:hidden 会把超高内容截断（修复
+     "我的录制"列表划不动） */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .page-header {
@@ -1784,32 +1800,40 @@ select {
   height: 12px;
 }
 
-/* 主截图模式悬浮胶囊：右下角切换 全图/裁图 */
-.step-detail-view-pill {
+/* 全图 / 裁图 切换：主截图区右下角悬浮，只作用于当前步骤
+   样式与同区域的 标注 / 删除 保持一套：半透明黑底、小圆角 */
+.step-detail-view-segmented {
   position: absolute;
-  right: 20px;
-  bottom: 15px;
-  padding: 6px 16px;
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1;
-  color: #fff;
-  background: #2a2a2a;
-  border: none;
-  border-radius: 999px;
-  cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  overflow: hidden;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.5);
   z-index: 10;
-  transition: background 0.15s, box-shadow 0.15s, transform 0.1s;
   user-select: none;
+}
+
+.step-detail-view-segmented-btn {
+  padding: 3px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.75);
+  background: transparent;
+  border: none;
+  cursor: pointer;
   font-family: inherit;
+  transition: background 0.15s, color 0.15s;
 }
-.step-detail-view-pill:hover {
-  background: #3a3a3a;
-  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
+
+.step-detail-view-segmented-btn:hover {
+  color: #fff;
+  background: rgba(0, 0, 0, 0.75);
 }
-.step-detail-view-pill:active {
-  transform: scale(0.97);
+
+.step-detail-view-segmented-btn.active {
+  color: #fff;
+  background: #ff6b35;
 }
 
 .image-overlay-toolbar {

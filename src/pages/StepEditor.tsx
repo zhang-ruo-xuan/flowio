@@ -28,6 +28,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import FileSaveDialog from "../components/FileSaveDialog";
 import AnnotationsOverlay from "../components/AnnotationsOverlay";
+import LoginSaveModal from "../components/LoginSaveModal";
 import type { Annotation } from "../lib/annotate";
 import type { Recording, Step } from "../types";
 
@@ -62,12 +63,8 @@ const FALLBACK_CATEGORIES = [
 
 /* ── Crop helper（Scribe-style 自适应裁剪）────────────── */
 
-/** 元素矩形外扩 padding（px） */
-const CROP_PAD = 24;
-/** 裁剪区域最小边长（px），不足时以矩形中心外扩 */
-const CROP_MIN_SIZE = 280;
-/** 裁剪区域最大不超过屏幕宽/高的比例 */
-const CROP_MAX_SCREEN_RATIO = 0.9;
+/** 元素矩形外扩 padding（px）—— 8px 让文本贴边但留呼吸 */
+const CROP_PAD = 8;
 /** 无元素矩形时，以点击点为中心裁屏幕的此比例 */
 const CROP_FALLBACK_RATIO = 0.4;
 
@@ -111,19 +108,10 @@ function cropAdaptiveBase64(
         let ch: number;
 
         if (cropW != null && cropH != null && cropW > 0 && cropH > 0 && x != null && y != null) {
-          // 元素矩形 + padding，不足最小尺寸以中心外扩
+          // 严格按元素真实矩形裁切：尊重原宽高比，仅加 CROP_PAD 让文本贴边但不贴死。
+          // 不强制最小/最大尺寸，避免把 URL 地址栏这种长条拉成大方块把文字糊掉。
           let rw = cropW + CROP_PAD * 2;
           let rh = cropH + CROP_PAD * 2;
-          rw = Math.max(rw, CROP_MIN_SIZE);
-          rh = Math.max(rh, CROP_MIN_SIZE);
-          // 超过屏幕 90% 等比缩放（只缩不放），保持宽高比
-          const scale = Math.min(
-            1,
-            (W * CROP_MAX_SCREEN_RATIO) / rw,
-            (H * CROP_MAX_SCREEN_RATIO) / rh,
-          );
-          rw = Math.max(1, Math.round(rw * scale));
-          rh = Math.max(1, Math.round(rh * scale));
           // Stage C: type 步骤左扩原始矩形宽的 1/3，把左侧 label 带进裁剪图
           if (actionType === "type") {
             const extra = Math.round(cropW / 3);
@@ -259,7 +247,7 @@ function Lightbox({
 
 interface StepEditorProps {
   siteToken?: string | null;
-  siteUser?: { id: string; email: string; display_name?: string; bio?: string; avatar?: string } | null;
+  siteUser?: { id: string; email?: string; display_name?: string; bio?: string; avatar?: string } | null;
 }
 
 // 把 base64 截图压缩为更小的 JPEG，降低上传体积，避免“保存草稿/发布”因请求体过大而失败
@@ -321,6 +309,30 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [aiGenerating, setAiGenerating] = useState(false);
 
+  // 未登录 + 录制完成后自动弹出「保存到云端」登录引导弹窗（LoginSaveModal）
+  const [showLoginSaveModal, setShowLoginSaveModal] = useState(false);
+  useEffect(() => {
+    if (siteToken) return;
+    if (sessionStorage.getItem("flowio_show_login_prompt") !== "1") return;
+    if (sessionStorage.getItem("flowio_login_prompt_dismissed") === "1") return;
+    // 延迟弹出，避免与编辑页加载/导航冲突
+    const timer = setTimeout(() => setShowLoginSaveModal(true), 400);
+    return () => clearTimeout(timer);
+  }, [siteToken]);
+
+  const handleLoginSaveModalClose = () => {
+    setShowLoginSaveModal(false);
+    sessionStorage.setItem("flowio_login_prompt_dismissed", "1");
+  };
+
+  const handleLoginSaveModalLogin = () => {
+    setShowLoginSaveModal(false);
+    sessionStorage.setItem("flowio_login_prompt_dismissed", "1");
+    invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" }).catch((err) => {
+      setToast({ type: "error", message: "打开登录页失败: " + String(err) });
+    });
+  };
+
   // Publish state
   const [publishing, setPublishing] = useState(false);
   const [categories, setCategories] = useState<{ id: string; name: string; slug: string }[]>([]);
@@ -365,7 +377,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch("http://47.102.154.233/api/categories");
+        const res = await fetch("https://flowio.cn/api/categories");
         const data = await res.json();
         if (!cancelled && data.ok && Array.isArray(data.categories) && data.categories.length > 0) {
           setCategories(data.categories);
@@ -480,6 +492,24 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       cancelled = true;
     };
   }, [recordingId]);
+
+  /* ── Account ownership: 登录后把当前教程精确归属到登录账号 ── */
+
+  useEffect(() => {
+    // 仅在已登录时执行：先同步隔离标记，再精确归属当前教程（仅当记录仍属 __local__）
+    if (!siteUser?.id || !recordingId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        await invoke("set_current_user", { userId: siteUser.id });
+        if (cancelled) return;
+        await invoke("claim_recording", { recordingId, userId: siteUser.id });
+      } catch (err) {
+        console.warn("[flowio] 归属当前教程到账号失败:", err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [siteUser?.id, recordingId]);
 
   /* ── Derived ─────────────────────────────────────────────── */
 
@@ -868,7 +898,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       if (pubCoverBase64) uploadData.cover_base64 = pubCoverBase64;
 
       // POST 到网站 API（上传大量截图时可能较慢，设置 90s 超时）
-      const PB_URL = "http://47.102.154.233";
+      const PB_URL = "https://flowio.cn";
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 90000);
       let res: Response;
@@ -1194,7 +1224,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           onClick={async () => {
             if (!siteToken) {
               try {
-                await invoke("open_external_url", { url: "http://47.102.154.233/login?redirect=flowio://auth" });
+                await invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" });
               } catch (err) {
                 setToast({ type: "error", message: "打开登录页失败: " + String(err) });
               }
@@ -1270,8 +1300,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       >
         {previewMode ? <><X size={14} /> 退出预览</> : <><Eye size={14} /> 预览</>}
       </button>
-      {/* 全图 / 裁剪图 统一切换：一键设置所有步骤主截图，选择教程主要风格 */}
-      <div className="titlebar-view-segmented" title="选择教程主要截图风格">
+
+      {/* 全图 / 裁图 统一切换：作用于全部步骤（选择教程主要截图风格） */}
+      <div className="titlebar-view-segmented" title="选择教程主要截图风格（作用于所有步骤）">
         <button
           className={`titlebar-view-segmented-btn${globalView === 'full' ? ' active' : ''}`}
           onClick={() => applyGlobalView('full')}
@@ -1527,6 +1558,17 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 className="step-detail-image"
                 ref={stepDetailImageRef}
               >
+                {/* 全图 / 裁图 切换：只作用于当前这一步（作用于所有步骤的开关在顶栏） */}
+                <div className="step-detail-view-segmented" title="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
+                  <button
+                    className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep.id) ? ' active' : ''}`}
+                    onClick={() => setViewCropped(selectedStep.id, false)}
+                  >全图</button>
+                  <button
+                    className={`step-detail-view-segmented-btn${getViewCropped(selectedStep.id) ? ' active' : ''}`}
+                    onClick={() => setViewCropped(selectedStep.id, true)}
+                  >裁图</button>
+                </div>
                 {(() => {
                   // 主截图：该步骤 stepViewCropped=true 且有裁剪图缓存时用裁剪图，否则用全图
                   const src = getStepMainSrc(selectedStep) || "";
@@ -1541,19 +1583,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                             onClick={() => openLightbox(selectedIndex)}
                             style={{ cursor: "pointer" }}
                           />
-                          {/* 主截图模式悬浮胶囊按钮：右下角悬浮，点击切换当前步骤全图/裁图 */}
-                          <button
-                            className="step-detail-view-pill"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const cur = getViewCropped(selectedStep?.id ?? '');
-                              setViewCropped(selectedStep?.id ?? '', !cur);
-                              setGlobalView(!cur ? 'crop' : 'full');
-                            }}
-                            title="切换主截图：全图 / 裁图"
-                          >
-                            {getViewCropped(selectedStep?.id ?? '') ? '裁图' : '全图'}
-                          </button>
                           <button
                             className="screenshot-annotate-btn"
                             onClick={(e) => {
@@ -1617,19 +1646,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                             <span>点击或拖拽上传步骤截图</span>
                           </div>
                         </div>
-                          {/* 另一张图仍存在时保留切换入口：裁图被删但全图还在 → 可切回全图 */}
-                          {selectedStep.screenshot_base64 && (
-                            <button
-                              className="step-detail-view-pill"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setViewCropped(selectedStep.id, false);
-                              }}
-                              title="切换到全图"
-                            >
-                              查看全图
-                            </button>
-                          )}
+                          {/* 裁剪图被删但全图还在时，右下角的全图/裁图切换仍可切回全图 */}
                         </>
                       )}
                     </>
@@ -1988,6 +2005,13 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         })(),
         document.body
       )}
+
+      {/* 未登录 + 录制完成后的「保存到云端」登录引导弹窗 */}
+      <LoginSaveModal
+        open={showLoginSaveModal}
+        onClose={handleLoginSaveModalClose}
+        onLogin={handleLoginSaveModalLogin}
+      />
     </div>
   );
 }

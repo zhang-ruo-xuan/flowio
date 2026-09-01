@@ -51,3 +51,8 @@ cargo_test*
 .superpowers/
 .workbuddy/
 web-viewer/
+
+# Local scratch
+_trash_flowio/
+verify_screen*.png
+verify_win.png

@@ -3,6 +3,9 @@ pub mod commands;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+/// 本地未归属录制的账号标识（未登录录制的教程均归属该账号）
+pub const LOCAL_USER: &str = "__local__";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepSave {
     pub order_index: i32,
@@ -78,6 +81,29 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
         .map_err(|e| format!("COMMIT: {}", e))?;
 
     Ok(())
+}
+
+/// 将一条仍属本地（`__local__`）的录制精确归属到指定账号。
+/// - 幂等：重复调用不会报错，第二次起返回 false（已不再属于 `__local__`）
+/// - 不抢占：记录已归属其他账号时直接返回 false，不做任何修改
+/// - 目标 user_id 为空或等于 `__local__` 时拒绝更新
+/// - 返回 true 表示本次实际发生了归属更新；false 表示未归属/无需变更
+pub fn claim_recording_to_user(
+    conn: &Connection,
+    recording_id: &str,
+    user_id: &str,
+) -> Result<bool, String> {
+    if user_id.is_empty() || user_id == LOCAL_USER {
+        return Ok(false);
+    }
+    let n = conn
+        .execute(
+            "UPDATE recordings SET user_id = ?1, updated_at = datetime('now') \
+             WHERE id = ?2 AND user_id = ?3",
+            params![user_id, recording_id, LOCAL_USER],
+        )
+        .map_err(|e| format!("claim recording failed: {}", e))?;
+    Ok(n > 0)
 }
 
 pub fn init_db(conn: &Connection) {
@@ -159,6 +185,13 @@ pub fn init_db(conn: &Connection) {
         );
         let _ = conn.execute_batch(&sql);
     }
+
+    // ── Migrations: recordings 账号归属列（旧库兼容，默认本地未归属）──
+    // SQLite >= 3.35.0 对已存在的列执行 ADD COLUMN 为 no-op，天然幂等。
+    let _ = conn.execute_batch(&format!(
+        "ALTER TABLE recordings ADD COLUMN user_id TEXT NOT NULL DEFAULT '{}'",
+        LOCAL_USER
+    ));
 }
 
 /// Open (or create) the database file and run migrations.
@@ -559,5 +592,84 @@ mod db_tests {
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('k1', 'v2')", []).unwrap();
         let v2: String = conn.query_row("SELECT value FROM settings WHERE key = 'k1'", [], |r| r.get(0)).unwrap();
         assert_eq!(v2, "v2");
+    }
+
+    // ---------- 账号归属（claim_recording_to_user） ----------
+
+    fn seed_recording(conn: &Connection, id: &str, user_id: &str) {
+        conn.execute(
+            "INSERT INTO recordings (id, title, app_name, status, total_steps, user_id) \
+             VALUES (?1, ?2, 'App', 'idle', 0, ?3)",
+            params![id, format!("Rec {}", id), user_id],
+        )
+        .unwrap();
+    }
+
+    fn user_id_of(conn: &Connection, id: &str) -> String {
+        conn.query_row("SELECT user_id FROM recordings WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn migrations_add_user_id_column_to_legacy_table() {
+        // 模拟旧库：recordings 表没有 user_id 列
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE recordings (id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', app_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'idle', total_steps INTEGER NOT NULL DEFAULT 0);",
+        )
+        .unwrap();
+        init_db(&conn);
+        let cols = columns(&conn, "recordings");
+        assert!(cols.contains(&"user_id".to_string()), "migration missing user_id column");
+        // 旧记录默认归属 __local__
+        seed_recording(&conn, "old", LOCAL_USER);
+        assert_eq!(user_id_of(&conn, "old"), LOCAL_USER);
+    }
+
+    #[test]
+    fn claim_transfers_local_recording_to_user() {
+        let conn = mem_db();
+        seed_recording(&conn, "r1", LOCAL_USER);
+        let claimed = claim_recording_to_user(&conn, "r1", "user-123").unwrap();
+        assert!(claimed, "should claim a __local__ recording");
+        assert_eq!(user_id_of(&conn, "r1"), "user-123");
+    }
+
+    #[test]
+    fn claim_is_idempotent() {
+        let conn = mem_db();
+        seed_recording(&conn, "r2", LOCAL_USER);
+        assert!(claim_recording_to_user(&conn, "r2", "user-123").unwrap());
+        // 已归属后再次调用：不得报错、不得改归属
+        assert!(!claim_recording_to_user(&conn, "r2", "user-123").unwrap());
+        assert_eq!(user_id_of(&conn, "r2"), "user-123");
+        // 尝试抢归属到其他账号：不生效
+        assert!(!claim_recording_to_user(&conn, "r2", "user-456").unwrap());
+        assert_eq!(user_id_of(&conn, "r2"), "user-123");
+    }
+
+    #[test]
+    fn claim_does_not_steal_other_users_recording() {
+        let conn = mem_db();
+        seed_recording(&conn, "r3", "user-owner");
+        let claimed = claim_recording_to_user(&conn, "r3", "user-other").unwrap();
+        assert!(!claimed, "must not steal a recording owned by another user");
+        assert_eq!(user_id_of(&conn, "r3"), "user-owner");
+    }
+
+    #[test]
+    fn claim_rejects_invalid_user() {
+        let conn = mem_db();
+        seed_recording(&conn, "r4", LOCAL_USER);
+        assert!(!claim_recording_to_user(&conn, "r4", "").unwrap());
+        assert!(!claim_recording_to_user(&conn, "r4", LOCAL_USER).unwrap());
+        assert_eq!(user_id_of(&conn, "r4"), LOCAL_USER);
+    }
+
+    #[test]
+    fn claim_missing_recording_is_noop() {
+        let conn = mem_db();
+        let claimed = claim_recording_to_user(&conn, "ghost", "user-123").unwrap();
+        assert!(!claimed);
     }
 }

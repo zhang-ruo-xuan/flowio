@@ -27,6 +27,18 @@ use crate::recorder::mouse::CapturedClick;
 static MOUSE_TX: Mutex<Option<Sender<CapturedClick>>> = Mutex::new(None);
 static KEY_TX: Mutex<Option<Sender<KeyEvent>>> = Mutex::new(None);
 
+/// 上一轮钩子线程句柄 + 它使用的停止标志。
+///
+/// 用途：保证**任何时刻只有一个** `WH_MOUSE_LL` / `WH_KEYBOARD_LL` 钩子存在。
+/// `init_hooks()` 每次调用都会 spawn 新线程并 `SetWindowsHookExW` 装新钩子，
+/// 但旧钩子只在旧线程跑到末尾时才 `UnhookWindowsHookEx`。若两个钩子并存，
+/// 每次点击会触发两次回调，而两个回调都读同一个 `MOUSE_TX` static（指向
+/// 最新 session 的 sender），于是同一次点击被投递两遍 —— 表现为每个操作
+/// 被记成两步（用户反馈的「1 和 2 重复、3 和 4 重复」）。
+/// 装新钩子前先把旧线程停掉并 join，可彻底杜绝这种情况。
+static HOOK_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+static HOOK_STOP: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
 /// Modifier key down-state tracking (combo-key semantics for Ctrl+C/V, etc.).
 /// Updated inside the WH_KEYBOARD_LL callback before each Press is forwarded,
 /// so the event carries the modifier state at the moment the key went down.
@@ -145,6 +157,9 @@ unsafe extern "system" fn keyboard_hook_proc(
         let is_modifier = matches!(vk, 0x11 | 0x10 | 0x12 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5);
         if is_press && !is_modifier {
             let name = vk_to_key_name(vk);
+            // 真实按键时刻（钩子触发的瞬间）。处理线程消费事件时也可能是
+            // 几百毫秒之后，但帧环里要找的是这一刻的屏幕，所以必须带上。
+            let ts = std::time::Instant::now();
             if let Ok(guard) = KEY_TX.lock() {
                 if let Some(ref tx) = *guard {
                     let _ = tx.send(KeyEvent::Press {
@@ -152,6 +167,7 @@ unsafe extern "system" fn keyboard_hook_proc(
                         ctrl: CTRL_DOWN.load(Ordering::SeqCst),
                         shift: SHIFT_DOWN.load(Ordering::SeqCst),
                         alt: ALT_DOWN.load(Ordering::SeqCst),
+                        ts,
                     });
                 }
             }
@@ -218,6 +234,31 @@ pub fn init_hooks(
     mouse_tx: Sender<CapturedClick>,
     running: Arc<AtomicBool>,
 ) {
+    // ── 钩子单例：先停掉并回收上一轮钩子线程 ──
+    // 不这么做的话，两个 WH_MOUSE_LL 并存会让每次点击上报两次，
+    // 最终每个操作被记成两步（成对重复）。
+    {
+        if let Ok(guard) = HOOK_STOP.lock() {
+            if let Some(prev_stop) = guard.as_ref() {
+                prev_stop.store(false, Ordering::Relaxed);
+            }
+        }
+        if let Ok(mut guard) = HOOK_THREAD.lock() {
+            if let Some(prev) = guard.take() {
+                if !prev.is_finished() {
+                    eprintln!(
+                        "[HOOK] previous hook thread still alive — joining before installing new hooks"
+                    );
+                    let _ = prev.join();
+                    eprintln!("[HOOK] previous hook thread joined");
+                }
+            }
+        }
+    }
+    if let Ok(mut guard) = HOOK_STOP.lock() {
+        *guard = Some(Arc::clone(&running));
+    }
+
     // Store senders in statics so the hook callbacks can access them.
     // Using Mutex<Option<>> instead of OnceLock allows replacement across
     // multiple recording sessions.
@@ -230,7 +271,7 @@ pub fn init_hooks(
         *guard = Some(mouse_tx);
     }
 
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         eprintln!("[HOOK] installing native hooks");
 
         // Install keyboard hook
@@ -292,6 +333,11 @@ pub fn init_hooks(
             let _ = UnhookWindowsHookEx(mhook);
         }
     });
+
+    // 记录句柄，供下一次 init_hooks 回收（保证钩子单例）
+    if let Ok(mut guard) = HOOK_THREAD.lock() {
+        *guard = Some(handle);
+    }
 }
 
 #[cfg(test)]

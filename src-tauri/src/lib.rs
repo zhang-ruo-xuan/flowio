@@ -7,6 +7,7 @@ mod editor;
 mod export;
 mod file_browser;
 mod redaction;
+mod hotkey;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -111,6 +112,9 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // 全局快捷键：Alt+Shift+S 录制 / Alt+Shift+P 暂停 / Alt+Shift+E 停止
+            hotkey::init_hotkeys(app.handle());
+
             let app_data_dir = app.path().app_data_dir().expect("failed to get app data dir");
             std::fs::create_dir_all(&app_data_dir).ok();
             let db_path = app_data_dir.join("flowio.db");
@@ -147,6 +151,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             db::commands::list_recordings,
+            db::commands::set_current_user,
+            db::commands::claim_recording,
             db::commands::delete_recording,
             db::commands::save_recording,
             db::commands::update_recording_app_name,
