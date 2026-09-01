@@ -613,6 +613,24 @@ pub fn screen_rect_in_image(
 // reliable answer is to OCR the already-captured screenshot and locate
 // `description` inside it.
 
+/// Append-only debug log for the OCR copy-crop path. Enabled by default while
+/// we stabilise OCR on real machines; writes a few lines per copy step to
+/// `%TEMP%/flowio_ocr.log`. Send that file back if copy crops still misbehave.
+pub(crate) fn ocr_debug(msg: &str) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("flowio_ocr.log"))
+    {
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
+
 /// Bounding rectangle of the OCR-detected words whose concatenated text
 /// contains a key fragment of `needle`.
 ///
@@ -625,26 +643,46 @@ pub fn locate_text_in_image(jpeg_path: &Path, needle: &str) -> Option<(i32, i32,
     if words.is_empty() {
         return None;
     }
-    let key = pick_query_substring(needle);
-    if key.len() < 4 {
+    let n_full = ocr_norm(needle);
+    if n_full.len() < 4 {
+        ocr_debug(&format!("locate: needle too short after norm ({} chars)", n_full.len()));
         return None;
     }
 
+    // Candidate keys: the full normalized string plus several interior slices.
+    // OCR is least reliable at the very start/end of a line, so we also try a
+    // few middle fragments — whichever matches with the shortest word span wins.
+    let candidates: Vec<String> = if n_full.len() <= 16 {
+        vec![n_full.clone()]
+    } else {
+        vec![
+            n_full.clone(),
+            n_full[4..].to_string(),
+            n_full[..n_full.len() - 4].to_string(),
+            n_full[n_full.len() / 4..3 * n_full.len() / 4].to_string(),
+        ]
+    };
+
     let mut best: Option<(usize, usize)> = None;
-    for start in 0..words.len() {
-        let mut joined = String::new();
-        let end_cap = (start + 16).min(words.len());
-        for end in (start + 1)..=end_cap {
-            joined.push_str(&words[end - 1].text);
-            if joined.contains(&key) {
-                match best {
-                    Some((bs, be)) if (be - bs) <= (end - start) => {}
-                    _ => best = Some((start, end)),
+    for key in &candidates {
+        if key.len() < 4 {
+            continue;
+        }
+        for start in 0..words.len() {
+            let mut joined = String::new();
+            let end_cap = (start + 28).min(words.len());
+            for end in (start + 1)..=end_cap {
+                joined.push_str(&ocr_norm(&words[end - 1].text));
+                if joined.contains(key) {
+                    match best {
+                        Some((bs, be)) if (be - bs) <= (end - start) => {}
+                        _ => best = Some((start, end)),
+                    }
+                    break;
                 }
-                break;
-            }
-            if joined.len() > needle.len() + key.len() + 32 {
-                break;
+                if joined.len() > key.len() + 48 {
+                    break;
+                }
             }
         }
     }
@@ -670,18 +708,27 @@ pub fn locate_text_in_image(jpeg_path: &Path, needle: &str) -> Option<(i32, i32,
     Some((x0, y0, x1 - x0, y1 - y0))
 }
 
-fn pick_query_substring(needle: &str) -> String {
-    let compact: String = needle.chars().filter(|c| !c.is_whitespace()).collect();
-    if compact.len() <= 24 {
-        return compact;
-    }
-    let s = compact.len() / 4;
-    let l = compact.len() / 2;
-    let mid: String = compact.chars().skip(s).take(l).collect();
-    if !mid.is_empty() {
-        return mid;
-    }
-    compact
+/// Normalise a string for OCR-safe substring matching.
+///
+/// OCR on small UI fonts routinely confuses `0`/`o`, `1`/`l`/`i`, `2`/`z`,
+/// `5`/`s`, `8`/`b`, and keeps every punctuation mark that has no semantic
+/// value for locating a copied URL/fragment anyway. We lowercase, collapse the
+/// most common look-alikes, and drop everything that is not a letter or digit.
+/// This lets "h ttps://pan baidu com/s/1abc" (as OCR may actually read it)
+/// still match "https://pan.baidu.com/s/1abc".
+fn ocr_norm(s: &str) -> String {
+    s.chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| match c {
+            '0' => 'o',
+            '1' | 'l' => 'i',
+            '5' => 's',
+            '2' => 'z',
+            '8' => 'b',
+            _ => c,
+        })
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
 }
 
 struct OcrItem {
@@ -717,7 +764,32 @@ fn ocr_words(jpeg_path: &Path) -> Option<Vec<OcrItem>> {
     let decoder = BitmapDecoder::CreateAsync(&stream).ok()?.get().ok()?;
     let bitmap = decoder.GetSoftwareBitmapAsync().ok()?.get().ok()?;
 
-    let engine: OcrEngine = OcrEngine::TryCreateFromUserProfileLanguages().ok()?;
+    let engine: Option<OcrEngine> = OcrEngine::TryCreateFromUserProfileLanguages().ok()
+        .or_else(|| {
+            OcrEngine::TryCreateFromLanguage(
+                &windows::Globalization::Language::CreateLanguage(
+                    &windows::core::HSTRING::from("zh-CN"),
+                )
+                .ok()?,
+            )
+            .ok()
+        })
+        .or_else(|| {
+            OcrEngine::TryCreateFromLanguage(
+                &windows::Globalization::Language::CreateLanguage(
+                    &windows::core::HSTRING::from("en-US"),
+                )
+                .ok()?,
+            )
+            .ok()
+        });
+    let engine = match engine {
+        Some(e) => e,
+        None => {
+            ocr_debug("ocr_words: no OCR engine (profile + zh-CN + en-US all failed)");
+            return None;
+        }
+    };
     let result = engine.RecognizeAsync(&bitmap).ok()?.get().ok()?;
 
     // OcrResult.Lines() → 每行 OcrLine，OcrLine.Words() → 每词 OcrWord。
@@ -747,8 +819,10 @@ fn ocr_words(jpeg_path: &Path) -> Option<Vec<OcrItem>> {
         }
     }
     if out.is_empty() {
+        ocr_debug("ocr_words: 0 words recognized");
         return None;
     }
+    ocr_debug(&format!("ocr_words: {} words recognized", out.len()));
     Some(out)
 }
 

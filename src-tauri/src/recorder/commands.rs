@@ -554,34 +554,66 @@ fn flush_shortcut_step(
             // 2) 在已经保存好的 JPEG 上 OCR，按 description 文字重写裁剪锚点。
             //    chromium 下 UIA / focused element 都不可靠（见 screenshot.rs
             //    OCR 段注释），OCR 是这一步唯一的精准定位手段。
-            if let Some((raw_x, raw_y, raw_w, raw_h)) =
-                screenshot::locate_text_in_image(&ss_path, &text)
-            {
-                if let Ok(mut st) = cs.lock() {
-                    if let Some(s) = st.get_mut(idx) {
-                        // OCR 返回的是"原图"坐标（save JPEG 时已含水印?不，
-                        // save 之前已经用 clean_img 去水印后写盘，所以 OCR 坐标
-                        // 已经是干净的截图坐标）。
-                        // 但 anchored rect 往往是选中行/列的小高度，按 description
-                        // 真实宽度（按字符串长度推算）放大裁剪框，保证完整可见。
+            match screenshot::locate_text_in_image(&ss_path, &text) {
+                Some((raw_x, raw_y, raw_w, raw_h)) => {
+                    screenshot::ocr_debug(&format!(
+                        "locate: HIT at ({},{}) {}x{} for '{}'",
+                        raw_x, raw_y, raw_w, raw_h,
+                        text.chars().take(30).collect::<String>()
+                    ));
+                    if let Ok(mut st) = cs.lock() {
+                        if let Some(s) = st.get_mut(idx) {
+                            // OCR 返回的是 clean_img（已去水印、已写盘）的坐标。
+                            let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
+                            // 框宽至少保证 OCR 识别出的文本框本体完整（×1.3 留边），
+                            // 再结合文本长度估算；取较大值，避免长 URL 被切一半。
+                            let by_text = text_len as i32 * 9 + 80;
+                            let by_ocr = (raw_w as f64 * 1.3) as i32;
+                            let desired_w = by_ocr.max(by_text).max(800).min(win_w_i32);
+                            let desired_h = ((raw_h as f64 * 2.2) as i32).max(160).min(win_h_i32);
+                            let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                                raw_x + raw_w / 2,
+                                raw_y + raw_h / 2,
+                                desired_w,
+                                desired_h,
+                                win_w_i32,
+                                win_h_i32,
+                                desired_w,
+                                desired_h,
+                            );
+                            s.x = Some(cx);
+                            s.y = Some(cy);
+                            s.crop_w = Some(cw);
+                            s.crop_h = Some(ch);
+                        }
+                    }
+                }
+                None => {
+                    // OCR 没匹配到（引擎缺失 / 文字被识别错 / 截图上没有该文本）。
+                    // 兜底：以复制发生时的鼠标位置为中心，按文本长度估算框宽，
+                    // 至少让复制内容大概率落在框内，而不是退回屏幕中心 60%。
+                    screenshot::ocr_debug(&format!(
+                        "locate: NO MATCH for '{}' (len {})",
+                        text.chars().take(40).collect::<String>(),
+                        text.chars().count()
+                    ));
+                    if let Some((mx, my)) = screenshot::get_cursor_pos() {
+                        let rx = (mx - ox_i32).clamp(0, win_w_i32);
+                        let ry = (my - oy_i32).clamp(0, win_h_i32);
                         let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
                         let desired_w = (text_len as i32 * 9 + 80).max(800).min(win_w_i32);
-                        let desired_h = (raw_h + 60).max(160).min(win_h_i32);
+                        let desired_h = 200.min(win_h_i32);
                         let (cx, cy, cw, ch) = screenshot::centered_crop_box(
-                            raw_x + raw_w / 2,
-                            raw_y + raw_h / 2,
-                            desired_w,
-                            desired_h,
-                            win_w_i32,
-                            win_h_i32,
-                            desired_w,
-                            desired_h,
+                            rx, ry, desired_w, desired_h, win_w_i32, win_h_i32, desired_w, desired_h,
                         );
-                        let _ = (ox_i32, oy_i32); // 当前锚点已是图片坐标，不再减
-                        s.x = Some(cx);
-                        s.y = Some(cy);
-                        s.crop_w = Some(cw);
-                        s.crop_h = Some(ch);
+                        if let Ok(mut st) = cs.lock() {
+                            if let Some(s) = st.get_mut(idx) {
+                                s.x = Some(cx);
+                                s.y = Some(cy);
+                                s.crop_w = Some(cw);
+                                s.crop_h = Some(ch);
+                            }
+                        }
                     }
                 }
             }
