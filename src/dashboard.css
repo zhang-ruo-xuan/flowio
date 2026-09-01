@@ -28,6 +28,48 @@
   border-radius: 8px;
 }
 
+/* 录制中：开始录制按钮原地替换为 暂停/恢复 + 停止 */
+.dashboard-rec-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.dashboard-rec-controls--center {
+  justify-content: center;
+}
+.rec-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 18px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.rec-pause {
+  background: #f0883e;
+}
+.rec-pause:hover {
+  background: #e0782e;
+}
+.rec-resume {
+  background: var(--orange, #2a6df4);
+}
+.rec-resume:hover {
+  background: var(--blue-hover, #1a5cd4);
+}
+.rec-stop {
+  background: #ef4444;
+}
+.rec-stop:hover {
+  background: #dc2626;
+}
+
 .dashboard-search {
   position: relative;
   width: 240px;
@@ -251,6 +293,25 @@
 
 .dark .dashboard-action-text {
   color: var(--text);
+}
+
+.dark .rec-pause {
+  background: #c96a2a;
+}
+.dark .rec-pause:hover {
+  background: #b85c20;
+}
+.dark .rec-resume {
+  background: var(--orange, #2a6df4);
+}
+.dark .rec-resume:hover {
+  background: var(--blue-hover, #1a5cd4);
+}
+.dark .rec-stop {
+  background: #dc2626;
+}
+.dark .rec-stop:hover {
+  background: #b91c1c;
 }
 
 .dark .dashboard-search .search-box-input {

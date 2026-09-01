@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
-import { Circle, Search, MoreVertical, Play, Pencil, FileText, Code, FileType, CheckCircle2, XCircle, Trash2 } from "lucide-react";
+import { Circle, Search, MoreVertical, Play, Pencil, FileText, Code, FileType, CheckCircle2, XCircle, Trash2, Pause, Square } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import FileSaveDialog from "../components/FileSaveDialog";
@@ -43,13 +43,27 @@ function formatTime(dateStr: string): string {
 interface DashboardProps {
   onEdit: (id: string) => void;
   onStartRecording: () => void;
+  recording?: boolean;
+  isPaused?: boolean;
+  onPauseRecording?: () => void;
+  onResumeRecording?: () => void;
+  onStopRecording?: () => void;
   locationKey?: string;
 }
 
 const PAGE_SIZE = 10;
 const PAGE_STORAGE_KEY = "flowio_dashboard_page";
 
-export default function Dashboard({ onEdit, onStartRecording, locationKey }: DashboardProps) {
+export default function Dashboard({
+  onEdit,
+  onStartRecording,
+  recording,
+  isPaused,
+  onPauseRecording,
+  onResumeRecording,
+  onStopRecording,
+  locationKey,
+}: DashboardProps) {
   const { siteUser } = useAuthStore();
   const [recordings, setRecordings] = useState<Recording[]>([]);
   const [search, setSearch] = useState("");
@@ -249,15 +263,46 @@ export default function Dashboard({ onEdit, onStartRecording, locationKey }: Das
       {/* Action card */}
       <div className="dashboard-action-card">
         <p className="dashboard-action-text">
-          点击「开始录制」后在任何应用中进行操作，录步会自动捕获每一步并生成操作指南。
+          {recording
+            ? "录制进行中，录步会自动捕获你在任何应用中的每一步操作。"
+            : "点击「开始录制」后在任何应用中进行操作，录步会自动捕获每一步并生成操作指南。"}
         </p>
-        <button
-          className="btn btn-primary dashboard-action-btn"
-          onClick={() => onStartRecording()}
-        >
-          <Circle size={14} fill="currentColor" />
-          开始录制
-        </button>
+        {recording ? (
+          <div className="dashboard-rec-controls">
+            {isPaused ? (
+              <button
+                className="btn dashboard-action-btn rec-btn rec-resume"
+                onClick={() => onResumeRecording?.()}
+              >
+                <Play size={14} fill="currentColor" />
+                恢复
+              </button>
+            ) : (
+              <button
+                className="btn dashboard-action-btn rec-btn rec-pause"
+                onClick={() => onPauseRecording?.()}
+              >
+                <Pause size={14} />
+                暂停
+              </button>
+            )}
+            <button
+              className="btn dashboard-action-btn rec-btn rec-stop"
+              onClick={() => onStopRecording?.()}
+            >
+              <Square size={13} fill="currentColor" />
+              停止
+            </button>
+          </div>
+        ) : (
+          <button
+            className="btn btn-primary dashboard-action-btn"
+            onClick={() => onStartRecording()}
+          >
+            <Circle size={14} fill="currentColor" />
+            开始录制
+          </button>
+        )}
       </div>
 
       {/* Table section */}
@@ -276,13 +321,42 @@ export default function Dashboard({ onEdit, onStartRecording, locationKey }: Das
             </div>
             <h3>还没有录制任何操作流程</h3>
             <p>点击下方按钮开始你的第一次录制，录步会自动捕获每一步并生成指南。</p>
-            <button
-              className="empty-state-btn"
-              onClick={() => onStartRecording()}
-            >
-              <Circle size={8} fill="currentColor" />
-              开始录制
-            </button>
+            {recording ? (
+              <div className="dashboard-rec-controls dashboard-rec-controls--center">
+                {isPaused ? (
+                  <button
+                    className="btn rec-btn rec-resume"
+                    onClick={() => onResumeRecording?.()}
+                  >
+                    <Play size={14} fill="currentColor" />
+                    恢复
+                  </button>
+                ) : (
+                  <button
+                    className="btn rec-btn rec-pause"
+                    onClick={() => onPauseRecording?.()}
+                  >
+                    <Pause size={14} />
+                    暂停
+                  </button>
+                )}
+                <button
+                  className="btn rec-btn rec-stop"
+                  onClick={() => onStopRecording?.()}
+                >
+                  <Square size={13} fill="currentColor" />
+                  停止
+                </button>
+              </div>
+            ) : (
+              <button
+                className="empty-state-btn"
+                onClick={() => onStartRecording()}
+              >
+                <Circle size={8} fill="currentColor" />
+                开始录制
+              </button>
+            )}
           </div>
         ) : (
           <>

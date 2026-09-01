@@ -411,7 +411,7 @@ function App() {
       <div className="app-body">
         <div className="body">
           <Routes>
-            <Route path="/" element={<Dashboard onEdit={handleEdit} onStartRecording={handleStartRecording} locationKey={location.key} />} />
+            <Route path="/" element={<Dashboard onEdit={handleEdit} onStartRecording={handleStartRecording} recording={recording} isPaused={isPaused} onPauseRecording={handlePauseRecording} onResumeRecording={handleResumeRecording} onStopRecording={handleStopRecording} locationKey={location.key} />} />
             <Route path="/settings" element={<SettingsPage darkMode={darkMode} onToggleDark={() => setDarkMode(!darkMode)} />} />
             <Route path="/profile" element={<ProfilePage />} />
             <Route path="/editor/:id" element={<StepEditor siteToken={siteToken} siteUser={siteUser} />} />
