@@ -134,11 +134,12 @@ function cropAdaptiveBase64(
           return;
         }
 
-        // clamp 到图像边界
-        left = Math.max(0, left);
-        top = Math.max(0, top);
-        cw = Math.min(cw, W - left);
-        ch = Math.min(ch, H - top);
+        // 贴边时整体平移进图内，而不是缩小裁剪框 —— 缩小会把内容切掉一半，
+        // 且锚点被挤到一边（用户报：复制的地方不在裁图中间）。
+        cw = Math.min(cw, W);
+        ch = Math.min(ch, H);
+        left = Math.min(Math.max(0, left), Math.max(0, W - cw));
+        top = Math.min(Math.max(0, top), Math.max(0, H - ch));
         if (cw <= 0 || ch <= 0) {
           resolve(base64);
           return;

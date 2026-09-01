@@ -18,9 +18,15 @@ use std::time::{Duration, Instant};
 use super::screenshot;
 
 /// A timestamped frame from the continuous capture thread.
+///
+/// `origin_x / origin_y` is the captured monitor's top-left corner in
+/// virtual-screen coordinates — needed to translate global input coordinates
+/// (click points, UIA rectangles) into this image's space.
 pub struct CapturedFrame {
     pub timestamp: Instant,
     pub image: DynamicImage,
+    pub origin_x: i32,
+    pub origin_y: i32,
 }
 
 /// Ring buffer of recent frames, queryable by timestamp or recency.
@@ -95,11 +101,13 @@ pub fn start_capture_thread(
         while running.load(Ordering::Relaxed) {
             let loop_start = Instant::now();
 
-            match screenshot::capture_fullscreen() {
-                Ok(img) => {
+            match screenshot::capture_fullscreen_with_origin() {
+                Ok((img, ox, oy)) => {
                     let frame = CapturedFrame {
                         timestamp: Instant::now(),
                         image: img,
+                        origin_x: ox,
+                        origin_y: oy,
                     };
                     if frame_tx.send(frame).is_err() {
                         eprintln!("[CAPTURE] frame channel closed, exiting");
@@ -128,6 +136,8 @@ mod capture_tests {
         CapturedFrame {
             timestamp: ts,
             image: DynamicImage::new_rgb8(4, 4),
+            origin_x: 0,
+            origin_y: 0,
         }
     }
 

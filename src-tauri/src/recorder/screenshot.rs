@@ -21,18 +21,60 @@ pub fn next_screenshot_path(prefix: &str) -> PathBuf {
     screenshot_dir().join(format!("{}_{}_{}.jpg", prefix, ts, c))
 }
 
-/// Capture the primary monitor's fullscreen as a DynamicImage.
-pub fn capture_fullscreen() -> Result<DynamicImage, String> {
+/// Current mouse position in virtual-screen coordinates.
+pub fn get_cursor_pos() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    unsafe {
+        let mut p = POINT::default();
+        if GetCursorPos(&mut p).is_ok() {
+            Some((p.x, p.y))
+        } else {
+            None
+        }
+    }
+}
+
+/// Capture the monitor the user is actually working on.
+///
+/// Returns `(image, monitor_x, monitor_y)` where the origin is the monitor's
+/// top-left corner in virtual-screen coordinates, so callers can translate
+/// global input coordinates (mouse clicks, UIA rectangles) into image space
+/// with a simple subtraction.
+///
+/// Picking the cursor's monitor matters: the old code always took the first
+/// monitor, so on a multi-monitor setup every step was captured from the
+/// wrong screen.
+pub fn capture_fullscreen_with_origin() -> Result<(DynamicImage, i32, i32), String> {
     let monitors = xcap::Monitor::all()
         .map_err(|e| format!("xcap: failed to enumerate monitors: {}", e))?;
+    if monitors.is_empty() {
+        return Err("xcap: no monitor found".to_string());
+    }
+    let (cx, cy) = get_cursor_pos().unwrap_or((0, 0));
     let monitor = monitors
-        .into_iter()
-        .next()
-        .ok_or_else(|| "xcap: no monitor found".to_string())?;
+        .iter()
+        .find(|m| {
+            let (mx, my) = (m.x(), m.y());
+            let (mw, mh) = (m.width() as i32, m.height() as i32);
+            cx >= mx && cx < mx + mw && cy >= my && cy < my + mh
+        })
+        .or_else(|| monitors.iter().find(|m| m.is_primary()))
+        .unwrap_or(&monitors[0]);
+    let (ox, oy) = (monitor.x(), monitor.y());
     let img = monitor
         .capture_image()
         .map_err(|e| format!("xcap: failed to capture image: {}", e))?;
-    Ok(DynamicImage::ImageRgba8(img))
+    Ok((DynamicImage::ImageRgba8(img), ox, oy))
+}
+
+/// Capture the monitor under the cursor as a DynamicImage.
+///
+/// The image is **never cropped to the active window**: the editor's 全图 view
+/// must show the whole screen, and window-cropping produced the broken
+/// narrow strips users reported.
+pub fn capture_fullscreen() -> Result<DynamicImage, String> {
+    capture_fullscreen_with_origin().map(|(img, _, _)| img)
 }
 
 /// Crop the top of an image to remove Flowio's own recording status bar.
@@ -104,49 +146,41 @@ pub fn crop_watermark(img: &mut DynamicImage) -> usize {
     0
 }
 
-/// Get the bounding rectangle (screen coordinates) of the currently focused
-/// (foreground) window. Returns `(left, top, width, height)` in pixels.
-pub fn get_active_window_rect() -> Option<(i32, i32, i32, i32)> {
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return None;
-        }
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() {
-            return None;
-        }
-        let w = rect.right - rect.left;
-        let h = rect.bottom - rect.top;
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-        Some((rect.left, rect.top, w, h))
-    }
-}
+// ── Crop geometry ────────────────────────────────────────────
 
-/// Crop a fullscreen image to the active window's on-screen area (clamped to
-/// the primary monitor). Returns `(cropped_image, offset_x, offset_y)` where
-/// the offset is the window's top-left corner in the fullscreen image space.
-/// When the window rect is unavailable or does not intersect the primary
-/// monitor, returns the original image with offset (0, 0).
-pub fn crop_to_active_window(img: DynamicImage) -> (DynamicImage, i32, i32) {
-    let (fw, fh) = (img.width() as i32, img.height() as i32);
-    let Some((wx, wy, ww, wh)) = get_active_window_rect() else {
-        return (img, 0, 0);
-    };
-    let left = wx.max(0);
-    let top = wy.max(0);
-    let right = (wx + ww).min(fw);
-    let bottom = (wy + wh).min(fh);
-    if right <= left || bottom <= top {
-        return (img, 0, 0);
+/// Build a crop box centred on `(cx, cy)` that is guaranteed to sit fully
+/// inside the image.
+///
+/// Solves the two ways the old code produced a broken thumbnail:
+///   - a tight element box near a screen edge was clamped by the caller, which
+///     slid the whole box sideways and pushed the element out of the centre
+///     (or cut it in half);
+///   - a 20 px-tall text box yielded an unreadable sliver.
+///
+/// The box is grown to at least `min_w * min_h` around the anchor and then
+/// **shifted** — never resized — back inside the image. The centre returned is
+/// the final one, so re-deriving the rectangle from `(centre, w, h)` on the
+/// frontend reproduces exactly this box.
+///
+/// Returns `(centre_x, centre_y, width, height)` in image coordinates.
+pub fn centered_crop_box(
+    cx: i32,
+    cy: i32,
+    w: i32,
+    h: i32,
+    img_w: i32,
+    img_h: i32,
+    min_w: i32,
+    min_h: i32,
+) -> (i32, i32, i32, i32) {
+    if img_w <= 0 || img_h <= 0 {
+        return (cx, cy, w.max(1), h.max(1));
     }
-    let (l, t, r, b) = (left as u32, top as u32, right as u32, bottom as u32);
-    let cropped = img.crop_imm(l, t, r - l, b - t);
-    (cropped, left, top)
+    let bw = w.max(1).max(min_w).min(img_w);
+    let bh = h.max(1).max(min_h).min(img_h);
+    let x0 = (cx - bw / 2).clamp(0, img_w - bw);
+    let y0 = (cy - bh / 2).clamp(0, img_h - bh);
+    (x0 + bw / 2, y0 + bh / 2, bw, bh)
 }
 
 /// Encode a DynamicImage as JPEG (quality 85) and write to disk.
@@ -381,6 +415,90 @@ pub fn get_focused_selected_text() -> Option<String> {
     }
 }
 
+/// Bounding rectangle (screen coordinates) of the text the user has currently
+/// selected, via UIA `TextPattern::GetSelection` →
+/// `TextRange::GetBoundingRectangles`.
+///
+/// This is the precise answer to "where did the copy happen". The focused
+/// element is useless for that: in a browser it is the whole document, and a
+/// few hundred milliseconds later — once the user has pasted somewhere — it
+/// reports the paste target instead. Both failure modes are what made copy
+/// steps crop to the find-in-page bar.
+///
+/// Returns `(left, top, width, height)`; `None` when there is no selection or
+/// the control does not expose text geometry.
+pub fn get_selected_text_rect() -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::System::Ole::{
+        SafeArrayAccessData, SafeArrayDestroy, SafeArrayUnaccessData,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPattern2Id,
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        let automation: IUIAutomation =
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL).ok()?;
+        let focused = automation.GetFocusedElement().ok()?;
+        let tp: IUIAutomationTextPattern =
+            focused.GetCurrentPatternAs(UIA_TextPattern2Id).ok()?;
+        let selections = tp.GetSelection().ok()?;
+        let len = selections.Length().ok()?;
+        if len <= 0 {
+            return None;
+        }
+
+        let (mut min_x, mut min_y) = (f64::MAX, f64::MAX);
+        let (mut max_x, mut max_y) = (f64::MIN, f64::MIN);
+        let mut found = false;
+
+        for i in 0..len {
+            let Ok(range) = selections.GetElement(i) else { continue };
+            let Ok(sa) = range.GetBoundingRectangles() else { continue };
+            if sa.is_null() {
+                continue;
+            }
+            let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+            if SafeArrayAccessData(sa, &mut data).is_err() || data.is_null() {
+                let _ = SafeArrayDestroy(sa);
+                continue;
+            }
+            // 每 4 个 double 描述一个矩形：x, y, width, height
+            let quads = ((*sa).rgsabound[0].cElements as usize) / 4;
+            let vals = std::slice::from_raw_parts(data as *const f64, quads * 4);
+            for q in vals.chunks_exact(4) {
+                let (x, y, w, h) = (q[0], q[1], q[2], q[3]);
+                if w <= 0.0 || h <= 0.0 {
+                    continue;
+                }
+                found = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x + w);
+                max_y = max_y.max(y + h);
+            }
+            let _ = SafeArrayUnaccessData(sa);
+            let _ = SafeArrayDestroy(sa);
+        }
+
+        if !found {
+            return None;
+        }
+        let left = min_x.round() as i32;
+        let top = min_y.round() as i32;
+        let w = (max_x - min_x).round() as i32;
+        let h = (max_y - min_y).round() as i32;
+        if w < 4 || h < 4 {
+            return None;
+        }
+        Some((left, top, w, h))
+    }
+}
+
 /// Read the bounding rectangle (screen coordinates) of the currently focused
 /// UIA element. Returns `(left, top, width, height)`.
 /// Used to crop keyboard steps to the focused input area (Scribe-style)
@@ -454,6 +572,37 @@ pub fn get_focused_element_rect_in_window(
         return None;
     }
     Some((lx - win_x, ty - win_y, w, h))
+}
+
+/// Translate a UIA **screen-space** rectangle into image space, clipping it to
+/// the visible part of the captured monitor.
+///
+/// Chromium reports document/virtual coordinates for in-page content (y=8429
+/// for a link far down a scrolled page), so a raw rectangle is unusable as a
+/// crop anchor. Clipping keeps whatever is actually on screen — for a
+/// select-all + copy that is the visible top of the selection, which is
+/// exactly the part the reader needs to see.
+///
+/// Returns `None` when nothing meaningful remains visible.
+pub fn screen_rect_in_image(
+    rect: (i32, i32, i32, i32),
+    origin_x: i32,
+    origin_y: i32,
+    img_w: i32,
+    img_h: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    let (lx, ty, w, h) = rect;
+    if w < 4 || h < 4 {
+        return None;
+    }
+    let x0 = lx.max(origin_x);
+    let y0 = ty.max(origin_y);
+    let x1 = (lx + w).min(origin_x + img_w);
+    let y1 = (ty + h).min(origin_y + img_h);
+    if x1 - x0 < 4 || y1 - y0 < 4 {
+        return None;
+    }
+    Some((x0 - origin_x, y0 - origin_y, x1 - x0, y1 - y0))
 }
 
 /// Bounding box of the pixels that differ between two same-sized images.
@@ -684,6 +833,68 @@ mod screenshot_tests {
         assert!(r.3 > 250, "高度应覆盖选区: {:?}", r);
         // 仍然比整窗紧：上方未变化的 120px 不该被包进来
         assert!(r.1 >= 100, "不应把未变化的顶部区域包进来: {:?}", r);
+    }
+
+    // ── centered_crop_box ─────────────────────────────────
+
+    #[test]
+    fn centered_crop_box_keeps_anchor_centred() {
+        let (cx, cy, w, h) = centered_crop_box(500, 400, 200, 100, 1920, 1080, 420, 280);
+        assert_eq!((w, h), (420, 280), "放大到最小尺寸");
+        assert_eq!((cx, cy), (500, 400), "锚点仍在正中");
+    }
+
+    #[test]
+    fn centered_crop_box_shifts_instead_of_shrinking_at_edge() {
+        // 锚点贴左边界：裁剪框整体右移，不能被缩小（缩小=内容被切一半）
+        let (cx, cy, w, h) = centered_crop_box(10, 400, 200, 100, 1920, 1080, 420, 280);
+        assert_eq!((w, h), (420, 280), "尺寸不变");
+        assert_eq!(cx - w / 2, 0, "整体平移贴到左边界");
+        assert_eq!(cy, 400);
+    }
+
+    #[test]
+    fn centered_crop_box_clamps_bottom_right() {
+        let (cx, cy, w, h) = centered_crop_box(1910, 1070, 200, 100, 1920, 1080, 420, 280);
+        assert_eq!(cx + w / 2, 1920, "右边界内");
+        assert_eq!(cy + h / 2, 1080, "下边界内");
+    }
+
+    #[test]
+    fn centered_crop_box_never_bigger_than_image() {
+        let (_, _, w, h) = centered_crop_box(5, 5, 5000, 5000, 300, 200, 420, 280);
+        assert_eq!((w, h), (300, 200));
+    }
+
+    // ── screen_rect_in_image ──────────────────────────────
+
+    #[test]
+    fn screen_rect_in_image_translates_origin() {
+        // 副屏在左侧：原点 (-1920, 0)
+        assert_eq!(
+            screen_rect_in_image((-1820, 100, 200, 50), -1920, 0, 1920, 1080),
+            Some((100, 100, 200, 50))
+        );
+    }
+
+    #[test]
+    fn screen_rect_in_image_clips_offscreen_document_rect() {
+        // Chromium 虚拟坐标：一个滚到页面深处的元素（y 远超屏幕）
+        assert_eq!(
+            screen_rect_in_image((100, 8000, 300, 4000), 0, 0, 1920, 1080),
+            None,
+            "完全在屏幕外"
+        );
+        // 部分可见：裁出可见的那一段
+        assert_eq!(
+            screen_rect_in_image((100, 900, 300, 4000), 0, 0, 1920, 1080),
+            Some((100, 900, 300, 180))
+        );
+    }
+
+    #[test]
+    fn screen_rect_in_image_rejects_degenerate() {
+        assert_eq!(screen_rect_in_image((0, 0, 2, 2), 0, 0, 1920, 1080), None);
     }
 
     // ── next_screenshot_path ──────────────────────────────

@@ -128,18 +128,19 @@ fn flush_key_step(
     // new character, so the thumbnail is missing the last typed glyph. 250 ms
     // is enough for any app to render while still being inside the ring window.
     let settle_ts = key_ts + Duration::from_millis(250);
-    let frame_img = ring.closest_to(settle_ts).map(|f| f.image.clone())
-        .or_else(|| ring.closest_to(key_ts).map(|f| f.image.clone()))
+    let frame = ring
+        .closest_to(settle_ts)
+        .or_else(|| ring.closest_to(key_ts))
+        .map(|f| (f.image.clone(), f.origin_x, f.origin_y))
         .or_else(|| {
             eprintln!("[flush_key] ring empty, direct capture");
-            screenshot::capture_fullscreen().ok()
+            screenshot::capture_fullscreen_with_origin().ok()
         });
-    let Some(frame_img) = frame_img else { return; };
+    let Some((frame_img, offset_x, offset_y)) = frame else { return };
 
-    // Window-crop the shot so the type step shows the active window region
-    // instead of the whole desktop (user expectation: window-area crop).
-    let (mut clean_img, offset_x, offset_y) = screenshot::crop_to_active_window(frame_img);
-    // UIA 坐标换算要基于"未裁水印"的窗口图，所以先量尺寸。
+    // 全屏原图入册：编辑器的「全图」视图必须就是整个屏幕，不裁窗口。
+    let mut clean_img = frame_img;
+    // UIA 坐标换算要基于"未裁水印"的图，所以先量尺寸。
     let (pre_w, pre_h) = (clean_img.width() as i32, clean_img.height() as i32);
 
     // Crop Flowio's own recording status bar from the top; the returned cut
@@ -184,12 +185,19 @@ fn flush_key_step(
     let (win_w, win_h) = (clean_img.width() as i32, clean_img.height() as i32);
     let (crop_x, crop_y, crop_w, crop_h) =
         match screenshot::get_focused_element_rect_in_window(offset_x, offset_y, pre_w, pre_h) {
-            Some((rx, ry, w, h)) => (
-                Some(rx + w / 2),
-                Some(ry + h / 2 - watermark_cut),
-                Some(w),
-                Some(h),
-            ),
+            Some((rx, ry, w, h)) => {
+                let (cx, cy, bw, bh) = screenshot::centered_crop_box(
+                    rx + w / 2,
+                    ry + h / 2 - watermark_cut,
+                    w + CROP_PAD * 2,
+                    h + CROP_PAD * 2,
+                    win_w,
+                    win_h,
+                    CROP_MIN_W,
+                    CROP_MIN_H,
+                );
+                (Some(cx), Some(cy), Some(bw), Some(bh))
+            }
             None => (
                 Some(win_w / 2),
                 Some(win_h / 2),
@@ -262,36 +270,84 @@ fn display_shortcut_key(key: &str) -> String {
     }
 }
 
-/// How a shortcut step should be "settled" after the keystroke.
+/// 裁剪框最小尺寸（px）。比这更小的元素矩形会被撑大，否则裁出来是一条
+/// 看不清内容的窄带。
+const CROP_MIN_W: i32 = 420;
+const CROP_MIN_H: i32 = 280;
+/// 元素矩形外扩 padding（px）——让被复制/被输入的文本不贴边。
+const CROP_PAD: i32 = 24;
+
+/// When to re-capture the screen after a shortcut keystroke.
 ///
-/// Applications need time to react to a shortcut: the find-in-page bar slides
-/// in, the selection highlight repaints, the clipboard is filled. Reading and
-/// capturing immediately at keypress time records the *pre-action* state,
-/// which is exactly the bug users reported ("搜索框没出来", "全选的截图不对").
+/// A flat "wait 450 ms" is wrong for every case: too late for select-all (the
+/// user has already pressed Ctrl+C/Ctrl+V and the step shows the *next*
+/// action), and far too early for a window switch (the Alt+Tab selector is
+/// still on screen).
+#[derive(Copy, Clone)]
+enum SettleWait {
+    /// Sleep a fixed duration, then capture.
+    Fixed(u64),
+    /// Poll every `poll` ms and capture the **first** frame that actually
+    /// differs from the keystroke frame — i.e. the frame where the effect
+    /// appeared. Gives up after `max` ms and keeps the last frame.
+    UntilChange { max: u64, poll: u64 },
+    /// No settle pass — the caller schedules its own (Alt+Tab waits for the
+    /// Alt key to be released before it can see the target window).
+    Skip,
+}
+
+/// Where the step's crop rectangle comes from.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum CropSource {
+    /// Recompute at settle time from what the shortcut changed on screen.
+    Changed,
+    /// Read the anchor **at keystroke time** and never touch it again.
+    ///
+    /// Copy / paste barely change the screen, so there is nothing to diff;
+    /// and reading the focused element later is actively wrong: Ctrl+A → C → V
+    /// arrive back to back, and by the time the copy step settles the focus has
+    /// moved to the paste target — which is how copy steps ended up cropped to
+    /// the find-in-page bar.
+    FocusAtKeystroke,
+    /// No crop at all: show the whole screen (window switch).
+    Full,
+}
+
+/// How a shortcut step should be "settled" after the keystroke.
 #[derive(Copy, Clone)]
 struct ShortcutSettle {
-    /// How long to wait before re-reading / re-capturing.
-    ms: u64,
+    wait: SettleWait,
     /// Where to read the step description from, if anywhere.
     source: Option<BackfillSource>,
-    /// Whether to recompute the crop rectangle from the settled view.
-    /// Off for window-switching shortcuts (Alt+Tab) where the "focused
-    /// element" after the switch belongs to a different window entirely.
-    update_crop: bool,
+    crop: CropSource,
 }
 
 impl ShortcutSettle {
-    /// Default for shortcuts whose effect is a UI change worth cropping.
-    const fn text(ms: u64, source: BackfillSource) -> Self {
-        Self { ms, source: Some(source), update_crop: true }
-    }
-    /// Visually settle only — no description text to read.
+    /// Shortcut whose effect is a visible UI change worth cropping.
     const fn visual(ms: u64) -> Self {
-        Self { ms, source: None, update_crop: true }
+        Self { wait: SettleWait::Fixed(ms), source: None, crop: CropSource::Changed }
     }
-    /// Window switch: re-capture, but keep the whole-window crop.
-    const fn switch(ms: u64) -> Self {
-        Self { ms, source: None, update_crop: false }
+    /// Copy / cut / paste: description from the clipboard, crop anchored to
+    /// the selection read at keystroke time.
+    const fn clipboard(ms: u64) -> Self {
+        Self {
+            wait: SettleWait::Fixed(ms),
+            source: Some(BackfillSource::Clipboard),
+            crop: CropSource::FocusAtKeystroke,
+        }
+    }
+    /// Select-all: capture the frame where the highlight appeared, not the
+    /// frame half a second later.
+    const fn select_all(max: u64, source: BackfillSource) -> Self {
+        Self {
+            wait: SettleWait::UntilChange { max, poll: 50 },
+            source: Some(source),
+            crop: CropSource::Changed,
+        }
+    }
+    /// Window switch (Alt+Tab): caller drives the settle pass.
+    const fn switch() -> Self {
+        Self { wait: SettleWait::Skip, source: None, crop: CropSource::Full }
     }
 }
 
@@ -315,17 +371,21 @@ fn flush_shortcut_step(
 ) -> Option<usize> {
     // Frame at keystroke time = the "before" view. Kept around so the settle
     // pass can diff against it and locate exactly what the shortcut changed.
-    let before_full = ring.closest_to(key_ts).map(|f| f.image.clone())
+    let before = ring
+        .closest_to(key_ts)
+        .map(|f| (f.image.clone(), f.origin_x, f.origin_y))
         .or_else(|| {
             eprintln!("[flush_shortcut] ring empty, direct capture");
-            screenshot::capture_fullscreen().ok()
+            screenshot::capture_fullscreen_with_origin().ok()
         });
-    let Some(before_full) = before_full else { return None; };
+    let Some((before_full, ox, oy)) = before else { return None; };
 
-    // Window-crop the fullscreen shot so the step shows the active window
-    // region instead of the whole desktop (user expectation: window-area crop).
-    let (mut clean_img, offset_x, offset_y) =
-        screenshot::crop_to_active_window(before_full.clone());
+    // 全屏原图直接入册：编辑器的「全图」视图必须就是整个屏幕。以前这里会按
+    // 活动窗口裁剪，多显示器或非最大化窗口下就裁出一条窄带 —— 用户报的那张
+    // 坏图就是这么来的。
+    let mut clean_img = before_full.clone();
+    // UIA 坐标换算基于"未裁水印"的图，所以先量尺寸。
+    let (pre_w, pre_h) = (clean_img.width() as i32, clean_img.height() as i32);
     // Crop Flowio's own recording status bar from the top; crop coordinates
     // computed in the pre-crop space must be shifted up by this amount.
     let watermark_cut = screenshot::crop_watermark(&mut clean_img) as i32;
@@ -339,11 +399,38 @@ fn flush_shortcut_step(
         }
     };
 
-    // Provisional crop = whole window. The precise crop is computed later by
-    // the settle pass, which knows what the shortcut actually changed.
     let (win_w, win_h) = (clean_img.width() as i32, clean_img.height() as i32);
-    let (crop_x, crop_y, crop_w, crop_h) =
-        (Some(win_w / 2), Some(win_h / 2), Some(win_w), Some(win_h));
+
+    // 复制/粘贴：锚点必须现在读。这类操作画面几乎不变（没法靠像素差定位），
+    // 而等到 settle 线程再去问 UIA「焦点在哪」时，Ctrl+A→C→V 早已把焦点带到
+    // 粘贴目标上了 —— 复制步骤于是裁到了查找框。
+    let anchor = if settle.crop == CropSource::FocusAtKeystroke {
+        // 选中文本的矩形就是"复制发生的地方"；没有选中态时退回焦点元素。
+        screenshot::get_selected_text_rect()
+            .or_else(|| screenshot::get_focused_element_rect())
+            .and_then(|r| screenshot::screen_rect_in_image(r, ox, oy, pre_w, pre_h))
+    } else {
+        None
+    };
+
+    // Provisional crop = whole screen; the precise crop is computed later by
+    // the settle pass (or already pinned by the keystroke-time anchor above).
+    let (crop_x, crop_y, crop_w, crop_h) = match anchor {
+        Some((rx, ry, w, h)) => {
+            let (cx, cy, bw, bh) = screenshot::centered_crop_box(
+                rx + w / 2,
+                ry + h / 2 - watermark_cut,
+                w + CROP_PAD * 2,
+                h + CROP_PAD * 2,
+                win_w,
+                win_h,
+                CROP_MIN_W,
+                CROP_MIN_H,
+            );
+            (Some(cx), Some(cy), Some(bw), Some(bh))
+        }
+        None => (Some(win_w / 2), Some(win_h / 2), Some(win_w), Some(win_h)),
+    };
 
     let window_title = activity::get_active_window_title();
     let step = StepData {
@@ -383,20 +470,91 @@ fn flush_shortcut_step(
     }
     let Some(idx) = pushed else { return None; };
 
-    settle_shortcut_step(
-        idx,
-        captured,
-        settle,
-        before_full,
-        (offset_x, offset_y, watermark_cut),
-    );
+    if !matches!(settle.wait, SettleWait::Skip) {
+        settle_shortcut_step(
+            idx,
+            captured,
+            settle,
+            before_full,
+            FrameGeom { origin_x: ox, origin_y: oy, pre_w, pre_h, watermark_cut },
+        );
+    }
     Some(idx)
+}
+
+/// Geometry of the provisional step image, used by the settle pass to align
+/// its re-capture with the keystroke frame.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct FrameGeom {
+    /// Captured monitor's top-left corner in virtual-screen coordinates.
+    origin_x: i32,
+    origin_y: i32,
+    /// Image size **before** the watermark was cropped off.
+    pre_w: i32,
+    pre_h: i32,
+    /// Rows removed from the top by `crop_watermark`.
+    watermark_cut: i32,
+}
+
+/// Block until the Alt key is released, or `max_ms` elapses.
+///
+/// Alt+Tab keeps the window switcher on screen for as long as Alt is held, so
+/// anything captured before the release shows the switcher — never the window
+/// the user actually switched to.
+fn wait_alt_release(max_ms: u64) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
+    let deadline = Instant::now() + Duration::from_millis(max_ms);
+    loop {
+        let down = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
+        if !down || Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Capture the **first** frame that visibly differs from `before`.
+///
+/// "Wait 450 ms, then shoot" is too coarse for select-all: Ctrl+A → C → V
+/// often arrive within that window, so the step ends up showing the pasted
+/// result instead of the selection highlight. Polling from ~50 ms and stopping
+/// at the first real change records the moment the user actually selected.
+///
+/// Returns `None` if recording stopped meanwhile or nothing could be captured.
+fn capture_when_changed(
+    before: &DynamicImage,
+    geom: FrameGeom,
+    max_ms: u64,
+    poll_ms: u64,
+    epoch: u64,
+) -> Option<(DynamicImage, i32, i32)> {
+    let deadline = Instant::now() + Duration::from_millis(max_ms);
+    let mut last: Option<(DynamicImage, i32, i32)> = None;
+    loop {
+        std::thread::sleep(Duration::from_millis(poll_ms));
+        if current_settle_epoch() != epoch {
+            return None;
+        }
+        if let Ok((img, ox, oy)) = screenshot::capture_fullscreen_with_origin() {
+            // 只有同一显示器、同尺寸的帧才能和按键帧做像素比对
+            let aligned = ox == geom.origin_x
+                && oy == geom.origin_y
+                && img.width() == before.width()
+                && img.height() == before.height();
+            if aligned && screenshot::changed_region(before, &img, 28, 6).is_some() {
+                return Some((img, ox, oy));
+            }
+            last = Some((img, ox, oy));
+        }
+        if Instant::now() >= deadline {
+            return last;
+        }
+    }
 }
 
 /// Background "settle" pass for a shortcut step.
 ///
-/// Runs `settle.ms` after the keystroke, when the application has finished
-/// reacting, and then in one shot:
+/// Waits according to `settle.wait`, then in one shot:
 ///   1. reads the description text while focus is still on the target
 ///      (`Clipboard` for copy/cut/paste, `FocusedSelection` for select-all);
 ///   2. re-captures the screen — this is the frame the reader actually wants
@@ -404,29 +562,35 @@ fn flush_shortcut_step(
 ///   3. recomputes the crop rectangle from the settled view, preferring the
 ///      UIA focused element and falling back to a before/after pixel diff;
 ///   4. writes all of the above back into the step.
-///
-/// `before_full` is the keystroke-time fullscreen frame and `win_meta` is
-/// `(offset_x, offset_y, watermark_cut)` of the provisional image, used to
-/// align the diff.
 fn settle_shortcut_step(
     idx: usize,
     captured: &Arc<Mutex<Vec<StepData>>>,
     settle: ShortcutSettle,
     before_full: DynamicImage,
-    win_meta: (i32, i32, i32),
+    geom: FrameGeom,
 ) {
     let epoch = current_settle_epoch();
     let cs = Arc::clone(captured);
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(settle.ms));
+        // 1) 等应用反应完 —— 不同快捷键等待策略不同。
+        let after = match settle.wait {
+            SettleWait::Fixed(ms) => {
+                std::thread::sleep(Duration::from_millis(ms));
+                screenshot::capture_fullscreen_with_origin().ok()
+            }
+            SettleWait::UntilChange { max, poll } => {
+                capture_when_changed(&before_full, geom, max, poll, epoch)
+            }
+            SettleWait::Skip => None,
+        };
 
         // Recording already stopped — the screen now shows Flowio itself, so
-        // whatever we capture would be wrong. Keep the provisional frame.
+        // whatever we captured would be wrong. Keep the provisional frame.
         if current_settle_epoch() != epoch {
             return;
         }
 
-        // 1) Text first — the focused control still owns the selection.
+        // 2) Text first — the focused control still owns the selection.
         let text = match settle.source {
             Some(BackfillSource::Clipboard) => {
                 screenshot::get_clipboard_text().unwrap_or_default()
@@ -437,43 +601,62 @@ fn settle_shortcut_step(
             None => String::new(),
         };
 
-        // 2) Re-capture the settled screen.
+        // 3) Re-capture the settled screen.
         let mut new_path: Option<String> = None;
         let mut new_crop: Option<(i32, i32, i32, i32)> = None; // (cx, cy, w, h)
         let mut new_win_title: Option<String> = None;
 
-        if let Ok(after_full) = screenshot::capture_fullscreen() {
-            let (mut after_img, ox, oy) = screenshot::crop_to_active_window(after_full);
-            // UIA 坐标要换算到"未裁水印"的窗口图空间，所以先量尺寸再裁。
+        if let Some((after_full, ox, oy)) = after {
+            let mut after_img = after_full;
+            // UIA 坐标要换算到"未裁水印"的图空间，所以先量尺寸再裁。
             let (pre_w, pre_h) = (after_img.width() as i32, after_img.height() as i32);
             let cut = screenshot::crop_watermark(&mut after_img) as i32;
+            let (img_w, img_h) = (after_img.width() as i32, after_img.height() as i32);
 
-            if settle.update_crop {
+            if settle.crop == CropSource::Changed {
                 // ① UIA focused element (semantically exact: the input, the
                 //    find box, the text field being edited).
                 let uia = screenshot::get_focused_element_rect_in_window(ox, oy, pre_w, pre_h)
-                    .map(|(rx, ry, w, h)| (rx + w / 2, ry + h / 2 - cut, w, h));
+                    .map(|(rx, ry, w, h)| (rx, ry - cut, w, h));
 
                 // ② Pixel diff against the keystroke frame. Chromium reports
                 //    document-virtual coords for in-page content, so UIA often
                 //    fails there — the diff still finds the highlight/bar.
-                let (bx, by, bcut) = win_meta;
                 let diff = {
-                    let (mut before_img, bx2, by2) =
-                        screenshot::crop_to_active_window(before_full);
-                    let bcut2 = screenshot::crop_watermark(&mut before_img) as i32;
-                    let aligned = (bx, by, bcut) == (bx2, by2, bcut2)
-                        && before_img.width() == after_img.width()
-                        && before_img.height() == after_img.height();
+                    let mut before_img = before_full;
+                    let bcut = screenshot::crop_watermark(&mut before_img) as i32;
+                    let aligned = geom
+                        == FrameGeom {
+                            origin_x: ox,
+                            origin_y: oy,
+                            pre_w,
+                            pre_h,
+                            watermark_cut: bcut,
+                        }
+                        && img_w > 0
+                        && img_h > 0;
                     if aligned {
                         screenshot::changed_region(&before_img, &after_img, 28, 6)
-                            .map(|(dx, dy, w, h)| (dx + w / 2, dy + h / 2, w, h))
+                            .map(|(dx, dy, w, h)| (dx, dy, w, h))
                     } else {
                         None
                     }
                 };
 
-                new_crop = uia.or(diff);
+                // 居中 + 完整落在图内：以前只把左上角 clamp 到边界，元素就被
+                // 挤到一边甚至被切掉一半。
+                new_crop = uia.or(diff).map(|(rx, ry, w, h)| {
+                    screenshot::centered_crop_box(
+                        rx + w / 2,
+                        ry + h / 2,
+                        w + CROP_PAD * 2,
+                        h + CROP_PAD * 2,
+                        img_w,
+                        img_h,
+                        CROP_MIN_W,
+                        CROP_MIN_H,
+                    )
+                });
             }
 
             let np = screenshot::next_screenshot_path("key_after");
@@ -483,7 +666,7 @@ fn settle_shortcut_step(
             new_win_title = activity::get_active_window_title();
         }
 
-        // 3) Commit everything in a single lock so the editor never sees a
+        // 4) Commit everything in a single lock so the editor never sees a
         //    half-updated step (new crop on the old image, etc.).
         if current_settle_epoch() != epoch {
             return;
@@ -493,21 +676,30 @@ fn settle_shortcut_step(
                 if !text.is_empty() && s.description.is_empty() {
                     s.description = text;
                 }
-                if settle.update_crop {
-                    match new_crop {
+                match settle.crop {
+                    CropSource::Changed => match new_crop {
                         Some((cx, cy, w, h)) => {
                             s.x = Some(cx);
                             s.y = Some(cy);
                             s.crop_w = Some(w);
                             s.crop_h = Some(h);
                         }
-                        // 切窗口类快捷键：不裁，整窗展示新窗口
+                        // 没定位到变化区域：整屏展示，不做半吊子裁剪
                         None => {
                             s.x = None;
                             s.y = None;
                             s.crop_w = None;
                             s.crop_h = None;
                         }
+                    },
+                    CropSource::FocusAtKeystroke => {
+                        // 保留按键时刻读到的锚点：此刻的焦点已经不是复制发生的地方了
+                    }
+                    CropSource::Full => {
+                        s.x = None;
+                        s.y = None;
+                        s.crop_w = None;
+                        s.crop_h = None;
                     }
                 }
                 // before_screenshot_path intentionally keeps the pre-action
@@ -547,25 +739,51 @@ fn is_pure_modifier(key: &str) -> bool {
 }
 
 /// Rewrite an Alt+Tab step's title once the target window has actually been
-/// activated, e.g. "快捷键 Alt+Tab · 切换到 无标题 - Notepad".
+/// activated, e.g. "快捷键 Alt+Tab · 切换到 无标题 - Notepad", and replaces
+/// the screenshot with the window that was landed on.
 ///
-/// Called again on every repeat Tab press, so the title always shows the
-/// window the user finally landed on.
-fn schedule_alt_tab_title(idx: usize, captured: &Arc<Mutex<Vec<StepData>>>) {
+/// Called again on every repeat Tab press, so both the title and the image
+/// always show the window the user finally landed on.
+///
+/// The wait is driven by the **Alt key release**, not a fixed delay: while Alt
+/// is held the screen shows the window switcher, so any screenshot taken
+/// before the release shows the switcher instead of the target window.
+fn schedule_alt_tab_settle(idx: usize, captured: &Arc<Mutex<Vec<StepData>>>) {
     let epoch = current_settle_epoch();
     let cs = Arc::clone(captured);
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(900));
+        wait_alt_release(3000);
+        std::thread::sleep(Duration::from_millis(300));
         if current_settle_epoch() != epoch {
             return;
         }
-        let Some(title) = activity::get_active_window_title().filter(|t| !t.is_empty()) else {
+        let title = activity::get_active_window_title().filter(|t| !t.is_empty());
+        let shot = screenshot::capture_fullscreen_with_origin().ok().and_then(
+            |(mut img, _, _)| {
+                screenshot::crop_watermark(&mut img);
+                let p = screenshot::next_screenshot_path("key_after");
+                screenshot::capture_frame_jpeg(&img, &p)
+                    .ok()
+                    .map(|_| p.to_string_lossy().to_string())
+            },
+        );
+        if current_settle_epoch() != epoch {
             return;
-        };
+        }
         if let Ok(mut st) = cs.lock() {
             if let Some(s) = st.get_mut(idx) {
-                s.title = format!("快捷键 Alt+Tab · 切换到 {}", title);
-                s.window_title = title;
+                if let Some(t) = title {
+                    s.title = format!("快捷键 Alt+Tab · 切换到 {}", t);
+                    s.window_title = t;
+                }
+                // 切窗口：整屏展示新窗口，不做裁剪
+                s.x = None;
+                s.y = None;
+                s.crop_w = None;
+                s.crop_h = None;
+                if let Some(p) = shot {
+                    s.screenshot_path = p;
+                }
             }
         }
     });
@@ -581,31 +799,30 @@ fn build_click_step(
     ring: &FrameRing,
     step_no: i32,
 ) -> Option<StepData> {
-    let frame_img = ring.closest_to(click_ts).map(|f| f.image.clone())
+    let frame = ring
+        .closest_to(click_ts)
+        .map(|f| (f.image.clone(), f.origin_x, f.origin_y))
         .or_else(|| {
             eprintln!("[BG] click: ring empty, direct capture");
-            screenshot::capture_fullscreen().ok()
+            screenshot::capture_fullscreen_with_origin().ok()
         })?;
+    let (frame_img, origin_x, origin_y) = frame;
 
-    let cx = x.round() as i32;
-    let cy = y.round() as i32;
+    // 全屏原图入册：编辑器的「全图」视图必须就是整个屏幕，不裁窗口。
+    // 点击坐标是全局虚拟屏幕坐标，减去显示器原点换算到图像空间。
+    let (cx, cy) = (x.round() as i32 - origin_x, y.round() as i32 - origin_y);
 
-    // Window-crop first: the step shows the active window region only
-    // (user expectation: window-area crop, not the whole desktop).
-    let (mut win_img, offset_x, offset_y) = screenshot::crop_to_active_window(frame_img);
-    let (win_cx_raw, win_cy_raw) = (cx - offset_x, cy - offset_y);
-
-    // Red element box + step number badge drawn on the window-cropped image
-    let mut annotated = win_img.clone();
-    screenshot::draw_click_marker(&mut annotated, win_cx_raw, win_cy_raw, step_no);
+    // Red element box + step number badge drawn on the fullscreen image
+    let mut annotated = frame_img.clone();
+    screenshot::draw_click_marker(&mut annotated, cx, cy, step_no);
 
     // Crop Flowio's own recording status bar from both images; the stored
     // click coordinates must be shifted up by the cropped height so the editor
     // anchors the thumbnail at the real click point.
-    let mut clean_before = win_img;
+    let mut clean_before = frame_img;
     let watermark_cut = screenshot::crop_watermark(&mut clean_before) as i32;
     screenshot::crop_watermark(&mut annotated);
-    let (win_cx, win_cy) = (win_cx_raw, win_cy_raw - watermark_cut);
+    let (win_cx, win_cy) = (cx, cy - watermark_cut);
 
     // Save clean before screenshot (no annotation)
     let before_path = screenshot::next_screenshot_path("click_before");
@@ -865,24 +1082,30 @@ fn spawn_event_thread(
                         let _pushed: Option<usize> = if ctrl {
                             match key_name.as_str() {
                                 // 全选：剪贴板不变，必须读焦点控件选中文本。
-                                // 450ms：等选区高亮渲染完成，否则裁图拍到的是
-                                // 全选之前的画面。
+                                // 截图不等固定 450ms —— 那时用户可能已经按了
+                                // Ctrl+C/Ctrl+V，全选步骤就变成了粘贴后的画面。
+                                // 改为轮询"画面一变就拍"，拍到的正是高亮选区。
                                 "KeyA" => flush_shortcut_step(
                                     "hotkey",
                                     "全选".to_string(),
                                     String::new(),
                                     &cs_for_thread,
-                                    ShortcutSettle::text(450, BackfillSource::FocusedSelection),
+                                    ShortcutSettle::select_all(
+                                        600,
+                                        BackfillSource::FocusedSelection,
+                                    ),
                                     &ring,
                                     combo_ts,
                                 ),
                                 // 复制/粘贴/剪切：剪贴板更新需要时间，450ms 后读。
+                                // 裁剪锚点在按键那一刻就读好（见 CropSource::
+                                // FocusAtKeystroke），否则会裁到粘贴目标上。
                                 "KeyC" => flush_shortcut_step(
                                     "copy",
                                     "复制".to_string(),
                                     String::new(),
                                     &cs_for_thread,
-                                    ShortcutSettle::text(450, BackfillSource::Clipboard),
+                                    ShortcutSettle::clipboard(450),
                                     &ring,
                                     combo_ts,
                                 ),
@@ -891,7 +1114,7 @@ fn spawn_event_thread(
                                     "粘贴".to_string(),
                                     String::new(),
                                     &cs_for_thread,
-                                    ShortcutSettle::text(450, BackfillSource::Clipboard),
+                                    ShortcutSettle::clipboard(450),
                                     &ring,
                                     combo_ts,
                                 ),
@@ -900,7 +1123,7 @@ fn spawn_event_thread(
                                     "剪切".to_string(),
                                     String::new(),
                                     &cs_for_thread,
-                                    ShortcutSettle::text(450, BackfillSource::Clipboard),
+                                    ShortcutSettle::clipboard(450),
                                     &ring,
                                     combo_ts,
                                 ),
@@ -925,7 +1148,9 @@ fn spawn_event_thread(
                         } else if alt {
                             if key_name == "KeyTab" {
                                 // Alt+Tab 会被按住 Alt 连按多次（每按一次切一个
-                                // 窗口），这里合并成一步：只刷新标题里的目标窗口。
+                                // 窗口），这里合并成一步：每次按 Tab 都重排一次
+                                // 「Alt 抬起后」的标题 + 截图更新，最终停留的
+                                // 就是用户真正切到的那个窗口。
                                 let now = Instant::now();
                                 let merged = match last_alt_tab {
                                     Some((last_ts, idx)) if now.duration_since(last_ts) < Duration::from_millis(2500) => {
@@ -936,7 +1161,7 @@ fn spawn_event_thread(
                                 match merged {
                                     Some(idx) => {
                                         last_alt_tab = Some((now, idx));
-                                        schedule_alt_tab_title(idx, &cs_for_thread);
+                                        schedule_alt_tab_settle(idx, &cs_for_thread);
                                         Some(idx)
                                     }
                                     None => {
@@ -945,13 +1170,13 @@ fn spawn_event_thread(
                                             "快捷键 Alt+Tab".to_string(),
                                             String::new(),
                                             &cs_for_thread,
-                                            ShortcutSettle::switch(600),
+                                            ShortcutSettle::switch(),
                                             &ring,
                                             combo_ts,
                                         );
                                         if let Some(i) = idx {
                                             last_alt_tab = Some((now, i));
-                                            schedule_alt_tab_title(i, &cs_for_thread);
+                                            schedule_alt_tab_settle(i, &cs_for_thread);
                                         }
                                         idx
                                     }
@@ -971,7 +1196,7 @@ fn spawn_event_thread(
                         typing_window_title = activity::get_active_window_title();
                         // Capture before screenshot on first keystroke
                         if let Ok(img) = screenshot::capture_fullscreen() {
-                            let (mut win_img, _, _) = screenshot::crop_to_active_window(img);
+                            let mut win_img = img;
                             screenshot::crop_watermark(&mut win_img);
                             let bp = screenshot::next_screenshot_path("key_before");
                             if screenshot::capture_frame_jpeg(&win_img, &bp).is_ok() {
