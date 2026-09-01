@@ -22,6 +22,7 @@ struct ExportRecording {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExportStep {
+    id: String,
     order_index: i32,
     step_number: i32,
     action_type: String,
@@ -29,6 +30,11 @@ struct ExportStep {
     description: String,
     tip: String,
     screenshot_path: String,
+    // 裁剪坐标（前端裁图模式需要）
+    x: Option<i32>,
+    y: Option<i32>,
+    crop_w: Option<i32>,
+    crop_h: Option<i32>,
 }
 
 // ── Tauri Command ─────────────────────────────────────────────
@@ -46,6 +52,7 @@ pub async fn export_recording(
     id: String,
     format: String,
     output_path: Option<String>,
+    crop_step_ids: Option<Vec<String>>,
 ) -> Result<String, String> {
     // async 命令运行在异步运行时线程，不阻塞 UI 主线程。内部 catch_unwind 防 panic 崩掉 IPC。
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -55,7 +62,7 @@ pub async fn export_recording(
                 serde_json::json!({ "done": done, "total": total }),
             );
         };
-        export_recording_inner(&db, &id, &format, output_path, Some(&progress))
+        export_recording_inner(&db, &id, &format, output_path, crop_step_ids.as_deref(), Some(&progress))
     }))
     .map_err(|_| "export_recording panicked".to_string())?
 }
@@ -67,9 +74,14 @@ pub(crate) fn export_recording_inner(
     id: &str,
     format: &str,
     output_path: Option<String>,
+    crop_step_ids: Option<&[String]>,
     progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
 ) -> Result<String, String> {
     let (recording, steps) = load_export_data(db, id)?;
+    // 构建 crop ID 集合用于 O(1) 查找
+    let crop_set: std::collections::HashSet<&str> = crop_step_ids
+        .map(|ids| ids.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
     // Phase C: 导出前自动脱敏（开关键 redact_before_export 默认关闭）——
     // 仅当用户在「设置 → 脱敏」中开启「导出前自动脱敏」时才执行；
     // 文本替换 + 截图生成脱敏副本，原图与数据库数据保持不动。
@@ -94,7 +106,7 @@ pub(crate) fn export_recording_inner(
 
     match format.to_lowercase().as_str() {
         "html" => {
-            let content = export_html(&recording, &steps);
+            let content = export_html(&recording, &steps, &crop_set);
             std::fs::write(&path, content)
                 .map_err(|e| format!("Failed to write HTML: {}", e))?;
             Ok(path.to_string_lossy().to_string())
@@ -105,17 +117,17 @@ pub(crate) fn export_recording_inner(
             let ss_dir = parent.join("screenshots");
             std::fs::create_dir_all(&ss_dir)
                 .map_err(|e| format!("Failed to create screenshots dir: {}", e))?;
-            let content = export_markdown(&recording, &steps, &ss_dir);
+            let content = export_markdown(&recording, &steps, &ss_dir, &crop_set);
             std::fs::write(&path, content)
                 .map_err(|e| format!("Failed to write Markdown: {}", e))?;
             Ok(path.to_string_lossy().to_string())
         }
         "pdf" => {
-            export_pdf(&recording, &steps, &path)?;
+            export_pdf(&recording, &steps, &path, &crop_set)?;
             Ok(path.to_string_lossy().to_string())
         }
         "docx" | "word" => {
-            export_docx(&recording, &steps, &path)?;
+            export_docx(&recording, &steps, &path, &crop_set)?;
             Ok(path.to_string_lossy().to_string())
         }
         other => Err(format!("Unsupported format: {}. Use html, markdown, docx, or pdf.", other)),
@@ -170,21 +182,27 @@ fn load_export_data(
 
     let mut stmt = conn
         .prepare(
-            "SELECT order_index, step_number, action_type, title, description, \
-             tip, screenshot_path FROM steps WHERE recording_id = ?1 ORDER BY order_index",
+            "SELECT id, order_index, step_number, action_type, title, description, \
+             tip, screenshot_path, x, y, crop_w, crop_h \
+             FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
         .query_map(params![id], |row| {
             Ok(ExportStep {
-                order_index: row.get(0)?,
-                step_number: row.get(1)?,
-                action_type: row.get(2)?,
-                title: row.get(3)?,
-                description: row.get(4)?,
-                tip: row.get(5)?,
-                screenshot_path: row.get(6)?,
+                id: row.get(0)?,
+                order_index: row.get(1)?,
+                step_number: row.get(2)?,
+                action_type: row.get(3)?,
+                title: row.get(4)?,
+                description: row.get(5)?,
+                tip: row.get(6)?,
+                screenshot_path: row.get(7)?,
+                x: row.get(8)?,
+                y: row.get(9)?,
+                crop_w: row.get(10)?,
+                crop_h: row.get(11)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -359,6 +377,33 @@ pub(crate) fn prepare_export_steps(
     Ok(steps)
 }
 
+// ── Export image cropping helper ──────────────────────────────
+
+/// 如果步骤在裁剪模式且有有效坐标，对图片字节做裁剪；否则原样返回。
+fn maybe_crop_screenshot_bytes(
+    raw_bytes: Vec<u8>,
+    x: Option<i32>,
+    y: Option<i32>,
+    crop_w: Option<i32>,
+    crop_h: Option<i32>,
+) -> Vec<u8> {
+    let (x, y, cw, ch) = match (x, y, crop_w, crop_h) {
+        (Some(a), Some(b), Some(c), Some(d)) if c > 0 && d > 0 => (a as u32, b as u32, c as u32, d as u32),
+        _ => return raw_bytes,
+    };
+    let mut img = match image::load_from_memory(&raw_bytes) {
+        Ok(i) => i,
+        Err(_) => return raw_bytes,
+    };
+    let cropped = img.crop(x, y, cw.min(img.width()), ch.min(img.height()));
+    let mut buf: Vec<u8> = Vec::new();
+    // 裁剪图输出 JPEG（与前端 cropAdaptiveBase64 一致）
+    if let Err(_) = cropped.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg) {
+        return raw_bytes;
+    }
+    buf
+}
+
 // ── HTML export ───────────────────────────────────────────────
 
 /// Generate the inner HTML body block (step cards).
@@ -366,6 +411,7 @@ pub(crate) fn prepare_export_steps(
 fn gen_html_body(
     recording: &ExportRecording,
     steps: &[ExportStep],
+    crop_set: &std::collections::HashSet<&str>,
 ) -> String {
     let step_cards: String = steps
         .iter()
@@ -373,12 +419,14 @@ fn gen_html_body(
             let screenshot_html = if s.screenshot_path.is_empty() {
                 build_screenshot_placeholder_html().to_string()
             } else {
-                let encoded = std::fs::read(&s.screenshot_path)
-                    .ok()
-                    .map(|data| {
-                        base64::engine::general_purpose::STANDARD.encode(&data)
-                    })
-                    .unwrap_or_default();
+                let raw = std::fs::read(&s.screenshot_path).ok().unwrap_or_default();
+                let is_crop = crop_set.contains(s.id.as_str());
+                let data = if is_crop && !raw.is_empty() {
+                    maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h)
+                } else {
+                    raw
+                };
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
                 let mime = mime_from_path(&s.screenshot_path);
                 build_screenshot_img_html(mime, &encoded, s.step_number)
             };
@@ -408,8 +456,8 @@ fn gen_html_body(
 }
 
 /// Generate standalone HTML with base64-embedded screenshots.
-fn export_html(recording: &ExportRecording, steps: &[ExportStep]) -> String {
-    gen_html_body(recording, steps)
+fn export_html(recording: &ExportRecording, steps: &[ExportStep], crop_set: &std::collections::HashSet<&str>) -> String {
+    gen_html_body(recording, steps, crop_set)
 }
 fn htmlescape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -442,7 +490,7 @@ fn mime_from_path(path: &str) -> &'static str {
 ///   - Clean title + metadata row
 ///   - Numbered step cards with badge-style header, description, screenshot, tip
 ///   - Screenshots copied to a `screenshots/` subdirectory and referenced via relative paths
-fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], ss_dir: &std::path::Path) -> String {
+fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], ss_dir: &std::path::Path, crop_set: &std::collections::HashSet<&str>) -> String {
     let step_list: String = steps
         .iter()
         .map(|s| {
@@ -456,14 +504,28 @@ fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], ss_dir: &s
                     .unwrap_or(std::ffi::OsStr::new("jpg"));
                 let filename = format!("step_{}.{}", s.step_number, ext.to_string_lossy());
                 let dest = ss_dir.join(&filename);
-                match std::fs::copy(src, &dest) {
-                    Ok(_) => {
-                        format!("![Screenshot](./screenshots/{})", filename)
+                let is_crop = crop_set.contains(s.id.as_str());
+                if is_crop {
+                    // 裁剪模式：读取→裁剪→写入
+                    match std::fs::read(src).ok().filter(|b| !b.is_empty()) {
+                        Some(raw) => {
+                            let cropped = maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h);
+                            match std::fs::write(&dest, &cropped) {
+                                Ok(_) => format!("![Screenshot](./screenshots/{})", filename),
+                                Err(_) => format!("> *(Screenshot export failed)*"),
+                            }
+                        }
+                        None => format!("> *(Screenshot not found: {})*", s.screenshot_path.replace('\\', "/")),
                     }
-                    Err(_) => format!(
-                        "> *(Screenshot not found: {})*",
-                        s.screenshot_path.replace('\\', "/")
-                    ),
+                } else {
+                    // 全图模式：直接复制原文件
+                    match std::fs::copy(src, &dest) {
+                        Ok(_) => format!("![Screenshot](./screenshots/{})", filename),
+                        Err(_) => format!(
+                            "> *(Screenshot not found: {})*",
+                            s.screenshot_path.replace('\\', "/")
+                        ),
+                    }
                 }
             };
 
@@ -505,6 +567,7 @@ fn export_docx(
     recording: &ExportRecording,
     steps: &[ExportStep],
     output_path: &std::path::Path,
+    crop_set: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
     const MAX_IMG_WIDTH_EMU: usize = 5_715_000; // ~600px at 96 DPI
 
@@ -560,8 +623,14 @@ fn export_docx(
         // ── Screenshot ────────────────────────────────────────
         if !s.screenshot_path.is_empty() {
             if let Ok(img_bytes) = std::fs::read(&s.screenshot_path) {
+                let is_crop = crop_set.contains(s.id.as_str());
+                let final_bytes = if is_crop && !img_bytes.is_empty() {
+                    maybe_crop_screenshot_bytes(img_bytes, s.x, s.y, s.crop_w, s.crop_h)
+                } else {
+                    img_bytes
+                };
                 let (w_emu, h_emu) = compute_image_emu_dims(*dim_opt, MAX_IMG_WIDTH_EMU);
-                let pic = Pic::new(&img_bytes).size(w_emu, h_emu);
+                let pic = Pic::new(&final_bytes).size(w_emu, h_emu);
                 docx = docx.add_paragraph(
                     Paragraph::new()
                         .add_run(Run::new().add_image(pic))
@@ -642,13 +711,14 @@ fn export_pdf(
     recording: &ExportRecording,
     steps: &[ExportStep],
     output_path: &std::path::Path,
+    crop_set: &std::collections::HashSet<&str>,
 ) -> Result<(), String> {
     if steps.is_empty() {
         return Err("No steps to export".to_string());
     }
 
     // 1. Generate standalone HTML with base64-embedded images
-    let html = gen_html_body(recording, steps);
+    let html = gen_html_body(recording, steps, crop_set);
 
     // 2. Write HTML to a temporary file
     let temp_dir = std::env::temp_dir();
@@ -903,6 +973,7 @@ mod tests {
         };
         let steps = vec![
             ExportStep {
+                id: "test-step".into(),
                 order_index: 0,
                 step_number: 1,
                 action_type: "click".into(),
@@ -912,6 +983,7 @@ mod tests {
                 screenshot_path: "".into(),
             },
             ExportStep {
+                id: "test-step".into(),
                 order_index: 1,
                 step_number: 2,
                 action_type: "type".into(),
@@ -982,6 +1054,7 @@ mod tests {
             created_at: "2026-08-09".into(),
         };
         let steps = vec![ExportStep {
+            id: "test-step".into(),
             order_index: 0,
             step_number: 1,
             action_type: "click".into(),
@@ -1011,6 +1084,7 @@ mod tests {
         };
         let steps = vec![
             ExportStep {
+                id: "test-step".into(),
                 order_index: 0,
                 step_number: 1,
                 action_type: "click".into(),
@@ -1020,6 +1094,7 @@ mod tests {
                 screenshot_path: "".into(),
             },
             ExportStep {
+                id: "test-step".into(),
                 order_index: 1,
                 step_number: 2,
                 action_type: "type".into(),
@@ -1050,6 +1125,7 @@ mod tests {
             created_at: "2026-08-09".into(),
         };
         let steps = vec![ExportStep {
+            id: "test-step".into(),
             order_index: 0,
             step_number: 1,
             action_type: "click".into(),
@@ -1073,6 +1149,7 @@ mod tests {
             created_at: "2026-08-09".into(),
         };
         let steps = vec![ExportStep {
+            id: "test-step".into(),
             order_index: 0,
             step_number: 1,
             action_type: "click".into(),
@@ -1140,6 +1217,7 @@ mod tests {
             created_at: "2026-08-09".into(),
         };
         let steps = vec![ExportStep {
+            id: "test-step".into(),
             order_index: 0,
             step_number: 1,
             action_type: "click".into(),
@@ -1167,6 +1245,7 @@ mod tests {
             created_at: "2026-08-09".into(),
         };
         let steps = vec![ExportStep {
+            id: "test-step".into(),
             order_index: 0,
             step_number: 1,
             action_type: "click".into(),
@@ -1196,6 +1275,7 @@ mod tests {
             created_at: "2026-08-09".into(),
         };
         let steps = vec![ExportStep {
+            id: "test-step".into(),
             order_index: 0,
             step_number: 1,
             action_type: "click".into(),
@@ -1222,6 +1302,7 @@ mod tests {
             created_at: "2026-08-09".into(),
         };
         let steps = vec![ExportStep {
+            id: "test-step".into(),
             order_index: 0,
             step_number: 1,
             action_type: "click|a".into(),

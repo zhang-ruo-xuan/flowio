@@ -1771,8 +1771,12 @@ select {
   opacity: 1;
 }
 
-/* 全图/裁图切换按钮：始终可见（不依赖 hover） */
+/* 全图/裁图切换按钮：仅鼠标悬浮时显示（与标注/删除按钮行为一致） */
 .step-detail-image .step-detail-view-segmented {
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.step-detail-image:hover .step-detail-view-segmented {
   opacity: 1;
 }
 

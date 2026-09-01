@@ -479,9 +479,19 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           setSelectedStepId(data.steps[0].id);
         }
 
-        // 默认视图：全图（screenshot_base64）；裁剪图通过分段按钮手动切换
-        setStepViewCropped({});
-        setGlobalView('full');
+        // 从 localStorage 恢复视图状态（裁图/全图偏好）
+        const savedView = localStorage.getItem(`flowio_view_${recordingId}`);
+        let initialView: Record<string, boolean> = {};
+        let initialGlobal: 'full' | 'crop' = 'full';
+        if (savedView) {
+          try {
+            const parsed = JSON.parse(savedView);
+            initialView = parsed.stepViewCropped || {};
+            initialGlobal = parsed.globalView || 'full';
+          } catch { /* ignore corrupt data */ }
+        }
+        setStepViewCropped(initialView);
+        setGlobalView(initialGlobal);
         setCropCache({});
       } catch (err) {
         if (!cancelled) setError(String(err));
@@ -536,6 +546,18 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     });
     return () => { cancelled = true; };
   }, [steps.map((s) => `${s.id}|${s.screenshot_base64}|${s.x}|${s.y}|${s.crop_w}|${s.crop_h}|${s.action_type}`).join("||")]);
+
+  /* 持久化裁图/全图视图偏好到 localStorage */
+  useEffect(() => {
+    if (!recordingId) return;
+    try {
+      localStorage.setItem(`flowio_view_${recordingId}`, JSON.stringify({
+        stepViewCropped,
+        globalView,
+      }));
+    } catch { /* storage full / unavailable */ }
+  }, [recordingId, stepViewCropped, globalView]);
+
   const selectedIndex = steps.findIndex((s) => s.id === selectedStepId);
 
   /* 主截图解析：全图（screenshot_base64）或裁剪图（缓存）；裁剪图已删或全图缺失时返回 null */
@@ -865,6 +887,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           id: recordingId,
           format,
           outputPath: savedPath,
+          cropStepIds: Object.keys(stepViewCropped).filter(id => stepViewCropped[id]),
         });
         setToast({ type: "success", message: `导出成功: ${path}` });
       } catch (err) {
