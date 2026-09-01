@@ -601,6 +601,44 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     }
   }, [selectedStep, editTitle, editDescription]);
 
+  /* ── Auto-save (debounce 800ms) ─────────────────────────── */
+  const autoSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [autoSaved, setAutoSaved] = useState(false);
+
+  useEffect(() => {
+    if (!selectedStep) return;
+    // 仅当值与原始步骤不同时才触发自动保存
+    const titleChanged = editTitle !== selectedStep.title;
+    const descChanged = editDescription !== selectedStep.description;
+    if (!titleChanged && !descChanged) return;
+
+    setAutoSaved(false);
+    if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
+    autoSaveRef.current = setTimeout(async () => {
+      try {
+        await invoke("update_step", {
+          stepId: selectedStep.id,
+          title: editTitle,
+          description: editDescription,
+          actionType: selectedStep.action_type,
+          tip: selectedStep.tip || "",
+        });
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === selectedStep.id
+              ? { ...s, title: editTitle, description: editDescription }
+              : s
+          )
+        );
+        setAutoSaved(true);
+        setTimeout(() => setAutoSaved(false), 1500);
+      } catch (err) {
+        console.error("Auto-save failed:", err);
+      }
+    }, 800);
+    return () => { if (autoSaveRef.current) clearTimeout(autoSaveRef.current); };
+  }, [editTitle, editDescription, selectedStep]);
+
   /* ── Upload screenshot ─────────────────────────────────── */
 
   const handleUploadScreenshot = useCallback(
@@ -1698,25 +1736,13 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 </div>
               )}
 
-              {/* Save button */}
-              <div className="step-detail-actions">
-                <button
-                  className="btn btn-primary"
-                  onClick={handleSaveStep}
-                  disabled={saving}
-                >
-                  {saving ? (
-                    <>
-                      <Loader2 size={14} className="spinner" /> 保存中...
-                    </>
-                  ) : saveSuccess ? (
-                    <>
-                      <Check size={14} /> 已保存
-                    </>
-                  ) : (
-                    "保存修改"
-                  )}
-                </button>
+              {/* Auto-save indicator */}
+              <div className="step-detail-actions" style={{ justifyContent: 'flex-start' }}>
+                {autoSaved && (
+                  <span style={{ color: '#22c55e', fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <Check size={12} /> 已自动保存
+                  </span>
+                )}
               </div>
               </div>
             </>

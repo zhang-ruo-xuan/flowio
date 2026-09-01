@@ -640,16 +640,58 @@ fn flush_shortcut_step(
                         }
                     }
                     None => {
-                        // ── Layer 3: 截图时刻鼠标位置（最靠谱的兜底）──
-                        // 用户复制时鼠标通常就在/靠近被复制的文字（刚用鼠标选中
-                        // 或键盘焦点就在那）。这比活动窗口中心（=整个浏览器）和
-                        // 屏幕中心都精确得多。
+                        // ── Layer 3: 智能锚点（按操作类型选最佳策略）──
                         //
-                        // 注意：这里的 cursor_at_capture 是截图瞬间同步读取的，
-                        // 不是 200ms 后异步读的——那时用户可能已经移开鼠标了。
+                        // COPY 类型：用户用 Ctrl+C 复制时鼠标通常不在文字上
+                        //   （可能用键盘选中后直接按 Ctrl+C），所以鼠标位置
+                        //   完全不可靠（日志铁证：cursor 在 (534,640) 而 URL
+                        //   在窗口中上部）。改用**活动窗口的上部中心**——网页
+                        //   内容总在地址栏/标签页下方，约占窗口 y=30%~80% 区域。
+                        //
+                        // 其他类型（CLICK/HOTKEY/SELECT_ALL 等）：鼠标位置仍然
+                        //   是最靠谱的锚点（用户刚在那个位置点了/操作了）。
                         let mut fallback_used = false;
+                        let is_copy = matches!(source, BackfillSource::Clipboard);
 
-                        if let Some((mx, my)) = cursor_at_capture {
+                        if is_copy {
+                            // COPY 专用策略：活动窗口上部中心
+                            let win_rect = crate::recorder::activity::get_active_window_rect()
+                                .and_then(|r| screenshot::screen_rect_in_image(r, ox_i32, oy_i32, win_w_i32, win_h_i32));
+
+                            if let Some((wx, wy, ww, wh)) = win_rect {
+                                // 窗口上部中心：x=中心, y=从顶部 35% 处（跳过标签栏+地址栏）
+                                let anchor_x = wx + ww / 2;
+                                let anchor_y = wy + (wh * 35 / 100); // 窗口高度 35% 处
+                                let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
+                                let desired_w = (text_len as i32 * 9 + 120).max(1000).min(win_w_i32);
+                                let desired_h = 450.min(wh);
+                                let (cx, cy, cw, ch) = screenshot::centered_crop_box(
+                                    anchor_x, anchor_y,
+                                    desired_w, desired_h,
+                                    win_w_i32, win_h_i32,
+                                    desired_w, desired_h,
+                                );
+                                if let Ok(mut st) = cs.lock() {
+                                    if let Some(s) = st.get_mut(idx) {
+                                        s.x = Some(cx);
+                                        s.y = Some(cy);
+                                        s.crop_w = Some(cw);
+                                        s.crop_h = Some(ch);
+                                    }
+                                }
+                                screenshot::ocr_debug(&format!(
+                                    "crop: L3 copy=window_upper_center ({},{}) box {}x{} for '{}' (len {})",
+                                    anchor_x, anchor_y, desired_w, desired_h,
+                                    text.chars().take(30).collect::<String>(),
+                                    text.chars().count()
+                                ));
+                                fallback_used = true;
+                            }
+                        }
+
+                        if !fallback_used {
+                            // 非 COPY 或获取窗口失败 → 用截图时刻鼠标位置
+                            if let Some((mx, my)) = cursor_at_capture {
                             let rx = (mx - ox_i32).clamp(0, win_w_i32);
                             let ry = (my - oy_i32).clamp(0, win_h_i32);
                             let text_len = text.chars().filter(|c| !c.is_whitespace()).count();
@@ -676,6 +718,7 @@ fn flush_shortcut_step(
                                 text.chars().count()
                             ));
                             fallback_used = true;
+                        }  // end if let Some(cursor_at_capture)
                         }
 
                         if !fallback_used {
