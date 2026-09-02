@@ -143,20 +143,33 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
             );
         }
 
+        // 表格软件：若同时有 before/after 截图，提示模型对比前后状态，
+        // 以便识别「向下填充到 B31」「整列复制」等仅在前后差异中显现的操作。
+        let is_ss = crate::ai::prompt::is_spreadsheet_window(&step.window_title) || spreadsheet_mode;
+        if is_ss && !original_before[i].is_empty() {
+            step_prompt = format!(
+                "{}\n【表格软件】你将收到两张截图：第一张为操作前、第二张为操作后，请对比前后状态判断操作（如某区域被填充/复制）。",
+                step_prompt
+            );
+        }
+
         let mut messages = vec![Message {
             role: "system".to_string(),
             content: serde_json::Value::String(system_prompt.clone()),
         }];
 
-        // Build user message with text + optional screenshot.
-        // 默认投喂 after 裁剪图（crop_and_encode 处理后的 screenshot_base64）；
-        // 表格软件改为投喂 after 全图（original_marked，已脱敏），让模型看清
-        // 顶部选项卡 / 公式栏 / 函数对话框（见 ai_image_for_step）。
-        // before 全图/裁剪图（original_before / step.before_screenshot_base64）不进入 prompt。
+        // Build user message with text + optional screenshot(s).
+        // 默认投喂 after 裁剪图；表格软件改为投喂 after 全图（original_marked），
+        // 并可附带 before 全图（original_before），让模型对比前后状态识别填充/复制。
         let ai_image = ai_image_for_step(step, &original_marked[i], spreadsheet_mode);
         let has_marked = !ai_image.is_empty();
+        let before_image: Option<&String> = if is_ss && !original_before[i].is_empty() {
+            Some(&original_before[i])
+        } else {
+            None
+        };
 
-        if !has_marked {
+        if !has_marked && before_image.is_none() {
             messages.push(Message {
                 role: "user".to_string(),
                 content: serde_json::Value::String(step_prompt),
@@ -167,14 +180,23 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
                     "type": "text",
                     "text": step_prompt,
                 }),
-                serde_json::json!({
+            ];
+            if let Some(b) = before_image {
+                content_parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:image/jpeg;base64,{}", b),
+                    },
+                }));
+            }
+            if has_marked {
+                content_parts.push(serde_json::json!({
                     "type": "image_url",
                     "image_url": {
                         "url": format!("data:image/jpeg;base64,{}", ai_image),
                     },
-                }),
-            ];
-
+                }));
+            }
             messages.push(Message {
                 role: "user".to_string(),
                 content: serde_json::Value::Array(content_parts),
