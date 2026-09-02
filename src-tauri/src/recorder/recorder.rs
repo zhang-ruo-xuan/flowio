@@ -229,39 +229,127 @@ unsafe extern "system" fn enum_windows_callback(hwnd: isize, lparam: isize) -> i
     1
 }
 
-/// Find the screen rectangle of the first visible top-level window owned by
-/// the given process (e.g. `wps.exe`). Returns `(left, top, right, bottom)`.
+/// Find the screen rectangle of the largest visible top-level window owned by
+/// the given process (e.g. `chrome.exe`).
+///
+/// Why "largest" instead of "first hit": some processes — most notably
+/// Chromium-based browsers and PWAs — own many auxiliary windows besides the
+/// main UI: taskbar previews, popup favicon chips, URL-bar suggestions. These
+/// are individually visible, on the same process, and their rect is often
+/// 32×32 (just a favicon). Returning the first match yields an icon-sized
+/// crop. Collecting every candidate, dropping rects smaller than 200×100, and
+/// picking the biggest by area reliably lands on the actual app window.
+///
+/// Returns `(left, top, right, bottom)` of the chosen rect, or `None` if no
+/// top-level visible window with a non-empty title is large enough.
 pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
-    let mut ctx: (Option<Rect>, &str) = (None, process_name);
+    let mut ctx: (Vec<WindowCandidate>, &str) = (Vec::new(), process_name);
     unsafe {
         EnumWindows(
-            Some(enum_windows_rect_callback),
-            (&mut ctx as *mut (Option<Rect>, &str)) as isize,
+            Some(enum_windows_rect_collect_callback),
+            (&mut ctx as *mut (Vec<WindowCandidate>, &str)) as isize,
         );
     }
-    ctx.0
+    let candidates = ctx.0;
+    // 200 px wide × 100 px tall = 20 000 px². Well below any realistic main UI,
+    // well above auxiliary controls (favicon chips are 32×32, URL-bar
+    // suggestions ~1×20 px). A tighter floor (100×60) was considered but some
+    // legitimate dock-style apps are genuinely small.
+    const MIN_W: i32 = 200;
+    const MIN_H: i32 = 100;
+
+    // Rank = (has_title, area). Tuple comparison gives us "prefer windows that
+    // actually declare a title; among those, prefer the largest".
+    //
+    // `has_title` is deliberately a *soft* preference, not a filter: Chromium
+    // main windows sometimes report an empty `GetWindowText` while their
+    // auxiliary child windows do carry one. Hard-filtering on title would then
+    // discard the real app window and every frame would be skipped (the user
+    // sees no screenshots at all) — a worse failure than a slightly-off crop.
+    let mut best: Option<(bool, i64, Rect)> = None;
+    for c in candidates {
+        let w = c.rect.width();
+        let h = c.rect.height();
+        if w < MIN_W || h < MIN_H {
+            continue;
+        }
+        let area = (w as i64) * (h as i64);
+        let better = match &best {
+            None => true,
+            Some((bh, ba, _)) => (c.has_title, area) > (*bh, *ba),
+        };
+        if better {
+            best = Some((c.has_title, area, c.rect));
+        }
+    }
+    if let Some((has_title, area, r)) = best {
+        eprintln!(
+            "[CAPTURE] find_window_rect_by_process({}): chose {}x{} at ({},{}), area={}, has_title={}",
+            process_name,
+            r.width(),
+            r.height(),
+            r.left,
+            r.top,
+            area,
+            has_title
+        );
+        Some(r)
+    } else {
+        eprintln!(
+            "[CAPTURE] find_window_rect_by_process({}): no candidate passed the {}x{} floor",
+            process_name, MIN_W, MIN_H
+        );
+        None
+    }
 }
 
-unsafe extern "system" fn enum_windows_rect_callback(hwnd: isize, lparam: isize) -> i32 {
+/// One visible window owned by the target process, collected during enumeration.
+struct WindowCandidate {
+    rect: Rect,
+    has_title: bool,
+}
+
+unsafe extern "system" fn enum_windows_rect_collect_callback(
+    hwnd: isize,
+    lparam: isize,
+) -> i32 {
+    // 1) Visible — invisible / minimised / cloaked windows are not what the
+    //    user means by "the app I'm looking at".
     if unsafe { IsWindowVisible(hwnd) } == 0 {
         return 1;
     }
-    let (found, process_name) = &mut *(lparam as *mut (Option<Rect>, &str));
-    if found.is_some() {
-        return 0; // already found
+    // (Ownership by the target process is checked *after* the title read below
+    // so the expensive process-name lookup runs on as few windows as possible.)
+    // 2) Record whether this window declares a non-empty title. NOT a filter:
+    //    Chromium main windows can report an empty title.
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    let mut has_title = false;
+    if len > 0 {
+        let mut buf: Vec<u16> = vec![0; (len + 1) as usize];
+        let actual = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if actual > 0 {
+            let title = String::from_utf16_lossy(&buf[..actual as usize]);
+            has_title = !title.trim().is_empty();
+        }
     }
+    // 3) Owned by the requested process. `process_name_of_pid` opens a handle
+    //    per call, so bail out early for windows we can't resolve.
     let mut pid: u32 = 0;
     unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
     let Some(name) = process_name_of_pid(pid) else {
         return 1;
     };
+    let (candidates, process_name) = &mut *(lparam as *mut (Vec<WindowCandidate>, &str));
     if !name.eq_ignore_ascii_case(process_name) {
         return 1;
     }
+    // 4) Read its rect.
     let mut rect = Rect::default();
-    if unsafe { GetWindowRect(hwnd, &mut rect) } != 0 {
-        *found = Some(rect);
-        return 0;
+    if unsafe { GetWindowRect(hwnd, &mut rect) } != 0
+        && rect.right > rect.left
+        && rect.bottom > rect.top
+    {
+        candidates.push(WindowCandidate { rect, has_title });
     }
     1
 }
