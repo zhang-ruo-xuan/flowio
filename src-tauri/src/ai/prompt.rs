@@ -38,10 +38,11 @@ pub fn build_system_prompt() -> String {
 
 /// Heuristic check: does the window title suggest a spreadsheet application?
 ///
-/// Used to inject spreadsheet-specific guidance into the per-step prompt.
-/// Keywords cover WPS 表格 / Excel / LibreOffice Calc / Numbers and common
+/// Used to inject spreadsheet-specific guidance into the per-step prompt, and to
+/// decide whether the full (uncropped) screenshot should be sent to the vision
+/// model. Keywords cover WPS 表格 / Excel / LibreOffice Calc / Numbers and common
 /// file extensions and UI terms.
-fn is_spreadsheet_window(title: &str) -> bool {
+pub(crate) fn is_spreadsheet_window(title: &str) -> bool {
     let t = title.to_lowercase();
     [
         "wps 表格",

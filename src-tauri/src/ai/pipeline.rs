@@ -17,6 +17,21 @@ const CROP_FALLBACK_RATIO: f32 = 0.4;
 /// JPEG quality for cropped screenshots (85 = good balance of size and fidelity).
 const CROP_JPEG_QUALITY: u8 = 85;
 
+/// Choose which screenshot to send to the vision model for a given step.
+///
+/// Spreadsheet apps (WPS 表格 / Excel / LibreOffice Calc / Numbers …) place the
+/// relevant UI — the ribbon, formula bar and function dialog — across the whole
+/// window, so a focused 400×400 crop often hides it. For those steps we send the
+/// full (already redacted) screenshot instead, trading more tokens for accuracy.
+/// Non-spreadsheet steps keep the cheaper focused crop.
+fn ai_image_for_step<'a>(step: &'a StepInput, full_marked: &'a str) -> &'a str {
+    if crate::ai::prompt::is_spreadsheet_window(&step.window_title) && !full_marked.is_empty() {
+        full_marked
+    } else {
+        &step.screenshot_base64
+    }
+}
+
 // ── Public pipeline API ───────────────────────────────────────
 
 /// Run the complete four-stage AI pipeline.
@@ -118,11 +133,13 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
             content: serde_json::Value::String(system_prompt.clone()),
         }];
 
-        // Build user message with text + optional screenshot
-        // 只投喂 after 裁剪图（crop_and_encode 处理后的 screenshot_base64）一张图；
-        // before 全图/裁剪图（original_before / step.before_screenshot_base64）与
-        // after 全图（original_marked）不再进入 prompt。
-        let has_marked = !step.screenshot_base64.is_empty();
+        // Build user message with text + optional screenshot.
+        // 默认投喂 after 裁剪图（crop_and_encode 处理后的 screenshot_base64）；
+        // 表格软件改为投喂 after 全图（original_marked，已脱敏），让模型看清
+        // 顶部选项卡 / 公式栏 / 函数对话框（见 ai_image_for_step）。
+        // before 全图/裁剪图（original_before / step.before_screenshot_base64）不进入 prompt。
+        let ai_image = ai_image_for_step(step, &original_marked[i]);
+        let has_marked = !ai_image.is_empty();
 
         if !has_marked {
             messages.push(Message {
@@ -138,7 +155,7 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
                 serde_json::json!({
                     "type": "image_url",
                     "image_url": {
-                        "url": format!("data:image/jpeg;base64,{}", step.screenshot_base64),
+                        "url": format!("data:image/jpeg;base64,{}", ai_image),
                     },
                 }),
             ];
@@ -492,6 +509,57 @@ mod pipeline_tests {
 
     fn decode(s: &str) -> Vec<u8> {
         base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    }
+
+    fn step_with_window(wt: &str, shot: &str) -> StepInput {
+        StepInput {
+            title: String::new(),
+            screenshot_base64: shot.to_string(),
+            before_screenshot_base64: String::new(),
+            description: String::new(),
+            click_x: None,
+            click_y: None,
+            crop_w: None,
+            crop_h: None,
+            action_type: String::new(),
+            window_title: wt.to_string(),
+        }
+    }
+
+    #[test]
+    fn ai_image_for_step_prefers_full_image_for_spreadsheet() {
+        let full = "FULL_REDACTED_BASE64".to_string();
+        let cropped = "CROPPED_BASE64".to_string();
+        let step = step_with_window("销售表.xlsx - WPS 表格", &cropped);
+        assert_eq!(
+            ai_image_for_step(&step, &full),
+            "FULL_REDACTED_BASE64",
+            "表格软件应送全图而非裁剪图"
+        );
+    }
+
+    #[test]
+    fn ai_image_for_step_keeps_crop_for_non_spreadsheet() {
+        let full = "FULL_REDACTED_BASE64".to_string();
+        let cropped = "CROPPED_BASE64".to_string();
+        let step = step_with_window("记事本", &cropped);
+        assert_eq!(
+            ai_image_for_step(&step, &full),
+            "CROPPED_BASE64",
+            "非表格软件仍应送裁剪图"
+        );
+    }
+
+    #[test]
+    fn ai_image_for_step_falls_back_to_crop_when_full_empty() {
+        let full = String::new();
+        let cropped = "CROPPED_BASE64".to_string();
+        let step = step_with_window("Excel - 工作簿1", &cropped);
+        assert_eq!(
+            ai_image_for_step(&step, &full),
+            "CROPPED_BASE64",
+            "全图为空时即使表格软件也回退到裁剪图"
+        );
     }
 
     // ── detect_window_change ──────────────────────────────────
