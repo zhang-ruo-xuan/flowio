@@ -268,6 +268,85 @@ fn crop_and_encode(
     crop_and_encode_typed(base64_str, click_x, click_y, crop_w, crop_h, "click")
 }
 
+/// `ai_crop_region` 的结果。三种状态语义不同，不能合并：
+/// - `Rect`：按此矩形裁剪（已 clamp 进图内）
+/// - `Full`：没有可用锚点，用整张图，**仍会重编码**
+/// - `Outside`：锚点完全落在图外，历史行为是**原样返回原始 base64**（连重编码都不做）。
+///   这条是防 panic 的既有约定——锚点在图外时裁出来的图没有意义，见
+///   `crop_and_encode_out_of_bounds_coords_no_panic`。
+pub(crate) enum AiCropRegion {
+    Rect(i32, i32, i32, i32),
+    Full,
+    Outside,
+}
+
+/// AI 裁图区域的纯几何（不碰图片字节）。
+///
+/// ⚠️ 本文件的常量（PAD=24 / MIN=280 / 缩到屏幕 90%）与导出端、前端**刻意不同**——
+/// 喂给 AI 的图需要更大上下文和最小尺寸保证。但 type 步骤「左扩 1/3 宽」的
+/// 几何推导是同一套，**左移量必须是 extra/2 而不是 extra**，否则右侧留白变成
+/// `PAD - extra/2`，元素宽 > 144px 时右边缘被切。
+/// 详见 `export/commands.rs::export_crop_box` 的注释与前端 `src/lib/cropAnchor.ts`。
+pub(crate) fn ai_crop_region(
+    img_w: i32,
+    img_h: i32,
+    click_x: Option<i32>,
+    click_y: Option<i32>,
+    crop_w: Option<i32>,
+    crop_h: Option<i32>,
+    action_type: &str,
+) -> AiCropRegion {
+    if img_w <= 0 || img_h <= 0 {
+        return AiCropRegion::Outside;
+    }
+    let raw = match (click_x, click_y, crop_w, crop_h) {
+        // 1. Element rect anchored adaptive crop
+        (Some(x), Some(y), Some(cw), Some(ch))
+            if x >= 0 && y >= 0 && cw > 0 && ch > 0 =>
+        {
+            let mut rw = (cw + CROP_PAD * 2).max(CROP_MIN_SIZE);
+            let mut rh = (ch + CROP_PAD * 2).max(CROP_MIN_SIZE);
+            // Scale down (never up) to fit within 90% of screen, keep aspect ratio
+            let scale = (1.0f32)
+                .min((img_w as f32 * CROP_MAX_SCREEN_RATIO) / rw as f32)
+                .min((img_h as f32 * CROP_MAX_SCREEN_RATIO) / rh as f32);
+            rw = (rw as f32 * scale).round().max(1.0) as i32;
+            rh = (rh as f32 * scale).round().max(1.0) as i32;
+            // Stage C: type 步骤左侧多留原始矩形宽的 1/3，把左侧 label 带进裁图。
+            // ⚠️ 是 `- extra / 2` 而不是 `- extra`：框宽 rw 本身已含 extra，居中项
+            // `x - rw/2` 天然在左右各分到 extra/2。多减一个 extra/2 会过冲，
+            // 使右侧留白变成 PAD - extra/2（cw=300 时切掉 26px 右边缘）。
+            if action_type == "type" {
+                let extra = ((cw as f64) / 3.0).round();
+                rw += extra as i32;
+                let left = (x as f64 - (rw as f64) / 2.0 - extra / 2.0).round() as i32;
+                (left, y - rh / 2, rw, rh)
+            } else {
+                (x - rw / 2, y - rh / 2, rw, rh)
+            }
+        }
+        // 2. Click point only: fallback ~40% of screen
+        (Some(x), Some(y), _, _) if x >= 0 && y >= 0 => {
+            let rw = ((img_w as f32) * CROP_FALLBACK_RATIO).round().max(1.0) as i32;
+            let rh = ((img_h as f32) * CROP_FALLBACK_RATIO).round().max(1.0) as i32;
+            (x - rw / 2, y - rh / 2, rw, rh)
+        }
+        // 3. No usable anchor: full image (still re-encoded)
+        _ => return AiCropRegion::Full,
+    };
+
+    let (l, t, w, h) = raw;
+    let left = l.max(0);
+    let top = t.max(0);
+    let w = w.min(img_w - left);
+    let h = h.min(img_h - top);
+    if w <= 0 || h <= 0 {
+        // 锚点完全在图外：调用方应原样返回原始 base64
+        return AiCropRegion::Outside;
+    }
+    AiCropRegion::Rect(left, top, w, h)
+}
+
 /// Stage C: 按 action_type 差异化裁剪策略。
 /// - scroll / nav / screenshot：整窗截图（不裁，原样返回，保留上下文）
 /// - type：输入框 + 左侧 label 区（元素矩形左扩 1/3 宽，让"用户名/密码"等 label 进图）
@@ -304,54 +383,14 @@ fn crop_and_encode_typed(
         return base64_str.to_string();
     }
 
-    // Determine crop region
-    let region: Option<(i32, i32, i32, i32)> = match (click_x, click_y, crop_w, crop_h) {
-        // 1. Element rect anchored adaptive crop
-        (Some(x), Some(y), Some(cw), Some(ch))
-            if x >= 0 && y >= 0 && cw > 0 && ch > 0 =>
-        {
-            let mut rw = cw + CROP_PAD * 2;
-            let mut rh = ch + CROP_PAD * 2;
-            rw = rw.max(CROP_MIN_SIZE);
-            rh = rh.max(CROP_MIN_SIZE);
-            // Scale down (never up) to fit within 90% of screen, keep aspect ratio
-            let scale = (1.0f32)
-                .min((img_w as f32 * CROP_MAX_SCREEN_RATIO) / rw as f32)
-                .min((img_h as f32 * CROP_MAX_SCREEN_RATIO) / rh as f32);
-            rw = (rw as f32 * scale).round().max(1.0) as i32;
-            rh = (rh as f32 * scale).round().max(1.0) as i32;
-            // Stage C: type 步骤左扩原始矩形宽的 1/3，把左侧 label（如"用户名/密码"）带进裁剪图
-            if action_type == "type" {
-                let extra = cw / 3;
-                rw += extra;
-                Some((x - rw / 2 - extra, y - rh / 2, rw, rh))
-            } else {
-                Some((x - rw / 2, y - rh / 2, rw, rh))
-            }
-        }
-        // 2. Click point only: fallback ~40% of screen
-        (Some(x), Some(y), _, _) if x >= 0 && y >= 0 => {
-            let rw = ((img_w as f32) * CROP_FALLBACK_RATIO).round().max(1.0) as i32;
-            let rh = ((img_h as f32) * CROP_FALLBACK_RATIO).round().max(1.0) as i32;
-            Some((x - rw / 2, y - rh / 2, rw, rh))
-        }
-        // 3. No usable anchor: full image
-        _ => None,
-    };
-
-    let cropped = match region {
-        Some((l, t, w, h)) => {
-            let left = l.max(0);
-            let top = t.max(0);
-            let w = w.min(img_w - left);
-            let h = h.min(img_h - top);
-            if w <= 0 || h <= 0 {
-                // Crop region fully outside image: return original unchanged
-                return base64_str.to_string();
-            }
+    let cropped = match ai_crop_region(img_w, img_h, click_x, click_y, crop_w, crop_h, action_type)
+    {
+        AiCropRegion::Rect(left, top, w, h) => {
             img.crop_imm(left as u32, top as u32, w as u32, h as u32)
         }
-        None => img,
+        AiCropRegion::Full => img,
+        // 锚点完全在图外：历史约定是原样返回，不做任何重编码
+        AiCropRegion::Outside => return base64_str.to_string(),
     };
 
     // Encode as JPEG with quality control
@@ -657,6 +696,149 @@ mod pipeline_tests {
         let base_img = image::load_from_memory(&decode(&base)).unwrap();
         let typed_img = image::load_from_memory(&decode(&typed)).unwrap();
         assert!(typed_img.width() > base_img.width());
+    }
+
+    /* ── 裁图几何（ai_crop_region）───────────────────────────────
+     * 本端常量（PAD=24 / MIN=280 / 缩到 90%）与导出端、前端**刻意不同**，
+     * 但 type 步骤「左扩 1/3 宽」的几何推导是同一套 —— 左移量必须是 extra/2。
+     * 旧写法 `- extra` 的过冲阈值更高（PAD=24 → 元素宽 > 144px 才被切），
+     * 所以下面用 cw=300 这种常见输入框宽度来锁定。
+     *
+     * 场景：800x600 截图，元素矩形中心 (400,300)、尺寸 300x40
+     *   rw = (300+48).max(280) = 348, rh = (40+48).max(280) = 280
+     *   scale = min(1.0, 720/348, 540/280) = 1.0（不缩）
+     *   type : extra = 100, rw = 448, left = 400-224-50 = 126, top = 300-140 = 160
+     *   click: left = 400-174 = 226, top = 160
+     */
+
+    /// 取出 Rect 分支，否则 panic —— 让断言保持简洁
+    fn rect(r: AiCropRegion) -> (i32, i32, i32, i32) {
+        match r {
+            AiCropRegion::Rect(l, t, w, h) => (l, t, w, h),
+            AiCropRegion::Full => panic!("期望 Rect，实际 Full"),
+            AiCropRegion::Outside => panic!("期望 Rect，实际 Outside"),
+        }
+    }
+
+    #[test]
+    fn ai_crop_region_golden_type_and_click() {
+        assert_eq!(
+            rect(ai_crop_region(
+                800, 600, Some(400), Some(300), Some(300), Some(40), "type"
+            )),
+            (126, 160, 448, 280)
+        );
+        assert_eq!(
+            rect(ai_crop_region(
+                800, 600, Some(400), Some(300), Some(300), Some(40), "click"
+            )),
+            (226, 160, 348, 280)
+        );
+    }
+
+    #[test]
+    fn ai_crop_region_type_never_clips_element_right_edge() {
+        // 核心防线：元素矩形须完整落在框内，四边留白 >= CROP_PAD。
+        // 旧写法 `- extra` 在 cw=300 时会把右边缘切掉 26px。
+        for cw in [24, 60, 100, 150, 200, 300, 480, 600, 900] {
+            for ch in [24, 40, 80, 200] {
+                for at in ["type", "click"] {
+                    let (l, t, w, h) = rect(ai_crop_region(
+                        1920, 1080, Some(960), Some(540), Some(cw), Some(ch), at,
+                    ));
+                    let (el, et) = (960 - cw / 2, 540 - ch / 2);
+                    let pads = [
+                        ("左", el - l),
+                        ("右", (l + w) - (el + cw)),
+                        ("上", et - t),
+                        ("下", (t + h) - (et + ch)),
+                    ];
+                    for (name, p) in pads {
+                        assert!(
+                            p >= CROP_PAD,
+                            "{at} {cw}x{ch} 元素被切：{name}侧留白 {p}px < CROP_PAD({CROP_PAD})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ai_crop_region_type_keeps_label_zone_on_left() {
+        let (l, _t, w, _h) = rect(ai_crop_region(
+            800, 600, Some(400), Some(300), Some(300), Some(40), "type",
+        ));
+        let (elem_left, elem_right) = (250, 550);
+        assert_eq!((l + w) - elem_right, CROP_PAD, "右侧留白应恰为 CROP_PAD");
+        assert_eq!(
+            elem_left - l,
+            CROP_PAD + 100,
+            "左侧留白应为 CROP_PAD + extra(100)"
+        );
+    }
+
+    #[test]
+    fn ai_crop_region_fallback_and_full_cases() {
+        // 只有点击点：屏幕 40%
+        assert_eq!(
+            rect(ai_crop_region(
+                800, 600, Some(400), Some(300), None, None, "click"
+            )),
+            (240, 180, 320, 240)
+        );
+        // 无坐标 → Full（用全图，但会重编码）
+        assert!(
+            matches!(
+                ai_crop_region(800, 600, None, None, None, None, "click"),
+                AiCropRegion::Full
+            ),
+            "无锚点应为 Full"
+        );
+        // 退化尺寸 / 锚点完全在图外 → Outside（原样返回，不重编码）
+        assert!(
+            matches!(
+                ai_crop_region(0, 0, Some(1), Some(1), Some(2), Some(2), "click"),
+                AiCropRegion::Outside
+            ),
+            "退化图尺寸应为 Outside"
+        );
+        assert!(
+            matches!(
+                ai_crop_region(100, 100, Some(5000), Some(5000), None, None, "click"),
+                AiCropRegion::Outside
+            ),
+            "锚点完全在图外应为 Outside（防 panic 的历史约定）"
+        );
+    }
+
+    #[test]
+    fn ai_crop_region_stays_within_image_bounds() {
+        for (cx, cy) in [(20, 20), (960, 540), (1900, 1060), (0, 0)] {
+            for at in ["type", "click"] {
+                if let AiCropRegion::Rect(l, t, w, h) =
+                    ai_crop_region(1920, 1080, Some(cx), Some(cy), Some(300), Some(40), at)
+                {
+                    assert!(l >= 0 && t >= 0, "{at} 负坐标 ({cx},{cy}) -> ({l},{t})");
+                    assert!(
+                        l + w <= 1920 && t + h <= 1080,
+                        "{at} 越界 ({cx},{cy}) -> {l},{t},{w},{h}"
+                    );
+                    assert!(w > 0 && h > 0, "{at} 退化尺寸 ({cx},{cy}) -> {w}x{h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ai_crop_region_applies_min_size_for_tiny_elements() {
+        // 极小元素：框被放大到 CROP_MIN_SIZE，元素自然居中
+        let (l, t, w, h) = rect(ai_crop_region(
+            800, 600, Some(400), Some(300), Some(10), Some(10), "click",
+        ));
+        assert_eq!(w, CROP_MIN_SIZE.min(800));
+        assert_eq!(h, CROP_MIN_SIZE.min(600));
+        assert!(l >= 0 && t >= 0 && l + w <= 800 && t + h <= 600);
     }
 
     #[test]

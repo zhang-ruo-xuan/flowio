@@ -388,6 +388,73 @@ pub(crate) fn prepare_export_steps(
 /// - 无坐标：与前端一致返回全图（前端此场景同样显示全图）。
 const EXPORT_CROP_PAD: i32 = 8;
 
+/// 导出裁剪框的纯几何（不碰图片字节），便于单测。
+///
+/// ⚠️ 这套「居中锚点 → 外扩 PAD → type 左扩 1/3 宽」的算法在仓库里有 **4 份实现**，
+/// 任何一份改动都必须同步其余三份，否则编辑器里看到的图和导出/AI 的图会不一致：
+///   1. `src/lib/cropAnchor.ts`          —— 前端 cropBoxFromAnchor / rectToCropAnchor
+///   2. `src/pages/StepEditor.tsx`       —— 前端 cropAdaptiveBase64（编辑器实际显示）
+///   3. `src-tauri/src/export/commands.rs` —— 本函数（导出 docx/html/pdf）
+///   4. `src-tauri/src/ai/pipeline.rs`   —— AI 管线裁图
+/// 一致性由 `npm run check:crop`（前端）与 `cargo test`（Rust 端）共同兜底。
+pub(crate) fn export_crop_box(
+    img_w: i32,
+    img_h: i32,
+    x: Option<i32>,
+    y: Option<i32>,
+    crop_w: Option<i32>,
+    crop_h: Option<i32>,
+    action_type: &str,
+) -> Option<(i32, i32, i32, i32)> {
+    // 整窗类型不裁剪（与前端 Stage C 一致）
+    if matches!(action_type, "scroll" | "nav" | "screenshot") {
+        return None;
+    }
+    if img_w <= 0 || img_h <= 0 {
+        return None;
+    }
+
+    // 分支选择（与前端 cropAdaptiveBase64 逐条对齐）：
+    // ① 有元素矩形（中心+尺寸）→ 按矩形外扩裁剪，**不校验坐标正负**——前端同样不校验，
+    //    元素中心落在屏幕外时两侧行为必须一致，否则编辑器显示裁图而导出变全图。
+    // ② 只有坐标且非负 → 点击点为中心裁 40%（前端此分支才要求 x>=0 && y>=0）。
+    // 前端 40% 兜底不加 CROP_PAD，此处用 add_pad 区分。
+    let (cx, cy, rw0, rh0, add_pad) = match (x, y, crop_w, crop_h) {
+        (Some(a), Some(b), Some(c), Some(d)) if c > 0 && d > 0 => (a, b, c, d, true),
+        (Some(a), Some(b), _, _) if a >= 0 && b >= 0 => {
+            let fw = ((img_w as f64) * 0.4).round() as i32;
+            let fh = ((img_h as f64) * 0.4).round() as i32;
+            (a, b, fw, fh, false)
+        }
+        _ => return None,
+    };
+
+    // ① 外扩 CROP_PAD
+    let mut rw = if add_pad { rw0 + EXPORT_CROP_PAD * 2 } else { rw0 };
+    let rh = if add_pad { rh0 + EXPORT_CROP_PAD * 2 } else { rh0 };
+
+    // ② type 步骤左侧多留原始宽的 1/3，把左侧 label（如"用户名"）带进裁图。
+    //    ⚠️ 左移量是 extra/2 而不是 extra：框宽 rw 已含 extra，居中项 cx - rw/2
+    //    天然在左右各分到 extra/2。写成 - extra 会过冲，使右侧留白变成
+    //    PAD - extra/2 —— 元素宽 > 48px 即为负值，右边缘被切（300px 输入框切 42px）。
+    //    extra 用 round 而非整数截断，与前端 Math.round(cropW / 3) 对齐。
+    let left = if add_pad && action_type == "type" {
+        let extra = ((rw0 as f64) / 3.0).round();
+        rw += extra as i32;
+        (cx as f64 - (rw as f64) / 2.0 - extra / 2.0).round() as i32
+    } else {
+        cx - rw / 2
+    };
+    let top = cy - rh / 2;
+
+    // 贴边平移进图内（不缩小裁剪框，避免内容被切掉一半）
+    let rw = rw.min(img_w).max(1);
+    let rh = rh.min(img_h).max(1);
+    let left = left.clamp(0, img_w - rw);
+    let top = top.clamp(0, img_h - rh);
+    Some((left, top, rw, rh))
+}
+
 fn maybe_crop_screenshot_bytes(
     raw_bytes: Vec<u8>,
     x: Option<i32>,
@@ -396,54 +463,17 @@ fn maybe_crop_screenshot_bytes(
     crop_h: Option<i32>,
     action_type: &str,
 ) -> Vec<u8> {
-    // 整窗类型不裁剪（与前端 Stage C 一致）
-    if matches!(action_type, "scroll" | "nav" | "screenshot") {
-        return raw_bytes;
-    }
-    // 前端逻辑：连坐标都没有才显示全图，这里保持一致
-    let has_point = matches!((x, y), (Some(a), Some(b)) if a >= 0 && b >= 0);
-    if !has_point {
-        return raw_bytes;
-    }
     let mut img = match image::load_from_memory(&raw_bytes) {
         Ok(i) => i,
         Err(_) => return raw_bytes,
     };
     let img_w = img.width() as i32;
     let img_h = img.height() as i32;
-
-    // 分支选择（与前端 cropAdaptiveBase64 一致）：
-    // ① 有元素矩形（中心+尺寸）→ 按矩形外扩裁剪；② 只有坐标 → 点击点为中心裁 40%。
-    // 前端 40% 兜底不加 CROP_PAD，此处用 add_pad 区分。
-    let (cx, cy, rw0, rh0, add_pad) = match (x, y, crop_w, crop_h) {
-        (Some(a), Some(b), Some(c), Some(d)) if c > 0 && d > 0 => (a, b, c, d, true),
-        (Some(a), Some(b), _, _) => {
-            let fw = ((img_w as f64) * 0.4).round() as i32;
-            let fh = ((img_h as f64) * 0.4).round() as i32;
-            (a, b, fw, fh, false)
-        }
-        _ => return raw_bytes,
+    let (left, top, rw, rh) = match export_crop_box(img_w, img_h, x, y, crop_w, crop_h, action_type)
+    {
+        Some(v) => v,
+        None => return raw_bytes,
     };
-
-    // ① 外扩 CROP_PAD；type 步骤左扩 1/3 宽（仅矩形分支，与前端一致）
-    let mut rw = if add_pad { rw0 + EXPORT_CROP_PAD * 2 } else { rw0 };
-    let rh = if add_pad { rh0 + EXPORT_CROP_PAD * 2 } else { rh0 };
-    let left;
-    let top;
-    if add_pad && action_type == "type" {
-        let extra = rw0 / 3;
-        rw += extra;
-        left = cx - rw / 2 - extra;
-    } else {
-        left = cx - rw / 2;
-    }
-    top = cy - rh / 2;
-
-    // 贴边平移进图内（不缩小裁剪框，避免内容被切掉一半）
-    let rw = rw.min(img_w).max(1);
-    let rh = rh.min(img_h).max(1);
-    let left = left.clamp(0, img_w - rw);
-    let top = top.clamp(0, img_h - rh);
 
     let cropped = img.crop(left as u32, top as u32, rw as u32, rh as u32);
     let mut buf: Vec<u8> = Vec::new();
@@ -1663,6 +1693,183 @@ mod tests {
             .find(|l| l.contains("font-family"))
             .expect("找不到 font-family 样式行");
         assert!(style_body.contains("Microsoft YaHei"));
+    }
+
+    /* ── 裁图几何（export_crop_box）──────────────────────────────────
+     * 这套算法在仓库里有 4 份实现（见 export_crop_box 的文档注释）。
+     * 下面的黄金值是**前端 cropBoxFromAnchor 的实算输出**，用作跨语言锚点：
+     * 任何一端改动而不同步其余三端，这里就会红。
+     *
+     * 场景：1920x1080 截图，元素矩形中心 (960,540)、尺寸 300x40
+     *   type : extra = round(300/3) = 100, w = 300+16+100 = 416, x = 960-208-50 = 702
+     *   click: w = 300+16 = 316, x = 960-158 = 802
+     */
+
+    /// 元素矩形是否完整落在裁图框内，且四边留白都 >= CROP_PAD。
+    /// 这是「裁图不能切掉目标元素」的可执行定义。
+    fn element_fully_inside(
+        img_w: i32,
+        img_h: i32,
+        cx: i32,
+        cy: i32,
+        cw: i32,
+        ch: i32,
+        action_type: &str,
+    ) -> (bool, String) {
+        let box_ = match export_crop_box(
+            img_w,
+            img_h,
+            Some(cx),
+            Some(cy),
+            Some(cw),
+            Some(ch),
+            action_type,
+        ) {
+            Some(b) => b,
+            None => return (false, "export_crop_box 返回 None".into()),
+        };
+        let (l, t, w, h) = box_;
+        let el = (cx - cw / 2, cy - ch / 2, cw, ch);
+        let pads = [
+            ("左", el.0 - l),
+            ("右", (l + w) - (el.0 + el.2)),
+            ("上", el.1 - t),
+            ("下", (t + h) - (el.1 + el.3)),
+        ];
+        let bad: Vec<String> = pads
+            .iter()
+            .filter(|(_, p)| *p < EXPORT_CROP_PAD)
+            .map(|(n, p)| format!("{n}={p}px"))
+            .collect();
+        (
+            bad.is_empty(),
+            format!("box={box_:?} 留白 {}", bad.join(" ")),
+        )
+    }
+
+    #[test]
+    fn export_crop_box_golden_matches_frontend() {
+        // 与前端 cropBoxFromAnchor({x:960,y:540,cropW:300,cropH:40}) 的实算输出一致
+        assert_eq!(
+            export_crop_box(1920, 1080, Some(960), Some(540), Some(300), Some(40), "type"),
+            Some((702, 512, 416, 56))
+        );
+        assert_eq!(
+            export_crop_box(1920, 1080, Some(960), Some(540), Some(300), Some(40), "click"),
+            Some((802, 512, 316, 56))
+        );
+    }
+
+    #[test]
+    fn export_crop_box_golden_edge_element_sizes() {
+        // 极小元素（24px）与超宽元素（900px），同样对齐前端实算值
+        assert_eq!(
+            export_crop_box(1920, 1080, Some(960), Some(540), Some(24), Some(40), "type"),
+            Some((932, 512, 48, 56))
+        );
+        assert_eq!(
+            export_crop_box(1920, 1080, Some(960), Some(540), Some(900), Some(40), "type"),
+            Some((202, 512, 1216, 56))
+        );
+    }
+
+    #[test]
+    fn export_crop_box_type_never_clips_element_right_edge() {
+        // v25 的核心防线：元素宽 > 48px 时旧写法（- extra）会把右边缘切掉。
+        // 这里枚举常见输入框宽度，断言四边留白都 >= CROP_PAD。
+        for cw in [24, 48, 60, 100, 120, 200, 300, 480, 600, 900] {
+            for ch in [24, 40, 80] {
+                for at in ["type", "click"] {
+                    let (ok, msg) = element_fully_inside(1920, 1080, 960, 540, cw, ch, at);
+                    assert!(ok, "元素被切：{cw}x{ch} at={at} {msg}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn export_crop_box_type_keeps_label_zone_on_left() {
+        // type 的语义：左侧留白应比右侧多出 ~cw/3（label 区），不能两侧一样
+        let (l, _t, w, _h) =
+            export_crop_box(1920, 1080, Some(960), Some(540), Some(300), Some(40), "type")
+                .expect("type 应产生裁图框");
+        let elem_left = 960 - 150;
+        let elem_right = 960 + 150;
+        let pad_left = elem_left - l;
+        let pad_right = (l + w) - elem_right;
+        assert_eq!(pad_right, EXPORT_CROP_PAD, "右侧留白应恰为 CROP_PAD");
+        assert_eq!(
+            pad_left,
+            EXPORT_CROP_PAD + 100,
+            "左侧留白应为 CROP_PAD + extra(100)"
+        );
+    }
+
+    #[test]
+    fn export_crop_box_whole_window_and_missing_anchor() {
+        for at in ["scroll", "nav", "screenshot"] {
+            assert_eq!(
+                export_crop_box(1920, 1080, Some(1), Some(1), Some(2), Some(2), at),
+                None,
+                "{at} 应返回全图"
+            );
+        }
+        // 无坐标 / 退化图尺寸
+        assert_eq!(
+            export_crop_box(1920, 1080, None, None, Some(2), Some(2), "click"),
+            None
+        );
+        assert_eq!(
+            export_crop_box(0, 0, Some(1), Some(1), Some(2), Some(2), "click"),
+            None
+        );
+        // 负坐标但**没有**元素矩形 → 40% 兜底分支要求坐标非负 → 全图（与前端一致）
+        assert_eq!(
+            export_crop_box(1920, 1080, Some(-5), Some(10), None, None, "click"),
+            None
+        );
+    }
+
+    #[test]
+    fn export_crop_box_negative_center_with_rect_matches_frontend() {
+        // 元素中心落在屏幕外（负坐标）但**有**完整矩形时，前端 cropAdaptiveBase64
+        // 会正常裁剪（它只在这一分支校验 cropW/cropH > 0，不看坐标正负）。
+        // 导出端必须逐像素对齐，否则编辑器显示裁图、导出却是全图。
+        //   cw=2 → rw=18, left = -5-9 = -14 → clamp 到 0；top = 10-9 = 1
+        assert_eq!(
+            export_crop_box(1920, 1080, Some(-5), Some(10), Some(2), Some(2), "click"),
+            Some((0, 1, 18, 18))
+        );
+    }
+
+    #[test]
+    fn export_crop_box_fallback_40pct_when_no_element_rect() {
+        // 只有点击点：以点击点为中心裁屏幕的 40%，且不加 CROP_PAD
+        assert_eq!(
+            export_crop_box(1920, 1080, Some(960), Some(540), None, None, "click"),
+            Some((576, 324, 768, 432))
+        );
+    }
+
+    #[test]
+    fn export_crop_box_clamps_into_image_bounds() {
+        // 元素贴左上角：框必须平移进图内，不能出现负坐标或越界
+        for at in ["type", "click"] {
+            let (l, t, w, h) =
+                export_crop_box(1920, 1080, Some(20), Some(20), Some(300), Some(40), at)
+                    .unwrap_or_else(|| panic!("{at} 应产生裁图框"));
+            assert!(l >= 0 && t >= 0, "{at} 出现负坐标: ({l},{t})");
+            assert!(l + w <= 1920 && t + h <= 1080, "{at} 越界: {l},{t},{w},{h}");
+        }
+    }
+
+    #[test]
+    fn export_crop_box_never_exceeds_image_size() {
+        // 元素比图还大：宽高饱和到图尺寸，起点归零
+        assert_eq!(
+            export_crop_box(400, 300, Some(200), Some(150), Some(3000), Some(2000), "type"),
+            Some((0, 0, 400, 300))
+        );
     }
 
     // B3 回归 B：Edge 路径探测不依赖单一硬编码路径（环境变量 + 固定路径候选）

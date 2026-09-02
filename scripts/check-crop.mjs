@@ -229,6 +229,41 @@ console.log('5. 手动框选：平移尺寸恒定 + 任意输入不越界');
   if (bad > 0) fail(`平移/安全不变式共 ${bad} 例违规`);
 }
 
+/* ═══ 6. 跨端黄金值（与 Rust 导出端共用同一组数）══════ */
+
+console.log('6. 跨端黄金值：编辑器与导出必须逐像素一致');
+{
+  // 同一套裁图算法在仓库里有 4 份实现（详见 src-tauri/src/export/commands.rs
+  // 的 export_crop_box 文档注释）。前端 2 份与导出端常量完全一致（PAD=8），
+  // 因此必须算出同样的矩形 —— 否则编辑器里看到的图和导出的图不是同一张。
+  //
+  // ⚠️ 下面每个数字都同时硬编码在 `src-tauri/src/export/commands.rs` 的
+  //    `export_crop_box_golden_*` 测试里。改任一端都必须同步改两处。
+  //
+  // 场景：1920x1080 截图，元素矩形中心 (960,540)
+  //   type  300x40：extra = round(300/3) = 100，w = 300+16+100 = 416，x = 960-208-50 = 702
+  //   click 300x40：w = 316，x = 960-158 = 802
+  const GOLDEN = [
+    ['type  300x40', { x: 960, y: 540, cropW: 300, cropH: 40 }, 'type', [702, 512, 416, 56]],
+    ['click 300x40', { x: 960, y: 540, cropW: 300, cropH: 40 }, 'click', [802, 512, 316, 56]],
+    ['type   24x40', { x: 960, y: 540, cropW: 24, cropH: 40 }, 'type', [932, 512, 48, 56]],
+    ['type  900x40', { x: 960, y: 540, cropW: 900, cropH: 40 }, 'type', [202, 512, 1216, 56]],
+  ];
+  let bad = 0;
+  for (const [name, anchor, t, [gx, gy, gw, gh]] of GOLDEN) {
+    const b = cropBoxFromAnchor(anchor, t);
+    const got = [b.x, b.y, b.width, b.height];
+    if (got.some((v, i) => v !== [gx, gy, gw, gh][i])) {
+      bad++;
+      fail(`${name} 期望 [${gx},${gy},${gw},${gh}]，实得 [${got}]`);
+    }
+  }
+  if (!bad) {
+    console.log(`   ${GOLDEN.length} 组与 Rust 导出端一致`);
+    console.log('   （AI 管线 PAD=24/MIN=280，常量不同，黄金值另见其 cargo test）');
+  }
+}
+
 /* ═══ 结论 ════════════════════════════════════════════ */
 
 console.log('');
