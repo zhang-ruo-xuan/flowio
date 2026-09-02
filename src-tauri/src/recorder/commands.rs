@@ -862,16 +862,16 @@ fn flush_shortcut_step(
                             }
 
                             if !fallback_used {
-                                // ── 非 COPY L4: 活动窗口 ──
+                                // ── 非 COPY L4: 活动窗口（精确裁剪到窗口边界）──
+                                // get_active_window_rect() 返回 GetWindowRect（含标题栏/边框），
+                                // screen_rect_in_image 转成图坐标后直接用作裁图区域，
+                                // 不再打 8 折/7 折（旧逻辑留 20%/30% 缝隙导致「全图」模式
+                                // 裁剪框比实际应用窗口小一圈）。
                                 if let Some((wx, wy, ww, wh)) = crate::recorder::activity::get_active_window_rect()
                                     .and_then(|r| screenshot::screen_rect_in_image(r, ox_i32, oy_i32, win_w_i32, win_h_i32))
                                 {
-                                    let (cx, cy, cw, ch) = screenshot::centered_crop_box(
-                                        wx + ww / 2, wy + wh / 2,
-                                        (ww as f64 * 0.8) as i32,
-                                        (wh as f64 * 0.7).max(300.0) as i32,
-                                        win_w_i32, win_h_i32, 600, 300,
-                                    );
+                                    // 窗口矩形已由 screen_rect_in_image clamp 到图内，直接使用
+                                    let (cx, cy, cw, ch) = (wx, wy, ww, wh);
                                     if let Ok(mut st) = cs.lock() {
                                         if let Some(s) = st.get_mut(idx) {
                                             s.x = Some(cx);
