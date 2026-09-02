@@ -213,19 +213,16 @@ pub async fn generate_ai_steps(
                         // Config JSON may have invalid escapes (corrupted DB or
                         // legacy data). Try sanitizing escapes then re-parsing.
                         let sanitized = crate::ai::parse::sanitize_json_escapes(&json);
-                        match serde_json::from_str::<AiConfig>(&sanitized) {
-                            Ok(cfg) => cfg,
-                            Err(e) => {
-                                log::error!(
-                                    "AI config JSON corrupt (first 300 chars): {} | error: {}",
-                                    &json[..json.len().min(300)],
-                                    e
-                                );
-                                return Err(format!(
-                                    "AI 配置数据损坏（JSON 解析失败），请重新在设置中保存一次 AI 服务商配置。详情：{}",
-                                    e
-                                ));
-                            }
+                        if let Ok(cfg) = serde_json::from_str::<AiConfig>(&sanitized) {
+                            cfg
+                        } else {
+                            // Still can't parse — fall back to built-in free tier
+                            // rather than blocking the user entirely.
+                            log::warn!(
+                                "AI config JSON corrupt (first 300 chars): {} | falling back to flowio-free",
+                                &json[..json.len().min(300)]
+                            );
+                            get_builtin_free_config()
                         }
                     }
                 }
