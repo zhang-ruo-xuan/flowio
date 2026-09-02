@@ -214,6 +214,179 @@ pub fn capture_target_window(process_name: &str) -> Result<(DynamicImage, i32, i
     Ok((DynamicImage::ImageRgba8(img), origin_x, origin_y))
 }
 
+/// PrintWindow a single HWND (GPU-aware) into a `DynamicImage`.
+///
+/// Returns only the image (no origin). Shared by the composite capture path so
+/// the main window and every floating layer are rendered with identical logic.
+/// `PW_RENDERFULLCONTENT` is tried first so GPU-accelerated apps (WPS Office,
+/// games) are not rendered as black; falls back to `PW_CLIENTRECTONLY` +
+/// `DwmIsCompositionEnabled`, then to `BitBlt`.
+fn print_window_to_image(hwnd_raw: isize) -> Result<DynamicImage, String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+        GetDIBits, GetWindowDC, ReleaseDC, SelectObject,
+        BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
+        SRCCOPY,
+    };
+    use windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
+    use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    use scopeguard::guard;
+    use std::mem;
+
+    let hwnd = HWND(hwnd_raw as *mut _);
+
+    let rect = {
+        let mut r = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() {
+            return Err("print_window_to_image: GetWindowRect failed".to_string());
+        }
+        r
+    };
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return Err(format!("print_window_to_image: invalid size {}x{}", width, height));
+    }
+
+    let img = unsafe {
+        let hdc_window = guard(GetWindowDC(hwnd), |val| {
+            let _ = ReleaseDC(hwnd, val);
+        });
+
+        let hdc_mem = guard(CreateCompatibleDC(*hdc_window), |val| {
+            let _ = DeleteDC(val);
+        });
+
+        use windows::Win32::Graphics::Gdi::HGDIOBJ;
+
+        let h_bitmap = guard(
+            CreateCompatibleBitmap(*hdc_window, width, height),
+            |val: HBITMAP| { let _ = DeleteObject(HGDIOBJ::from(val)); },
+        );
+
+        let h_gdiobj: HGDIOBJ = (*h_bitmap).into();
+        SelectObject(*hdc_mem, h_gdiobj);
+
+        let mut ok = false;
+        // PW_RENDERFULLCONTENT (flag=2): captures GPU-rendered content (Win8+)
+        ok = PrintWindow(hwnd, *hdc_mem, PRINT_WINDOW_FLAGS(2)).as_bool();
+        // Fallback: PW_CLIENTRECTONLY (flag=0) with DWM composition
+        if !ok {
+            if let Ok(enabled) = DwmIsCompositionEnabled() {
+                if enabled.as_bool() {
+                    ok = PrintWindow(hwnd, *hdc_mem, PRINT_WINDOW_FLAGS(0)).as_bool();
+                }
+            }
+        }
+        // Last resort: BitBlt from window DC
+        if !ok {
+            let _ = BitBlt(*hdc_mem, 0, 0, width, height, *hdc_window, 0, 0, SRCCOPY);
+        }
+
+        // Read bits into image buffer
+        let buffer_size = (width * height * 4) as usize;
+        let mut bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biSizeImage: buffer_size as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buffer = vec![0u8; buffer_size];
+        let read_ok = GetDIBits(
+            *hdc_mem, *h_bitmap, 0, height as u32,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut bitmap_info, DIB_RGB_COLORS,
+        ) != 0;
+
+        if !read_ok {
+            return Err("GetDIBits failed after PrintWindow/BitBlt".to_string());
+        }
+
+        // BGRA → RGBA (swap R and B channels in-place)
+        for chunk in buffer.chunks_exact_mut(4) {
+            let tmp = chunk[0];
+            chunk[0] = chunk[2]; // R ← B
+            chunk[2] = tmp;       // B ← R
+        }
+
+        image::RgbaImage::from_raw(width as u32, height as u32, buffer)
+            .ok_or_else(|| "print_window_to_image: invalid image dimensions".to_string())?
+    };
+
+    Ok(DynamicImage::ImageRgba8(img))
+}
+
+/// True when two screen rectangles share any area.
+fn rects_intersect(a: super::recorder::Rect, b: super::recorder::Rect) -> bool {
+    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+}
+
+/// Capture a specific process as the **entire software**: the main application
+/// window plus every floating layer (modal dialogs, panels, floaters) owned by
+/// the same process, composited into one image.
+///
+/// `PrintWindow` only ever renders a single HWND's client area, so a modal
+/// dialog that is its own top-level window can never appear in a single
+/// `PrintWindow` call. We enumerate all visible windows of the process family,
+/// pick the largest as the base, then overlay every intersecting sibling window
+/// at its screen offset.
+///
+/// Returns `(image, origin_x, origin_y)` where `(0,0)` of the image maps to the
+/// main window's top-left on the virtual screen — same contract as
+/// `capture_fullscreen_with_origin`.
+pub fn capture_target_window_composite(process_name: &str) -> Result<(DynamicImage, i32, i32), String> {
+    let candidates = super::recorder::enum_target_windows(process_name);
+    if candidates.is_empty() {
+        return Err(format!(
+            "capture_target_window_composite: no visible window for {}",
+            process_name
+        ));
+    }
+    let main_hwnd = super::recorder::pick_main_hwnd(&candidates).ok_or_else(|| {
+        format!(
+            "capture_target_window_composite: no main window for {}",
+            process_name
+        )
+    })?;
+    let main_rect = candidates
+        .iter()
+        .find(|(h, _)| *h == main_hwnd)
+        .map(|(_, r)| *r)
+        .ok_or_else(|| {
+            "capture_target_window_composite: main window rect missing".to_string()
+        })?;
+    let (mx, my) = (main_rect.left, main_rect.top);
+
+    let mut canvas = print_window_to_image(main_hwnd)?;
+    // Iterate in reverse so later-created (top-most) windows paint last.
+    for (hwnd, rect) in candidates.iter().rev() {
+        if *hwnd == main_hwnd {
+            continue;
+        }
+        if !rects_intersect(*rect, main_rect) {
+            continue;
+        }
+        if let Ok(pop) = print_window_to_image(*hwnd) {
+            image::imageops::overlay(
+                &mut canvas,
+                &pop,
+                (rect.left - mx) as i64,
+                (rect.top - my) as i64,
+            );
+        }
+    }
+
+    Ok((canvas, mx, my))
+}
+
 use windows::Win32::UI::WindowsAndMessaging::WINDOWINFO;
 
 /// Capture the monitor under the cursor as a DynamicImage.

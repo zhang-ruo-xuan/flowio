@@ -1864,6 +1864,7 @@ fn build_recording_save(
     id: String,
     title: &str,
     steps: &[StepData],
+    target_app: Option<String>,
 ) -> (crate::db::RecordingSave, String) {
     let saves = steps_to_step_saves(steps);
     let step_count = saves.len();
@@ -1871,6 +1872,7 @@ fn build_recording_save(
         id: id.clone(),
         title: recording_title_or_default(title),
         app_name: String::new(),
+        target_app,
         steps: saves,
     };
     (save, format!("{} ({} steps)", id, step_count))
@@ -2197,7 +2199,12 @@ pub fn finish_recording(
             msg
         })?;
 
-        build_recording_save(recorder.id.clone(), &recorder.title, &recorder.steps)
+        build_recording_save(
+            recorder.id.clone(),
+            &recorder.title,
+            &recorder.steps,
+            recorder.target_window.clone(),
+        )
     };
 
     let conn = db.0.lock().map_err(|e| {
@@ -2688,7 +2695,7 @@ mod commands_tests {
     #[test]
     fn build_recording_save_basic() {
         let steps = vec![make_step(0), make_step(1), make_step(2)];
-        let (save, rec_id) = build_recording_save("rec-1".into(), "标题", &steps);
+        let (save, rec_id) = build_recording_save("rec-1".into(), "标题", &steps, None);
         assert_eq!(save.id, "rec-1");
         assert_eq!(save.title, "标题");
         assert_eq!(save.app_name, "");
@@ -2699,7 +2706,7 @@ mod commands_tests {
     #[test]
     fn build_recording_save_empty_title_fallback() {
         let steps = vec![make_step(0)];
-        let (save, rec_id) = build_recording_save("rec-2".into(), "", &steps);
+        let (save, rec_id) = build_recording_save("rec-2".into(), "", &steps, None);
         assert!(save.title.starts_with("录制 "));
         assert_eq!(save.app_name, "");
         assert_eq!(rec_id, "rec-2 (1 steps)");
@@ -2707,7 +2714,7 @@ mod commands_tests {
 
     #[test]
     fn build_recording_save_zero_steps() {
-        let (save, rec_id) = build_recording_save("rec-0".into(), "空", &[]);
+        let (save, rec_id) = build_recording_save("rec-0".into(), "空", &[], None);
         assert_eq!(save.steps.len(), 0);
         assert_eq!(rec_id, "rec-0 (0 steps)");
     }

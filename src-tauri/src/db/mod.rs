@@ -30,6 +30,7 @@ pub struct RecordingSave {
     pub id: String,
     pub title: String,
     pub app_name: String,
+    pub target_app: Option<String>,
     pub steps: Vec<StepSave>,
 }
 
@@ -39,8 +40,8 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
         .map_err(|e| format!("BEGIN: {}", e))?;
 
     if let Err(e) = conn.execute(
-        "INSERT INTO recordings (id, title, app_name, status, total_steps) VALUES (?1, ?2, ?3, 'completed', ?4)",
-        params![recording.id, recording.title, recording.app_name, recording.steps.len() as i32],
+        "INSERT INTO recordings (id, title, app_name, target_app, status, total_steps) VALUES (?1, ?2, ?3, ?4, 'completed', ?5)",
+        params![recording.id, recording.title, recording.app_name, recording.target_app, recording.steps.len() as i32],
     ) {
         let _ = conn.execute("ROLLBACK", []);
         return Err(format!("Insert recording failed: {}", e));
@@ -192,6 +193,11 @@ pub fn init_db(conn: &Connection) {
         "ALTER TABLE recordings ADD COLUMN user_id TEXT NOT NULL DEFAULT '{}'",
         LOCAL_USER
     ));
+
+    // ── Migrations: 录制指定软件的目标进程名（旧库兼容）──
+    let _ = conn.execute_batch(
+        "ALTER TABLE recordings ADD COLUMN target_app TEXT",
+    );
 }
 
 /// Open (or create) the database file and run migrations.
@@ -244,6 +250,7 @@ mod db_tests {
             id: id.into(),
             title: format!("Recording {}", id),
             app_name: "TestApp".into(),
+            target_app: None,
             steps: (0..n).map(|i| step(i as i32, (i + 1) as i32, opt)).collect(),
         }
     }
@@ -400,6 +407,7 @@ mod db_tests {
             id: "empty".into(),
             title: "Empty".into(),
             app_name: "App".into(),
+            target_app: None,
             steps: vec![],
         };
         save_recording_to_db(&conn, &rec).unwrap();

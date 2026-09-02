@@ -111,7 +111,7 @@ pub fn start_capture_thread(
             // In target-window mode, use PrintWindow (captures GPU-accelerated
             // windows like WPS Office that GDI BitBlt renders as black).
             let capture_result = match &target_window {
-                Some(target) => screenshot::capture_target_window(target),
+                Some(target) => screenshot::capture_target_window_composite(target),
                 None => screenshot::capture_fullscreen_with_origin(),
             };
 

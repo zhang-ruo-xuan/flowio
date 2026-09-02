@@ -249,6 +249,7 @@ mod tests {
             id: id.into(),
             title: format!("Rec {}", id),
             app_name: "TestApp".into(),
+            target_app: None,
             steps: (1..=n as i32).map(|i| step(i, i % 2 == 0)).collect(),
         }
     }

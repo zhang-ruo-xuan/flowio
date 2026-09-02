@@ -58,6 +58,11 @@ pub struct AiJob {
     /// "code"/"terminal"），`None` 表示自动按窗口标题推断领域。
     #[serde(default)]
     pub domain_mode: Option<String>,
+    /// 录制指定软件时记录的目标进程名。非空时无论窗口标题如何，强制走
+    /// 「整软件全图」喂图策略（等价 Spreadsheet 领域），AI 始终看到整张
+    /// 软件截图（含所有浮层弹窗）而非聚焦裁图。
+    #[serde(default)]
+    pub target_app: Option<String>,
 }
 
 /// Result returned by the AI pipeline.

@@ -12,6 +12,7 @@ pub struct Recording {
     pub id: String,
     pub title: String,
     pub app_name: String,
+    pub target_app: String,
     pub status: String,
     pub total_steps: i32,
     pub duration_secs: i32,
@@ -74,18 +75,19 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
     let recording = conn
         .query_row(
             "SELECT id, title, app_name, status, total_steps, duration_secs, \
-             created_at, updated_at FROM recordings WHERE id = ?1",
+             created_at, updated_at, target_app FROM recordings WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Recording {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     app_name: row.get(2)?,
-                    status: row.get(3)?,
-                    total_steps: row.get(4)?,
-                    duration_secs: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    target_app: row.get(3)?,
+                    status: row.get(4)?,
+                    total_steps: row.get(5)?,
+                    duration_secs: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
                 })
             },
         )
@@ -599,6 +601,7 @@ mod editor_tests {
             id: "r1".into(),
             title: "标题".into(),
             app_name: "App".into(),
+            target_app: String::new(),
             status: "completed".into(),
             total_steps: 3,
             duration_secs: 12,
@@ -684,6 +687,7 @@ mod editor_tests {
                 id: "r1".into(),
                 title: "标题".into(),
                 app_name: "App".into(),
+                target_app: String::new(),
                 status: "recording".into(),
                 total_steps: 1,
                 duration_secs: 5,

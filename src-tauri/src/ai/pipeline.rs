@@ -70,10 +70,17 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
     let mut job = job;
     // 领域模式：window_title 命中关键词自动判定领域，或用户手动标记（domain_mode）。
     // forced 模式（domain_mode 非 None）对全部分步强制使用指定领域。
-    let force_domain: Option<AppDomain> = job
+    let mut force_domain: Option<AppDomain> = job
         .domain_mode
         .as_deref()
         .map(crate::ai::domain::AppDomain::parse);
+    // 录制指定软件：无论窗口标题如何，强制「整软件全图」喂图策略。
+    // 等价 Spreadsheet 领域 → full_image()=true，AI 始终看到整张软件截图
+    // （含所有浮层弹窗），而非聚焦裁图；before_after()=true 让模型对比前后
+    // 全图，识别仅在差异中显现的操作（如函数弹窗的确认/取消）。
+    if job.target_app.is_some() {
+        force_domain = Some(AppDomain::Spreadsheet);
+    }
     for s in &mut job.steps {
         // 表格软件（WPS 表格/Excel/Calc…）：用户录制自己的表格，且 AI 需看清
         // 单元格内容（列标、函数名、数据表取值）才能写出精确步骤。跳过 OCR 脱敏

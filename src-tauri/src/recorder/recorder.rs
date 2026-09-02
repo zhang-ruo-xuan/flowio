@@ -283,12 +283,77 @@ pub fn find_window_hwnd_by_process(process_name: &str) -> Option<isize> {
             (&mut ctx as *mut (Vec<HwndCandidate>, Vec<String>)) as isize,
         );
     }
-    pick_target_hwnd(&ctx.0).inspect(|hwnd| {
-        capture_dbg_log(&format!(
-            "[CAPTURE] find_window_hwnd_by_process({}): hwnd=0x{:X}",
-            process_name, hwnd
-        ));
-    })
+    pick_target_hwnd(&ctx.0)        .inspect(|hwnd| {
+            capture_dbg_log(&format!(
+                "[CAPTURE] find_window_hwnd_by_process({}): hwnd=0x{:X}",
+                process_name, hwnd
+            ));
+        })
+}
+
+/// Enumerate ALL visible top-level windows belonging to the target process
+/// family (as `(hwnd, rect)` pairs).
+///
+/// Unlike `find_window_hwnd_by_process` (which picks a SINGLE window), this
+/// returns every candidate so the capture layer can composite the main window
+/// together with its floating layers (modal dialogs, panels, floaters) into one
+/// "entire software" image. See `screenshot::capture_target_window`.
+pub fn enum_target_windows(process_name: &str) -> Vec<(isize, Rect)> {
+    let family = process_family(process_name);
+    let mut ctx: (Vec<(isize, Rect)>, Vec<String>) = (Vec::new(), family);
+    unsafe {
+        EnumWindows(
+            Some(enum_windows_rect_hwnd_collect_callback),
+            (&mut ctx as *mut (Vec<(isize, Rect)>, Vec<String>)) as isize,
+        );
+    }
+    ctx.0
+}
+
+/// Pick the main application window (the BASE layer of the composite): the
+/// visible window with the largest area. Modal dialogs / panels are smaller, so
+/// the largest window is reliably the main app window.
+pub(super) fn pick_main_hwnd(candidates: &[(isize, Rect)]) -> Option<isize> {
+    let mut best: Option<(i64, isize)> = None;
+    for (hwnd, rect) in candidates {
+        let w = rect.width();
+        let h = rect.height();
+        if w < MIN_W || h < MIN_H {
+            continue;
+        }
+        let area = (w as i64) * (h as i64);
+        let better = match &best {
+            None => true,
+            Some((bs, _)) => area > *bs,
+        };
+        if better {
+            best = Some((area, *hwnd));
+        }
+    }
+    best.map(|(_, hwnd)| hwnd)
+}
+
+unsafe extern "system" fn enum_windows_rect_hwnd_collect_callback(hwnd: isize, lparam: isize) -> i32 {
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
+        return 1;
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    let Some(name) = process_name_of_pid(pid) else {
+        return 1;
+    };
+    let (candidates, family) = &mut *(lparam as *mut (Vec<(isize, Rect)>, Vec<String>));
+    if !family.iter().any(|m| name.eq_ignore_ascii_case(m)) {
+        return 1;
+    }
+    let mut rect = Rect::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) } != 0
+        && rect.right > rect.left
+        && rect.bottom > rect.top
+    {
+        candidates.push((hwnd, rect));
+    }
+    1
 }
 
 /// A candidate window with its HWND for PrintWindow capture.

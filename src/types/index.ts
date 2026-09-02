@@ -11,6 +11,7 @@ export interface Recording {
   id: string;
   title: string;
   app_name: string;
+  target_app?: string;
   status: string;
   total_steps: number;
   duration_secs?: number;
