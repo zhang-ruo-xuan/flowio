@@ -7,6 +7,11 @@ use crate::ai::types::StepOutput;
 /// - Markdown code-fenced JSON: ` ```json ... ``` `
 /// - Loose code-fenced JSON: ` ``` ... ``` `
 ///
+/// Also sanitizes invalid escape sequences that some LLMs produce
+/// (e.g. `\s`, `\(`, `\.`) which are valid in regex strings but
+/// **not** in JSON — they cause `serde_json` to error with
+/// "invalid escape at line 1 column N".
+///
 /// After successful parsing, performs an `action_type` consistency check:
 /// if the AI returned `action_type` differs from `original_action_type`,
 /// appends `[AI检测异常]` to the title and logs a warning — but still
@@ -14,12 +19,17 @@ use crate::ai::types::StepOutput;
 pub fn parse_step_output(raw: &str, original_action_type: &str) -> Result<StepOutput, String> {
     let trimmed = raw.trim();
 
+    // Sanitize invalid escape sequences once, before any parsing attempt.
+    // Some LLMs emit non-JSON escapes (\s, \(, \., etc.) that cause
+    // serde_json to error with "invalid escape at line 1 column N".
+    let sanitized = sanitize_json_escapes(trimmed);
+
     // Try direct JSON parse first
-    let mut step = if let Ok(step) = serde_json::from_str::<StepOutput>(trimmed) {
+    let mut step = if let Ok(step) = serde_json::from_str::<StepOutput>(&sanitized) {
         step
     } else {
         // Try to extract JSON from markdown code blocks
-        let json_str = extract_json_from_markdown(trimmed)?;
+        let json_str = extract_json_from_markdown(&sanitized)?;
         serde_json::from_str::<StepOutput>(&json_str).map_err(|e| {
             format!(
                 "Failed to parse StepOutput from JSON: {}. Raw: {}",
@@ -42,6 +52,69 @@ pub fn parse_step_output(raw: &str, original_action_type: &str) -> Result<StepOu
     }
 
     Ok(step)
+}
+
+/// Sanitize invalid JSON escape sequences produced by some LLMs.
+///
+/// JSON only allows these escapes: `\" \\ \/ \b \f \n \r \t \uXXXX`.
+/// LLMs sometimes emit regex-style escapes like `\s` `\(` `\.` or
+/// Chinese-punctuation escapes, which cause `serde_json::from_str` to fail
+/// with "invalid escape at line 1 column N".
+///
+/// This function scans for `\` followed by an invalid escape character and
+/// replaces it with `\\` (escaped backslash) + the character — effectively
+/// treating the backslash as a literal rather than an escape introducer.
+///
+/// It is careful to **not** break valid `\uXXXX` sequences (exactly 4 hex
+/// digits after `\u`) and preserves all standard JSON escapes.
+fn sanitize_json_escapes(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            // Check if this is a valid JSON escape
+            let is_valid = match next {
+                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => true,
+                'u' => {
+                    // \u must be followed by exactly 4 hex digits
+                    let mut ok = true;
+                    for j in 2..=5 {
+                        if i + j >= chars.len() || !chars[i + j].is_ascii_hexdigit() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                }
+                _ => false,
+            };
+            if is_valid {
+                // Valid JSON escape — keep as-is
+                out.push('\\');
+                out.push(next);
+                // For \uXXXX, also copy the 4 hex digits
+                if next == 'u' {
+                    for j in 2..=5 {
+                        out.push(chars[i + j]);
+                    }
+                    i += 6;
+                    continue;
+                }
+                i += 2;
+                continue;
+            }
+            // Invalid escape: convert `\x` → `\\x`
+            out.push_str("\\\\");
+            out.push(next);
+            i += 2;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Attempt to extract a JSON substring from a string that may be
@@ -216,5 +289,46 @@ mod tests {
         let result = parse_step_output(raw, "").unwrap();
         assert_eq!(result.title, "点击");
         assert!(!result.title.contains("[AI检测异常]"));
+    }
+
+    // ── sanitize_json_escapes ─────────────────────────────────
+
+    #[test]
+    fn test_sanitize_preserves_valid_escapes() {
+        // All standard JSON escapes must pass through unchanged
+        let input = r#"{"a":"\" \\ \/ \b \f \n \r \t"}"#;
+        let out = sanitize_json_escapes(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn test_sanitize_fixes_invalid_escapes() {
+        // \s \( \) \. are NOT valid JSON escapes
+        let input = r#"{"title":"测试\s内容\(重要\)"}"#;
+        let out = sanitize_json_escapes(input);
+        // After sanitization: \s → \\s, \( → \\(, \) → \\)
+        assert!(!out.contains("\\s") || out.contains("\\\\s")); // should be double-backslash now
+        // Must be parseable as JSON
+        let v: serde_json::Value = serde_json::from_str(&out).expect("sanitized JSON should parse");
+        assert_eq!(v["title"].as_str().unwrap(), "测试\\s内容\\(重要\\)");
+    }
+
+    #[test]
+    fn test_sanitize_handles_invalid_u_escape() {
+        // \u not followed by 4 hex digits
+        let input = r#"{"desc":"error\u123"}"#;
+        let out = sanitize_json_escapes(input);
+        // Should not panic and should produce valid JSON
+        let v: serde_json::Value = serde_json::from_str(&out).expect("should parse after sanitize");
+        assert!(v["desc"].as_str().unwrap().contains("\\u"));
+    }
+
+    #[test]
+    fn test_parse_with_invalid_escapes_succeeds() {
+        // Full integration: LLM output with invalid escapes should parse OK
+        let raw = r#"{"title":"在\s输入框\(\)中输入","description":"点击\.按钮","action_type":"type","tip":""}"#;
+        let result = parse_step_output(raw, "type").unwrap();
+        assert!(result.title.contains("输入框"));
+        assert_eq!(result.action_type, "type");
     }
 }
