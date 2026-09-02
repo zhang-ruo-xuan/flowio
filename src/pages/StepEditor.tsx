@@ -1655,17 +1655,18 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 if (!_src) {
                   // ── 无截图（COPY / HOTKEY 等）：紧凑居中卡片 ──
                   return (
-                    <div className="step-detail-image step-detail-image--empty">
+                    <div className="step-detail-image step-detail-image--empty"
+                      style={{ backgroundColor: '#f5f6f7' }}>
                       <div
                         className="step-detail-no-image step-detail-no-image-compact"
                         onClick={pickFileForUpload}
                         onContextMenu={pasteScreenshot}
                         style={{ position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
                       >
-                        <div className="upload-hint">
-                          <span className="no-image-action-type">{selectedStep?.action_type?.toUpperCase() || ''}</span>
-                          <span className="no-image-title">{selectedStep?.title || '(无标题)'}</span>
-                          <span className="no-image-hint">点击或右键粘贴上传截图</span>
+                        <div className="upload-hint" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#9aa0a6' }}>
+                          <span className="no-image-action-type" style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '1px', color: '#c0c4cc', textTransform: 'uppercase' }}>{selectedStep?.action_type?.toUpperCase() || ''}</span>
+                          <span className="no-image-title" style={{ fontSize: '18px', fontWeight: 600, color: '#24292e', marginTop: '2px' }}>{selectedStep?.title || '(无标题)'}</span>
+                          <span className="no-image-hint" style={{ fontSize: '12px', color: '#9aa0a6' }}>点击或右键粘贴上传截图</span>
                         </div>
                       </div>
                     </div>
