@@ -1682,6 +1682,22 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                             src={`data:image/jpeg;base64,${src}`}
                             alt={`步骤 ${selectedIndex + 1} 截图`}
                             onClick={() => openLightbox(selectedIndex)}
+                            onLoad={(e) => {
+                              // 把图片实际宽高比写到容器上，消除 16:9 锁死留下的 letterbox 缝隙。
+                              // 同时把容器 max-height（420）也算进去：宽高比的"宽"按容器宽度、
+                              // "高"按 min(自然高, 420) 算，确保容器最终实际高宽比跟图片一致，
+                              // 否则窄窗口下 contain 会留下几像素左右 letterbox。
+                              const img = e.currentTarget;
+                              const parent = img.parentElement;
+                              if (parent && img.naturalWidth > 0 && img.naturalHeight > 0) {
+                                const w = parent.clientWidth;
+                                const MAX_H = 420;
+                                const naturalH = (w * img.naturalHeight) / img.naturalWidth;
+                                const effectiveH = Math.min(naturalH, MAX_H);
+                                const effectiveAspect = w / effectiveH;
+                                parent.style.setProperty('--step-img-aspect', `${effectiveAspect}`);
+                              }
+                            }}
                             style={{ cursor: "pointer" }}
                           />
                           <button

@@ -970,7 +970,8 @@ select {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  padding: 16px 40px;
+  /* 缩小左右内边距（之前 40px 让主预览图左侧留下一条灰底"缝隙"）+ 收紧上内边距 */
+  padding: 12px 16px 16px;
 }
 
 /* ---- Editor topbar ---- */
@@ -1712,7 +1713,8 @@ select {
 
 .step-detail {
   width: 100%;
-  max-width: 640px;
+  /* 取消 max-width 限制，让主预览图能把右侧空间用满；之前 640px 会在宽窗口下留大块空白 */
+  max-width: none;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -1722,7 +1724,10 @@ select {
   position: relative;
   width: 100%;
   flex-shrink: 0;
-  aspect-ratio: 16 / 9;
+  /* 跟随主预览图实际宽高比（由 <img onLoad> 写入 --step-img-aspect）。
+     截图裁掉 watermark 后比例常 ≠ 16/9（如 1536×824 ≈ 1.86:1），锁死 16/9
+     会让 object-fit: contain 留下底部 letterbox 缝隙。 */
+  aspect-ratio: var(--step-img-aspect, 16 / 9);
   min-height: 200px;
   max-height: 420px;
   border: 1px solid var(--border);
