@@ -390,7 +390,7 @@ fn resolve_provider_test_endpoint(provider_id: &str, api_key: &str) -> Option<(S
         "openai" => Some(("https://api.openai.com/v1/models".to_string(), false)),
         "deepseek" => Some(("https://api.deepseek.com/v1/models".to_string(), false)),
         "moonshot" => Some(("https://api.moonshot.cn/v1/models".to_string(), false)),
-        "zhipu" => Some(("https://open.bigmodel.cn/api/paas/v4/models".to_string(), false)),
+        "zhipu" | "flowio-free" => Some(("https://open.bigmodel.cn/api/paas/v4/models".to_string(), false)),
         "anthropic" => Some(("https://api.anthropic.com/v1/models".to_string(), false)),
         "gemini" => Some((
             format!(
@@ -545,6 +545,13 @@ pub fn test_api_key(
     provider_id: String,
     api_key: String,
 ) -> Result<String, String> {
+    // "builtin" sentinel from frontend → use actual built-in key for flowio-free
+    let api_key = if api_key == "builtin" && provider_id == "flowio-free" {
+        get_builtin_free_config().api_key
+    } else {
+        api_key
+    };
+
     // Determine base_url: try built-in first, then look up custom provider
     let (test_url, is_post) = match resolve_provider_test_endpoint(&provider_id, &api_key) {
         Some(ep) => ep,
@@ -1043,7 +1050,7 @@ mod ai_commands_tests {
         assert_eq!(url, "https://qianfan.baidubce.com/v2/chat/completions");
         assert!(is_post);
 
-        for p in ["deepseek", "moonshot", "zhipu", "anthropic", "qwen", "doubao", "minimax", "yi", "baichuan"] {
+        for p in ["deepseek", "moonshot", "zhipu", "flowio-free", "anthropic", "qwen", "doubao", "minimax", "yi", "baichuan"] {
             assert!(resolve_provider_test_endpoint(p, "k").is_some(), "{}", p);
         }
     }
