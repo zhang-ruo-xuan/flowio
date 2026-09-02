@@ -617,14 +617,31 @@ pub struct CustomProvider {
 }
 
 /// Read the custom providers list from the settings table.
+///
+/// Gracefully handles legacy/corrupt data: if the stored JSON is not a
+/// valid array, returns an empty list (and overwrites the bad data so
+/// the error doesn't recur).
 fn read_custom_providers(db: &DbState) -> Result<Vec<CustomProvider>, String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare("SELECT value FROM settings WHERE key = ?1")
-        .map_err(|e| e.to_string())?;
-    let json: Option<String> = stmt.query_row(params![CUSTOM_PROVIDERS_KEY], |row| row.get(0)).ok();
+    let json = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .map_err(|e| e.to_string())?;
+        stmt.query_row(params![CUSTOM_PROVIDERS_KEY], |row| row.get::<_, String>(0)).ok()
+    };
+    // Lock released here before potential write below.
     match json {
-        Some(s) if !s.is_empty() => serde_json::from_str(&s).map_err(|e| e.to_string()),
+        Some(s) if !s.is_empty() => {
+            match serde_json::from_str::<Vec<CustomProvider>>(&s) {
+                Ok(providers) => Ok(providers),
+                Err(_) => {
+                    // Legacy/corrupt data (object instead of array, etc.):
+                    // overwrite with empty array so it doesn't block future saves.
+                    let _ = write_custom_providers(db, &[]);
+                    Ok(Vec::new())
+                }
+            }
+        }
         _ => Ok(Vec::new()),
     }
 }
