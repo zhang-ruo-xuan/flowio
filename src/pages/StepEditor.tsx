@@ -314,6 +314,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const [showSaveDialog, setShowSaveDialog] = useState<string | null>(null);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [aiGenerating, setAiGenerating] = useState(false);
+  const [spreadsheetMode, setSpreadsheetMode] = useState(false);
 
   // 未登录 + 录制完成后自动弹出「保存到云端」登录引导弹窗（LoginSaveModal）
   const [showLoginSaveModal, setShowLoginSaveModal] = useState(false);
@@ -1138,7 +1139,10 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const handleAiGenerate = useCallback(async () => {
     setAiGenerating(true);
     try {
-      const result: string = await invoke("generate_ai_steps", { recordingId });
+      const result: string = await invoke("generate_ai_steps", {
+        recordingId,
+        spreadsheetMode,
+      });
       alert(result);
       await reloadRecording();
     } catch (err) {
@@ -1360,6 +1364,19 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           </button>
           {toolsOpen && (
             <div className="export-dropdown" style={{ right: 0, zIndex: 9999 }}>
+              <label
+                className="export-dropdown-item"
+                style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <input
+                  type="checkbox"
+                  checked={spreadsheetMode}
+                  onChange={(e) => setSpreadsheetMode(e.target.checked)}
+                  style={{ cursor: "pointer" }}
+                />
+                <span className="export-dropdown-item-label">表格软件模式（精准识别单元格/函数）</span>
+              </label>
               <button
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleAiGenerate(); }}

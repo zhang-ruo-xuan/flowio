@@ -53,6 +53,10 @@ pub struct StepOutput {
 pub struct AiJob {
     pub recording_id: String,
     pub steps: Vec<StepInput>,
+    /// 用户手动标记的「表格软件模式」：识别时使用全图 + 表格专项 prompt，
+    /// 即使窗口标题不含 Excel/WPS 等关键词也能精准识别单元格/函数。
+    #[serde(default)]
+    pub spreadsheet_mode: bool,
 }
 
 /// Result returned by the AI pipeline.

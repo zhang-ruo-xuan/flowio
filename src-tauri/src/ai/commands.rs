@@ -59,12 +59,14 @@ fn run_ai_pipeline_sync(
     config: &AiConfig,
     step_rows: &[StepRow],
     recording_id: String,
+    spreadsheet_mode: bool,
 ) -> Result<AiResult, String> {
     let step_inputs: Vec<StepInput> = step_rows.iter().map(row_to_step_input).collect();
 
     let job = AiJob {
         recording_id,
         steps: step_inputs,
+        spreadsheet_mode,
     };
 
     pipeline::run_pipeline(config, job)
@@ -167,6 +169,7 @@ fn get_builtin_free_config() -> AiConfig {
 pub async fn generate_ai_steps(
     db: State<'_, DbState>,
     recording_id: String,
+    spreadsheet_mode: Option<bool>,
 ) -> Result<String, String> {
     // ── Phase 1: Load config and steps from DB (main thread) ──
     let config: AiConfig = {
@@ -280,7 +283,7 @@ pub async fn generate_ai_steps(
     // ── Phase 2: Run pipeline on background thread ──────────
     let rid = recording_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        run_ai_pipeline_sync(&config, &step_rows, rid)
+        run_ai_pipeline_sync(&config, &step_rows, rid, spreadsheet_mode.unwrap_or(false))
     })
     .await
     .map_err(|e| format!("AI 生成任务异常: {}", e))?
@@ -920,7 +923,7 @@ mod ai_commands_tests {
     #[test]
     fn run_ai_pipeline_sync_empty_steps_returns_empty() {
         let cfg = AiConfig { provider: text_provider(), api_key: "sk-test".into() };
-        let result = run_ai_pipeline_sync(&cfg, &[], "rec-1".into()).unwrap();
+        let result = run_ai_pipeline_sync(&cfg, &[], "rec-1".into(), false).unwrap();
         assert!(result.steps.is_empty());
         assert!(result.errors.is_empty());
     }
@@ -934,7 +937,7 @@ mod ai_commands_tests {
         image::DynamicImage::new_rgb8(8, 8).save(&png).unwrap();
         let cfg = AiConfig { provider: text_provider(), api_key: "sk-test".into() };
         let rows = vec![step_row_with_screenshot(png.to_string_lossy().to_string())];
-        let err = run_ai_pipeline_sync(&cfg, &rows, "rec-1".into()).unwrap_err();
+        let err = run_ai_pipeline_sync(&cfg, &rows, "rec-1".into(), false).unwrap_err();
         assert!(err.contains("不支持图片识别"), "err: {}", err);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -948,7 +951,7 @@ mod ai_commands_tests {
         let cfg = AiConfig { provider: text_provider(), api_key: "sk-test".into() };
         let mut row = step_row_with_screenshot(String::new());
         row.before_screenshot_path = png.to_string_lossy().to_string();
-        let err = run_ai_pipeline_sync(&cfg, &[row], "rec-1".into()).unwrap_err();
+        let err = run_ai_pipeline_sync(&cfg, &[row], "rec-1".into(), false).unwrap_err();
         assert!(err.contains("不支持图片识别"), "err: {}", err);
         let _ = std::fs::remove_dir_all(&dir);
     }

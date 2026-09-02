@@ -68,7 +68,7 @@ pub(crate) fn is_spreadsheet_window(title: &str) -> bool {
 ///
 /// Includes step number, title, description (from recording metadata),
 /// and instructs the model to produce a structured JSON output.
-pub fn build_step_prompt(step: &StepInput, step_number: usize) -> String {
+pub fn build_step_prompt(step: &StepInput, step_number: usize, force_spreadsheet: bool) -> String {
     let context_line = if !step.window_title.is_empty() {
         format!("操作窗口：{}\n", step.window_title)
     } else {
@@ -81,7 +81,7 @@ pub fn build_step_prompt(step: &StepInput, step_number: usize) -> String {
         String::new()
     };
 
-    let spreadsheet_hint = if is_spreadsheet_window(&step.window_title) {
+    let spreadsheet_hint = if is_spreadsheet_window(&step.window_title) || force_spreadsheet {
         "【表格软件】此步骤疑似电子表格操作，请严格按「表格/电子表格软件专项规则」撰写：标题必须含精确单元格引用（如 B22），涉及函数时写明函数名与入口，描述补全关键参数取值与填充范围。\n".to_string()
     } else {
         String::new()
@@ -153,7 +153,7 @@ mod prompt_tests {
 
     #[test]
     fn build_step_prompt_includes_metadata() {
-        let p = build_step_prompt(&input("点击保存", "描述", "click", "记事本"), 1);
+        let p = build_step_prompt(&input("点击保存", "描述", "click", "记事本"), 1, false);
         assert!(p.contains("第 1 个操作步骤"));
         assert!(p.contains("操作窗口：记事本"));
         assert!(p.contains("录制动作类型：click"));
@@ -166,6 +166,7 @@ mod prompt_tests {
         let p = build_step_prompt(
             &input("单击", "", "click", "销售表.xlsx - WPS 表格"),
             2,
+            false,
         );
         assert!(p.contains("【表格软件】"), "表格窗口应注入表格软件强化指令");
         assert!(p.contains("B22") || p.contains("单元格"), "应提示精确单元格引用");
@@ -173,13 +174,21 @@ mod prompt_tests {
 
     #[test]
     fn build_step_prompt_omits_spreadsheet_hint_for_non_spreadsheet_window() {
-        let p = build_step_prompt(&input("点击", "", "click", "记事本"), 3);
+        let p = build_step_prompt(&input("点击", "", "click", "记事本"), 3, false);
         assert!(!p.contains("【表格软件】"), "非表格窗口不应注入表格软件指令");
     }
 
     #[test]
+    fn build_step_prompt_force_spreadsheet_injects_hint_without_keyword() {
+        // 窗口标题无任何表格关键词，但用户手动标记表格模式 → 仍注入强化指令
+        let p = build_step_prompt(&input("单击", "", "click", "销售表"), 2, true);
+        assert!(p.contains("【表格软件】"), "手动表格模式应注入表格软件强化指令");
+        assert!(p.contains("B22") || p.contains("单元格"));
+    }
+
+    #[test]
     fn build_step_prompt_omits_empty_context() {
-        let p = build_step_prompt(&input("点击", "", "", ""), 3);
+        let p = build_step_prompt(&input("点击", "", "", ""), 3, false);
         assert!(p.contains("第 3 个操作步骤"));
         assert!(!p.contains("操作窗口："));
         assert!(!p.contains("录制动作类型："));
@@ -188,7 +197,7 @@ mod prompt_tests {
     #[test]
     fn build_step_prompt_no_placeholder_leftover() {
         // 步骤号占位符正确替换，不会残留模板变量
-        let p = build_step_prompt(&input("a", "b", "c", "d"), 7);
+        let p = build_step_prompt(&input("a", "b", "c", "d"), 7, false);
         assert!(!p.contains("{step_number}"));
         assert!(!p.contains("{context}"));
         assert!(!p.contains("{action}"));
@@ -198,7 +207,7 @@ mod prompt_tests {
 
     #[test]
     fn build_step_prompt_large_step_number() {
-        let p = build_step_prompt(&input("t", "d", "click", "w"), 999);
+        let p = build_step_prompt(&input("t", "d", "click", "w"), 999, false);
         assert!(p.contains("第 999 个操作步骤"));
     }
 }

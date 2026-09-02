@@ -23,9 +23,12 @@ const CROP_JPEG_QUALITY: u8 = 85;
 /// relevant UI — the ribbon, formula bar and function dialog — across the whole
 /// window, so a focused 400×400 crop often hides it. For those steps we send the
 /// full (already redacted) screenshot instead, trading more tokens for accuracy.
-/// Non-spreadsheet steps keep the cheaper focused crop.
-fn ai_image_for_step<'a>(step: &'a StepInput, full_marked: &'a str) -> &'a str {
-    if crate::ai::prompt::is_spreadsheet_window(&step.window_title) && !full_marked.is_empty() {
+/// Non-spreadsheet steps keep the cheaper focused crop. `force_spreadsheet`
+/// additionally triggers spreadsheet handling when the user manually flagged the
+/// recording (even if the window title doesn't contain a spreadsheet keyword).
+fn ai_image_for_step<'a>(step: &'a StepInput, full_marked: &'a str, force_spreadsheet: bool) -> &'a str {
+    let is_ss = crate::ai::prompt::is_spreadsheet_window(&step.window_title) || force_spreadsheet;
+    if is_ss && !full_marked.is_empty() {
         full_marked
     } else {
         &step.screenshot_base64
@@ -64,13 +67,16 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
     let redact_config = crate::redaction::RedactionConfig::default_all();
     let redact_mode = crate::redaction::RedactMode::Blur;
     let mut job = job;
+    // 表格软件模式：窗口标题命中关键词，或用户手动标记（spreadsheet_mode）。
+    // 两者任一为真即按表格场景处理（跳过脱敏 + 送全图 + 表格专项 prompt）。
+    let spreadsheet_mode = job.spreadsheet_mode;
     for s in &mut job.steps {
         // 表格软件（WPS 表格/Excel/Calc…）：用户录制自己的表格，且 AI 需看清
         // 单元格内容（列标、函数名、数据表取值）才能写出精确步骤。跳过 OCR 脱敏
         // 模糊，避免单元格文字被糊掉影响识别。
         // ⚠️ 隐私权衡：表格内容会原样送往视觉模型——仅建议用于非敏感演示数据；
         // 若含手机号/身份证等真实 PII，仍应由用户自行脱敏后再录制。
-        if crate::ai::prompt::is_spreadsheet_window(&s.window_title) {
+        if crate::ai::prompt::is_spreadsheet_window(&s.window_title) || spreadsheet_mode {
             log::info!("[ai] 表格软件步骤跳过脱敏：{}", s.window_title);
             continue;
         }
@@ -126,7 +132,7 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
 
     for (i, step) in preprocessed.iter().enumerate() {
         let step_number = i + 1;
-        let mut step_prompt = prompt::build_step_prompt(step, step_number);
+        let mut step_prompt = prompt::build_step_prompt(step, step_number, spreadsheet_mode);
 
         // Detect dramatic window change between before/after screenshots
         // and prepend a hard override instruction when detected.
@@ -147,7 +153,7 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
         // 表格软件改为投喂 after 全图（original_marked，已脱敏），让模型看清
         // 顶部选项卡 / 公式栏 / 函数对话框（见 ai_image_for_step）。
         // before 全图/裁剪图（original_before / step.before_screenshot_base64）不进入 prompt。
-        let ai_image = ai_image_for_step(step, &original_marked[i]);
+        let ai_image = ai_image_for_step(step, &original_marked[i], spreadsheet_mode);
         let has_marked = !ai_image.is_empty();
 
         if !has_marked {
@@ -541,7 +547,7 @@ mod pipeline_tests {
         let cropped = "CROPPED_BASE64".to_string();
         let step = step_with_window("销售表.xlsx - WPS 表格", &cropped);
         assert_eq!(
-            ai_image_for_step(&step, &full),
+            ai_image_for_step(&step, &full, false),
             "FULL_REDACTED_BASE64",
             "表格软件应送全图而非裁剪图"
         );
@@ -553,7 +559,7 @@ mod pipeline_tests {
         let cropped = "CROPPED_BASE64".to_string();
         let step = step_with_window("记事本", &cropped);
         assert_eq!(
-            ai_image_for_step(&step, &full),
+            ai_image_for_step(&step, &full, false),
             "CROPPED_BASE64",
             "非表格软件仍应送裁剪图"
         );
@@ -565,9 +571,22 @@ mod pipeline_tests {
         let cropped = "CROPPED_BASE64".to_string();
         let step = step_with_window("Excel - 工作簿1", &cropped);
         assert_eq!(
-            ai_image_for_step(&step, &full),
+            ai_image_for_step(&step, &full, false),
             "CROPPED_BASE64",
             "全图为空时即使表格软件也回退到裁剪图"
+        );
+    }
+
+    #[test]
+    fn ai_image_for_step_force_spreadsheet_overrides_unrelated_title() {
+        let full = "FULL_REDACTED_BASE64".to_string();
+        let cropped = "CROPPED_BASE64".to_string();
+        // 窗口标题无任何表格关键词，但用户手动标记了表格模式 → 仍送全图
+        let step = step_with_window("销售表", &cropped);
+        assert_eq!(
+            ai_image_for_step(&step, &full, true),
+            "FULL_REDACTED_BASE64",
+            "手动表格模式应覆盖窗口标题关键词缺失"
         );
     }
 
