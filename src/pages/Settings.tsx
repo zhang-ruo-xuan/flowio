@@ -641,6 +641,12 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   /* Config form for existing provider */
                   selectedProv && (
                     <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "14px 16px" }}>
+                      {/* flowio-free has a built-in API key — no need to show input */}
+                      {selectedId === "flowio-free" ? (
+                        <p className="hint" style={{ margin: 0, color: "var(--text-secondary)" }}>
+                          内置 API Key，无需配置
+                        </p>
+                      ) : (
                       <div className="form-group" style={{ marginBottom: 12 }}>
                         <label>API Key</label>
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
@@ -652,6 +658,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                         </div>
                         <p className="hint">密钥将加密存储在本地，仅用于 AI 功能调用</p>
                       </div>
+                      )}
 
                       {selectedProv?.custom ? (
                       <div className="form-group" style={{ marginBottom: 14 }}>
