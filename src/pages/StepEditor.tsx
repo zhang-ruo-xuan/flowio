@@ -314,7 +314,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const [showSaveDialog, setShowSaveDialog] = useState<string | null>(null);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [aiGenerating, setAiGenerating] = useState(false);
-  const [spreadsheetMode, setSpreadsheetMode] = useState(false);
+  const [domainMode, setDomainMode] = useState<"auto" | "spreadsheet" | "browser" | "code" | "terminal">("auto");
 
   // 未登录 + 录制完成后自动弹出「保存到云端」登录引导弹窗（LoginSaveModal）
   const [showLoginSaveModal, setShowLoginSaveModal] = useState(false);
@@ -1141,7 +1141,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     try {
       const result: string = await invoke("generate_ai_steps", {
         recordingId,
-        spreadsheetMode,
+        domainMode: domainMode === "auto" ? null : domainMode,
       });
       alert(result);
       await reloadRecording();
@@ -1369,13 +1369,19 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
                 onClick={(e) => e.stopPropagation()}
               >
-                <input
-                  type="checkbox"
-                  checked={spreadsheetMode}
-                  onChange={(e) => setSpreadsheetMode(e.target.checked)}
-                  style={{ cursor: "pointer" }}
-                />
-                <span className="export-dropdown-item-label">表格软件模式（精准识别单元格/函数）</span>
+                <span className="export-dropdown-item-label">识别场景</span>
+                <select
+                  value={domainMode}
+                  onChange={(e) => setDomainMode(e.target.value as typeof domainMode)}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ cursor: "pointer", fontSize: 12, padding: "2px 4px", borderRadius: 4, border: "1px solid #555", background: "#2a2a2a", color: "#fff" }}
+                >
+                  <option value="auto">自动</option>
+                  <option value="spreadsheet">表格</option>
+                  <option value="browser">浏览器</option>
+                  <option value="code">代码</option>
+                  <option value="terminal">终端</option>
+                </select>
               </label>
               <button
                 className="export-dropdown-item"

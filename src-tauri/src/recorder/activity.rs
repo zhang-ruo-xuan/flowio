@@ -1,6 +1,8 @@
 //! Active window title detection via Windows FFI.
 //! Used during recording to generate natural-language step titles.
 
+use crate::ai::domain::{browser_page_name, AppDomain};
+
 extern "system" {
     fn GetForegroundWindow() -> isize;
     fn GetWindowTextLengthW(hwnd: isize) -> i32;
@@ -114,6 +116,21 @@ pub fn make_click_title_with_app(window_title: Option<&str>, app: Option<&str>) 
     }
 }
 
+/// 领域感知的点击步骤标题：浏览器域自动剥离「 - 浏览器」后缀只保留网页名，
+/// 其余领域沿用窗口标题原样。
+pub fn make_click_title_for_domain(window_title: Option<&str>, domain: AppDomain) -> String {
+    match window_title {
+        Some(title) if !title.is_empty() => {
+            let display = match domain {
+                AppDomain::Browser => browser_page_name(title),
+                _ => title.to_string(),
+            };
+            format!("在「{}」中点击", display)
+        }
+        _ => "点击".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod activity_tests {
     use super::*;
@@ -149,6 +166,36 @@ mod activity_tests {
         assert_eq!(
             make_click_title_with_app(Some("微信"), Some("QQ")),
             "在「微信」中点击"
+        );
+    }
+
+    #[test]
+    fn click_title_for_domain_browser_strips_suffix() {
+        use crate::ai::domain::AppDomain;
+        assert_eq!(
+            make_click_title_for_domain(Some("百度 - Google Chrome"), AppDomain::Browser),
+            "在「百度」中点击"
+        );
+        assert_eq!(
+            make_click_title_for_domain(Some("GitHub - Microsoft Edge"), AppDomain::Browser),
+            "在「GitHub」中点击"
+        );
+    }
+
+    #[test]
+    fn click_title_for_domain_non_browser_keeps_title() {
+        use crate::ai::domain::AppDomain;
+        assert_eq!(
+            make_click_title_for_domain(Some("Excel - 工作簿1"), AppDomain::Spreadsheet),
+            "在「Excel - 工作簿1」中点击"
+        );
+        assert_eq!(
+            make_click_title_for_domain(Some("记事本"), AppDomain::Other),
+            "在「记事本」中点击"
+        );
+        assert_eq!(
+            make_click_title_for_domain(None, AppDomain::Browser),
+            "点击"
         );
     }
 }

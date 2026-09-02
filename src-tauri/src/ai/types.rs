@@ -53,10 +53,11 @@ pub struct StepOutput {
 pub struct AiJob {
     pub recording_id: String,
     pub steps: Vec<StepInput>,
-    /// 用户手动标记的「表格软件模式」：识别时使用全图 + 表格专项 prompt，
-    /// 即使窗口标题不含 Excel/WPS 等关键词也能精准识别单元格/函数。
+    /// 用户手动标记的「识别场景」：覆盖自动领域推断。
+    /// 取值为 [`crate::ai::domain::AppDomain::key`]（"spreadsheet"/"browser"/
+    /// "code"/"terminal"），`None` 表示自动按窗口标题推断领域。
     #[serde(default)]
-    pub spreadsheet_mode: bool,
+    pub domain_mode: Option<String>,
 }
 
 /// Result returned by the AI pipeline.

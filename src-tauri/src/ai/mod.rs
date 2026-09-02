@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod domain;
 pub mod http;
 pub mod parse;
 pub mod pipeline;

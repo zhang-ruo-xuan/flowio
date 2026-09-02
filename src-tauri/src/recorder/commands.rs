@@ -34,6 +34,7 @@ use crate::recorder::recorder;
 use crate::recorder::screenshot;
 use crate::recorder::selection_bridge;
 use crate::recorder::state::RecordingState;
+use crate::ai::domain::AppDomain;
 use crate::recorder::StepData;
 use crate::RecordingManager;
 
@@ -54,8 +55,18 @@ fn resolve_step_description(
 }
 
 /// Build the title for a typed step.
-fn resolve_typed_title(window_title: Option<&str>) -> String {
-    format!("在「{}」中输入", window_title.unwrap_or(""))
+/// 浏览器域自动剥离「 - 浏览器」后缀只保留网页名，其余领域沿用窗口标题原样。
+fn resolve_typed_title(window_title: Option<&str>, domain: AppDomain) -> String {
+    match window_title {
+        Some(t) if !t.is_empty() => {
+            let display = match domain {
+                AppDomain::Browser => crate::ai::domain::browser_page_name(t),
+                _ => t.to_string(),
+            };
+            format!("在「{}」中输入", display)
+        }
+        _ => "在「」中输入".to_string(),
+    }
 }
 
 /// Re-index drained captured steps onto the recorder's step list:
@@ -85,12 +96,16 @@ fn build_typed_step(
     crop_w: Option<i32>,
     crop_h: Option<i32>,
 ) -> StepData {
+    let domain = window_title
+        .as_deref()
+        .map(crate::ai::domain::detect_domain)
+        .unwrap_or(AppDomain::Other);
     StepData {
         id: Uuid::new_v4().to_string(),
         order_index: 0,
         step_number: 0,
         action_type: "type".to_string(),
-        title: resolve_typed_title(window_title.as_deref()),
+        title: resolve_typed_title(window_title.as_deref(), domain),
         description,
         tip: None,
         screenshot_path,
@@ -1273,7 +1288,11 @@ fn build_click_step(
     let now_ms = current_time_millis();
 
     let window_title = activity::get_active_window_title();
-    let title = activity::make_click_title(window_title.as_deref());
+    let click_domain = window_title
+        .as_deref()
+        .map(crate::ai::domain::detect_domain)
+        .unwrap_or(AppDomain::Other);
+    let title = activity::make_click_title_for_domain(window_title.as_deref(), click_domain);
 
     Some(StepData {
         id: Uuid::new_v4().to_string(),
@@ -2344,12 +2363,20 @@ mod commands_tests {
 
     #[test]
     fn typed_title_with_window() {
-        assert_eq!(resolve_typed_title(Some("Chrome")), "在「Chrome」中输入");
+        assert_eq!(
+            resolve_typed_title(Some("Chrome"), AppDomain::Other),
+            "在「Chrome」中输入"
+        );
+        // 浏览器域自动剥离后缀
+        assert_eq!(
+            resolve_typed_title(Some("百度 - Google Chrome"), AppDomain::Browser),
+            "在「百度」中输入"
+        );
     }
 
     #[test]
     fn typed_title_without_window() {
-        assert_eq!(resolve_typed_title(None), "在「」中输入");
+        assert_eq!(resolve_typed_title(None, AppDomain::Other), "在「」中输入");
     }
 
     // ── reindex_steps（finish 排水重排）─────────────────────────────
