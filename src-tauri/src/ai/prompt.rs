@@ -28,6 +28,10 @@ pub fn build_system_prompt() -> String {
 - 复制粘贴区域：写明源区域与目标，如「将 A2:A10 复制到 C2」「填充序列至 B31」
 - 设置单元格格式：写明格式类型，如「将 B 列设为货币格式」「把 A 列设为日期格式」
 - 在单元格输入公式（以 = 开头）时，标题用「输入公式」并尽量写出完整公式，如「输入公式 =VLOOKUP(A22,$A$2:$E$21,2,FALSE)」；输入普通文本/数字用「输入」，如「在 B22 输入 销售表」
+- 插入图表/数据透视表：写明图表类型与数据来源，如「基于 A1:D10 插入柱状图」「对销售明细插入数据透视表」
+- 查找替换：写明查找内容与替换值，如「查找 待发货 替换为 已发货」
+- 合并单元格/跨列居中：写明范围，如「合并 A1:C1 并居中」
+- 条件格式/数据验证：写明规则，如「对销售额列设置大于 1000 高亮」「限制 B 列只能输入日期」
 
 截图说明：
 你会收到一张截图：
@@ -158,6 +162,15 @@ mod prompt_tests {
             p.contains("排序") || p.contains("筛选") || p.contains("插入") || p.contains("填充"),
             "应覆盖常见表格操作（排序/筛选/插入行列/填充）"
         );
+    }
+
+    #[test]
+    fn build_system_prompt_includes_more_spreadsheet_operations() {
+        let p = build_system_prompt();
+        assert!(p.contains("数据透视表"), "应覆盖图表/数据透视表操作");
+        assert!(p.contains("查找替换"), "应覆盖查找替换操作");
+        assert!(p.contains("合并单元格"), "应覆盖合并单元格操作");
+        assert!(p.contains("条件格式") || p.contains("数据验证"), "应覆盖条件格式/数据验证");
     }
 
     #[test]
