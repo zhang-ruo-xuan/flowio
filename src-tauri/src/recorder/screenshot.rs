@@ -324,11 +324,6 @@ fn print_window_to_image(hwnd_raw: isize) -> Result<DynamicImage, String> {
     Ok(DynamicImage::ImageRgba8(img))
 }
 
-/// True when two screen rectangles share any area.
-fn rects_intersect(a: super::recorder::Rect, b: super::recorder::Rect) -> bool {
-    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
-}
-
 /// Capture a specific process as the **entire software**: the main application
 /// window plus every floating layer (modal dialogs, panels, floaters) owned by
 /// the same process, composited into one image.
@@ -336,8 +331,9 @@ fn rects_intersect(a: super::recorder::Rect, b: super::recorder::Rect) -> bool {
 /// `PrintWindow` only ever renders a single HWND's client area, so a modal
 /// dialog that is its own top-level window can never appear in a single
 /// `PrintWindow` call. We enumerate all visible windows of the process family,
-/// pick the largest as the base, then overlay every intersecting sibling window
-/// at its screen offset.
+/// pick the largest as the base, then overlay every sibling window at its screen
+/// offset within the union bounds (so dialogs spilling outside the main window
+/// are still captured in full).
 ///
 /// Returns `(image, origin_x, origin_y)` where `(0,0)` of the image maps to the
 /// main window's top-left on the virtual screen — same contract as
@@ -363,28 +359,52 @@ pub fn capture_target_window_composite(process_name: &str) -> Result<(DynamicIma
         .ok_or_else(|| {
             "capture_target_window_composite: main window rect missing".to_string()
         })?;
-    let (mx, my) = (main_rect.left, main_rect.top);
 
-    let mut canvas = print_window_to_image(main_hwnd)?;
-    // Iterate in reverse so later-created (top-most) windows paint last.
+    // Bound the composite by the UNION of the main window and every floating
+    // layer, so dialogs/popups that spill *outside* the main window are not
+    // clipped by `overlay` (which cannot grow its destination). Origin = union
+    // top-left on the virtual screen.
+    let mut min_l = main_rect.left;
+    let mut min_t = main_rect.top;
+    let mut max_r = main_rect.right;
+    let mut max_b = main_rect.bottom;
+    for (_, r) in &candidates {
+        min_l = min_l.min(r.left);
+        min_t = min_t.min(r.top);
+        max_r = max_r.max(r.right);
+        max_b = max_b.max(r.bottom);
+    }
+    let (ox, oy) = (min_l, min_t);
+    let union_w = (max_r - min_l) as u32;
+    let union_h = (max_b - min_t) as u32;
+
+    // Blank canvas sized to the union; each window is blitted at its screen offset.
+    let mut canvas = DynamicImage::new_rgba8(union_w, union_h);
+
+    let main_img = print_window_to_image(main_hwnd)?;
+    image::imageops::overlay(
+        &mut canvas,
+        &main_img,
+        (main_rect.left - ox) as i64,
+        (main_rect.top - oy) as i64,
+    );
+
+    // Overlay floating layers in reverse order so the top-most window paints last.
     for (hwnd, rect) in candidates.iter().rev() {
         if *hwnd == main_hwnd {
-            continue;
-        }
-        if !rects_intersect(*rect, main_rect) {
             continue;
         }
         if let Ok(pop) = print_window_to_image(*hwnd) {
             image::imageops::overlay(
                 &mut canvas,
                 &pop,
-                (rect.left - mx) as i64,
-                (rect.top - my) as i64,
+                (rect.left - ox) as i64,
+                (rect.top - oy) as i64,
             );
         }
     }
 
-    Ok((canvas, mx, my))
+    Ok((canvas, ox, oy))
 }
 
 use windows::Win32::UI::WindowsAndMessaging::WINDOWINFO;
