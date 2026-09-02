@@ -243,11 +243,12 @@ unsafe extern "system" fn enum_windows_callback(hwnd: isize, lparam: isize) -> i
 /// Returns `(left, top, right, bottom)` of the chosen rect, or `None` if no
 /// top-level visible window with a non-empty title is large enough.
 pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
-    let mut ctx: (Vec<WindowCandidate>, &str) = (Vec::new(), process_name);
+    let family = process_family(process_name);
+    let mut ctx: (Vec<WindowCandidate>, Vec<String>) = (Vec::new(), family);
     unsafe {
         EnumWindows(
             Some(enum_windows_rect_collect_callback),
-            (&mut ctx as *mut (Vec<WindowCandidate>, &str)) as isize,
+            (&mut ctx as *mut (Vec<WindowCandidate>, Vec<String>)) as isize,
         );
     }
     pick_target_rect(&ctx.0).inspect(|r| {
@@ -274,11 +275,12 @@ pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
 /// handle (HWND) instead of its rect — needed by `capture_target_window` which
 /// uses `PrintWindow` on the handle directly.
 pub fn find_window_hwnd_by_process(process_name: &str) -> Option<isize> {
-    let mut ctx: (Vec<HwndCandidate>, &str) = (Vec::new(), process_name);
+    let family = process_family(process_name);
+    let mut ctx: (Vec<HwndCandidate>, Vec<String>) = (Vec::new(), family);
     unsafe {
         EnumWindows(
             Some(enum_windows_hwnd_collect_callback),
-            (&mut ctx as *mut (Vec<HwndCandidate>, &str)) as isize,
+            (&mut ctx as *mut (Vec<HwndCandidate>, Vec<String>)) as isize,
         );
     }
     pick_target_hwnd(&ctx.0).inspect(|hwnd| {
@@ -314,8 +316,8 @@ unsafe extern "system" fn enum_windows_hwnd_collect_callback(
     let mut pid: u32 = 0;
     unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
     let Some(name) = process_name_of_pid(pid) else { return 1; };
-    let (candidates, process_name) = &mut *(lparam as *mut (Vec<HwndCandidate>, &str));
-    if !name.eq_ignore_ascii_case(process_name) { return 1; }
+    let (candidates, family) = &mut *(lparam as *mut (Vec<HwndCandidate>, Vec<String>));
+    if !family.iter().any(|m| name.eq_ignore_ascii_case(m)) { return 1; }
     let mut rect = Rect::default();
     if unsafe { GetWindowRect(hwnd, &mut rect) } != 0
         && rect.right > rect.left && rect.bottom > rect.top
@@ -447,8 +449,8 @@ unsafe extern "system" fn enum_windows_rect_collect_callback(
     let Some(name) = process_name_of_pid(pid) else {
         return 1;
     };
-    let (candidates, process_name) = &mut *(lparam as *mut (Vec<WindowCandidate>, &str));
-    if !name.eq_ignore_ascii_case(process_name) {
+    let (candidates, family) = &mut *(lparam as *mut (Vec<WindowCandidate>, Vec<String>));
+    if !family.iter().any(|m| name.eq_ignore_ascii_case(m)) {
         return 1;
     }
     // 4) Read its rect.
@@ -539,16 +541,54 @@ pub fn pid_is_flowio(pid: u32) -> bool {
 }
 
 /// Return `true` when the given PID matches the target process name.
-/// PID-based variant of [`foreground_is_target`] for use in the event thread
-/// with the PID captured at hook-callback time.
+///
+/// For **multi-process suites** (e.g. WPS Office = wps.exe + et.exe + wpp.exe +
+/// wpspdf.exe + wpscloudsvr.exe), selecting any member automatically includes the
+/// entire family — so popups, dialogs, and child-process UI are never dropped.
 pub fn pid_is_target(pid: u32, target_process_name: &str) -> bool {
     if pid == 0 {
         return false;
     }
-    process_name_of_pid(pid)
-        .map(|n| n.eq_ignore_ascii_case(target_process_name))
-        .unwrap_or(false)
+    let Some(name) = process_name_of_pid(pid) else { return false; };
+    let family = process_family(target_process_name);
+    family.iter().any(|m| name.eq_ignore_ascii_case(m))
 }
+
+/// Return the "process family" for a given process name.
+///
+/// Multi-process apps (WPS, MS Office) spawn child processes for different
+/// components (spreadsheet engine, PDF viewer, cloud sync). When the user
+/// selects one member, we must match *all* members to avoid dropping events
+/// that land on sibling processes.
+fn process_family(name: &str) -> Vec<String> {
+    let lower = name.to_ascii_lowercase();
+    if WPS_FAMILY.iter().any(|m| lower == *m) {
+        WPS_FAMILY.iter().map(|s| s.to_string()).collect()
+    } else if MS_OFFICE_FAMILY.iter().any(|m| lower == *m) {
+        MS_OFFICE_FAMILY.iter().map(|s| s.to_string()).collect()
+    } else {
+        vec![name.to_string()]
+    }
+}
+
+/// All processes belonging to the WPS Office suite.
+const WPS_FAMILY: &[&str] = &[
+    "wps.exe",       // WPS Writer (文字/文档)
+    "et.exe",        // WPS Spreadsheets (表格)
+    "wpp.exe",       // WPS Presentation (演示/PPT)
+    "wpspdf.exe",    // WPS PDF
+    "wpscloudsvr.exe", // WPS Cloud Service (云服务/登录/素材)
+];
+
+/// All processes belonging to Microsoft Office suite.
+const MS_OFFICE_FAMILY: &[&str] = &[
+    "winword.exe",   // Word
+    "excel.exe",     // Excel
+    "powerpnt.exe",  // PowerPoint
+    "outlook.exe",   // Outlook
+    "onenote.exe",   // OneNote
+    "teams.exe",     // Teams
+];
 
 /// Retrieve the caption of the currently focused foreground window.
 ///
