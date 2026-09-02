@@ -269,35 +269,12 @@ pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
     })
 }
 
-/// Find the HWND of the best matching visible window for the given process name.
-///
-/// Same selection logic as `find_window_rect_by_process` but returns the window
-/// handle (HWND) instead of its rect — needed by `capture_target_window` which
-/// uses `PrintWindow` on the handle directly.
-pub fn find_window_hwnd_by_process(process_name: &str) -> Option<isize> {
-    let family = process_family(process_name);
-    let mut ctx: (Vec<HwndCandidate>, Vec<String>) = (Vec::new(), family);
-    unsafe {
-        EnumWindows(
-            Some(enum_windows_hwnd_collect_callback),
-            (&mut ctx as *mut (Vec<HwndCandidate>, Vec<String>)) as isize,
-        );
-    }
-    pick_target_hwnd(&ctx.0)        .inspect(|hwnd| {
-            capture_dbg_log(&format!(
-                "[CAPTURE] find_window_hwnd_by_process({}): hwnd=0x{:X}",
-                process_name, hwnd
-            ));
-        })
-}
-
 /// Enumerate ALL visible top-level windows belonging to the target process
 /// family (as `(hwnd, rect)` pairs).
 ///
-/// Unlike `find_window_hwnd_by_process` (which picks a SINGLE window), this
-/// returns every candidate so the capture layer can composite the main window
+/// Returns every candidate so the capture layer can composite the main window
 /// together with its floating layers (modal dialogs, panels, floaters) into one
-/// "entire software" image. See `screenshot::capture_target_window`.
+/// "entire software" image. See `screenshot::capture_target_window_composite`.
 pub fn enum_target_windows(process_name: &str) -> Vec<(isize, Rect)> {
     let family = process_family(process_name);
     let mut ctx: (Vec<(isize, Rect)>, Vec<String>) = (Vec::new(), family);
@@ -354,87 +331,6 @@ unsafe extern "system" fn enum_windows_rect_hwnd_collect_callback(hwnd: isize, l
         candidates.push((hwnd, rect));
     }
     1
-}
-
-/// A candidate window with its HWND for PrintWindow capture.
-struct HwndCandidate {
-    hwnd: isize,
-    rect: Rect,
-    has_title: bool,
-}
-
-unsafe extern "system" fn enum_windows_hwnd_collect_callback(
-    hwnd: isize,
-    lparam: isize,
-) -> i32 {
-    if unsafe { IsWindowVisible(hwnd) } == 0 { return 1; }
-    let len = unsafe { GetWindowTextLengthW(hwnd) };
-    let mut has_title = false;
-    if len > 0 {
-        let mut buf: Vec<u16> = vec![0; (len + 1) as usize];
-        let actual = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
-        if actual > 0 {
-            let title = String::from_utf16_lossy(&buf[..actual as usize]);
-            has_title = !title.trim().is_empty();
-        }
-    }
-    let mut pid: u32 = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-    let Some(name) = process_name_of_pid(pid) else { return 1; };
-    let (candidates, family) = &mut *(lparam as *mut (Vec<HwndCandidate>, Vec<String>));
-    if !family.iter().any(|m| name.eq_ignore_ascii_case(m)) { return 1; }
-    let mut rect = Rect::default();
-    if unsafe { GetWindowRect(hwnd, &mut rect) } != 0
-        && rect.right > rect.left && rect.bottom > rect.top
-    {
-        candidates.push(HwndCandidate { hwnd, rect, has_title });
-    }
-    1
-}
-
-fn pick_target_hwnd(candidates: &[HwndCandidate]) -> Option<isize> {
-    const TITLED_BONUS: i64 = 2;
-
-    // ── Priority 1: foreground window belonging to target process ──
-    // When a modal dialog (e.g. WPS "函数参数", "查找值") pops up, it becomes
-    // the foreground window but has a DIFFERENT HWND from the main window.
-    // If we always pick the largest window (main window), PrintWindow on the
-    // main-window HWND never captures the dialog.  By preferring the foreground
-    // window we naturally follow the user's focus: main spreadsheet normally,
-    // dialog when one is open.
-    let fg = unsafe { GetForegroundWindow() };
-    if fg != 0 {
-        if let Some(fg_c) = candidates.iter().find(|c| c.hwnd == fg) {
-            let w = fg_c.rect.width();
-            let h = fg_c.rect.height();
-            if w >= MIN_W && h >= MIN_H {
-                capture_dbg_log(&format!(
-                    "[CAPTURE] pick_target: foreground hwnd=0x{:X} (target process)",
-                    fg
-                ));
-                return Some(fg);
-            }
-        }
-    }
-
-    // ── Priority 2: largest/titled window (original fallback) ──
-    let mut best: Option<(i64, isize)> = None;
-    for c in candidates {
-        let w = c.rect.width();
-        let h = c.rect.height();
-        if w < MIN_W || h < MIN_H { continue; }
-        let area = (w as i64) * (h as i64);
-        let score = if c.has_title { area * TITLED_BONUS } else { area };
-        let better = match &best {
-            None => true,
-            Some((bs, _)) => score > *bs,
-        };
-        if better { best = Some((score, c.hwnd)); }
-    }
-    best.map(|(_, hwnd)| {
-        capture_dbg_log(&format!("[CAPTURE] pick_target: largest hwnd=0x{:X}", hwnd));
-        hwnd
-    })
 }
 
 /// Pure window-ranking logic, extracted from `find_window_rect_by_process`
