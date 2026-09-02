@@ -1651,117 +1651,97 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
             <>
               {/* ── Screenshot ──── */}
               {(() => {
-                // 主截图：该步骤 stepViewCropped=true 且有裁剪图缓存时用裁剪图，否则用全图
                 const _src = getStepMainSrc(selectedStep) || "";
-                return (
-                  <div className={`step-detail-image${_src ? "" : " step-detail-image--empty"}`}>
-                    {/* 全图 / 裁图 切换：只作用于当前这一步（作用于所有步骤的开关在顶栏）。
-                        无截图（COPY/HOTKEY 等）时不显示——切换无意义，且易误判为"裁图坏了"。 */}
-                    {_src && (
-                      <div className="step-detail-view-segmented" title="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
-                        <button
-                          className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep.id) ? ' active' : ''}`}
-                          onClick={() => setViewCropped(selectedStep.id, false)}
-                        >全图</button>
-                        <button
-                          className={`step-detail-view-segmented-btn${getViewCropped(selectedStep.id) ? ' active' : ''}`}
-                          onClick={() => setViewCropped(selectedStep.id, true)}
-                        >裁图</button>
-                      </div>
-                    )}
-                    {(() => {
-                      const src = getStepMainSrc(selectedStep) || "";
-                      return (
-                    <>
-                      {src ? (
-                        <>
-                          <img
-                            ref={detailImgRef}
-                            src={`data:image/jpeg;base64,${src}`}
-                            alt={`步骤 ${selectedIndex + 1} 截图`}
-                            onClick={() => openLightbox(selectedIndex)}
-                            onLoad={(e) => {
-                              // 让容器形状完全贴合图片，消除 object-fit: contain 的 letterbox 留白。
-                              //
-                              // 注意：只写 aspect-ratio 是不够的。容器是 width:100% + max-height:420，
-                              // 图片一旦被 max-height 压住，盒子仍是满宽、只是高度停在 420，
-                              // contain 按高度缩放后左右各留一条灰底（1920×1080 在 800px 容器里
-                              // 左右各 27px，在 1200px 里各 227px）——这正是"还是有缝隙"的来源。
-                              // 必须同时把 max-width 收到 maxHeight × 宽高比，让盒子整体缩成图片的
-                              // 形状；min-height 也要清掉，否则窄容器下的宽图会被撑高、重新出现
-                              // 上下留白。详见 lib/previewBox.ts。
-                              const img = e.currentTarget;
-                              const parent = img.parentElement;
-                              const box = previewBox(img.naturalWidth, img.naturalHeight);
-                              if (parent && box) {
-                                parent.style.setProperty("--step-img-aspect", `${box.aspect}`);
-                                parent.style.maxWidth = `${box.maxWidth}px`;
-                                parent.style.minHeight = `${box.minHeight}px`;
-                              }
-                            }}
-                            style={{ cursor: "pointer" }}
-                          />
-                          <button
-                            className="screenshot-annotate-btn"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              // 标注固定使用 after 全图（screenshot_base64）
-                              openAnnotate(selectedStep.id);
-                            }}
-                            title="裁剪/添加文字/高亮/箭头/模糊标注"
-                          >
-                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-                              <path d="M8 2v12M2 8h12" />
-                              <circle cx="8" cy="8" r="5.5" />
-                            </svg>
-                            标注
-                          </button>
-                          <button
-                            className="screenshot-delete-btn"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              // 删除只针对当前视图：裁图模式删裁图（全图保留），全图模式删全图
-                              const isCropView = getViewCropped(selectedStep?.id ?? '');
-                              if (isCropView) {
-                                if (confirm("确定删除裁剪图？")) {
-                                  setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: true }));
-                                }
-                              } else {
-                                if (confirm("确定删除截图？")) {
-                                  invoke('delete_step_screenshot', {
-                                    stepId: selectedStep.id,
-                                    isAfter: true,
-                                  });
-                                  const updated = [...steps];
-                                  updated[selectedIndex] = { ...updated[selectedIndex], screenshot_base64: null };
-                                  setSteps(updated);
-                                  // 全图删除后裁图也不复存在，清理裁图删除标记并切回全图视图
-                                  setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: false }));
-                                  setViewCropped(selectedStep.id, false);
-                                }
-                              }
-                            }}
-                            title="删除当前截图"
-                          >
-                            ✕
-                          </button>
-                        </>
-                      ) : (
-                        <div
-                          className="step-detail-no-image step-detail-no-image-compact"
-                          onClick={pickFileForUpload}
-                          onContextMenu={pasteScreenshot}
-                        >
-                          <div className="upload-hint">
-                            <span className="no-image-action-type">{selectedStep?.action_type?.toUpperCase() || ''}</span>
-                            <span className="no-image-title">{selectedStep?.title || '(无标题)'}</span>
-                            <span className="no-image-hint">点击或右键粘贴上传截图</span>
-                          </div>
+                if (!_src) {
+                  // ── 无截图（COPY / HOTKEY 等）：紧凑居中卡片 ──
+                  return (
+                    <div className="step-detail-image step-detail-image--empty">
+                      <div
+                        className="step-detail-no-image step-detail-no-image-compact"
+                        onClick={pickFileForUpload}
+                        onContextMenu={pasteScreenshot}
+                      >
+                        <div className="upload-hint">
+                          <span className="no-image-action-type">{selectedStep?.action_type?.toUpperCase() || ''}</span>
+                          <span className="no-image-title">{selectedStep?.title || '(无标题)'}</span>
+                          <span className="no-image-hint">点击或右键粘贴上传截图</span>
                         </div>
-                      )}
-                    </>
+                      </div>
+                    </div>
                   );
-                })()}
+                }
+                // ── 有截图：图片 + 切换 + 标注 + 删除 ──
+                return (
+                  <div className="step-detail-image">
+                    {/* 全图 / 裁图 切换 */}
+                    <div className="step-detail-view-segmented" title="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
+                      <button
+                        className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep.id) ? ' active' : ''}`}
+                        onClick={() => setViewCropped(selectedStep.id, false)}
+                      >全图</button>
+                      <button
+                        className={`step-detail-view-segmented-btn${getViewCropped(selectedStep.id) ? ' active' : ''}`}
+                        onClick={() => setViewCropped(selectedStep.id, true)}
+                      >裁图</button>
+                    </div>
+                    <img
+                      ref={detailImgRef}
+                      src={`data:image/jpeg;base64,${_src}`}
+                      alt={`步骤 ${selectedIndex + 1} 截图`}
+                      onClick={() => openLightbox(selectedIndex)}
+                      onLoad={(e) => {
+                        const img = e.currentTarget;
+                        const parent = img.parentElement;
+                        const box = previewBox(img.naturalWidth, img.naturalHeight);
+                        if (parent && box) {
+                          parent.style.setProperty("--step-img-aspect", `${box.aspect}`);
+                          parent.style.maxWidth = `${box.maxWidth}px`;
+                          parent.style.minHeight = `${box.minHeight}px`;
+                        }
+                      }}
+                      style={{ cursor: "pointer" }}
+                    />
+                    <button
+                      className="screenshot-annotate-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openAnnotate(selectedStep.id);
+                      }}
+                      title="裁剪/添加文字/高亮/箭头/模糊标注"
+                    >
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                        <path d="M8 2v12M2 8h12" />
+                        <circle cx="8" cy="8" r="5.5" />
+                      </svg>
+                      标注
+                    </button>
+                    <button
+                      className="screenshot-delete-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const isCropView = getViewCropped(selectedStep?.id ?? '');
+                        if (isCropView) {
+                          if (confirm("确定删除裁剪图？")) {
+                            setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: true }));
+                          }
+                        } else {
+                          if (confirm("确定删除截图？")) {
+                            invoke('delete_step_screenshot', {
+                              stepId: selectedStep.id,
+                              isAfter: true,
+                            });
+                            const updated = [...steps];
+                            updated[selectedIndex] = { ...updated[selectedIndex], screenshot_base64: null };
+                            setSteps(updated);
+                            setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: false }));
+                            setViewCropped(selectedStep.id, false);
+                          }
+                        }
+                      }}
+                      title="删除当前截图"
+                    >
+                      ✕
+                    </button>
                   </div>
                 );
               })()}

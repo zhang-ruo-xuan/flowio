@@ -1947,12 +1947,13 @@ select {
    用显式 class（step-detail-image--empty）而非 :has()，避免旧版 WebView2 对
    :has() 支持不一致导致收缩/居中不生效（"空白复制的文本不在正中间"）。 */
 .step-detail-image--empty {
-  min-height: 120px;
-  max-height: 200px;
-  aspect-ratio: auto;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  min-height: 120px !important;
+  max-height: 200px !important;
+  aspect-ratio: auto !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  background-color: #f5f6f7 !important;
 }
 
 .step-detail-no-image-compact {
