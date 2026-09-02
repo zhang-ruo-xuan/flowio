@@ -662,4 +662,57 @@ mod recorder_tests {
         let candidates = vec![make_candidate(0, 0, 500, 99, true)];
         assert_eq!(pick_target_rect(&candidates), None);
     }
+
+    // ── Real-desktop probe ─────────────────────────────────────────────
+    //
+    // `#[ignore]`-gated test that prints what `list_target_windows` and
+    // `find_window_rect_by_process` see on the *current* machine. Run with
+    // `cargo test --lib -- --ignored --nocapture probe_real_desktop`. Used
+    // to validate v15/v17 against a real Chromium-like layout without
+    // having to round-trip through the user.
+    //
+    // Not in normal CI because it depends on real window state — would
+    // not run on a CI runner with nothing open.
+
+    #[test]
+    #[ignore]
+    fn probe_real_desktop() {
+        eprintln!("\n=== list_target_windows ===");
+        for w in list_target_windows() {
+            eprintln!(
+                "  hwnd=0x{:08x} proc={:20} title={:?}",
+                w.hwnd, w.process_name, w.title
+            );
+        }
+
+        // Collect unique process names from the enumeration above.
+        let procs: std::collections::BTreeSet<String> =
+            list_target_windows().into_iter().map(|w| w.process_name).collect();
+
+        eprintln!("\n=== find_window_rect_by_process per proc ===");
+        for proc in &procs {
+            match find_window_rect_by_process(proc) {
+                Some(r) => eprintln!(
+                    "  {:24} -> {:4}x{:4} at ({:5},{:5}) [{},{},{},{}]",
+                    proc, r.width(), r.height(), r.left, r.top,
+                    r.left, r.top, r.right, r.bottom
+                ),
+                None => eprintln!("  {:24} -> None", proc),
+            }
+        }
+
+        // Sanity gate: every picked rect must satisfy the MIN_W × MIN_H
+        // floor. A 32x32 result would mean the favicon-chip bug is back.
+        for proc in &procs {
+            if let Some(r) = find_window_rect_by_process(proc) {
+                assert!(
+                    r.width() >= MIN_W && r.height() >= MIN_H,
+                    "real-desktop probe picked too-small rect for {}: {}x{}",
+                    proc,
+                    r.width(),
+                    r.height()
+                );
+            }
+        }
+    }
 }
