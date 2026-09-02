@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Settings, LogOut, RefreshCw } from "lucide-react";
+import { ArrowLeft, Settings, LogOut, RefreshCw, User } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAuthStore } from "../store/authStore";
 
@@ -120,7 +120,7 @@ export default function ProfilePage() {
                 {avatarUrl && !avatarError ? (
                   <img src={avatarUrl} alt={name} style={{ width: "100%", height: "100%", objectFit: "cover" }} onError={() => setAvatarError(true)} />
                 ) : (
-                  name.charAt(0).toUpperCase()
+                  <User size={20} strokeWidth={2.5} />
                 )}
               </div>
 

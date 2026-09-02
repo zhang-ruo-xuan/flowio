@@ -113,7 +113,6 @@ function App() {
       try {
         const dl = await invoke<{ token: string; id: string; email: string; display_name?: string; bio?: string; avatar?: string } | null>("get_pending_deep_link");
         if (dl) {
-          console.log("[flowio] 启动时发现未处理的 deep-link:", dl);
           setAuth(dl.token, { id: dl.id, email: dl.email, display_name: dl.display_name, bio: dl.bio, avatar: dl.avatar });
           syncLocalUser(dl.id);
         }
@@ -128,7 +127,6 @@ function App() {
     let unlisten: (() => void) | undefined;
     (async () => {
       unlisten = await listen("deep-link-auth", (event: any) => {
-        console.log("[deep-link-auth] 收到事件:", event.payload);
         const { token, id, email, display_name, bio, avatar } = event.payload;
         setAuth(token, { id, email, display_name, bio, avatar });
         syncLocalUser(id);
@@ -394,7 +392,8 @@ function App() {
               title={siteToken ? `${siteUser?.display_name || siteUser?.email || '用户'}（点击进入个人中心）` : "登录网站账号"}
             >
               {siteToken ? (
-                siteUser?.avatar && !avatarLoadFailed ? (
+                (() => {
+                  return siteUser?.avatar && !avatarLoadFailed ? (
                   <img
                     className="titlebar-avatar-img"
                     src={`https://flowio.cn/api/files/users/${siteUser.id}/${siteUser.avatar}`}
@@ -403,9 +402,10 @@ function App() {
                   />
                 ) : (
                   <span className="titlebar-avatar">
-                    {(siteUser?.display_name || siteUser?.email || "U")[0].toUpperCase()}
+                    <User size={16} strokeWidth={2.5} />
                   </span>
-                )
+                );
+                })()
               ) : (
                 <><User size={15} /><span className="titlebar-login-text">登录</span></>
               )}

@@ -910,8 +910,8 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   {profileAvatarUrl && !profileAvatarError ? (
                     <img src={profileAvatarUrl} alt="avatar" onError={() => setProfileAvatarError(true)} style={{ width: 56, height: 56, borderRadius: "50%", objectFit: "cover", border: "1px solid var(--border)" }} />
                   ) : (
-                    <div style={{ width: 56, height: 56, borderRadius: "50%", background: "var(--green)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, fontWeight: 600 }}>
-                      {profileName.charAt(0).toUpperCase()}
+                    <div style={{ width: 56, height: 56, borderRadius: "50%", background: "var(--green)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      <User size={28} strokeWidth={2} />
                     </div>
                   )}
                   <div>

@@ -28,10 +28,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import FileSaveDialog from "../components/FileSaveDialog";
 import AnnotationsOverlay from "../components/AnnotationsOverlay";
-import CropOverlay, { type CropRectPx } from "../components/CropOverlay";
 import LoginSaveModal from "../components/LoginSaveModal";
 import type { Annotation } from "../lib/annotate";
-import { CROP_PAD, cropBoxFromAnchor, rectToCropAnchor } from "../lib/cropAnchor";
+import { CROP_PAD } from "../lib/cropAnchor";
 import { previewBox } from "../lib/previewBox";
 import type { Recording, Step } from "../types";
 
@@ -459,8 +458,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
   /* Annotation (手动标注编辑器) */
   const [annotateOpen, setAnnotateOpen] = useState(false);
-  /* 手动框选裁图弹窗 */
-  const [cropPickerOpen, setCropPickerOpen] = useState(false);
   const [annotateStepId, setAnnotateStepId] = useState<string>("");
 
   // ⚠️ 这里**不要**再给主预览容器写死高度。
@@ -1224,56 +1221,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     setAnnotateOpen(false);
   };
 
-  /* ── 手动框选裁图（裁图不准时一键修）─────────────────── */
-
-  /**
-   * 当前步骤自动裁图算出的矩形，作为框选弹窗的初始选区，用户可在此基础上微调。
-   * 没有锚点（如纯点击兜底）时返回 null，弹窗会默认给中央 60% 的框。
-   */
-  const initialCropRect = (step: Step | undefined): CropRectPx | null => {
-    if (!step) return null;
-    if (step.x == null || step.y == null || step.crop_w == null || step.crop_h == null) return null;
-    if (step.crop_w <= 0 || step.crop_h <= 0) return null;
-    return cropBoxFromAnchor(
-      { x: step.x, y: step.y, cropW: step.crop_w, cropH: step.crop_h },
-      step.action_type,
-    );
-  };
-
-  /**
-   * 框选确认：把矩形反算成裁图锚点落库，再更新前端 steps。
-   * cropCache 的 effect 依赖里包含 x/y/crop_w/crop_h，更新后会自动重算裁图。
-   * 只改锚点、不动 screenshot_base64 —— 原图完整保留，可以反复重裁。
-   */
-  const handleCropConfirm = async (rect: CropRectPx) => {
-    setCropPickerOpen(false);
-    const step = selectedStep;
-    if (!step) return;
-    const anchor = rectToCropAnchor(rect, step.action_type);
-    try {
-      await invoke("update_step_crop", {
-        stepId: step.id,
-        x: anchor.x,
-        y: anchor.y,
-        cropW: anchor.cropW,
-        cropH: anchor.cropH,
-      });
-      setSteps((prev) =>
-        prev.map((s) =>
-          s.id === step.id
-            ? { ...s, x: anchor.x, y: anchor.y, crop_w: anchor.cropW, crop_h: anchor.cropH }
-            : s,
-        ),
-      );
-      // 立刻切到裁图视图，让用户看到结果
-      setViewCropped(step.id, true);
-      setToast({ type: "success", message: "裁图已更新" });
-    } catch (err) {
-      console.error("保存裁图失败:", err);
-      setToast({ type: "error", message: "保存裁图失败" });
-    }
-  };
-
   /* ── Loading / Error ─────────────────────────────────────── */
 
   if (loading) {
@@ -1752,25 +1699,10 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                             className="screenshot-annotate-btn"
                             onClick={(e) => {
                               e.stopPropagation();
-                              setCropPickerOpen(true);
-                            }}
-                            title="手动框选这一步的裁图区域（自动裁图没对准时用）"
-                          >
-                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-                              <path d="M4.5 1.5v9a2 2 0 0 0 2 2h8" />
-                              <path d="M1.5 4.5h9a2 2 0 0 1 2 2v8" />
-                            </svg>
-                            重新裁图
-                          </button>
-                          <button
-                            className="screenshot-annotate-btn"
-                            onClick={(e) => {
-                              e.stopPropagation();
                               // 标注固定使用 after 全图（screenshot_base64）
                               openAnnotate(selectedStep.id);
                             }}
                             title="裁剪/添加文字/高亮/箭头/模糊标注"
-                            style={{ right: 132 }}
                           >
                             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
                               <path d="M8 2v12M2 8h12" />
@@ -1923,18 +1855,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           />
         );
       })()}
-
-      {/* 手动框选裁图：只改裁图锚点，保留原图，可反复重裁 */}
-      {cropPickerOpen && selectedStep?.screenshot_base64 && (
-        <CropOverlay
-          // key 保证切换步骤时重建实例，不残留上一步骤的选区
-          key={selectedStep.id}
-          imageBase64={selectedStep.screenshot_base64}
-          initialRect={initialCropRect(selectedStep)}
-          onConfirm={handleCropConfirm}
-          onCancel={() => setCropPickerOpen(false)}
-        />
-      )}
 
       {/* Custom Save Dialog */}
       {showSaveDialog && (() => {
