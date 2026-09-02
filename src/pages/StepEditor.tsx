@@ -115,11 +115,14 @@ function cropAdaptiveBase64(
           // 不强制最小/最大尺寸，避免把 URL 地址栏这种长条拉成大方块把文字糊掉。
           let rw = cropW + CROP_PAD * 2;
           let rh = cropH + CROP_PAD * 2;
-          // Stage C: type 步骤左扩原始矩形宽的 1/3，把左侧 label 带进裁剪图
+          // Stage C: type 步骤左侧多留原始矩形宽的 1/3，把左侧 label 带进裁剪图。
+          // ⚠️ 是 - extra / 2 不是 - extra：rw 已含 extra，居中项 x - rw/2 已在左右
+          // 各分到 extra/2；再左移 extra 会过冲，使右侧留白变成 CROP_PAD - extra/2
+          // （元素宽 > 48px 即为负，右边缘被切掉）。与 lib/cropAnchor 保持一致。
           if (actionType === "type") {
             const extra = Math.round(cropW / 3);
             rw += extra;
-            left = Math.round(x - rw / 2 - extra);
+            left = Math.round(x - rw / 2 - extra / 2);
           } else {
             left = Math.round(x - rw / 2);
           }

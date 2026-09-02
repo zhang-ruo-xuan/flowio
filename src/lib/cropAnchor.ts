@@ -38,7 +38,13 @@ export interface CropAnchor {
  * 与 cropAdaptiveBase64 的矩形计算保持一致（不含最后 clamp 到图边界那一步，
  * 因为手动框选的矩形本来就在图内，clamp 不生效）。
  *
- * type 步骤特殊：矩形左扩原始宽度的 1/3，把左侧 label（如"用户名"）带进裁图。
+ * type 步骤特殊：矩形左侧多留原始宽度的 1/3，把左侧 label（如"用户名"）带进裁图。
+ *
+ * ⚠️ 注意是 `- extra / 2` 而不是 `- extra`：框宽 `width` 里已经含了 `extra`，
+ * 居中项 `x - width/2` 天然在左右各分到 `extra/2`；要让左侧**总共**多出 `extra`，
+ * 只需再左移 `extra/2`。写成 `- extra` 会过冲 `extra/2`，导致右侧留白变成
+ * `PAD - extra/2` —— 元素宽度 > 48px 时即为负值，右边缘被切掉（300px 的输入框
+ * 会被切 42px）。
  */
 export function cropBoxFromAnchor(anchor: CropAnchor, actionType?: string): CropRectPx {
   const { x, y, cropW, cropH } = anchor;
@@ -47,7 +53,7 @@ export function cropBoxFromAnchor(anchor: CropAnchor, actionType?: string): Crop
     const extra = Math.round(cropW / 3);
     const width = cropW + CROP_PAD * 2 + extra;
     return {
-      x: Math.round(x - width / 2 - extra),
+      x: Math.round(x - width / 2 - extra / 2),
       y: Math.round(y - height / 2),
       width,
       height,
@@ -76,7 +82,8 @@ export function rectToCropAnchor(rect: CropRectPx, actionType?: string): CropAnc
     ? Math.round(((rect.width - CROP_PAD * 2) * 3) / 4)
     : rect.width - CROP_PAD * 2;
   let cropH = rect.height - CROP_PAD * 2;
-  let cx = rect.x + rect.width / 2 + (isType ? Math.round(cropW / 3) : 0);
+  // forward 的居中项已在左右各分到 extra/2，故中心点只需再右移 extra/2
+  let cx = rect.x + rect.width / 2 + (isType ? Math.round(cropW / 3) / 2 : 0);
   let cy = rect.y + rect.height / 2;
 
   let best: CropAnchor = { x: cx, y: cy, cropW, cropH };
