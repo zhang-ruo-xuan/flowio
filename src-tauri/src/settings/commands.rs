@@ -111,7 +111,14 @@ pub fn get_redaction_config(db: State<DbState>) -> Result<serde_json::Value, Str
         .ok();
     match json {
         Some(s) if !s.is_empty() => {
-            serde_json::from_str(&s).map_err(|e| e.to_string())
+            match serde_json::from_str(&s) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    // Config may have invalid escapes; try sanitizing
+                    let sanitized = crate::ai::parse::sanitize_json_escapes(&s);
+                    serde_json::from_str(&sanitized).map_err(|_| e.to_string())
+                }
+            }
         }
         _ => Ok(default_redaction_config()),
     }
