@@ -1741,25 +1741,17 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                           </button>
                         </>
                       ) : (
-                        <>
-                          <svg viewBox="0 0 16 9" style={{ width: '100%', pointerEvents: 'none', visibility: 'hidden' }} />
-                          <div
-                            className="step-detail-no-image"
-                            onClick={pickFileForUpload}
-                            onContextMenu={pasteScreenshot}
+                        <div
+                          className="step-detail-no-image step-detail-no-image-compact"
+                          onClick={pickFileForUpload}
+                          onContextMenu={pasteScreenshot}
                         >
                           <div className="upload-hint">
-                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                              <circle cx="8.5" cy="8.5" r="1.5"/>
-                              <polyline points="21 15 16 10 5 21"/>
-                            </svg>
-                            <span>上传截图</span>
-                            <span>点击或拖拽上传步骤截图</span>
+                            <span className="no-image-action-type">{selectedStep?.action_type?.toUpperCase() || ''}</span>
+                            <span className="no-image-title">{selectedStep?.title || '(无标题)'}</span>
+                            <span className="no-image-hint">点击或右键粘贴上传截图</span>
                           </div>
                         </div>
-                          {/* 裁剪图被删但全图还在时，右下角的全图/裁图切换仍可切回全图 */}
-                        </>
                       )}
                     </>
                   );
