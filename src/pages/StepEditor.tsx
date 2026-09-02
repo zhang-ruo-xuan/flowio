@@ -1770,6 +1770,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                               openAnnotate(selectedStep.id);
                             }}
                             title="裁剪/添加文字/高亮/箭头/模糊标注"
+                            style={{ right: 132 }}
                           >
                             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
                               <path d="M8 2v12M2 8h12" />
