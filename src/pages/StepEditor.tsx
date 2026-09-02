@@ -1652,7 +1652,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               {/* ── Screenshot ──── */}
               {(() => {
                 const _src = getStepMainSrc(selectedStep) || "";
-                if (!_src) {
+                const _noImage = !_src || (selectedStep?.action_type === 'COPY') || (selectedStep?.action_type === 'HOTKEY');
+                if (_noImage) {
                   // ── 无截图（COPY / HOTKEY 等）：紧凑居中卡片 ──
                   return (
                     <div className="step-detail-image step-detail-image--empty"
