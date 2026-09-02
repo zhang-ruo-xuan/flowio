@@ -1660,6 +1660,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                         className="step-detail-no-image step-detail-no-image-compact"
                         onClick={pickFileForUpload}
                         onContextMenu={pasteScreenshot}
+                        style={{ position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
                       >
                         <div className="upload-hint">
                           <span className="no-image-action-type">{selectedStep?.action_type?.toUpperCase() || ''}</span>

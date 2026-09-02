@@ -1957,8 +1957,8 @@ select {
 }
 
 .step-detail-no-image-compact {
-  position: relative;
-  inset: auto;
+  position: relative !important;
+  inset: auto !important;
   width: 100%;
   padding: 20px 16px;
 }
