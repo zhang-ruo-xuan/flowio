@@ -205,8 +205,6 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
   const H = image.naturalHeight;
   const dispW = Math.round(W * scale);
   const dispH = Math.round(H * scale);
-  // 可用区必须先实测再定缩放，所以首帧图仍是原尺寸 —— 先藏起来，避免闪一下
-  const fitted = avail !== null;
 
   return (
     <div style={styles.backdrop} onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
@@ -225,7 +223,6 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
               ...styles.stage,
               width: dispW,
               height: dispH,
-              visibility: fitted ? 'visible' : 'hidden',
             }}
             onMouseDown={(e) => {
               if (e.target === e.currentTarget || (e.target as HTMLElement).tagName === 'IMG') {

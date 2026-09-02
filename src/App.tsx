@@ -67,36 +67,45 @@ function App() {
   }, []);
 
   // 网站 token 自动刷新（PocketBase auth-refresh）
-  useEffect(() => {
+  // 合并策略：只覆盖服务端返回了非空值的字段，避免把已有头像/昵称清空。
+  // 窗口获焦时也刷新，保证用户在网站改了头像/简介后切回桌面端能自动同步。
+  const doAuthRefresh = useCallback(async () => {
     if (!siteToken) return;
-    (async () => {
-      try {
-        const res = await fetch("https://flowio.cn/api/collections/users/auth-refresh", {
-          method: "POST",
-          headers: { Authorization: siteToken },
-        });
-        if (!res.ok) {
-          console.log("[flowio] 网站 token 已过期，清除登录状态");
-          clearAuth();
-          return;
-        }
-        const data = await res.json();
-        if (data.token && data.record?.id) {
-          setAuth(data.token, {
-            id: data.record.id,
-            email: data.record.email || "",
-            display_name: data.record.display_name || "",
-            bio: data.record.bio || "",
-            avatar: data.record.avatar || "",
-          });
-          syncLocalUser(data.record.id);
-          console.log("[flowio] 网站 token 刷新成功:", data.record.email);
-        }
-      } catch (err) {
-        console.warn("[flowio] token 刷新失败:", err);
+    try {
+      const res = await fetch("https://flowio.cn/api/collections/users/auth-refresh", {
+        method: "POST",
+        headers: { Authorization: siteToken },
+      });
+      if (!res.ok) {
+        console.log("[flowio] 网站 token 已过期，清除登录状态");
+        clearAuth();
+        return;
       }
-    })();
-  }, []);
+      const data = await res.json();
+      if (data.token && data.record?.id) {
+        const prev = siteUser;
+        setAuth(data.token, {
+          id: data.record.id,
+          email: data.record.email || prev?.email || "",
+          display_name: data.record.display_name || prev?.display_name || "",
+          bio: data.record.bio || prev?.bio || "",
+          avatar: data.record.avatar || prev?.avatar || "",
+        });
+        syncLocalUser(data.record.id);
+        console.log("[flowio] 网站 token 刷新成功:", data.record.email);
+      }
+    } catch (err) {
+      console.warn("[flowio] token 刷新失败:", err);
+    }
+  }, [siteToken, siteUser, syncLocalUser]);
+
+  useEffect(() => { doAuthRefresh(); }, []);
+  // 窗口从后台切回前台时也刷新一次（用户可能在网站改了头像/简介）
+  useEffect(() => {
+    const handleFocus = () => { doAuthRefresh(); };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [doAuthRefresh]);
 
   // 启动时处理挂起的 deep-link（登录回调）
   useEffect(() => {
@@ -382,7 +391,7 @@ function App() {
             <button
               className="titlebar-btn titlebar-btn-login"
               onClick={() => siteToken ? navigate("/profile") : invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" })}
-              title={siteToken ? `已登录 ${siteUser?.email}（点击进入个人中心）` : "登录网站账号"}
+              title={siteToken ? `${siteUser?.display_name || siteUser?.email || '用户'}（点击进入个人中心）` : "登录网站账号"}
             >
               {siteToken ? (
                 siteUser?.avatar && !avatarLoadFailed ? (

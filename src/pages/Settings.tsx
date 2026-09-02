@@ -343,12 +343,13 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
       if (res.ok) {
         const data = await res.json();
         if (data.token && data.record?.id) {
+          const prev = siteUser;
           setAuth(data.token, {
             id: data.record.id,
-            email: data.record.email || "",
-            display_name: data.record.display_name || "",
-            bio: data.record.bio || "",
-            avatar: data.record.avatar || "",
+            email: data.record.email || prev?.email || "",
+            display_name: data.record.display_name || prev?.display_name || "",
+            bio: data.record.bio || prev?.bio || "",
+            avatar: data.record.avatar || prev?.avatar || "",
           });
           setProfileAvatarError(false);
           setProfileSyncMsg("已同步");
