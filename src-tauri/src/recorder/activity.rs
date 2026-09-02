@@ -6,6 +6,8 @@ extern "system" {
     fn GetWindowTextLengthW(hwnd: isize) -> i32;
     fn GetWindowTextW(hwnd: isize, buf: *mut u16, max_count: i32) -> i32;
     fn GetWindowRect(hwnd: isize, rect: *mut i32) -> i32;  // (left, top, right, bottom)
+    fn GetClientRect(hwnd: isize, rect: *mut i32) -> i32;  // (left, top, right, bottom)
+    fn ClientToScreen(hwnd: isize, point: *mut i32) -> i32; // (x, y) 原地改写
 }
 
 /// Retrieve the caption of the currently focused foreground window.
@@ -52,6 +54,45 @@ pub fn get_active_window_rect() -> Option<(i32, i32, i32, i32)> {
             return None;
         }
         Some((l, t, w, h))
+    }
+}
+
+/// 前台窗口**客户区**在屏幕上的矩形 `(x, y, width, height)`，物理像素。
+///
+/// ## 与 `get_active_window_rect()` 的区别（关键）
+/// `GetWindowRect` 含 DWM 的**隐形缩放边框**：最大化窗口会返回比屏幕大一圈的
+/// 矩形（每边约 7px @96dpi），底部还会多垫一个任务栏高度 —— 拿它当坐标锚点
+/// 会整体偏移。客户区恰好等于窗口的**视觉边界**，也就是浏览器
+/// `window.outerWidth / outerHeight` 的语义，是把扩展上报的"视口相对坐标"
+/// 换算成屏幕坐标时唯一可靠的锚点。
+///
+/// 对 Chrome/Edge 这类**自绘标题栏**的窗口，客户区还包含标签栏与地址栏，
+/// 因此 `客户区高 - 视口高 = 浏览器 chrome 高度`，正是垂直换算需要的量。
+///
+/// 前提是进程为 DPI 感知（tao 启动时会设 `PER_MONITOR_AWARE_V2`），
+/// 否则拿到的是被系统虚拟化的 96-dpi 坐标。
+pub fn get_active_client_rect() -> Option<(i32, i32, i32, i32)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd == 0 {
+            return None;
+        }
+        // 客户坐标恒为 (0, 0, w, h)
+        let mut rect = [0i32; 4];
+        if GetClientRect(hwnd, rect.as_mut_ptr()) == 0 {
+            return None;
+        }
+        // 客户区原点 (0,0) → 屏幕坐标
+        let mut pt = [0i32; 2];
+        if ClientToScreen(hwnd, pt.as_mut_ptr()) == 0 {
+            return None;
+        }
+        let w = rect[2] - rect[0];
+        let h = rect[3] - rect[1];
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        Some((pt[0], pt[1], w, h))
     }
 }
 

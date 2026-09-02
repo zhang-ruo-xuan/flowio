@@ -33,11 +33,117 @@ const PORTS: [u16; 4] = [9527, 9528, 9529, 9530];
 struct SelectionPayload {
     /// 被选中的文本，用于与剪贴板内容校验
     text: String,
-    /// 选区矩形（**屏幕物理像素**）：左上角 x/y + 宽高
+    /// 选区矩形（**屏幕物理像素**）：左上角 x/y + 宽高。
+    /// 由扩展自行估算，作为校准不可用时的兜底。
     x: i32,
     y: i32,
     width: i32,
     height: i32,
+    /// 以下 5 项为**窗口校准**路径的输入，全部缺省时（旧版扩展）走兜底。
+    /// 选区左上角相对**视口**的偏移（CSS 像素）
+    rx: Option<f64>,
+    ry: Option<f64>,
+    /// 视口尺寸（CSS 像素）
+    vw: Option<f64>,
+    vh: Option<f64>,
+    /// `window.devicePixelRatio`
+    dpr: Option<f64>,
+}
+
+/// 边框宽度上限（物理像素）。超出说明布局不对称（如 DevTools 停靠在侧边），
+/// 校准前提不成立 → 放弃。
+const MAX_FRAME_PX: i32 = 32;
+/// 浏览器非网页区域高度上限（物理像素）：标签栏 + 地址栏 + 书签栏 + 边框。
+const MAX_CHROME_PX: i32 = 512;
+
+/// 用真实窗口矩形，把「视口相对坐标」换算成「屏幕物理坐标」。
+///
+/// ## 为什么需要
+/// 扩展自己算绝对坐标要走 `(window.screenX + r.left) * devicePixelRatio`。
+/// 但 `screenX` 是 **CSS 像素**、原点在**主显示器**左上角 —— 多显示器缩放倍数
+/// 不同时（如主屏 100%、副屏 150%），这个乘法会整体偏掉几百像素。
+/// 客户区原点是 Win32 直接给出的**物理像素**，与截图同一坐标系，
+/// 可以彻底绕开这整类问题。
+///
+/// ## 参数
+/// - `client`：`activity::get_active_client_rect()` → (x, y, w, h)，物理像素
+/// - `rx/ry`：选区相对视口的偏移，CSS 像素
+/// - `vw/vh`：视口尺寸，CSS 像素
+/// - `dpr`：`devicePixelRatio`
+///
+/// ## 返回 `None` 的语义
+/// 数据"讲不通"（坐标系不一致 / 布局不对称 / 参数越界）→ 调用方应**原样回落**
+/// 到扩展估算的绝对坐标。宁可不修正，也不要引入新的偏移。
+pub(crate) fn calibrate_to_screen(
+    client: (i32, i32, i32, i32),
+    rx: f64,
+    ry: f64,
+    vw: f64,
+    vh: f64,
+    dpr: f64,
+) -> Option<(i32, i32)> {
+    if vw <= 0.0 || vh <= 0.0 || !dpr.is_finite() || !(0.25..=8.0).contains(&dpr) {
+        return None;
+    }
+    if !rx.is_finite() || !ry.is_finite() {
+        return None;
+    }
+    let (cx, cy, cw, ch) = client;
+    if cw <= 0 || ch <= 0 {
+        return None;
+    }
+
+    let vw_px = (vw * dpr).round();
+    let vh_px = (vh * dpr).round();
+
+    // 左右边框（假设对称）
+    let frame = ((cw as f64 - vw_px) / 2.0).round() as i32;
+    // 浏览器 chrome（标签栏 + 地址栏…）+ 下边框
+    let chrome = ch - vh_px as i32;
+
+    // 守卫：frame 必须是个"边框该有的量"。为负说明视口比客户区还宽 ——
+    // 典型诱因是桌面端未做 DPI 感知、坐标被系统虚拟化。
+    if !(0..=MAX_FRAME_PX).contains(&frame) {
+        return None;
+    }
+    // chrome 至少得有一个下边框的高度，也不该离谱地高
+    if !(frame..=MAX_CHROME_PX).contains(&chrome) {
+        return None;
+    }
+
+    Some((
+        cx + frame + (rx * dpr).round() as i32,
+        cy + chrome - frame + (ry * dpr).round() as i32,
+    ))
+}
+
+/// 决定这条上报最终采用哪个矩形：**窗口校准优先，失败则原样兜底**。
+fn resolve_rect(p: &SelectionPayload) -> (i32, i32, i32, i32) {
+    let w = p.width.max(1);
+    let h = p.height.max(1);
+
+    if let (Some(rx), Some(ry), Some(vw), Some(vh), Some(dpr)) =
+        (p.rx, p.ry, p.vw, p.vh, p.dpr)
+    {
+        if let Some(client) = super::activity::get_active_client_rect() {
+            match calibrate_to_screen(client, rx, ry, vw, vh, dpr) {
+                Some((x, y)) => {
+                    ocr_debug(&format!(
+                        "selection_bridge: calibrated win=({},{},{},{}) vw={} vh={} dpr={} -> abs=({},{}) est=({},{})",
+                        client.0, client.1, client.2, client.3, vw, vh, dpr, x, y, p.x, p.y
+                    ));
+                    return (x, y, w, h);
+                }
+                None => {
+                    ocr_debug(&format!(
+                        "selection_bridge: calibration rejected win=({},{},{},{}) vw={} vh={} dpr={} -> keep estimate",
+                        client.0, client.1, client.2, client.3, vw, vh, dpr
+                    ));
+                }
+            }
+        }
+    }
+    (p.x, p.y, w, h)
 }
 
 /// 一条缓存的上报记录
@@ -182,15 +288,16 @@ fn handle(mut stream: TcpStream) {
 
     let resp = match serde_json::from_slice::<SelectionPayload>(&body) {
         Ok(p) => {
+            let (x, y, w, h) = resolve_rect(&p);
             ocr_debug(&format!(
                 "selection_bridge: L0 hit rect=({},{},{},{}) text={:?}",
-                p.x,
-                p.y,
-                p.width,
-                p.height,
+                x,
+                y,
+                w,
+                h,
                 p.text.chars().take(40).collect::<String>()
             ));
-            record_selection(p.text, (p.x, p.y, p.width, p.height));
+            record_selection(p.text, (x, y, w, h));
             cors_response(200, "ok")
         }
         Err(e) => {
@@ -389,5 +496,120 @@ mod tests {
             "expected 400, got: {:?}",
             resp
         );
+    }
+
+    // ---------- 窗口校准（calibrate_to_screen）----------
+
+    /// 基线：最大化 Chrome，100% 缩放。
+    /// 客户区 = 工作区 (0,0,1920,1040)；视口 1920×950 → chrome 高 90。
+    /// 选区相对视口 (100,200) → 屏幕 (100, 290)。
+    #[test]
+    fn calibrate_maximized_chrome_at_100pct() {
+        assert_eq!(
+            calibrate_to_screen((0, 0, 1920, 1040), 100.0, 200.0, 1920.0, 950.0, 1.0),
+            Some((100, 290))
+        );
+    }
+
+    /// 150% 缩放：客户区与视口都以物理像素计，chrome 也跟着放大到 135。
+    /// 视口内相对坐标 (100,200) CSS px → 物理 (150,300)。
+    #[test]
+    fn calibrate_scales_with_dpr() {
+        assert_eq!(
+            calibrate_to_screen((0, 0, 2880, 1560), 100.0, 200.0, 1920.0, 950.0, 1.5),
+            Some((150, 435))
+        );
+    }
+
+    /// **这条是存在理由**：副屏（客户区原点物理 (2560,100)）。
+    /// 扩展用 `screenX * dpr` 算绝对坐标时会把副屏偏移按错误的倍数放大，
+    /// 而校准路径直接用客户区原点，不受影响。
+    #[test]
+    fn calibrate_second_monitor_uses_client_origin() {
+        assert_eq!(
+            calibrate_to_screen((2560, 100, 1920, 1040), 10.0, 20.0, 1920.0, 950.0, 1.0),
+            Some((2570, 210))
+        );
+    }
+
+    /// 还原（非最大化）窗口：客户区宽 1922 > 视口 1920 → 每边边框 1px。
+    #[test]
+    fn calibrate_restored_window_accounts_for_frame() {
+        assert_eq!(
+            calibrate_to_screen((100, 100, 1922, 1032), 10.0, 20.0, 1920.0, 930.0, 1.0),
+            Some((111, 221))
+        );
+    }
+
+    /// DevTools 停靠在右侧 → 左右不对称，frame 被算成 240px。
+    /// 校准前提不成立，必须返回 None 让调用方回落，而不是给出偏移几百像素的结果。
+    #[test]
+    fn calibrate_rejects_devtools_docked_side() {
+        assert_eq!(
+            calibrate_to_screen((0, 0, 2400, 1040), 10.0, 20.0, 1920.0, 950.0, 1.0),
+            None
+        );
+    }
+
+    /// 坐标系不一致（假设桌面端被系统虚拟化成 96-dpi，客户区只有 1280 宽）：
+    /// frame 为负 → 拒绝。宁可不修正，也不要引入新的偏移。
+    #[test]
+    fn calibrate_rejects_dpi_mismatch() {
+        assert_eq!(
+            calibrate_to_screen((0, 0, 1280, 693), 10.0, 20.0, 1920.0, 950.0, 1.0),
+            None
+        );
+    }
+
+    /// 参数越界/非法一律拒绝
+    #[test]
+    fn calibrate_rejects_nonsense_params() {
+        let ok = (0, 0, 1920, 1040);
+        assert_eq!(calibrate_to_screen(ok, 0.0, 0.0, 1920.0, 950.0, 0.0), None); // dpr=0
+        assert_eq!(calibrate_to_screen(ok, 0.0, 0.0, 1920.0, 950.0, -1.0), None); // dpr<0
+        assert_eq!(calibrate_to_screen(ok, 0.0, 0.0, 1920.0, 950.0, 99.0), None); // dpr 离谱
+        assert_eq!(calibrate_to_screen(ok, 0.0, 0.0, 0.0, 950.0, 1.0), None); // vw=0
+        assert_eq!(calibrate_to_screen(ok, 0.0, 0.0, 1920.0, -5.0, 1.0), None); // vh<0
+        assert_eq!(calibrate_to_screen((0, 0, 0, 0), 0.0, 0.0, 100.0, 100.0, 1.0), None); // 空窗口
+        assert_eq!(
+            calibrate_to_screen(ok, f64::NAN, 0.0, 1920.0, 950.0, 1.0),
+            None
+        ); // NaN
+    }
+
+    /// 兜底路径：上报里没有校准字段时，`resolve_rect` 必须原样返回扩展估算值。
+    #[test]
+    fn resolve_rect_falls_back_without_calibration_fields() {
+        let p = SelectionPayload {
+            text: "t".into(),
+            x: 11,
+            y: 22,
+            width: 333,
+            height: 44,
+            rx: None,
+            ry: None,
+            vw: None,
+            vh: None,
+            dpr: None,
+        };
+        assert_eq!(resolve_rect(&p), (11, 22, 333, 44));
+    }
+
+    /// 宽高为 0/负时兜底成 1，避免裁图塌缩
+    #[test]
+    fn resolve_rect_clamps_degenerate_size() {
+        let p = SelectionPayload {
+            text: "t".into(),
+            x: 1,
+            y: 2,
+            width: 0,
+            height: -3,
+            rx: None,
+            ry: None,
+            vw: None,
+            vh: None,
+            dpr: None,
+        };
+        assert_eq!(resolve_rect(&p), (1, 2, 1, 1));
     }
 }
