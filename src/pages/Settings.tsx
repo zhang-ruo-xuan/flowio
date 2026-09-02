@@ -27,7 +27,8 @@ interface ProviderConfig {
 }
 
 const BUILTIN_PROVIDERS: ProviderDef[] = [
-  { id: "zhipu", name: "智谱 AI", base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions", models: ["glm-4v"] },
+  { id: "flowio-free", name: "Flowio 免费试用 (GLM-4.6V-Flash)", base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions", models: ["glm-4.6v-flash"] },
+  { id: "zhipu", name: "智谱 AI", base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions", models: ["glm-4v", "glm-4-flash", "glm-4.6v-flash"] },
   { id: "qwen", name: "阿里百炼 (通义千问)", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-vl-plus", "qwen-vl-max"] },
   { id: "doubao", name: "字节豆包", base_url: "https://ark.cn-beijing.volces.com/api/v3", models: ["doubao-vision-pro-32k"] },
   { id: "yi", name: "零一万物 Yi", base_url: "https://api.lingyiwanwu.com/v1", models: ["yi-vision"] },
@@ -60,10 +61,10 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
   const { siteUser, siteToken, clearAuth, setAuth } = useAuthStore();
 
   /* ---- AI Config State ---- */
-  const [defaultProvider, setDefaultProvider] = useState("zhipu");
+  const [defaultProvider, setDefaultProvider] = useState("flowio-free");
   const [providers, setProviders] = useState<ProviderDef[]>([...BUILTIN_PROVIDERS]);
   const providersRef = useRef(providers);
-  const [selectedId, setSelectedId] = useState("zhipu");
+  const [selectedId, setSelectedId] = useState("flowio-free");
   const [providerConfigs, setProviderConfigs] = useState<Record<string, ProviderConfig>>({});
   const [loadingConfigs, setLoadingConfigs] = useState(true);
 
@@ -144,16 +145,22 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
 
   // Save config — validates first
   const handleSave = async () => {
-    if (!editApiKey.trim()) { setSaveResult("请先输入 API Key"); return; }
+    // flowio-free has a built-in API key; no need for user input
+    if (selectedId !== "flowio-free" && !editApiKey.trim()) { setSaveResult("请先输入 API Key"); return; }
     setSaving(true);
     setSaveResult(null);
 
     try {
-      await invoke<string>("test_api_key", { providerId: selectedId, apiKey: editApiKey });
+      // For flowio-free, test with built-in key; otherwise test user's key
+      const keyToTest = selectedId === "flowio-free" ? "builtin" : editApiKey;
+      await invoke<string>("test_api_key", { providerId: selectedId, apiKey: keyToTest });
     } catch (e: unknown) {
-      setSaveResult(typeof e === "string" ? e : String(e));
-      setSaving(false);
-      return;
+      // flowio-free builtin key doesn't need testing — skip test error for it
+      if (selectedId !== "flowio-free") {
+        setSaveResult(typeof e === "string" ? e : String(e));
+        setSaving(false);
+        return;
+      }
     }
 
     const def = providers.find((p) => p.id === selectedId)!;
@@ -161,7 +168,8 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
       await invoke("set_ai_config", {
         config: {
           provider: { id: def.id, name: def.name, base_url: def.base_url, model: editModel || def.models[0] },
-          api_key: editApiKey,
+          // flowio-free uses backend built-in key; others store user's key
+          api_key: selectedId === "flowio-free" ? "" : editApiKey,
         },
       });
       setSaveResult("保存成功");

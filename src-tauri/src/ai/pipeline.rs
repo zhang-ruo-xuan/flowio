@@ -437,6 +437,7 @@ fn model_supports_vision(model: &str) -> bool {
         "claude-3",
         "gemini",
         "glm-4v",
+        "glm-4.6v",
         "qwen-vl",
         "doubao-vision",
         "yi-vision",
@@ -452,7 +453,7 @@ fn model_supports_vision(model: &str) -> bool {
 /// Suggest a vision-capable model for the given provider.
 fn suggest_vision_model(provider_id: &str) -> String {
     match provider_id {
-        "zhipu" => "「glm-4v」".to_string(),
+        "flowio-free" | "zhipu" => "「glm-4.6v-flash」".to_string(),
         "qwen" => "「qwen-vl-plus」或「qwen-vl-max」".to_string(),
         "doubao" => "「doubao-vision-pro-32k」".to_string(),
         "yi" => "「yi-vision」".to_string(),
@@ -557,6 +558,7 @@ mod pipeline_tests {
             "gemini-2.0-flash",
             "glm-4v",
             "glm-4v-plus",
+            "glm-4.6v-flash",
             "qwen-vl-plus",
             "qwen-vl-max",
             "doubao-vision-pro-32k",
@@ -604,7 +606,8 @@ mod pipeline_tests {
 
     #[test]
     fn suggest_vision_model_branches() {
-        assert_eq!(suggest_vision_model("zhipu"), "「glm-4v」");
+        assert_eq!(suggest_vision_model("flowio-free"), "「glm-4.6v-flash」");
+        assert_eq!(suggest_vision_model("zhipu"), "「glm-4.6v-flash」");
         assert!(suggest_vision_model("qwen").contains("qwen-vl"));
         assert!(suggest_vision_model("doubao").contains("doubao-vision"));
         assert_eq!(suggest_vision_model("yi"), "「yi-vision」");

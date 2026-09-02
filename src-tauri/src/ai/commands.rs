@@ -128,7 +128,7 @@ pub fn set_default_provider(db: State<DbState>, provider_id: String) -> Result<(
 }
 
 /// Get the default AI provider from the settings table.
-/// Returns 'zhipu' if no default is set.
+/// Returns 'flowio-free' if no default is set.
 #[tauri::command]
 pub fn get_default_provider(db: State<DbState>) -> Result<String, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -136,7 +136,24 @@ pub fn get_default_provider(db: State<DbState>) -> Result<String, String> {
         .prepare("SELECT value FROM settings WHERE key = 'default_ai_provider'")
         .map_err(|e| e.to_string())?;
     let result: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
-    Ok(result.unwrap_or_else(|| "zhipu".to_string()))
+    Ok(result.unwrap_or_else(|| "flowio-free".to_string()))
+}
+
+/// Built-in free-tier AI configuration (Flowio free trial).
+///
+/// Uses Zhipu GLM-4.6V-Flash (vision-capable) with a built-in API key.
+/// New users get this out-of-the-box — no setup required.
+/// Matches the extension's `flowio-free` provider in modelEnum.ts.
+fn get_builtin_free_config() -> AiConfig {
+    AiConfig {
+        provider: AiProvider {
+            id: "flowio-free".into(),
+            name: "Flowio 免费试用 (GLM-4.6V-Flash)".into(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions".into(),
+            model: "glm-4.6v-flash".into(),
+        },
+        api_key: "874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U".into(),
+    }
 }
 
 /// Trigger AI-powered step generation for a recording.
@@ -172,7 +189,11 @@ pub async fn generate_ai_steps(
             }
         }
 
-        if let Some(cfg) = maybe_cfg {
+        if let Some(mut cfg) = maybe_cfg {
+            // flowio-free with empty key → fill in built-in key
+            if cfg.provider.id == "flowio-free" && cfg.api_key.is_empty() {
+                cfg.api_key = get_builtin_free_config().api_key;
+            }
             cfg
         } else {
             let rows: Vec<(String, String)> = conn
@@ -209,9 +230,8 @@ pub async fn generate_ai_steps(
                     }
                 }
                 _ => {
-                    return Err(
-                        "AI 配置未设置，请先在设置中配置 AI 服务商。".to_string(),
-                    );
+                    // No user-configured AI provider → use built-in free tier
+                    get_builtin_free_config()
                 }
             }
         }
@@ -939,7 +959,7 @@ mod ai_commands_tests {
         let conn2 = rusqlite::Connection::open_in_memory().unwrap();
         crate::db::init_db(&conn2);
         let d: Option<String> = conn2.query_row("SELECT value FROM settings WHERE key = 'default_ai_provider'", [], |r| r.get(0)).ok();
-        assert_eq!(d, None, "缺省时无默认 provider 行（命令层回退 zhipu）");
+        assert_eq!(d, None, "缺省时无默认 provider 行（命令层回退 flowio-free）");
     }
 
     #[test]
