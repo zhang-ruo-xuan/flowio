@@ -185,7 +185,28 @@ pub async fn generate_ai_steps(
 
             match rows.into_iter().next() {
                 Some((_, json)) if !json.is_empty() => {
-                    serde_json::from_str::<AiConfig>(&json).map_err(|e| e.to_string())?
+                    // Try normal parse first
+                    if let Ok(cfg) = serde_json::from_str::<AiConfig>(&json) {
+                        cfg
+                    } else {
+                        // Config JSON may have invalid escapes (corrupted DB or
+                        // legacy data). Try sanitizing escapes then re-parsing.
+                        let sanitized = crate::ai::parse::sanitize_json_escapes(&json);
+                        match serde_json::from_str::<AiConfig>(&sanitized) {
+                            Ok(cfg) => cfg,
+                            Err(e) => {
+                                log::error!(
+                                    "AI config JSON corrupt (first 300 chars): {} | error: {}",
+                                    &json[..json.len().min(300)],
+                                    e
+                                );
+                                return Err(format!(
+                                    "AI 配置数据损坏（JSON 解析失败），请重新在设置中保存一次 AI 服务商配置。详情：{}",
+                                    e
+                                ));
+                            }
+                        }
+                    }
                 }
                 _ => {
                     return Err(
@@ -270,8 +291,15 @@ pub fn get_ai_config(db: State<DbState>, provider_id: String) -> Result<Option<A
 
     match json {
         Some(s) if !s.is_empty() => {
-            let config: AiConfig = serde_json::from_str(&s).map_err(|e| e.to_string())?;
-            Ok(Some(config))
+            match serde_json::from_str::<AiConfig>(&s) {
+                Ok(config) => Ok(Some(config)),
+                Err(e) => {
+                    let sanitized = crate::ai::parse::sanitize_json_escapes(&s);
+                    serde_json::from_str::<AiConfig>(&sanitized)
+                        .map(Some)
+                        .map_err(|_| format!("AI 配置数据损坏，请重新保存配置。原始错误：{}", e))
+                }
+            }
         }
         _ => Ok(None),
     }
@@ -292,8 +320,15 @@ pub fn get_first_ai_config(db: State<DbState>) -> Result<Option<AiConfig>, Strin
 
     match rows.into_iter().next() {
         Some((_, json)) if !json.is_empty() => {
-            let config: AiConfig = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-            Ok(Some(config))
+            match serde_json::from_str::<AiConfig>(&json) {
+                Ok(config) => Ok(Some(config)),
+                Err(e) => {
+                    let sanitized = crate::ai::parse::sanitize_json_escapes(&json);
+                    serde_json::from_str::<AiConfig>(&sanitized)
+                        .map(Some)
+                        .map_err(|_| format!("AI 配置数据损坏，请重新保存配置。原始错误：{}", e))
+                }
+            }
         }
         _ => Ok(None),
     }

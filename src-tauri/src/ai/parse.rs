@@ -113,7 +113,7 @@ fn finish_step(mut step: StepOutput, original_action_type: &str) -> StepOutput {
 ///
 /// It is careful to **not** break valid `\uXXXX` sequences (exactly 4 hex
 /// digits after `\u`) and preserves all standard JSON escapes.
-fn sanitize_json_escapes(input: &str) -> String {
+pub(crate) fn sanitize_json_escapes(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
