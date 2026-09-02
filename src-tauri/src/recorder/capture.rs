@@ -108,40 +108,15 @@ pub fn start_capture_thread(
         while running.load(Ordering::Relaxed) {
             let loop_start = Instant::now();
 
-            match screenshot::capture_fullscreen_with_origin() {
-                Ok((full, origin_x, origin_y)) => {
-                    let (img, ox, oy) = match &target_window {
-                        Some(target) => {
-                            match super::recorder::find_window_rect_by_process(target) {
-                                Some(rect) => {
-                                    // rect is in screen coordinates; convert to
-                                    // virtual-desktop image coordinates.
-                                    let x0 = (rect.left - origin_x) as u32;
-                                    let y0 = (rect.top - origin_y) as u32;
-                                    let x1 = (rect.right - origin_x) as u32;
-                                    let y1 = (rect.bottom - origin_y) as u32;
-                                    if x1 > x0 && y1 > y0 {
-                                        let cw = x1 - x0;
-                                        let ch = y1 - y0;
-                                        // offset keeps screen-space semantics: the
-                                        // cropped image's (0,0) maps to screen
-                                        // (rect.left, rect.top).
-                                        (full.crop_imm(x0, y0, cw, ch), rect.left, rect.top)
-                                    } else {
-                                        // Target window off-screen/minimized: skip frame.
-                                        skip_frame(&loop_start, interval);
-                                        continue;
-                                    }
-                                }
-                                None => {
-                                    // Target window closed/hidden: skip frame.
-                                    skip_frame(&loop_start, interval);
-                                    continue;
-                                }
-                            }
-                        }
-                        None => (full, origin_x, origin_y),
-                    };
+            // In target-window mode, use PrintWindow (captures GPU-accelerated
+            // windows like WPS Office that GDI BitBlt renders as black).
+            let capture_result = match &target_window {
+                Some(target) => screenshot::capture_target_window(target),
+                None => screenshot::capture_fullscreen_with_origin(),
+            };
+
+            match capture_result {
+                Ok((img, ox, oy)) => {
 
                     let frame = CapturedFrame {
                         timestamp: Instant::now(),

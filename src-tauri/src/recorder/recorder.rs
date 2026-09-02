@@ -268,6 +268,81 @@ pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
     })
 }
 
+/// Find the HWND of the best matching visible window for the given process name.
+///
+/// Same selection logic as `find_window_rect_by_process` but returns the window
+/// handle (HWND) instead of its rect — needed by `capture_target_window` which
+/// uses `PrintWindow` on the handle directly.
+pub fn find_window_hwnd_by_process(process_name: &str) -> Option<isize> {
+    let mut ctx: (Vec<HwndCandidate>, &str) = (Vec::new(), process_name);
+    unsafe {
+        EnumWindows(
+            Some(enum_windows_hwnd_collect_callback),
+            (&mut ctx as *mut (Vec<HwndCandidate>, &str)) as isize,
+        );
+    }
+    pick_target_hwnd(&ctx.0).inspect(|hwnd| {
+        capture_dbg_log(&format!(
+            "[CAPTURE] find_window_hwnd_by_process({}): hwnd=0x{:X}",
+            process_name, hwnd
+        ));
+    })
+}
+
+/// A candidate window with its HWND for PrintWindow capture.
+struct HwndCandidate {
+    hwnd: isize,
+    rect: Rect,
+    has_title: bool,
+}
+
+unsafe extern "system" fn enum_windows_hwnd_collect_callback(
+    hwnd: isize,
+    lparam: isize,
+) -> i32 {
+    if unsafe { IsWindowVisible(hwnd) } == 0 { return 1; }
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    let mut has_title = false;
+    if len > 0 {
+        let mut buf: Vec<u16> = vec![0; (len + 1) as usize];
+        let actual = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if actual > 0 {
+            let title = String::from_utf16_lossy(&buf[..actual as usize]);
+            has_title = !title.trim().is_empty();
+        }
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    let Some(name) = process_name_of_pid(pid) else { return 1; };
+    let (candidates, process_name) = &mut *(lparam as *mut (Vec<HwndCandidate>, &str));
+    if !name.eq_ignore_ascii_case(process_name) { return 1; }
+    let mut rect = Rect::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) } != 0
+        && rect.right > rect.left && rect.bottom > rect.top
+    {
+        candidates.push(HwndCandidate { hwnd, rect, has_title });
+    }
+    1
+}
+
+fn pick_target_hwnd(candidates: &[HwndCandidate]) -> Option<isize> {
+    const TITLED_BONUS: i64 = 2;
+    let mut best: Option<(i64, isize)> = None;
+    for c in candidates {
+        let w = c.rect.width();
+        let h = c.rect.height();
+        if w < MIN_W || h < MIN_H { continue; }
+        let area = (w as i64) * (h as i64);
+        let score = if c.has_title { area * TITLED_BONUS } else { area };
+        let better = match &best {
+            None => true,
+            Some((bs, _)) => score > *bs,
+        };
+        if better { best = Some((score, c.hwnd)); }
+    }
+    best.map(|(_, hwnd)| hwnd)
+}
+
 /// Pure window-ranking logic, extracted from `find_window_rect_by_process`
 /// so it can be exercised without Win32. Drops candidates with rect below
 /// `MIN_W × MIN_H`, then scores the survivors as `area × TITLED_BONUS` when

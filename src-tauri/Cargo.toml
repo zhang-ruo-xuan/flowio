@@ -24,6 +24,7 @@ docx-rs = "0.4"
 log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 xcap = "0.3"
+scopeguard = "1.1"
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -39,6 +40,8 @@ windows = { version = "0.58", features = [
     "Globalization",
     "Graphics_Imaging",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Storage_Xps",
     "Media_Ocr",
     "Storage_Streams",
 ] }
