@@ -582,10 +582,12 @@ fn flush_shortcut_step(
             // ── COPY L1: UIA 选区矩形（被复制文本的精确几何）──
             // sel_rect_at_capture（事件时刻抓的）只作 a11y warmup——事件时刻剪贴板还没读，
             // 无法做文本校验，不可直接采信（会拿到查找条残留选区）。
-            // 统一在后台线程读剪贴板后带校验查询：选区在复制后 1-2 秒内通常还在，
-            // 重试最多 ~1.2s，不影响录制主流程。
+            // 统一在后台线程读剪贴板后带校验查询：选区在复制后通常还在，
+            // 重试窗口约 2s（递增退避，前段密集抢选区还在的窗口，后段等 a11y 树激活）。
+            // 递增退避不影响录制主流程；配合录制启动时的 a11y 预热，
+            // 稳态下应该第 1 次就命中。
             let sel_rect = if is_copy_op {
-                screenshot::get_selected_text_rect_with_retry(8, 150, &text)
+                screenshot::get_selected_text_rect_with_retry(10, 100, &text)
             } else {
                 None
             };
@@ -1930,6 +1932,15 @@ pub fn start_recording(
     recorder.event_thread = Some(handle);
     recorder.running_flag = Some(running);
     recorder.captured_steps = Some(captured_steps);
+
+    // ── a11y 预热（后台线程）──────────────────────────────
+    // Chromium 的无障碍树是惰性激活的：录制刚开始时树往往还没建好，
+    // 会导致**第一次** Ctrl+C 拿不到精确选区矩形（退化到 OCR/屏幕中心兜底）。
+    // 录制一开始就后台探测，等用户真正复制时树已就绪，首查即命中。
+    // 激活是进程级且持久的，命中后线程立即退出，不做无谓轮询（纯只读查询，无副作用）。
+    std::thread::spawn(move || {
+        screenshot::warmup_uia_text_pattern(40, 500);
+    });
 
     // --- Store in manager ---
     {

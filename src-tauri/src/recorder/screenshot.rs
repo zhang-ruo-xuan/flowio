@@ -500,28 +500,77 @@ pub fn get_selected_text_rect_matching(expected_clipboard: &str) -> Option<(i32,
     sel_rect_impl(Some(expected_clipboard))
 }
 
-fn sel_rect_impl(expected_clipboard: Option<&str>) -> Option<(i32, i32, i32, i32)> {
+// 模块级导入：`focused_text_pattern()` 的返回类型写在签名上，函数体内的
+// `use` 作用域覆盖不到签名，所以这两个名字必须在模块作用域可见。
+use windows::Win32::UI::Accessibility::{IUIAutomationTextPattern, UIA_TextPatternId};
+
+/// 取当前聚焦元素的 UIA TextPattern。失败（None）有两种含义：
+/// 1. 焦点在不支持文本的控件上（图片、按钮等）——正常情况；
+/// 2. **无障碍树尚未激活** —— Chromium 的 a11y 树是惰性构建的，
+///    没有辅助技术客户端连接时 GetCurrentPatternAs 直接失败。
+///
+/// 第 2 种情况正是「复制步骤定位不准」的根因，需要靠重复查询把树"唤醒"。
+fn focused_text_pattern() -> Option<IUIAutomationTextPattern> {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, UIA_TextPattern2Id};
+
+    unsafe {
+        // 重复调用在同一线程会返回 S_FALSE / RPC_E_CHANGED_MODE，忽略即可
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL).ok()?;
+        let focused = automation.GetFocusedElement().ok()?;
+        // 先尝试 TextPattern2，失败再试 TextPattern（Chromium 可能只支持其中一个）
+        focused
+            .GetCurrentPatternAs(UIA_TextPattern2Id)
+            .or_else(|_| focused.GetCurrentPatternAs(UIA_TextPatternId))
+            .ok()
+    }
+}
+
+/// 当前聚焦元素是否已暴露 TextPattern —— 用于探测无障碍树是否激活。
+///
+/// 注意：false 也可能是"焦点本来就在无文本控件上"，所以预热探测是
+/// **尽力而为**：探测到就说明树已就绪，探测不到不意味着有故障。
+pub fn uia_text_pattern_available() -> bool {
+    focused_text_pattern().is_some()
+}
+
+/// a11y 预热：周期性探测 TextPattern，一旦拿到就立即返回。
+///
+/// 为什么需要它：Chromium 的无障碍树惰性激活，录制开始时往往还没建好，
+/// 导致第一次 Ctrl+C 的选区查询必然失败（要等重试窗口内反复查询唤醒）。
+/// 录制一开始就后台预热，等用户真正复制时树已就绪，首查即命中。
+///
+/// 激活是**进程级且持久**的，所以命中后线程立即退出，不做无谓轮询。
+/// 只能在后台线程调用（总耗时最多 max_attempts × delay_ms）。
+pub fn warmup_uia_text_pattern(max_attempts: u32, delay_ms: u64) -> bool {
+    for attempt in 0..max_attempts {
+        if uia_text_pattern_available() {
+            ocr_debug(&format!(
+                "a11y warmup: TextPattern available after ~{}ms",
+                (attempt as u64) * delay_ms
+            ));
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    ocr_debug(&format!(
+        "a11y warmup: TextPattern unavailable after {}ms (focus stayed on non-text UI)",
+        (max_attempts as u64) * delay_ms
+    ));
+    false
+}
+
+fn sel_rect_impl(expected_clipboard: Option<&str>) -> Option<(i32, i32, i32, i32)> {
     use windows::Win32::System::Ole::{
         SafeArrayAccessData, SafeArrayDestroy, SafeArrayUnaccessData,
     };
-    use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPattern2Id,
-    };
 
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-        let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL).ok()?;
-        let focused = automation.GetFocusedElement().ok()?;
-        // 先尝试 TextPattern2，失败再试 TextPattern（Chromium 可能只支持其中一个）
-        let tp: IUIAutomationTextPattern = focused
-            .GetCurrentPatternAs(UIA_TextPattern2Id)
-            .or_else(|_| focused.GetCurrentPatternAs(windows::Win32::UI::Accessibility::UIA_TextPatternId))
-            .ok()?;
+        let tp: IUIAutomationTextPattern = focused_text_pattern()?;
         let selections = tp.GetSelection().ok()?;
         let len = selections.Length().ok()?;
         if len <= 0 {
@@ -613,8 +662,17 @@ pub fn get_selected_text_rect_with_retry(
             }
             return Some(r);
         }
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        // 递增退避：刚复制完的几百毫秒内选区还在，用密集重试抢这个窗口；
+        // 之后还失败，更可能是 a11y 树未激活，逐步拉长间隔等它构建完成。
+        let backoff = delay_ms + (attempt as u64) * (delay_ms / 3);
+        std::thread::sleep(std::time::Duration::from_millis(backoff));
     }
+    // MISS 记录：用于区分"选区已消失"（正常）与"a11y 未激活"（可优化）
+    ocr_debug(&format!(
+        "sel_rect: MISS after {} attempts (clipboard={:?})",
+        max_attempts,
+        expected_clipboard.chars().take(40).collect::<String>()
+    ));
     None
 }
 
