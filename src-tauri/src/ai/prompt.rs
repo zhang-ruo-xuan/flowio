@@ -17,6 +17,13 @@ pub fn build_system_prompt() -> String {
 - 不要猜测截图中不存在的元素
 - 不要描述不相关的界面细节（颜色/形状等，除非是操作的关键标识）
 
+表格/电子表格软件专项规则（当截图出现单元格网格、列标 A/B/C、行号、公式栏、函数对话框时适用，如 WPS 表格、Excel、LibreOffice Calc、Numbers 等）：
+- 标题必须包含具体单元格引用（如「单击 B22」「双击 B22 填充柄」），严禁写「点击单元格」这类笼统描述
+- 涉及函数时，标题或描述写明函数名（如 VLOOKUP、SUM、IF）及所在入口（如「公式」选项卡 → 「插入函数」）
+- 描述中写明关键参数与取值（如 查找值=A22、数据表=$A$2:$E$21、列序=2、匹配条件=FALSE）
+- 双击单元格右下角填充柄并下拖到目标行时，标题用「向下填充到 B31」等明确范围
+- 窗口标题含工作表/工作簿名（如「销售表」）时，描述可引用该名称
+
 截图说明：
 你会收到一张截图：
 - （after）操作后的截图：以点击坐标为中心裁剪的 400×400 局部区域（无有效坐标时为全图），用于判断用户在该界面上的操作。
@@ -27,6 +34,33 @@ pub fn build_system_prompt() -> String {
 {"title": "2-20字中文标题，动词开头", "description": "10-200字中文描述", "action_type": "click/input/select/scroll/navigate/other", "tip": "可选的操作提示或注意事项"}
 "#
     .to_string()
+}
+
+/// Heuristic check: does the window title suggest a spreadsheet application?
+///
+/// Used to inject spreadsheet-specific guidance into the per-step prompt.
+/// Keywords cover WPS 表格 / Excel / LibreOffice Calc / Numbers and common
+/// file extensions and UI terms.
+fn is_spreadsheet_window(title: &str) -> bool {
+    let t = title.to_lowercase();
+    [
+        "wps 表格",
+        "wps表格",
+        "excel",
+        "calc",
+        "numbers",
+        "电子表格",
+        "单元格",
+        "工作表",
+        ".xlsx",
+        ".xls",
+        ".et",
+        ".ods",
+        "spreadsheet",
+        "sheet",
+    ]
+    .iter()
+    .any(|k| t.contains(k))
 }
 
 /// Build a single-step prompt for the vision model.
@@ -46,10 +80,16 @@ pub fn build_step_prompt(step: &StepInput, step_number: usize) -> String {
         String::new()
     };
 
+    let spreadsheet_hint = if is_spreadsheet_window(&step.window_title) {
+        "【表格软件】此步骤疑似电子表格操作，请严格按「表格/电子表格软件专项规则」撰写：标题必须含精确单元格引用（如 B22），涉及函数时写明函数名与入口，描述补全关键参数取值与填充范围。\n".to_string()
+    } else {
+        String::new()
+    };
+
     format!(
         r#"请为以下第 {step_number} 个操作步骤生成中文标题、描述、操作类型和提示。
 
-{context}{action}原始标题：{original_title}
+{context}{action}{spreadsheet_hint}原始标题：{original_title}
 原始描述：{original_desc}
 
 请根据操作截图推断用户实际执行的操作，输出 JSON：
@@ -103,6 +143,14 @@ mod prompt_tests {
     }
 
     #[test]
+    fn build_system_prompt_includes_spreadsheet_rules() {
+        let p = build_system_prompt();
+        assert!(p.contains("表格"), "system prompt 应包含表格软件专项规则");
+        assert!(p.contains("单元格"), "应提及单元格引用");
+        assert!(p.contains("VLOOKUP") || p.contains("函数名"), "应提及函数名识别");
+    }
+
+    #[test]
     fn build_step_prompt_includes_metadata() {
         let p = build_step_prompt(&input("点击保存", "描述", "click", "记事本"), 1);
         assert!(p.contains("第 1 个操作步骤"));
@@ -110,6 +158,22 @@ mod prompt_tests {
         assert!(p.contains("录制动作类型：click"));
         assert!(p.contains("原始标题：点击保存"));
         assert!(p.contains("原始描述：描述"));
+    }
+
+    #[test]
+    fn build_step_prompt_injects_spreadsheet_hint_for_spreadsheet_window() {
+        let p = build_step_prompt(
+            &input("单击", "", "click", "销售表.xlsx - WPS 表格"),
+            2,
+        );
+        assert!(p.contains("【表格软件】"), "表格窗口应注入表格软件强化指令");
+        assert!(p.contains("B22") || p.contains("单元格"), "应提示精确单元格引用");
+    }
+
+    #[test]
+    fn build_step_prompt_omits_spreadsheet_hint_for_non_spreadsheet_window() {
+        let p = build_step_prompt(&input("点击", "", "click", "记事本"), 3);
+        assert!(!p.contains("【表格软件】"), "非表格窗口不应注入表格软件指令");
     }
 
     #[test]
