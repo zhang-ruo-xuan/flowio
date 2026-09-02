@@ -455,6 +455,13 @@ pub(crate) fn export_crop_box(
     Some((left, top, rw, rh))
 }
 
+/// 返回 `(最终写出去的字节, 这些字节对应的真实像素尺寸)`。
+///
+/// ⚠️ 调用方必须拿**第二个返回值**去算显示尺寸，不要用原图尺寸：
+/// DOCX 导出曾经传原图尺寸给 `Pic::new(cropped_bytes).size(w, h)`，
+/// 于是裁剪后的图被按原图比例拉伸变形（如 1920×1080 原图裁出 800×600，
+/// 显示成 16:9 的框 → 横向拉伸 33%），且小裁剪区域会被放大到 600px 宽变模糊。
+/// 见测试 `docx_image_emu_matches_written_bytes`。
 fn maybe_crop_screenshot_bytes(
     raw_bytes: Vec<u8>,
     x: Option<i32>,
@@ -462,17 +469,18 @@ fn maybe_crop_screenshot_bytes(
     crop_w: Option<i32>,
     crop_h: Option<i32>,
     action_type: &str,
-) -> Vec<u8> {
+) -> (Vec<u8>, Option<(usize, usize)>) {
     let mut img = match image::load_from_memory(&raw_bytes) {
         Ok(i) => i,
-        Err(_) => return raw_bytes,
+        Err(_) => return (raw_bytes, None),
     };
     let img_w = img.width() as i32;
     let img_h = img.height() as i32;
+    let full_dims = Some((img.width() as usize, img.height() as usize));
     let (left, top, rw, rh) = match export_crop_box(img_w, img_h, x, y, crop_w, crop_h, action_type)
     {
         Some(v) => v,
-        None => return raw_bytes,
+        None => return (raw_bytes, full_dims),
     };
 
     let cropped = img.crop(left as u32, top as u32, rw as u32, rh as u32);
@@ -480,9 +488,9 @@ fn maybe_crop_screenshot_bytes(
     // 输出 JPEG 质量 85（与前端 canvas.toDataURL("image/jpeg", 0.85) 一致）
     let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
     if cropped.write_with_encoder(enc).is_err() {
-        return raw_bytes;
+        return (raw_bytes, full_dims);
     }
-    buf
+    (buf, Some((rw as usize, rh as usize)))
 }
 
 // ── HTML export ───────────────────────────────────────────────
@@ -503,7 +511,7 @@ fn gen_html_body(
                 let raw = std::fs::read(&s.screenshot_path).ok().unwrap_or_default();
                 let is_crop = crop_set.contains(s.id.as_str());
                 let data = if is_crop && !raw.is_empty() {
-                    maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type)
+                    maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type).0
                 } else {
                     raw
                 };
@@ -590,7 +598,7 @@ fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], ss_dir: &s
                     // 裁剪模式：读取→裁剪→写入
                     match std::fs::read(src).ok().filter(|b| !b.is_empty()) {
                         Some(raw) => {
-                            let cropped = maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type);
+                            let cropped = maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type).0;
                             match std::fs::write(&dest, &cropped) {
                                 Ok(_) => format!("![Screenshot](./screenshots/{})", filename),
                                 Err(_) => format!("> *(Screenshot export failed)*"),
@@ -705,12 +713,13 @@ fn export_docx(
         if !s.screenshot_path.is_empty() {
             if let Ok(img_bytes) = std::fs::read(&s.screenshot_path) {
                 let is_crop = crop_set.contains(s.id.as_str());
-                let final_bytes = if is_crop && !img_bytes.is_empty() {
+                // ⚠️ 尺寸必须跟着 final_bytes 走：裁剪后原图尺寸就失效了
+                let (final_bytes, final_dims) = if is_crop && !img_bytes.is_empty() {
                     maybe_crop_screenshot_bytes(img_bytes, s.x, s.y, s.crop_w, s.crop_h, &s.action_type)
                 } else {
-                    img_bytes
+                    (img_bytes, *dim_opt)
                 };
-                let (w_emu, h_emu) = compute_image_emu_dims(*dim_opt, MAX_IMG_WIDTH_EMU);
+                let (w_emu, h_emu) = compute_image_emu_dims(final_dims, MAX_IMG_WIDTH_EMU);
                 let pic = Pic::new(&final_bytes).size(w_emu, h_emu);
                 docx = docx.add_paragraph(
                     Paragraph::new()
@@ -1026,22 +1035,24 @@ const MAX_IMG_PX: usize = 600;
 
 fn compute_image_emu_dims(dim: Option<(usize, usize)>, max_width_emu: usize) -> (u32, u32) {
     match dim {
-        Some((w, h)) if w > MAX_IMG_PX => {
+        Some((w, h)) if w > 0 && h > 0 && w > MAX_IMG_PX => {
             let ratio = MAX_IMG_PX as f64 / w as f64;
             ((MAX_IMG_PX * EMU_PER_PX) as u32, (h as f64 * ratio * EMU_PER_PX as f64) as u32)
         }
-        Some((w, h)) => {
+        Some((w, h)) if w > 0 && h > 0 => {
             ((w * EMU_PER_PX) as u32, (h * EMU_PER_PX) as u32)
         }
-        None => {
-            (max_width_emu as u32, (max_width_emu * 3 / 4) as u32)
-        }
+        // 读不到尺寸、或宽高为 0（Word 里会渲染异常）：走兜底比例
+        _ => (max_width_emu as u32, (max_width_emu * 3 / 4) as u32),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 本文件源码，供静态防线扫描（编译期嵌入，改完文件 cargo test 立即生效）。
+    const COMMANDS_SRC: &str = include_str!("commands.rs");
 
     #[test]
     fn test_export_pdf_no_screenshots() {
@@ -1666,14 +1677,146 @@ mod tests {
         assert_eq!(compute_image_emu_dims(Some((1200, 600)), 5_715_000), (5_715_000, 2_857_500));
         // 超宽非整数比例（1200x900 → 600x450）
         assert_eq!(compute_image_emu_dims(Some((1200, 900)), 5_715_000), (5_715_000, 4_286_250));
-        // 0x0 图
-        assert_eq!(compute_image_emu_dims(Some((0, 0)), 5_715_000), (0, 0));
+        // 0x0 图：宽高为 0 在 Word 里渲染异常，退回兜底比例（与「读不到尺寸」一致）
+        assert_eq!(compute_image_emu_dims(Some((0, 0)), 5_715_000), (5_715_000, 4_286_250));
+        assert_eq!(compute_image_emu_dims(Some((0, 100)), 5_715_000), (5_715_000, 4_286_250));
+        assert_eq!(compute_image_emu_dims(Some((100, 0)), 5_715_000), (5_715_000, 4_286_250));
         // 无尺寸 → 回退占位（max_width_emu x 3/4）
         assert_eq!(compute_image_emu_dims(None, 5_715_000), (5_715_000, 4_286_250));
         // 自定义 fallback
         assert_eq!(compute_image_emu_dims(None, 100_000), (100_000, 75_000));
         // 超高图（宽 2000 高 4000 → 600x1200）
         assert_eq!(compute_image_emu_dims(Some((2000, 4000)), 5_715_000), (5_715_000, 11_430_000));
+    }
+
+    /// 构造一张纯色 JPEG，用于裁剪/尺寸回归。
+    fn test_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([120u8, 160, 200]));
+        let mut buf = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90);
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(enc)
+            .expect("测试图编码失败");
+        buf
+    }
+
+    /// DOCX 里图片的显示尺寸必须与**实际写进去的字节**一致。
+    ///
+    /// 不变式：
+    ///   1. 显示宽高比 == 图片实际宽高比（不变形）
+    ///   2. 显示宽度 ≤ 图片实际宽度（不放大 → 不变模糊）
+    ///
+    /// 旧行为：裁剪后仍传原图尺寸给 `Pic::new(cropped).size(w, h)`。
+    /// 1920×1080 原图裁出 800×600 时，显示框是 16:9 而图片是 4:3 → 横向拉伸 33%；
+    /// 裁出 300×200 时更会被放大到 600px 宽（2 倍）变模糊。
+    #[test]
+    fn docx_image_emu_matches_written_bytes() {
+        const EMU_PER_PX: f64 = 9525.0;
+        const MAX_EMU: usize = 5_715_000;
+        // (图宽, 图高, crop x, y, w, h, action)
+        // type 会向外扩展一圈（元素 + 留白），比例反而接近原图、变形小；
+        // click 不扩展，裁剪框是什么比例就是什么比例 —— 变形最明显。
+        let cases = [
+            (1920u32, 1080u32, 560i32, 240i32, 800i32, 600i32, "type"),
+            (1920, 1080, 800, 400, 300, 200, "type"),
+            (2560, 1440, 960, 480, 640, 480, "type"),
+            (1920, 1080, 700, 300, 400, 500, "click"),
+            (1920, 1080, 900, 200, 300, 600, "click"),
+            (3840, 2160, 1500, 900, 400, 700, "click"),
+            (1366, 768, 500, 200, 200, 150, "click"),
+        ];
+        for (iw, ih, cx, cy, cw, ch, action) in cases {
+            let raw = test_jpeg(iw, ih);
+            let (bytes, dims) = maybe_crop_screenshot_bytes(
+                raw, Some(cx), Some(cy), Some(cw), Some(ch), action,
+            );
+
+            // 1) 返回的尺寸必须就是这些字节的真实尺寸
+            let real = image::load_from_memory(&bytes).expect("输出应是合法图片");
+            let (rw, rh) = (real.width(), real.height());
+            assert_eq!(
+                dims,
+                Some((rw as usize, rh as usize)),
+                "返回尺寸与实际字节不符（{iw}x{ih} 裁 {cw}x{ch}）"
+            );
+
+            let (w_emu, h_emu) = compute_image_emu_dims(dims, MAX_EMU);
+
+            // 2) 不变形
+            let shown_ratio = w_emu as f64 / h_emu as f64;
+            let real_ratio = rw as f64 / rh as f64;
+            assert!(
+                (shown_ratio - real_ratio).abs() < 0.01,
+                "显示宽高比 {shown_ratio:.3} ≠ 图片实际 {real_ratio:.3}（{iw}x{ih} 裁出 {rw}x{rh} 会变形）"
+            );
+
+            // 3) 不放大
+            assert!(
+                w_emu as f64 <= rw as f64 * EMU_PER_PX + 1.0,
+                "显示宽 {:.0}px > 图片实际宽 {rw}px（被放大，会模糊）",
+                w_emu as f64 / EMU_PER_PX
+            );
+
+            // 量化输出（cargo test -- --nocapture）：修复前按原图尺寸算会怎样
+            let (ow, oh) = compute_image_emu_dims(Some((iw as usize, ih as usize)), MAX_EMU);
+            let old_ratio = ow as f64 / oh as f64;
+            let old_scale = (ow as f64 / EMU_PER_PX) / rw as f64;
+            println!(
+                "  {iw}x{ih} {action} 裁 {cw}x{ch} → 实际 {rw}x{rh}｜修复后显示 {:.0}x{:.0}px｜\
+                 按原图算 {:.0}x{:.0}px（宽高比 {old_ratio:.3} vs 实际 {real_ratio:.3}，变形 {:+.1}%，缩放 {old_scale:.2}x）",
+                w_emu as f64 / EMU_PER_PX,
+                h_emu as f64 / EMU_PER_PX,
+                ow as f64 / EMU_PER_PX,
+                oh as f64 / EMU_PER_PX,
+                (old_ratio / real_ratio - 1.0) * 100.0,
+            );
+        }
+    }
+
+    /// 静态防线：DOCX 的图片尺寸必须来自「实际写出去的字节」。
+    ///
+    /// 上面的行为测试测的是 `maybe_crop_screenshot_bytes` 返回值对不对，
+    /// **测不到调用点传了哪个参数** —— 就算把 `final_dims` 改回 `*dim_opt`，
+    /// 行为测试照样全绿。只能扫源码补这个洞（同类教训见 check-fit.mjs 第 9/11 段）。
+    #[test]
+    fn docx_must_size_image_from_written_bytes() {
+        // ⚠️ 两道自指陷阱，都踩过：
+        // 1) 只扫 `#[cfg(test)]` 之前的生产代码 —— 否则 forbidden 字符串写在防线
+        //    自己的源码里，`contains` 恒为真，防线永远不会失败。
+        // 2) 即便如此仍把字符串拆开拼接：万一以后有人把这类字符串挪到生产区，
+        //    也不至于让断言自我满足。
+        // 3) 剥注释：说明文字里会出现被禁用的旧写法。
+        let prod: &str = COMMANDS_SRC.split("#[cfg(test)]").next().unwrap_or("");
+        let code: String = prod
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let required = concat!("compute_image_emu_dims(", "final_dims");
+        let forbidden = concat!("compute_image_emu_dims(", "*dim_opt");
+        assert!(
+            code.contains(required),
+            "DOCX 必须用 final_dims（裁剪后的真实尺寸）算显示尺寸"
+        );
+        assert!(
+            !code.contains(forbidden),
+            "DOCX 仍用原图尺寸 *dim_opt 算显示尺寸 —— 裁剪后会被拉伸变形、小图会被放大变模糊"
+        );
+    }
+
+    /// 未裁剪（或裁剪失败）时，返回尺寸必须仍是原图尺寸。
+    #[test]
+    fn maybe_crop_returns_full_dims_when_not_cropped() {
+        let raw = test_jpeg(1920, 1080);
+        let (bytes, dims) = maybe_crop_screenshot_bytes(raw, None, None, None, None, "click");
+        assert_eq!(dims, Some((1920, 1080)));
+        let real = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((real.width(), real.height()), (1920, 1080));
+
+        // 非法字节：解码失败 → 原样返回，尺寸为 None（由调用方走兜底）
+        let (bad, dims) = maybe_crop_screenshot_bytes(vec![0u8, 1, 2, 3], None, None, None, None, "click");
+        assert_eq!(bad, vec![0u8, 1, 2, 3]);
+        assert_eq!(dims, None);
     }
 
     // B3 回归 A：PDF/HTML 模板必须带 CJK 字体回退，否则非中文系统中文渲染为豆腐块
