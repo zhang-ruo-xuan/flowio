@@ -1208,6 +1208,18 @@ select {
 
 .step-item-thumb-empty {
   color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #f0f1f3;
+}
+
+.step-item-thumb-empty .thumb-empty-type {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: #9aa0a6;
 }
 
 .step-item-delete {
