@@ -25,20 +25,55 @@ pub fn parse_step_output(raw: &str, original_action_type: &str) -> Result<StepOu
     let sanitized = sanitize_json_escapes(trimmed);
 
     // Try direct JSON parse first
-    let mut step = if let Ok(step) = serde_json::from_str::<StepOutput>(&sanitized) {
-        step
-    } else {
-        // Try to extract JSON from markdown code blocks
-        let json_str = extract_json_from_markdown(&sanitized)?;
-        serde_json::from_str::<StepOutput>(&json_str).map_err(|e| {
-            format!(
-                "Failed to parse StepOutput from JSON: {}. Raw: {}",
-                e,
-                &json_str[..json_str.len().min(200)]
-            )
-        })?
-    };
+    if let Ok(step) = serde_json::from_str::<StepOutput>(&sanitized) {
+        return Ok(finish_step(step, original_action_type));
+    }
 
+    // Try to extract JSON from markdown code blocks (sanitized)
+    if let Ok(json_str) = extract_json_from_markdown(&sanitized) {
+        let json_sanitized = sanitize_json_escapes(&json_str);
+        if let Ok(step) = serde_json::from_str::<StepOutput>(&json_sanitized) {
+            return Ok(finish_step(step, original_action_type));
+        }
+        // Log the extracted JSON that still fails
+        log::warn!(
+            "AI parse: markdown-extracted JSON still invalid (first 300 chars): {}",
+            &json_sanitized[..json_sanitized.len().min(300)]
+        );
+    }
+
+    // ── Second-pass: aggressive fallback ──
+    // Some LLMs produce escapes that slip through the char-level scanner
+    // (e.g. multi-byte UTF-8 after backslash, or exotic control chars).
+    // Use regex-like replacement: any \<non-valid> → \\<non-valid>.
+    let aggressive = aggressively_sanitize_escapes(trimmed);
+    if let Ok(step) = serde_json::from_str::<StepOutput>(&aggressive) {
+        log::warn!("AI parse: aggressive sanitizer succeeded where standard one failed");
+        return Ok(finish_step(step, original_action_type));
+    }
+
+    // Still failing — try markdown extraction on aggressive result
+    if let Ok(json_str) = extract_json_from_markdown(&aggressive) {
+        let agg2 = sanitize_json_escapes(&json_str);
+        if let Ok(step) = serde_json::from_str::<StepOutput>(&agg2) {
+            return Ok(finish_step(step, original_action_type));
+        }
+    }
+
+    // All attempts failed — return detailed error with raw content for debugging
+    log::error!(
+        "AI parse: ALL attempts failed. Raw (first 500 chars): {} | Sanitized (first 500): {} | Aggressive (first 500): {}",
+        &trimmed[..trimmed.len().min(500)],
+        &sanitized[..sanitized.len().min(500)],
+        &aggressive[..aggressive.len().min(500)]
+    );
+    Err(format!(
+        "invalid escape at line 1 column (details logged). Raw AI response: {}",
+        &trimmed[..trimmed.len().min(200)]
+    ))
+}
+
+fn finish_step(mut step: StepOutput, original_action_type: &str) -> StepOutput {
     // ── action_type consistency check (case-insensitive + alias normalization) ──
     let normalized_original = normalize_action_type(original_action_type);
     let normalized_ai = normalize_action_type(&step.action_type);
@@ -50,8 +85,7 @@ pub fn parse_step_output(raw: &str, original_action_type: &str) -> Result<StepOu
         );
         step.title = format!("{}[AI检测异常]", step.title);
     }
-
-    Ok(step)
+    step
 }
 
 /// Sanitize invalid JSON escape sequences produced by some LLMs.
@@ -115,6 +149,63 @@ fn sanitize_json_escapes(input: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Aggressive second-pass sanitizer for escape sequences.
+///
+/// Unlike `sanitize_json_escapes` which does careful char-by-char analysis,
+/// this function uses a byte-level regex-like approach: it scans for `\`
+/// followed by any byte that is NOT a valid JSON escape character, and
+/// doubles the backslash. This catches edge cases the char-level scanner
+/// might miss (e.g. multi-byte UTF-8 interactions, unusual control chars).
+///
+/// Valid JSON escapes (preserved): `" \ / b f n r t u` (and uXXXX).
+fn aggressively_sanitize_escapes(input: &str) -> String {
+    const VALID_JSON_ESCAPE_BYTES: &[u8] = b"\"\\/bfnrtu";
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() + 64);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if VALID_JSON_ESCAPE_BYTES.contains(&next) {
+                // Check \uXXXX specifically — need 4 hex digits after
+                if next == b'u' {
+                    if i + 5 < bytes.len()
+                        && bytes[i + 2].is_ascii_hexdigit()
+                        && bytes[i + 3].is_ascii_hexdigit()
+                        && bytes[i + 4].is_ascii_hexdigit()
+                        && bytes[i + 5].is_ascii_hexdigit()
+                    {
+                        // Valid \uXXXX — copy all 6 bytes
+                        out.extend_from_slice(&bytes[i..=i + 5]);
+                        i += 6;
+                        continue;
+                    }
+                    // Invalid \u (not followed by 4 hex) → escape the backslash
+                    out.extend_from_slice(b"\\\\");
+                    out.push(next);
+                    i += 2;
+                    continue;
+                }
+                // Other valid single-char escape — keep
+                out.push(b'\\');
+                out.push(next);
+                i += 2;
+                continue;
+            }
+            // Invalid escape: double the backslash
+            out.extend_from_slice(b"\\\\");
+            out.push(next);
+            i += 2;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Safety: all content came from valid UTF-8 input; we only inserted
+    // ASCII bytes, so the result is still valid UTF-8
+    String::from_utf8(out).unwrap_or_else(|_| sanitize_json_escapes(input))
 }
 
 /// Attempt to extract a JSON substring from a string that may be
@@ -330,5 +421,45 @@ mod tests {
         let result = parse_step_output(raw, "type").unwrap();
         assert!(result.title.contains("输入框"));
         assert_eq!(result.action_type, "type");
+    }
+
+    // ── aggressively_sanitize_escapes ──────────────────────────
+
+    #[test]
+    fn test_aggressive_same_as_standard_for_common_cases() {
+        let input = r#"{"title":"测试\s内容\(重要\)"}"#;
+        let standard = sanitize_json_escapes(input);
+        let aggressive = aggressively_sanitize_escapes(input);
+        // Both should produce valid JSON
+        let v1: serde_json::Value = serde_json::from_str(&standard).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&aggressive).unwrap();
+        assert_eq!(v1["title"], v2["title"]);
+    }
+
+    #[test]
+    fn test_aggressive_handles_byte_level_escapes() {
+        // Edge case: backslash followed by high-byte or unusual chars
+        let input = r#"{"desc":"path\C:\Users\Test"}"#;
+        let out = aggressively_sanitize_escapes(input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("aggressive should handle \\C");
+        assert!(v["desc"].as_str().unwrap().contains("\\"));
+    }
+
+    #[test]
+    fn test_aggressive_preserves_valid_unicode_escapes() {
+        let input = r#"{"name":"\u4f60\u597d"}"#;  // 你好
+        let out = aggressively_sanitize_escapes(input);
+        assert_eq!(out, input);  // Should be unchanged
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["name"].as_str().unwrap(), "你好");
+    }
+
+    #[test]
+    fn test_aggressive_invalid_u_with_partial_hex() {
+        let input = r#"{"x":"\uZZZ"}"#;
+        let out = aggressively_sanitize_escapes(input);
+        // Should not panic and produce parseable JSON
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["x"].as_str().unwrap().starts_with("\\"));
     }
 }
