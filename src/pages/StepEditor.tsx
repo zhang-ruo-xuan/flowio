@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useLayoutEffect, useCallback, useRef, Fragment } from "react";
+﻿import { useState, useEffect, useCallback, useRef, Fragment } from "react";
 import { createPortal } from "react-dom";
 import {
   ArrowLeft,
@@ -463,22 +463,12 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const [cropPickerOpen, setCropPickerOpen] = useState(false);
   const [annotateStepId, setAnnotateStepId] = useState<string>("");
 
-  const stepDetailImageRef = useRef<HTMLDivElement>(null);
-
-  useLayoutEffect(() => {
-    const el = stepDetailImageRef.current;
-    if (!el) return;
-    const setHeight = () => {
-      const w = el.clientWidth;
-      if (w > 0) {
-        el.style.height = `${Math.min(Math.max(w * 9 / 16, 200), 520)}px`;
-      }
-    };
-    setHeight();
-    const ro = new ResizeObserver(setHeight);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
+  // ⚠️ 这里**不要**再给主预览容器写死高度。
+  // v24 之前的遗留代码曾写 `height = clamp(w*9/16, 200, 520)`，把盒子锁成 16:9，
+  // inline height 会盖掉 CSS 的 aspect-ratio —— v24 修好的宽度收窄因此白做，
+  // 容器高度仍按 16:9 算，非 16:9 的图（16:10 / 4:3 / 带鱼屏 / 裁图后的极端比例）
+  // 照样出 letterbox。实测 40 种组合里 31 例有留白，上下最大 312px。
+  // 现在高度完全交给 CSS：width:100% + max-width + aspect-ratio + max-height。
 
   /* ── Load / reload recording ────────────────────────────── */
 
@@ -1713,10 +1703,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           ) : selectedStep ? (
             <>
               {/* ── Screenshot ──── */}
-              <div
-                className="step-detail-image"
-                ref={stepDetailImageRef}
-              >
+              <div className="step-detail-image">
                 {/* 全图 / 裁图 切换：只作用于当前这一步（作用于所有步骤的开关在顶栏） */}
                 <div className="step-detail-view-segmented" title="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
                   <button

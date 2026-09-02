@@ -4,6 +4,7 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Annotation, AnnoType, drawAnnotation, flattenAnnotations } from '../lib/annotate';
+import { containScale, contentArea } from '../lib/fitBox';
 
 export type ToolType = 'select' | 'text' | 'highlight' | 'arrow' | 'blur' | 'crop' | 'delete';
 
@@ -35,6 +36,26 @@ const SIZE_PRESETS = [
 ];
 const FONT_SIZES = [14, 20, 24, 28, 36, 48];
 
+/**
+ * 标注弹窗的布局常量，**必须与 styles.css 保持一致**（改 CSS 时同步改这里）：
+ *   .annotation-toolbar      height: 56px
+ *   .annotation-canvas-area  padding: 40px
+ * 只在 ResizeObserver 还没给出实测值前用作兜底，之后一律以实测内容区为准。
+ */
+const TOOLBAR_H = 56;
+const CANVAS_AREA_PAD = 40;
+
+/** ResizeObserver 不可用时的兜底：按窗口尺寸估算内容区（须自己扣掉工具栏与 padding） */
+function windowFallbackArea(): { w: number; h: number } {
+  const c = contentArea(
+    window.innerWidth,
+    window.innerHeight - TOOLBAR_H,
+    CANVAS_AREA_PAD,
+    CANVAS_AREA_PAD,
+  );
+  return { w: c.availW, h: c.availH };
+}
+
 export default function AnnotationsOverlay({ imageUrl, annotations: initial, onSave, onClose }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [annotations, setAnnotations] = useState<Annotation[]>(initial);
@@ -45,6 +66,9 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
   const [drawCurrent, setDrawCurrent] = useState<{ x: number; y: number } | null>(null);
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   const [scale, setScale] = useState(1);
+  /** 内容区实测可用尺寸（已扣 padding），由 ResizeObserver 维护 */
+  const [avail, setAvail] = useState<{ w: number; h: number } | null>(null);
+  const areaRef = useRef<HTMLDivElement>(null);
   const [imageSrc, setImageSrc] = useState(imageUrl);
   const [cropRect, setCropRect] = useState<CropRect | null>(null);
   const [isCropping, setIsCropping] = useState(false);
@@ -79,12 +103,9 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
     if (imageSrc.startsWith('http://') || imageSrc.startsWith('https://')) {
       img.crossOrigin = 'anonymous';
     }
+    // ⚠️ 这里**不要**再算 scale：可用尺寸由 ResizeObserver 实测，见下方 fit 效果
     img.onload = () => {
       setImage(img);
-      const maxW = Math.min(window.innerWidth * 0.995, img.width);
-      const maxH = window.innerHeight - 56;
-      const s = Math.min(maxW / img.width, maxH / img.height, 1);
-      setScale(s);
     };
     img.onerror = () => {
       // 图片加载失败（如远程图无 CORS）也允许继续，只是无法烧录
@@ -100,18 +121,33 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
     }
   }, [textPlacePos]);
 
-  // 窗口尺寸变化时重新计算缩放，截图跟随放大
+  // 实测内容区可用尺寸。
+  // 历史 bug：旧代码用 window.innerWidth*0.995 / innerHeight-56 当可用区，
+  // 但 .annotation-canvas-area 有 padding:40px，工具栏还占 56px —— 全都没扣。
+  // 结果只要图比屏幕大，canvas 就溢出，被 overflow:hidden 上下各裁 40px。
+  // ResizeObserver 的 contentRect 是 content box（天然已扣 padding），比手算可靠。
   useEffect(() => {
-    const onResize = () => {
-      if (!image) return;
-      const maxW = Math.min(window.innerWidth * 0.995, image.width);
-      const maxH = window.innerHeight - 56;
-      const s = Math.min(maxW / image.width, maxH / image.height, 1);
-      setScale(s);
-    };
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
-  }, [image]);
+    const el = areaRef.current;
+    if (!el) return;
+    if (typeof ResizeObserver === 'undefined') {
+      // 兜底：老环境退回窗口估算（此时必须自己扣掉 padding 与工具栏）
+      setAvail(windowFallbackArea());
+      return;
+    }
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect;
+      if (r && r.width > 0 && r.height > 0) setAvail({ w: r.width, h: r.height });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // 图或可用区任一变化 → 重算等比缩放（永不放大）
+  useEffect(() => {
+    if (!image) return;
+    const box = avail ?? windowFallbackArea();
+    setScale(containScale({ availW: box.w, availH: box.h, imgW: image.width, imgH: image.height }));
+  }, [image, avail]);
 
   // Draw
   useEffect(() => {
@@ -757,7 +793,7 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
           <button className="annotation-close-btn" onClick={onClose}>✕</button>
         </div>
       </div>
-      <div className="annotation-canvas-area">
+      <div className="annotation-canvas-area" ref={areaRef}>
         <div
           className="annotation-canvas-wrapper"
           style={{ width: image ? image.width * scale : 0, height: image ? image.height * scale : 0 }}

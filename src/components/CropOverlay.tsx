@@ -7,6 +7,7 @@ import {
   newRect,
   resizeRect,
 } from '../lib/cropDrag';
+import { containScale } from '../lib/fitBox';
 
 export type { CropRectPx };
 
@@ -52,26 +53,59 @@ interface DragState {
 
 export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCancel }: Props) {
   const stageRef = useRef<HTMLDivElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
 
   const [image, setImage] = useState<HTMLImageElement | null>(null);
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [scale, setScale] = useState(1);
+  /** 内容区实测可用尺寸（已扣 padding），由 ResizeObserver 维护 */
+  const [avail, setAvail] = useState<{ w: number; h: number } | null>(null);
   const [rect, setRect] = useState<CropRectPx | null>(null);
   const [dragging, setDragging] = useState(false);
 
-  /* ── 加载图片并计算显示缩放 ─────────────────────── */
+  /* ── 加载图片 ───────────────────────────────────── */
+  // ⚠️ 这里**不要**算 scale：可用尺寸由 ResizeObserver 实测，见下方 fit 效果。
+  // 历史 bug：旧代码用 window.innerWidth*0.92 / innerHeight-150 硬编码可用区，
+  // 与真实留白（panel maxHeight 94vh + 头部/底部/padding 约 128px）对不上，
+  // 高度约束时反而溢出 → canvasWrap 出现滚动条，且图比能显示的小约 5%。
   useEffect(() => {
     const img = new Image();
     img.onload = () => {
       setImage(img);
-      const maxW = window.innerWidth * 0.92;
-      const maxH = window.innerHeight - 150;
-      const s = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight, 1);
-      setScale(s);
+      setStatus('ready');
     };
-    img.onerror = () => setImage(null);
+    img.onerror = () => setStatus('error');
     img.src = `data:image/jpeg;base64,${imageBase64}`;
   }, [imageBase64]);
+
+  /* ── 实测内容区可用尺寸 ─────────────────────────── */
+  // canvasWrap 是 flex-shrink 的（panel 有 maxHeight:94vh），所以它的尺寸
+  // 就是「内容装得下的最大尺寸」——测量它无需硬编码任何留白常量。
+  // contentRect 是 content box，天然已扣掉 padding:12。
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect;
+      if (r && r.width > 0 && r.height > 0) setAvail({ w: r.width, h: r.height });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // 图或可用区任一变化 → 重算等比缩放（永不放大）
+  useEffect(() => {
+    if (!image || !avail) return;
+    setScale(
+      containScale({
+        availW: avail.w,
+        availH: avail.h,
+        imgW: image.naturalWidth,
+        imgH: image.naturalHeight,
+      }),
+    );
+  }, [image, avail]);
 
   /** 图片就绪后：用传入的初始选区，或默认取画面中央 60% */
   useEffect(() => {
@@ -158,10 +192,11 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
     return () => window.removeEventListener('keydown', onKey);
   }, [rect, onCancel, onConfirm]);
 
-  if (!image) {
+  // 旧实现把「还没加载完」也当成加载失败，data: URL 解码期间会闪一句「截图加载失败」
+  if (status === 'error' || !image) {
     return (
       <div style={styles.backdrop}>
-        <div style={{ color: '#fff' }}>截图加载失败</div>
+        <div style={{ color: '#fff' }}>{status === 'error' ? '截图加载失败' : '加载中…'}</div>
       </div>
     );
   }
@@ -170,6 +205,8 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
   const H = image.naturalHeight;
   const dispW = Math.round(W * scale);
   const dispH = Math.round(H * scale);
+  // 可用区必须先实测再定缩放，所以首帧图仍是原尺寸 —— 先藏起来，避免闪一下
+  const fitted = avail !== null;
 
   return (
     <div style={styles.backdrop} onMouseDown={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
@@ -181,10 +218,15 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
           </span>
         </div>
 
-        <div style={styles.canvasWrap}>
+        <div style={styles.canvasWrap} ref={wrapRef}>
           <div
             ref={stageRef}
-            style={{ ...styles.stage, width: dispW, height: dispH }}
+            style={{
+              ...styles.stage,
+              width: dispW,
+              height: dispH,
+              visibility: fitted ? 'visible' : 'hidden',
+            }}
             onMouseDown={(e) => {
               if (e.target === e.currentTarget || (e.target as HTMLElement).tagName === 'IMG') {
                 beginDrag(e, 'new');
@@ -282,6 +324,9 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     maxHeight: '94vh',
+    // 旧实现只限了高度。首帧图还是原尺寸（等实测可用区），若不限宽度，
+    // 超宽截图会把面板撑到视口外、闪出横向滚动条。与 maxHeight 对称地限一下。
+    maxWidth: '94vw',
     overflow: 'hidden',
   },
   header: {
