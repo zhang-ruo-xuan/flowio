@@ -522,6 +522,91 @@ console.log('9. 静态防线：组件源码不得再出现「window 尺寸直接
   console.log('   通过（两个弹窗都实测容器 + 常量与 CSS 对齐）');
 }
 
+/* ═══ 10. 标注视觉权重：必须与截图分辨率无关 ═══════════════ */
+/**
+ * 不变式：**两张图在屏幕上显示为同样高度时，标注的粗细/字号必须看起来一样大。**
+ *
+ * 现状 `src/lib/annotate.ts` 把 strokeWidth / fontSize / 箭头头部长度写死成
+ * **图像像素**（`a.strokeWidth || 3`、`a.fontSize || 24`、`14 + sw*2`），
+ * 而 canvas 是按图像分辨率画的、再用 CSS 缩到 `scale` 显示
+ * （`canvas.width = image.width` + `style.width = image.width * scale`）。
+ * 于是屏幕上的实际观感 = 图像像素值 × scale，而 scale 又随截图分辨率变化 ——
+ * 4K 截图缩到 0.29 显示时，24px 的字只有 7px，3px 的箭头线只有 0.9px。
+ *
+ * 与第 8 段「命中容差」是同一类错误：**把某一坐标系的数字用到了另一坐标系**，
+ * 只是方向相反（那边该除以 scale，这边该乘以图高比例）。
+ */
+console.log('10. 标注视觉权重：必须与截图原始分辨率无关');
+{
+  // annotate.ts 里写死的**图像像素**默认值
+  const STYLE = [
+    ['高亮边框', 2],
+    ['箭头线宽', 3],
+    ['箭头头部', 14 + 3 * 2],
+    ['模糊虚线', 4],
+    ['文字字号', 24],
+  ];
+  const REF_H = 1080; // 归一化基准：1080p 观感完全不变，只缩放其它分辨率
+
+  const WINS = [[1366, 768], [1920, 1080], [2560, 1440]];
+
+  // ── (a) 相对权重 = 屏幕观感 / 图片显示高度，理想情况下与分辨率无关 ──
+  const agg = new Map(); // name -> {min, max}
+  for (const [vw, vh] of WINS) {
+    const box = contentArea(vw, vh - TOOLBAR_H, AREA_PAD, AREA_PAD);
+    for (const [iw, ih] of SHOTS) {
+      const s = containScale({ availW: box.availW, availH: box.availH, imgW: iw, imgH: ih });
+      const dispH = ih * s; // 图片在屏幕上的显示高度
+      for (const [name, px] of STYLE) {
+        const oldW = (px * s) / dispH;              // 现状
+        const newW = (px * (ih / REF_H) * s) / dispH; // 按图高等比
+        const a = agg.get(name) ?? { oldMin: Infinity, oldMax: -Infinity, newMin: Infinity, newMax: -Infinity };
+        a.oldMin = Math.min(a.oldMin, oldW); a.oldMax = Math.max(a.oldMax, oldW);
+        a.newMin = Math.min(a.newMin, newW); a.newMax = Math.max(a.newMax, newW);
+        agg.set(name, a);
+      }
+    }
+  }
+
+  console.log('   (a) 相对权重（屏幕观感 ÷ 图片显示高度），跨 8 种截图分辨率：');
+  let worst = 0;
+  for (const [name] of STYLE) {
+    const a = agg.get(name);
+    const ratio = a.oldMax / a.oldMin;
+    const nRatio = a.newMax / a.newMin;
+    worst = Math.max(worst, ratio);
+    console.log(
+      `     ${name}：现状极差 ${ratio.toFixed(2)}×` +
+      `（${(a.oldMin * 100).toFixed(3)}% ~ ${(a.oldMax * 100).toFixed(3)}% 图高）` +
+      ` → 归一化后 ${nRatio.toFixed(2)}×`
+    );
+  }
+  console.log(`     最大不一致 ${worst.toFixed(2)}× —— 同一张图放大分辨率，标注就变细 ${worst.toFixed(1)} 倍`);
+
+  // ── (b) 具体观感：固定窗口 1366×768，各分辨率截图下的字号/线宽 ──
+  const [vw, vh] = [1366, 768];
+  const box = contentArea(vw, vh - TOOLBAR_H, AREA_PAD, AREA_PAD);
+  console.log(`   (b) 编辑器里实际看到的尺寸（窗口 ${vw}×${vh}，可用 ${box.availW}×${box.availH}）：`);
+  console.log('     注：宽度受限的图（如带鱼屏）整体显示得小，标注随之变小是**正确**的；');
+  console.log('     判据是「相对权重是否恒定」，不是「绝对像素是否相同」。');
+  for (const [iw, ih] of SHOTS) {
+    const s = containScale({ availW: box.availW, availH: box.availH, imgW: iw, imgH: ih });
+    const dispH = ih * s;
+    const bound = dispH < box.availH - 0.5 ? '宽受限' : '高受限';
+    const fontOld = 24 * s;
+    const fontNew = 24 * (ih / REF_H) * s;
+    const lineOld = 3 * s;
+    const lineNew = 3 * (ih / REF_H) * s;
+    console.log(
+      `     ${String(iw + '×' + ih).padEnd(10)} scale=${s.toFixed(3)} 显示高 ${dispH.toFixed(0).padStart(3)}px ${bound} → ` +
+      `字号 ${fontOld.toFixed(1).padStart(4)}px / 箭头线宽 ${lineOld.toFixed(2)}px` +
+      `　归一化后 ${fontNew.toFixed(1).padStart(4)}px / ${lineNew.toFixed(2)}px`
+    );
+  }
+  console.log('     ⚠️ 高受限的几行显示高度都是 632px，但字号从 21.1px 一路掉到 7.0px —— 这就是观感不一致');
+  console.log('     ℹ️ 本段为度量段（暂不阻断）；确认方案后改为硬断言 + 静态防线');
+}
+
 /* ═══ 结论 ════════════════════════════════════════════════ */
 
 console.log('');
