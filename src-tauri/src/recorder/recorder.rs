@@ -329,6 +329,30 @@ unsafe extern "system" fn enum_windows_hwnd_collect_callback(
 
 fn pick_target_hwnd(candidates: &[HwndCandidate]) -> Option<isize> {
     const TITLED_BONUS: i64 = 2;
+
+    // ── Priority 1: foreground window belonging to target process ──
+    // When a modal dialog (e.g. WPS "函数参数", "查找值") pops up, it becomes
+    // the foreground window but has a DIFFERENT HWND from the main window.
+    // If we always pick the largest window (main window), PrintWindow on the
+    // main-window HWND never captures the dialog.  By preferring the foreground
+    // window we naturally follow the user's focus: main spreadsheet normally,
+    // dialog when one is open.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg != 0 {
+        if let Some(fg_c) = candidates.iter().find(|c| c.hwnd == fg) {
+            let w = fg_c.rect.width();
+            let h = fg_c.rect.height();
+            if w >= MIN_W && h >= MIN_H {
+                capture_dbg_log(&format!(
+                    "[CAPTURE] pick_target: foreground hwnd=0x{:X} (target process)",
+                    fg
+                ));
+                return Some(fg);
+            }
+        }
+    }
+
+    // ── Priority 2: largest/titled window (original fallback) ──
     let mut best: Option<(i64, isize)> = None;
     for c in candidates {
         let w = c.rect.width();
@@ -342,7 +366,10 @@ fn pick_target_hwnd(candidates: &[HwndCandidate]) -> Option<isize> {
         };
         if better { best = Some((score, c.hwnd)); }
     }
-    best.map(|(_, hwnd)| hwnd)
+    best.map(|(_, hwnd)| {
+        capture_dbg_log(&format!("[CAPTURE] pick_target: largest hwnd=0x{:X}", hwnd));
+        hwnd
+    })
 }
 
 /// Pure window-ranking logic, extracted from `find_window_rect_by_process`
