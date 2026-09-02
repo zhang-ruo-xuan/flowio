@@ -49,46 +49,58 @@ pub struct SelectionReport {
     pub at: Instant,
 }
 
-static LAST: OnceLock<Mutex<Option<SelectionReport>>> = OnceLock::new();
+/// 缓存条数上限。
+///
+/// 必须 > 1：用户常常**连续复制**好几段（复制 A → 复制 B → 复制 C），
+/// 桌面端为每个步骤回填时都会拿剪贴板内容来查。若只留最后一条，
+/// A、B 两个步骤的文本校验会全部失败，反而集体退化到 UIA 兜底 ——
+/// 比"从不上报"更糟。保留一小段历史后，按文本匹配即可各取所需。
+const MAX_REPORTS: usize = 8;
+
+static RECENT: OnceLock<Mutex<Vec<SelectionReport>>> = OnceLock::new();
 /// 实际监听中的端口（诊断用；未启动则为 None）
 static ACTIVE_PORT: OnceLock<u16> = OnceLock::new();
 
-fn last_slot() -> &'static Mutex<Option<SelectionReport>> {
-    LAST.get_or_init(|| Mutex::new(None))
+fn recent_slot() -> &'static Mutex<Vec<SelectionReport>> {
+    RECENT.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// 记录一条扩展上报的选区
 fn record_selection(text: String, rect: (i32, i32, i32, i32)) {
-    if let Ok(mut g) = last_slot().lock() {
-        *g = Some(SelectionReport {
+    if let Ok(mut g) = recent_slot().lock() {
+        g.push(SelectionReport {
             text,
             rect,
             at: Instant::now(),
         });
+        if g.len() > MAX_REPORTS {
+            g.remove(0);
+        }
     }
 }
 
-/// 取最近一条与剪贴板内容匹配的选区矩形（屏幕物理像素）。
+/// 取与剪贴板内容匹配的选区矩形（屏幕物理像素），**从最新往回找**。
 ///
 /// 两道校验，与 L1a（UIA）保持同等严格：
 /// 1. 时效：超过 `max_age_ms` 视为过期（复制动作与回填之间隔太久）；
 /// 2. 文本：选区文本必须匹配剪贴板内容（防残留/Ctrl+F 查找条选区骗过几何）。
 pub fn last_selection_matching(clipboard: &str, max_age_ms: u64) -> Option<(i32, i32, i32, i32)> {
-    let g = last_slot().lock().ok()?;
-    let r = g.as_ref()?;
-    // 用 >= 而非 >：max_age_ms = 0 的语义是"不采信任何上报"，
-    // 若用 >，同一毫秒内（elapsed 取整为 0）反而会被判为有效。
-    if r.at.elapsed().as_millis() >= max_age_ms as u128 {
-        return None;
+    let g = recent_slot().lock().ok()?;
+    for r in g.iter().rev() {
+        // 用 >= 而非 >：max_age_ms = 0 的语义是"不采信任何上报"，
+        // 若用 >，同一毫秒内（elapsed 取整为 0）反而会被判为有效。
+        if r.at.elapsed().as_millis() >= max_age_ms as u128 {
+            continue;
+        }
+        let (_x, _y, w, h) = r.rect;
+        if w < 4 || h < 4 {
+            continue;
+        }
+        if selection_matches_clipboard(&r.text, clipboard) {
+            return Some(r.rect);
+        }
     }
-    let (_x, _y, w, h) = r.rect;
-    if w < 4 || h < 4 {
-        return None;
-    }
-    if !selection_matches_clipboard(&r.text, clipboard) {
-        return None;
-    }
-    Some(r.rect)
+    None
 }
 
 /// 当前监听端口（诊断用）
@@ -99,8 +111,13 @@ pub fn active_port() -> Option<u16> {
 /// 启动上报接收服务（后台线程，阻塞式 accept，请求量极低无需异步）。
 /// 端口全被占用时静默放弃 —— L0 不可用不影响录制。
 pub fn start_server() {
-    std::thread::spawn(|| {
-        let bound = PORTS
+    start_server_on(PORTS.to_vec());
+}
+
+/// 在**指定端口**上启动（供集成测试使用；生产请调 `start_server()`）。
+pub fn start_server_on(ports: Vec<u16>) {
+    std::thread::spawn(move || {
+        let bound = ports
             .iter()
             .find_map(|p| TcpListener::bind(("127.0.0.1", *p)).ok().map(|l| (*p, l)));
 
@@ -245,5 +262,132 @@ mod tests {
     fn empty_store_returns_none() {
         // 注意：与上面的测试共享全局状态，这里只能断言"文本完全不同时必为 None"
         assert_eq!(last_selection_matching("__definitely_not_present__", 0), None);
+    }
+
+    /// **连续复制**场景（MAX_REPORTS 的存在理由）：复制 A → B → C 后，
+    /// 每个步骤回填时都应取到自己那段文本的矩形。
+    /// 若只缓存最后一条，A/B 的文本校验会全部失败 → 集体退化，比不上报更糟。
+    #[test]
+    fn consecutive_copies_each_resolve_to_own_rect() {
+        record_selection("copy alpha unique".to_string(), (1, 1, 100, 20));
+        record_selection("copy beta unique".to_string(), (2, 2, 200, 20));
+        record_selection("copy gamma unique".to_string(), (3, 3, 300, 20));
+        assert_eq!(
+            last_selection_matching("copy alpha unique", 3000),
+            Some((1, 1, 100, 20))
+        );
+        assert_eq!(
+            last_selection_matching("copy beta unique", 3000),
+            Some((2, 2, 200, 20))
+        );
+        assert_eq!(
+            last_selection_matching("copy gamma unique", 3000),
+            Some((3, 3, 300, 20))
+        );
+    }
+
+    /// 缓存上限：超过 MAX_REPORTS 后最旧的被挤出（防止长时间录制后无限增长）
+    #[test]
+    fn report_buffer_is_bounded() {
+        for i in 0..(MAX_REPORTS + 5) {
+            record_selection(format!("bounded {}", i), (i as i32, 0, 10, 10));
+        }
+        // 最旧的几条应已被丢弃
+        assert_eq!(last_selection_matching("bounded 0", 3000), None);
+        // 最新的仍在
+        assert_eq!(
+            last_selection_matching(&format!("bounded {}", MAX_REPORTS + 4), 3000),
+            Some(((MAX_REPORTS + 4) as i32, 0, 10, 10))
+        );
+    }
+
+    /// 端到端：真的起服务、真的发 HTTP POST、真的从缓存里查到。
+    /// 覆盖 HTTP 解析（请求头 + Content-Length + body）这条手写链路，
+    /// 这是纯单元测试碰不到、又最容易写错的部分。
+    #[test]
+    fn http_round_trip_records_selection() {
+        use std::io::{Read as _, Write as _};
+        use std::time::Duration;
+
+        const TEST_PORT: u16 = 19527; // 与生产端口（9527+）刻意错开
+        start_server_on(vec![TEST_PORT]);
+
+        // 等服务线程完成 bind + listen
+        let mut up = false;
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", TEST_PORT)).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(up, "test server failed to bind on port {}", TEST_PORT);
+
+        let body = r#"{"text":"l0 http round trip","x":11,"y":22,"width":333,"height":44}"#;
+        let req = format!(
+            "POST /selection HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut s = TcpStream::connect(("127.0.0.1", TEST_PORT)).expect("connect failed");
+        s.write_all(req.as_bytes()).expect("write failed");
+        let _ = s.flush();
+
+        let mut resp = String::new();
+        let _ = s.read_to_string(&mut resp);
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "unexpected response: {:?}",
+            resp
+        );
+
+        // 服务端在另一个线程写缓存，轮询等待
+        let mut got = None;
+        for _ in 0..100 {
+            if let Some(r) = last_selection_matching("l0 http round trip", 3000) {
+                got = Some(r);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(got, Some((11, 22, 333, 44)));
+    }
+
+    /// 坏 payload 应返回 400 且不污染缓存
+    #[test]
+    fn malformed_payload_is_rejected() {
+        use std::io::{Read as _, Write as _};
+        use std::time::Duration;
+
+        const TEST_PORT: u16 = 19528;
+        start_server_on(vec![TEST_PORT]);
+
+        let mut up = false;
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", TEST_PORT)).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(up, "test server failed to bind on port {}", TEST_PORT);
+
+        let body = "not-json-at-all";
+        let req = format!(
+            "POST /selection HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut s = TcpStream::connect(("127.0.0.1", TEST_PORT)).expect("connect failed");
+        s.write_all(req.as_bytes()).expect("write failed");
+        let _ = s.flush();
+
+        let mut resp = String::new();
+        let _ = s.read_to_string(&mut resp);
+        assert!(
+            resp.starts_with("HTTP/1.1 400"),
+            "expected 400, got: {:?}",
+            resp
+        );
     }
 }
