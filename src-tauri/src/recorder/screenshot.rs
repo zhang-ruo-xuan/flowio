@@ -115,9 +115,15 @@ pub fn capture_fullscreen() -> Result<DynamicImage, String> {
 ///   - enough red pixels (>5)
 ///   - a dark background characteristic (majority of row's non-red pixels are dark, L<60)
 /// This prevents false positives from red desktop icons or wallpaper elements.
-/// If found, crops from the first detected row to just below the last detected row.
-/// Returns the number of pixels cropped from the top (0 when no watermark was found),
-/// so callers can adjust crop coordinates that refer to the pre-crop image space.
+///
+/// If found, crops from the top of the image to **just below the last row of the
+/// first _contiguous_ run** of watermark rows. Contiguity matters: the scan stops
+/// at the first non-watermark row, so red text further down the page can never
+/// drag the cut line past the bar and eat the content in between.
+///
+/// Returns the number of pixels cropped from the top (0 when no watermark was
+/// found), so callers can adjust crop coordinates that refer to the pre-crop
+/// image space (`y_after = y_before - returned`).
 pub fn crop_watermark(img: &mut DynamicImage) -> usize {
     let w = img.width();
     let h = img.height();
@@ -160,18 +166,30 @@ pub fn crop_watermark(img: &mut DynamicImage) -> usize {
                 watermark_start = Some(y);
             }
             watermark_end = y;
+        } else if watermark_start.is_some() {
+            // 连续块结束：再往下遇到的红字属于页面内容，不是状态条。
+            // 少了这个 break，`watermark_end` 会被条下方几十行处的一行红字
+            // 带跑，按它裁会把中间的正常内容一起吃掉。
+            break;
         }
     }
 
-    if let Some(start) = watermark_start {
-        let crop_top = (start as u32).min(h.saturating_sub(1));
-        if crop_top > 0 && crop_top < h {
-            *img = img.crop_imm(0, crop_top, w, h - crop_top);
+    if watermark_start.is_some() {
+        // 裁到**水印块最后一行**的下方（end + 1），而不是块的第一行（start）：
+        // 只裁到 start 等于把状态条整个留在图里、只是上移到了新图顶部 ——
+        // 旧实现就是这样，`crop_watermark_removes_top_red_on_dark` 只断言了
+        // 高度变化，让这个错误藏了很久。
+        //
+        // `start` 可能为 0（状态条贴着屏幕顶边），所以这里**不能**要求 cut > 0。
+        // `.min(h - 1)` 保证至少留 1 行，不会裁成空图。
+        let cut = (watermark_end + 1).min(h.saturating_sub(1) as usize);
+        if cut > 0 && cut < h as usize {
+            *img = img.crop_imm(0, cut as u32, w, h - cut as u32);
             eprintln!(
                 "[crop_watermark] cropped top {}px (watermark rows {}-{})",
-                crop_top, start, watermark_end
+                cut, watermark_start.unwrap_or(0), watermark_end
             );
-            return crop_top as usize;
+            return cut;
         }
     }
     0
@@ -1718,13 +1736,114 @@ mod screenshot_tests {
         DynamicImage::ImageRgba8(img)
     }
 
+    /// 构造「指定行区间为水印条」的深底红字图，采样约定与 `top_red_watermark` 一致。
+    fn bar_rows(w: u32, h: u32, ranges: &[(u32, u32)]) -> DynamicImage {
+        let dark = image::Rgba([36u8, 41, 46, 255]); // #24292e
+        let red = image::Rgba([0xE7u8, 0x4C, 0x3C, 255]);
+        let mut img = image::RgbaImage::from_pixel(w, h, dark);
+        for &(y0, y1) in ranges {
+            for y in y0..y1.min(h) {
+                for x in (0..80u32).step_by(8) {
+                    if x < w {
+                        img.put_pixel(x, y, red);
+                    }
+                }
+            }
+        }
+        DynamicImage::ImageRgba8(img)
+    }
+
+    /// 返回图中所有「含可被采样到的红像素」的行号（判据与 crop_watermark 同源）。
+    fn red_rows(img: &DynamicImage) -> Vec<u32> {
+        let rgba = img.to_rgba8();
+        let w = rgba.width();
+        let mut out = Vec::new();
+        for y in 0..rgba.height() {
+            let mut n = 0usize;
+            for x in (0..w).step_by(8) {
+                let p = rgba.get_pixel(x, y);
+                if p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80 {
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                out.push(y);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn crop_watermark_must_actually_remove_the_bar() {
+        // 水印条在 y=10..30（不贴顶）。文档承诺「crops from the first detected row
+        // to just below the last detected row」——裁完图里不该再有任何红行。
+        // ⚠️ 名字里带 removes 的旧测试只断言了高度变化，从没验证红色是否消失。
+        let mut img = bar_rows(200, 200, &[(10, 30)]);
+        let cut = crop_watermark(&mut img);
+        let left = red_rows(&img);
+        let head: Vec<u32> = left.iter().take(5).copied().collect();
+        println!(
+            "\n[水印 y=10..30] 裁掉 {} 行，剩余高度 {}，残留红行 {} 条（前 5 条 {:?}）",
+            cut, img.height(), left.len(), head
+        );
+        assert!(
+            left.is_empty(),
+            "裁完仍有 {} 条红行（前几条 {head:?}）—— 水印条没被裁掉，只是上移到了图顶",
+            left.len()
+        );
+    }
+
+    #[test]
+    fn crop_watermark_bar_at_row_zero_must_be_removed() {
+        // 水印条贴着屏幕顶边（start=0）：旧实现要求 `crop_top > 0` 才裁，
+        // 于是 start=0 时整个分支被跳过，bar 原样留在截图里。
+        let mut img = bar_rows(200, 200, &[(0, 20)]);
+        let cut = crop_watermark(&mut img);
+        let left = red_rows(&img);
+        println!(
+            "\n[水印贴顶 y=0..20] 裁掉 {} 行，剩余高度 {}，残留红行 {} 条",
+            cut, img.height(), left.len()
+        );
+        assert!(
+            left.is_empty(),
+            "贴顶的水印条没被裁掉（cut={cut}，残留 {} 条红行）",
+            left.len()
+        );
+    }
+
+    #[test]
+    fn crop_watermark_must_not_crop_past_a_disconnected_row() {
+        // 水印条 y=10..30，其**下方 30 行处**另有一行孤立的红字（y=60，暗底）。
+        // watermark_end 取的是「最后一个满足条件的行」且**不要求连续**，
+        // 于是会一路裁到 y=60，吃掉 y=30..59 的正常内容。
+        let mut img = bar_rows(200, 200, &[(10, 30), (60, 61)]);
+        let cut = crop_watermark(&mut img);
+        println!(
+            "\n[水印 y=10..30 + 孤立红行 y=60] 裁掉 {} 行，剩余高度 {}（期望裁 30 行、剩 170）",
+            cut, img.height()
+        );
+        assert_eq!(
+            cut, 30,
+            "只应裁掉水印条本身（30 行），实际裁掉 {cut} 行 —— 把中间的正常内容也吃掉了"
+        );
+    }
+
     #[test]
     fn crop_watermark_removes_top_red_on_dark() {
-        let mut img = top_red_watermark(200, 200);
+        let mut img = top_red_watermark(200, 200); // 水印条在 y=10..30
         crop_watermark(&mut img);
-        // 顶部 10 行水印被裁剪，剩余 190 行
-        assert_eq!(img.height(), 190);
+        // 裁到水印块最后一行的下方：y=0..30 全部裁掉，剩余 170 行。
+        //
+        // ⚠️ 这里原来是 190 —— 旧实现只裁到块的第一行（y=10），把水印条整个
+        //    留在图里、只上移到了图顶；而这个测试**只断言了高度**，于是 bug
+        //    一直没被发现。现在补上「图里不该再有红行」这条真正的断言。
+        assert_eq!(img.height(), 170);
         assert_eq!(img.width(), 200);
+        assert!(
+            red_rows(&img).is_empty(),
+            "水印条被裁掉后图里不该再有红行，实得 {:?}",
+            red_rows(&img)
+        );
     }
 
     #[test]
@@ -1789,18 +1908,32 @@ mod screenshot_tests {
 
     #[test]
     fn crop_watermark_watermark_at_bottom_of_scan_zone() {
+        // 扫描区（顶部 100 行）里有**两块**红字：状态条 y=10..30，以及页面自身的
+        // 红字 y=80..100。裁切必须只吃掉第一块 —— 若把 cut 线定在第二块末尾，
+        // 中间 50 行正常内容会被连带裁掉（这正是扫描循环里 break 的作用）。
         let img = top_red_watermark(200, 200);
         let mut rgba = img.to_rgba8();
         let red = image::Rgba([0xE7u8, 0x4C, 0x3C, 255]);
         for y in 80..100u32 {
-            for (_, x) in (0..80u32).step_by(8).enumerate() {
+            for x in (0..80u32).step_by(8) {
                 rgba.put_pixel(x, y, red);
             }
         }
         let mut img2 = DynamicImage::ImageRgba8(rgba);
         crop_watermark(&mut img2);
-        // 第一处水印从 y=10 开始 → 裁剪后剩余 190 行
-        assert_eq!(img2.height(), 190);
+
+        assert_eq!(
+            img2.height(),
+            170,
+            "只裁掉第一块（y=0..30），不能一路裁到第二块末尾"
+        );
+        // 第二块仍在图里，只是整体上移了 30 行（原 y=80..100 → 现 y=50..70）
+        let left = red_rows(&img2);
+        assert_eq!(
+            (left.first().copied(), left.last().copied()),
+            (Some(50), Some(69)),
+            "页面自身的红字应保留并上移 30 行，实得 {left:?}"
+        );
     }
 
     #[test]
