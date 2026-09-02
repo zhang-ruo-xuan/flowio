@@ -910,9 +910,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   {profileAvatarUrl && !profileAvatarError ? (
                     <img src={profileAvatarUrl} alt="avatar" onError={() => setProfileAvatarError(true)} style={{ width: 56, height: 56, borderRadius: "50%", objectFit: "cover", border: "1px solid var(--border)" }} />
                   ) : (
-                    <div style={{ width: 56, height: 56, borderRadius: "50%", background: "var(--green)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                      <User size={28} strokeWidth={2} />
-                    </div>
+                    <img src="https://flowio.cn/flowio-icon.png" alt="avatar" style={{ width: 56, height: 56, borderRadius: "50%", objectFit: "cover", border: "1px solid var(--border)" }} />
                   )}
                   <div>
                     <div style={{ fontSize: 18, fontWeight: 600, color: "var(--text)", lineHeight: 1.3 }}>{profileName}</div>

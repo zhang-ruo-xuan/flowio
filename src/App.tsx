@@ -401,9 +401,11 @@ function App() {
                     onError={() => setAvatarLoadFailed(true)}
                   />
                 ) : (
-                  <span className="titlebar-avatar">
-                    <User size={16} strokeWidth={2.5} />
-                  </span>
+                  <img
+                    className="titlebar-avatar-img"
+                    src="https://flowio.cn/flowio-icon.png"
+                    alt="avatar"
+                  />
                 );
                 })()
               ) : (

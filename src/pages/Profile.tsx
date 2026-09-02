@@ -120,7 +120,7 @@ export default function ProfilePage() {
                 {avatarUrl && !avatarError ? (
                   <img src={avatarUrl} alt={name} style={{ width: "100%", height: "100%", objectFit: "cover" }} onError={() => setAvatarError(true)} />
                 ) : (
-                  <User size={20} strokeWidth={2.5} />
+                  <img src="https://flowio.cn/flowio-icon.png" alt="avatar" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                 )}
               </div>
 
