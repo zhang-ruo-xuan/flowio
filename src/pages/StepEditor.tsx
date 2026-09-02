@@ -1650,22 +1650,28 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           ) : selectedStep ? (
             <>
               {/* ── Screenshot ──── */}
-              <div className="step-detail-image">
-                {/* 全图 / 裁图 切换：只作用于当前这一步（作用于所有步骤的开关在顶栏） */}
-                <div className="step-detail-view-segmented" title="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
-                  <button
-                    className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep.id) ? ' active' : ''}`}
-                    onClick={() => setViewCropped(selectedStep.id, false)}
-                  >全图</button>
-                  <button
-                    className={`step-detail-view-segmented-btn${getViewCropped(selectedStep.id) ? ' active' : ''}`}
-                    onClick={() => setViewCropped(selectedStep.id, true)}
-                  >裁图</button>
-                </div>
-                {(() => {
-                  // 主截图：该步骤 stepViewCropped=true 且有裁剪图缓存时用裁剪图，否则用全图
-                  const src = getStepMainSrc(selectedStep) || "";
-                  return (
+              {(() => {
+                // 主截图：该步骤 stepViewCropped=true 且有裁剪图缓存时用裁剪图，否则用全图
+                const _src = getStepMainSrc(selectedStep) || "";
+                return (
+                  <div className={`step-detail-image${_src ? "" : " step-detail-image--empty"}`}>
+                    {/* 全图 / 裁图 切换：只作用于当前这一步（作用于所有步骤的开关在顶栏）。
+                        无截图（COPY/HOTKEY 等）时不显示——切换无意义，且易误判为"裁图坏了"。 */}
+                    {_src && (
+                      <div className="step-detail-view-segmented" title="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
+                        <button
+                          className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep.id) ? ' active' : ''}`}
+                          onClick={() => setViewCropped(selectedStep.id, false)}
+                        >全图</button>
+                        <button
+                          className={`step-detail-view-segmented-btn${getViewCropped(selectedStep.id) ? ' active' : ''}`}
+                          onClick={() => setViewCropped(selectedStep.id, true)}
+                        >裁图</button>
+                      </div>
+                    )}
+                    {(() => {
+                      const src = getStepMainSrc(selectedStep) || "";
+                      return (
                     <>
                       {src ? (
                         <>
@@ -1756,7 +1762,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                     </>
                   );
                 })()}
-              </div>
+                  </div>
+                );
+              })()}
 
               {/* ── Scrollable form ──── */}
               <div className="step-detail-scroll">
