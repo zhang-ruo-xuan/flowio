@@ -306,12 +306,26 @@ pub(crate) fn ai_crop_region(
         {
             let mut rw = (cw + CROP_PAD * 2).max(CROP_MIN_SIZE);
             let mut rh = (ch + CROP_PAD * 2).max(CROP_MIN_SIZE);
-            // Scale down (never up) to fit within 90% of screen, keep aspect ratio
-            let scale = (1.0f32)
-                .min((img_w as f32 * CROP_MAX_SCREEN_RATIO) / rw as f32)
-                .min((img_h as f32 * CROP_MAX_SCREEN_RATIO) / rh as f32);
+            // Scale down (never up) to fit within 90% of screen, keep aspect ratio.
+            //
+            // ⚠️ 缩放的**下限是元素本身**，不是 90% 屏幕：元素大到超过 90% 屏幕时，
+            // 无条件缩到 90% 会把元素边缘切掉——AI 就拿着一张被截断的图写描述
+            // （修复前实测：4K 全屏元素左右各切 164px、上下各切 78px）。
+            // 故缩放上限取 `max(90% 屏幕, 落库值)`：小元素照旧缩，大元素不缩。
+            let max_w = (img_w as f32 * CROP_MAX_SCREEN_RATIO).max(cw as f32);
+            let max_h = (img_h as f32 * CROP_MAX_SCREEN_RATIO).max(ch as f32);
+            let scale = (1.0f32).min(max_w / rw as f32).min(max_h / rh as f32);
             rw = (rw as f32 * scale).round().max(1.0) as i32;
             rh = (rh as f32 * scale).round().max(1.0) as i32;
+            // ⚠️ 等比缩放会**连累**另一个方向：scale 取两方向的最小值，限制更紧的
+            // 那一方会把另一方也拉到比元素还小（实测 1920 宽的框被拉成 1884，
+            // 反而切掉 1900 宽的元素 16px）。所以缩放后再分别抬回元素尺寸。
+            // 「不切元素」优先级高于「保持宽高比」——裁图框的宽高比本来就不影响
+            // 输出是否变形（裁多大就是多大，不拉伸）。
+            // `cw/ch` 是落库值，已被 `.min(图宽/高)` 截过，故抬回去也不会越界。
+            rw = rw.max(cw);
+            rh = rh.max(ch);
+            // 见测试 `both_consumers_must_contain_the_visible_element_rect`。
             // Stage C: type 步骤左侧多留原始矩形宽的 1/3，把左侧 label 带进裁图。
             // ⚠️ 是 `- extra / 2` 而不是 `- extra`：框宽 rw 本身已含 extra，居中项
             // `x - rw/2` 天然在左右各分到 extra/2。多减一个 extra/2 会过冲，
@@ -644,12 +658,32 @@ mod pipeline_tests {
 
     #[test]
     fn crop_and_encode_rect_scales_down_keeps_ratio() {
-        // 大矩形超出屏幕 90% → 等比缩放保留宽高比
+        // 大矩形超出屏幕 90% → 等比缩放保留宽高比。
+        //
+        // ⚠️ 用例必须是**元素仍在屏幕内**的场景（870 < 1000）：等比缩放的约束
+        // 只在「元素放得下」时才有意义。元素大到超出屏幕时走另一条规则
+        // ——不缩、不切，见 `crop_and_encode_rect_larger_than_screen_not_cropped`。
+        let png = solid_png(1000, 1000, [3, 4, 5]);
+        let out = crop_and_encode(&b64(&png), Some(500), Some(500), Some(870), Some(400));
+        let img = image::load_from_memory(&decode(&out)).unwrap();
+        // rw=918 rh=448 → scale=min(1, 900/918, 900/448)=0.98039… → 900×439
+        // 比例 918:448 ≈ 2.05 与 900:439 ≈ 2.05 一致（等比）
+        assert_eq!((img.width(), img.height()), (900, 439));
+    }
+
+    #[test]
+    fn crop_and_encode_rect_larger_than_screen_not_cropped() {
+        // 元素比屏幕还大（500x300 落在 400x300 的图里）：可见部分就是整张图，
+        // 此时「缩到 90% 保持聚焦」没有意义——缩了只会把元素切掉，AI 会拿着
+        // 一张被截断的图写描述。修复前这里裁出 360×229（左右各丢 20px）。
         let png = solid_png(400, 300, [3, 4, 5]);
         let out = crop_and_encode(&b64(&png), Some(200), Some(150), Some(500), Some(300));
         let img = image::load_from_memory(&decode(&out)).unwrap();
-        // rw=548 rh=348 → scale=min(1, 360/548, 270/348)=0.6569… → 360×229
-        assert_eq!((img.width(), img.height()), (360, 229));
+        assert_eq!(
+            (img.width(), img.height()),
+            (400, 300),
+            "元素超出屏幕时应裁整图，不能缩到把元素切掉"
+        );
     }
 
     #[test]
@@ -849,5 +883,163 @@ mod pipeline_tests {
             let out = crop_and_encode_typed(&b64(&png), Some(50), Some(40), Some(20), Some(10), at);
             assert_eq!(out, b64(&png));
         }
+    }
+
+    /* ── 跨消费端一致性：导出端 vs AI 端 ────────────────────────────
+     * 存库锚点由录制端 recorder/commands.rs 生成（它 bake 了自己的 CROP_PAD=24
+     * 与 CROP_MIN 420x280），之后被两个消费端**各自独立解释**：
+     *   - 导出端 export_crop_box   （PAD=8，贴边平移不缩小）
+     *   - AI 端   ai_crop_region   （PAD=24 / MIN=280 / 缩到屏幕 90%）
+     *
+     * AI 端的常量差异是**刻意**的，声明的意图见 ai_crop_region 的注释：
+     * 「喂给 AI 的图需要更大上下文和最小尺寸保证」。这句话可证伪，它蕴含
+     * 一条不变式：**AI 看到的区域不该比用户/导出看到的更小**。
+     * 若某场景下 AI 框反而更小，AI 就是拿着一张比用户所见更窄的图在写描述。
+     */
+
+    /// 复刻录制端存库逻辑（recorder/commands.rs：CROP_PAD=24 / CROP_MIN_W=420 / CROP_MIN_H=280）。
+    /// 返回落库的 (x, y, crop_w, crop_h)。
+    fn stored_anchor(
+        img_w: i32,
+        img_h: i32,
+        elem_w: i32,
+        elem_h: i32,
+        cx: i32,
+        cy: i32,
+    ) -> (i32, i32, i32, i32) {
+        const REC_PAD: i32 = 24;
+        const REC_MIN_W: i32 = 420;
+        const REC_MIN_H: i32 = 280;
+        let bw = (elem_w + REC_PAD * 2).max(1).max(REC_MIN_W).min(img_w);
+        let bh = (elem_h + REC_PAD * 2).max(1).max(REC_MIN_H).min(img_h);
+        let x0 = (cx - bw / 2).clamp(0, img_w - bw);
+        let y0 = (cy - bh / 2).clamp(0, img_h - bh);
+        (x0 + bw / 2, y0 + bh / 2, bw, bh)
+    }
+
+    #[test]
+    fn both_consumers_must_contain_the_visible_element_rect() {
+        use crate::export::commands::export_crop_box;
+
+        let cases = vec![
+            // (img_w, img_h, 元素宽, 元素高, action_type, 场景)
+            (1920, 1080, 40, 20, "click", "小按钮"),
+            (1920, 1080, 300, 40, "click", "输入框"),
+            (1920, 1080, 300, 40, "type", "输入框(type)"),
+            (1920, 1080, 600, 400, "click", "大文本域"),
+            (1920, 1080, 1800, 60, "click", "整行"),
+            (1920, 1080, 1900, 1050, "click", "接近全屏"),
+            (3840, 2160, 80, 40, "click", "4K 小按钮"),
+            (3840, 2160, 600, 80, "click", "4K 输入框"),
+            (3840, 2160, 3600, 2100, "click", "4K 接近全屏"),
+            (1366, 768, 300, 40, "click", "低分辨率输入框"),
+        ];
+
+        println!(
+            "\n{:<16} {:<6} {:>9} {:>10} | {:>11} {:>11} | {:>7} {:>8} {:>8}",
+            "场景", "type", "元素", "落库值", "导出框", "AI 框", "AI/导出", "导出切掉", "AI 切掉"
+        );
+        let mut violations: Vec<String> = Vec::new();
+
+        for (iw, ih, ew, eh, at, name) in cases {
+            let (cx, cy) = (iw / 2, ih / 2);
+            let (sx, sy, sw, sh) = stored_anchor(iw, ih, ew, eh, cx, cy);
+
+            // 元素在图内的**可见**范围（元素可能比屏幕还大，超出部分不算被切）
+            let vis_l = (cx - ew / 2).max(0);
+            let vis_r = (cx + ew / 2).min(iw);
+            let vis_t = (cy - eh / 2).max(0);
+            let vis_b = (cy + eh / 2).min(ih);
+
+            let (ex, ey, ew2, eh2) =
+                match export_crop_box(iw, ih, Some(sx), Some(sy), Some(sw), Some(sh), at) {
+                    Some(v) => v,
+                    None => {
+                        println!("{name}: 导出端不裁剪（整窗类型）");
+                        continue;
+                    }
+                };
+            let (ax, ay, aw, ah) =
+                match ai_crop_region(iw, ih, Some(sx), Some(sy), Some(sw), Some(sh), at) {
+                    AiCropRegion::Rect(l, t, w, h) => (l, t, w, h),
+                    _ => {
+                        println!("{name}: AI 端 Full/Outside");
+                        continue;
+                    }
+                };
+
+            // 某条边被切掉多少像素（0 = 完整包含）。
+            // 方向：框界**越过了**元素界才算切 —— 框比元素大（有余量）不算。
+            let cut = |l: i32, t: i32, w: i32, h: i32| -> i32 {
+                let cut_left = (l - vis_l).max(0); // 框左界在元素左界右侧
+                let cut_right = (vis_r - (l + w)).max(0); // 框右界在元素右界左侧
+                let cut_top = (t - vis_t).max(0);
+                let cut_bottom = (vis_b - (t + h)).max(0);
+                cut_left + cut_right + cut_top + cut_bottom
+            };
+            let cut_export = cut(ex, ey, ew2, eh2);
+            let cut_ai = cut(ax, ay, aw, ah);
+
+            let ratio = (aw as f64 * ah as f64) / (ew2 as f64 * eh2 as f64);
+            println!(
+                "{:<16} {:<6} {:>9} {:>10} | {:>11} {:>11} | {:>6.2}x {:>8} {:>8}",
+                name,
+                at,
+                format!("{ew}x{eh}"),
+                format!("{sw}x{sh}"),
+                format!("{ew2}x{eh2}"),
+                format!("{aw}x{ah}"),
+                ratio,
+                if cut_export > 0 {
+                    format!("{cut_export}px")
+                } else {
+                    "—".to_string()
+                },
+                if cut_ai > 0 {
+                    format!("{cut_ai}px")
+                } else {
+                    "—".to_string()
+                }
+            );
+
+            if cut_export > 0 {
+                violations.push(format!(
+                    "{name}（{iw}x{ih} {at}，元素 {ew}x{eh}）：导出框 {ew2}x{eh2}@({ex},{ey}) 切掉元素可见部分 {cut_export}px"
+                ));
+            }
+            if cut_ai > 0 {
+                violations.push(format!(
+                    "{name}（{iw}x{ih} {at}，元素 {ew}x{eh}）：AI 框 {aw}x{ah}@({ax},{ay}) 切掉元素可见部分 {cut_ai}px —— AI 会拿着被截断的图写描述"
+                ));
+            }
+
+            // 缩放必须保持宽高比（ai_crop_region 的注释承诺 keep aspect ratio）。
+            // 只对「框没被 clamp 到图边界」且非 type 的场景断言：
+            //   - 触界意味着尺寸已被图截断，比例本来就不由缩放决定；
+            //   - type 步骤还要左扩 extra，宽高比必然改变。
+            // ⚠️ 这条断言是 `max_w/max_h` 里 `.max(cw/ch)` 的专属防线：
+            //    只靠缩放后的 `rw.max(cw)` 虽能避免切元素，却会让比例失真
+            //    （实测 1848×299，比例偏离 7%）。
+            let touched_edge = ax <= 0 || ay <= 0 || ax + aw >= iw || ay + ah >= ih;
+            if at != "type" && !touched_edge {
+                let rw0 = (sw + CROP_PAD * 2).max(CROP_MIN_SIZE) as f64;
+                let rh0 = (sh + CROP_PAD * 2).max(CROP_MIN_SIZE) as f64;
+                let want = rw0 / rh0;
+                let got = aw as f64 / ah as f64;
+                let dev = (got - want).abs() / want;
+                if dev > 0.02 {
+                    violations.push(format!(
+                        "{name}（{iw}x{ih} {at}）：AI 框 {aw}x{ah} 宽高比 {got:.3} 偏离缩放前 {want:.3} 达 {:.1}% —— 缩放没保持等比",
+                        dev * 100.0
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "裁图框没盖住元素的可见部分：\n  - {}",
+            violations.join("\n  - ")
+        );
     }
 }

@@ -390,13 +390,22 @@ const EXPORT_CROP_PAD: i32 = 8;
 
 /// 导出裁剪框的纯几何（不碰图片字节），便于单测。
 ///
-/// ⚠️ 这套「居中锚点 → 外扩 PAD → type 左扩 1/3 宽」的算法在仓库里有 **4 份实现**，
+/// ⚠️ 这套「居中锚点 → 外扩 PAD → type 左扩 1/3 宽」的算法在仓库里有 **4 份消费端实现**，
 /// 任何一份改动都必须同步其余三份，否则编辑器里看到的图和导出/AI 的图会不一致：
-///   1. `src/lib/cropAnchor.ts`          —— 前端 cropBoxFromAnchor / rectToCropAnchor
-///   2. `src/pages/StepEditor.tsx`       —— 前端 cropAdaptiveBase64（编辑器实际显示）
-///   3. `src-tauri/src/export/commands.rs` —— 本函数（导出 docx/html/pdf）
-///   4. `src-tauri/src/ai/pipeline.rs`   —— AI 管线裁图
-/// 一致性由 `npm run check:crop`（前端）与 `cargo test`（Rust 端）共同兜底。
+///   1. `src/lib/cropAnchor.ts`          —— 前端 cropBoxFromAnchor / rectToCropAnchor（PAD=8）
+///   2. `src/pages/StepEditor.tsx`       —— 前端 cropAdaptiveBase64（编辑器实际显示，PAD=8）
+///   3. `src-tauri/src/export/commands.rs` —— 本函数（导出 docx/html/pdf，PAD=8）
+///   4. `src-tauri/src/ai/pipeline.rs`   —— AI 管线裁图（PAD=24 / MIN=280 / 缩到屏幕 90%，
+///                                          常量**刻意不同**，喂给 AI 的图需要更大上下文）
+///
+/// 另有 **1 份生产端实现**，语义与上面 4 份相反（它是**生成**落库值，上面 4 份是
+/// **消费**落库值），常量取值也不同，**不在上面这份同步清单里**：
+///   5. `src-tauri/src/recorder/commands.rs` —— 录制时算落库值（PAD=24 / MIN 420x280）。
+///      这里的 PAD 会被 bake 进落库值，消费端还会再外扩一次，所以元素四周的
+///      **实际留白 = 24（录制端）+ 消费端各自的 PAD**，不是任何单处的常量。
+///
+/// 一致性由 `npm run check:crop`（前端，第 6 段跨端黄金值）与
+/// `both_consumers_must_contain_the_visible_element_rect`（cargo，导出 vs AI）共同兜底。
 pub(crate) fn export_crop_box(
     img_w: i32,
     img_h: i32,

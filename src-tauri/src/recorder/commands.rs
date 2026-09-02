@@ -277,6 +277,17 @@ fn display_shortcut_key(key: &str) -> String {
 const CROP_MIN_W: i32 = 420;
 const CROP_MIN_H: i32 = 280;
 /// 元素矩形外扩 padding（px）——让被复制/被输入的文本不贴边。
+///
+/// ⚠️ 这是**生成落库值**的一端，和仓库里另外几处同名 `CROP_PAD` **语义不同、
+/// 取值也故意不同**，改之前务必看清自己改的是哪一端：
+///   - 这里（录制端，`recorder/commands.rs`）：PAD=24，**会被 bake 进落库值**；
+///   - 消费端前端 `src/lib/cropAnchor.ts` 与导出端 `export/commands.rs`：PAD=8，
+///     拿到落库值后再各外扩一次；
+///   - 消费端 AI `ai/pipeline.rs`：PAD=24（另有 MIN=280 与 90% 屏幕缩放）。
+/// 因此**元素四周的实际留白 = 24（这里）+ 消费端各自的 PAD**，不是任何单处的
+/// 常量值。想改"裁图松紧"必须同时看两端，只改一处会得到意料之外的总留白。
+/// 消费端之间的几何一致性由 `both_consumers_must_contain_the_visible_element_rect`
+/// （ai/pipeline.rs）与 `npm run check:crop` 第 6 段兜底。
 const CROP_PAD: i32 = 24;
 
 /// When to re-capture the screen after a shortcut keystroke.
