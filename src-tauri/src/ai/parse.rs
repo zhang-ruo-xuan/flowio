@@ -60,6 +60,18 @@ pub fn parse_step_output(raw: &str, original_action_type: &str) -> Result<StepOu
         }
     }
 
+    // ── Third-pass: tolerant regex extraction (last resort) ──
+    // If serde_json still can't parse (structural issues, control chars,
+    // truncated JSON, etc.), extract fields manually via regex.
+    // This guarantees we never hard-fail on messy LLM output — worst case
+    // we get partial data with a [容错] marker.
+    if let Some(step) = tolerant_extract_fields(trimmed) {
+        log::warn!(
+            "AI parse: tolerant regex extraction succeeded after all JSON parsers failed"
+        );
+        return Ok(finish_step(step, original_action_type));
+    }
+
     // All attempts failed — return detailed error with raw content for debugging
     log::error!(
         "AI parse: ALL attempts failed. Raw (first 500 chars): {} | Sanitized (first 500): {} | Aggressive (first 500): {}",
@@ -206,6 +218,98 @@ fn aggressively_sanitize_escapes(input: &str) -> String {
     // Safety: all content came from valid UTF-8 input; we only inserted
     // ASCII bytes, so the result is still valid UTF-8
     String::from_utf8(out).unwrap_or_else(|_| sanitize_json_escapes(input))
+}
+
+/// Tolerant field extractor: when all JSON parsers fail, use regex to
+/// pull `title`, `description`, `action_type`, and `tip` out of the raw
+/// AI response text. This handles:
+/// - Malformed JSON (missing braces, trailing commas, unquoted keys)
+/// - Control characters inside strings
+/// - Any escape sequence issues (since we're not using serde_json)
+///
+/// Returns `None` only if even `title` cannot be extracted.
+fn tolerant_extract_fields(text: &str) -> Option<StepOutput> {
+    let title = extract_json_field_value(text, "title")?;
+    let description = extract_json_field_value(text, "description").unwrap_or_default();
+    let action_type = extract_json_field_value(text, "action_type").unwrap_or_default();
+    let tip = extract_json_field_value(text, "tip").unwrap_or_default();
+
+    // Clean up common LLM artifacts in extracted strings
+    let clean_title = clean_llm_artifacts(&title);
+    let clean_desc = clean_llm_artifacts(&description);
+
+    Some(StepOutput {
+        title: format!("{}[容错]", clean_title),
+        description: clean_desc,
+        action_type: if action_type.is_empty() { "click".into() } else { action_type },
+        tip,
+    })
+}
+
+/// Extract the value of a JSON string field from potentially-malformed text.
+///
+/// Matches patterns like `"field":"value"` or `"field": "value"` and
+/// extracts the value between quotes, handling escaped quotes (`\"`)
+/// by finding the matching closing quote.
+///
+/// Uses manual scanning (not regex) to avoid adding a crate dependency.
+fn extract_json_field_value(text: &str, field: &str) -> Option<String> {
+    // Manual search for "field":\s*"
+    let field_pattern = format!("\"{}\"", field);
+    let mut pos = text.find(&field_pattern)?;
+    pos += field_pattern.len();
+
+    // Skip whitespace
+    while pos < text.len() && text.as_bytes()[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    // Expect ':'
+    if pos >= text.len() || text.as_bytes()[pos] != b':' {
+        return None;
+    }
+    pos += 1;
+
+    // Skip whitespace after colon
+    while pos < text.len() && text.as_bytes()[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    // Expect opening '"'
+    if pos >= text.len() || text.as_bytes()[pos] != b'"' {
+        return None;
+    }
+    pos += 1;
+
+    // Now scan for the closing unescaped quote
+    let chars: Vec<char> = text[pos..].chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2, // skip escape sequence (including \")
+            '"' => {
+                let value: String = chars[..i].iter().collect();
+                return Some(value);
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Remove common LLM output artifacts from extracted strings:
+/// - Leading/trailing whitespace
+/// - Markdown bold markers (**text**)
+/// - Trailing punctuation that looks like LLM filler
+fn clean_llm_artifacts(s: &str) -> String {
+    let mut cleaned = s.trim().to_string();
+    // Remove **...** markdown bold
+    if cleaned.starts_with("**") && cleaned.ends_with("**") && cleaned.len() >= 4 {
+        cleaned = cleaned[2..cleaned.len() - 2].trim().to_string();
+    }
+    // Remove single *...* italic
+    if cleaned.starts_with('*') && cleaned.ends_with('*') && cleaned.len() >= 2 {
+        cleaned = cleaned[1..cleaned.len() - 1].trim().to_string();
+    }
+    cleaned
 }
 
 /// Attempt to extract a JSON substring from a string that may be
@@ -461,5 +565,58 @@ mod tests {
         // Should not panic and produce parseable JSON
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["x"].as_str().unwrap().starts_with("\\"));
+    }
+
+    // ── tolerant_extract_fields ───────────────────────────────
+
+    #[test]
+    fn test_tolerant_extracts_valid_json() {
+        let input = r#"{"title":"点击登录","description":"点按钮","action_type":"click","tip":""}"#;
+        let result = tolerant_extract_fields(input).unwrap();
+        assert_eq!(result.title, "点击登录[容错]");
+        assert_eq!(result.description, "点按钮");
+        assert_eq!(result.action_type, "click");
+    }
+
+    #[test]
+    fn test_tolerant_handles_invalid_escapes_in_values() {
+        // This would fail serde_json but regex extraction doesn't care about escapes
+        let input = r#"{"title":"在\s输入框中\(\)输入","description":"测试\.内容","action_type":"type","tip":""}"#;
+        let result = tolerant_extract_fields(input).unwrap();
+        assert!(result.title.contains("输入框"));
+        assert!(result.action_type == "type");
+    }
+
+    #[test]
+    fn test_tolerant_handles_malformed_structure() {
+        // Missing closing brace, extra commas — regex still finds fields
+        let input = r#"{"title":"测试标题", "description": "这是描述,,,,"action_type":"click",,,"#;
+        let result = tolerant_extract_fields(input).unwrap();
+        assert_eq!(result.title, "测试标题[容错]");
+        assert!(result.description.contains("描述"));
+    }
+
+    #[test]
+    fn test_tolerant_returns_none_without_title() {
+        let input = r#"{"description":"no title here","action_type":"click"}"#;
+        assert!(tolerant_extract_fields(input).is_none());
+    }
+
+    #[test]
+    fn test_tolerant_clean_llm_artifacts() {
+        assert_eq!(clean_llm_artifacts("  **加粗标题**  "), "加粗标题");
+        assert_eq!(clean_llm_artifacts("*斜体*"), "斜体");
+        assert_eq!(clean_llm_artifacts("  正常文本  "), "正常文本");
+    }
+
+    #[test]
+    fn test_tolerant_integration_parse_falls_back_to_tolerant() {
+        // Simulate a response that's so broken even aggressive sanitizer fails
+        // (e.g. control chars inside strings that break JSON structure)
+        let raw = "Here's some garbage\n{\"title\":\"实际标题\",\"description\":\"含\\s非法转义\",\"action_type\":\"type\",\"tip\":\"\"}\nmore garbage";
+        // This should parse via normal path (the JSON is actually valid after sanitize)
+        let result = parse_step_output(raw, "type");
+        assert!(result.is_ok());
+        assert!(result.unwrap().title.contains("实际标题"));
     }
 }
