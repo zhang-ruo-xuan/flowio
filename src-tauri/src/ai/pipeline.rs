@@ -65,6 +65,15 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
     let redact_mode = crate::redaction::RedactMode::Blur;
     let mut job = job;
     for s in &mut job.steps {
+        // 表格软件（WPS 表格/Excel/Calc…）：用户录制自己的表格，且 AI 需看清
+        // 单元格内容（列标、函数名、数据表取值）才能写出精确步骤。跳过 OCR 脱敏
+        // 模糊，避免单元格文字被糊掉影响识别。
+        // ⚠️ 隐私权衡：表格内容会原样送往视觉模型——仅建议用于非敏感演示数据；
+        // 若含手机号/身份证等真实 PII，仍应由用户自行脱敏后再录制。
+        if crate::ai::prompt::is_spreadsheet_window(&s.window_title) {
+            log::info!("[ai] 表格软件步骤跳过脱敏：{}", s.window_title);
+            continue;
+        }
         match crate::redaction::redact_base64_screenshot(
             &s.screenshot_base64,
             &redact_config,
