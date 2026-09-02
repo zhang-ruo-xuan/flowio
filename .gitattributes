@@ -1,0 +1,14 @@
+# 统一换行符：仓库内一律 LF。
+# 背景：编辑器/工具曾在保存时把整个 tsx 文件改成 CRLF，导致一次 47 行的改动
+# 在 git diff 里变成 1700 行噪音，且污染 git blame。这里强制归一化。
+* text=auto eol=lf
+
+# 二进制文件不做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.pfx binary

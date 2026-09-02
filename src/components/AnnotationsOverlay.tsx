@@ -5,6 +5,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Annotation, AnnoType, drawAnnotation, flattenAnnotations } from '../lib/annotate';
 import { containScale, contentArea } from '../lib/fitBox';
+import { annoSlop, cropSlop, hitAnnotation, hitCropHandle } from '../lib/annoHit';
 
 export type ToolType = 'select' | 'text' | 'highlight' | 'arrow' | 'blur' | 'crop' | 'delete';
 
@@ -328,51 +329,25 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
     }
   };
 
+  /**
+   * 命中检测（入参为**图像坐标**）。
+   * 容差按**屏幕像素**定义后除以 scale —— 直接写 8/12 会被当成图像像素，
+   * 4K 截图缩小显示时屏幕容差只剩 3.5px，箭头基本点不中。
+   */
   const findAt = (x: number, y: number): Annotation | null => {
     for (let i = annotations.length - 1; i >= 0; i--) {
       const a = annotations[i];
-      if (a.type === 'arrow') {
-        const dx = (a.endX ?? 0) - a.x, dy = (a.endY ?? 0) - a.y;
-        const len = Math.hypot(dx, dy);
-        if (len === 0) continue;
-        const t = Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / (len * len)));
-        if (Math.hypot(x - (a.x + t * dx), y - (a.y + t * dy)) < 12) return a;
-      } else {
-        const m = 8;
-        const w = a.width || 0, h = a.height || 0;
-        const bx = a.x;
-        const by = a.y;
-        if (x >= bx - m && x <= bx + w + m &&
-            y >= by - m && y <= by + h + m) return a;
-      }
+      const m = annoSlop(a, scale);
+      if (hitAnnotation(a, x, y, m)) return a;
     }
     return null;
   };
 
-  /** 裁剪框手柄命中检测（图像像素坐标） */
+  /** 裁剪框手柄命中检测（入参为**图像坐标**，容差同样按屏幕像素换算） */
   const hitTestCrop = (x: number, y: number): null | 'move' | 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se' => {
     if (!cropRect) return null;
-    const { x: cx, y: cy, width: cw, height: ch } = cropRect;
-    const hit = 14; // 边手柄命中半径
-    const corner = 16; // 角手柄命中范围
-    const inX = x >= cx && x <= cx + cw;
-    const inY = y >= cy && y <= cy + ch;
-
-    // 四角优先
-    if (Math.abs(x - cx) <= corner && Math.abs(y - cy) <= corner) return 'nw';
-    if (Math.abs(x - (cx + cw)) <= corner && Math.abs(y - cy) <= corner) return 'ne';
-    if (Math.abs(x - cx) <= corner && Math.abs(y - (cy + ch)) <= corner) return 'sw';
-    if (Math.abs(x - (cx + cw)) <= corner && Math.abs(y - (cy + ch)) <= corner) return 'se';
-
-    // 四边
-    if (inX && Math.abs(y - cy) <= hit) return 'n';
-    if (inX && Math.abs(y - (cy + ch)) <= hit) return 's';
-    if (inY && Math.abs(x - cx) <= hit) return 'w';
-    if (inY && Math.abs(x - (cx + cw)) <= hit) return 'e';
-
-    // 框内 → 整体移动
-    if (x > cx && x < cx + cw && y > cy && y < cy + ch) return 'move';
-    return null;
+    const { edge, corner } = cropSlop(scale);
+    return hitCropHandle(cropRect, x, y, edge, corner);
   };
 
   /** 根据 cropResize 方向 + 鼠标位移更新 cropRect（限制在图片范围内，最小 20px） */

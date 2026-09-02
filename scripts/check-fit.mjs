@@ -357,9 +357,99 @@ console.log('7. 主预览容器：遗留的 16:9 高度锁（v24 只修了宽度
   console.log('   静态防线：主预览容器不得写死高度 ✓');
 }
 
-/* ═══ 8. 静态防线：两个弹窗都必须走实测可用区 ═══════════════ */
+/* ═══ 8. 命中容差：图像像素 vs 屏幕像素 ═════════════════════ */
 
-console.log('8. 静态防线：组件源码不得再出现「window 尺寸直接当可用区」');
+const H = await import(new URL('../src/lib/annoHit.ts', import.meta.url).href);
+const { HIT_SLOP, slopPx, hitAnnotation, hitCropHandle } = H;
+
+console.log('8. 命中容差：阈值必须按屏幕像素定义（除以 scale 后才能用）');
+{
+  // 标注弹窗的可用区 = 窗口 -(padding 40*2) -(工具栏 56 + padding 40*2)
+  const VIEWPORTS2 = [
+    [1366, 768],
+    [1600, 900],
+    [1920, 1080],
+    [2560, 1440],
+  ];
+  const SHOTS2 = [
+    [1366, 768, '1x 笔记本'],
+    [1920, 1080, '1080p'],
+    [2560, 1440, '2K'],
+    [3440, 1440, '带鱼屏'],
+    [3840, 2160, '4K'],
+  ];
+
+  // 阈值写死成图像像素时，屏幕上的实际容差 = 阈值 × scale
+  const rows = [];
+  let worst = Infinity;
+  let tooSmall = 0;
+  let n = 0;
+  for (const [vw, vh] of VIEWPORTS2) {
+    for (const [iw, ih, label] of SHOTS2) {
+      const box = contentArea(vw, vh - TOOLBAR_H, AREA_PAD, AREA_PAD);
+      const s = containScale({ availW: box.availW, availH: box.availH, imgW: iw, imgH: ih });
+      n++;
+      const screenSlop = HIT_SLOP.arrow * s; // 旧实现：12 被当成图像像素
+      if (screenSlop < worst) worst = screenSlop;
+      if (screenSlop < 6) tooSmall++; // 屏幕 <6px 基本点不中
+      if (rows.length < 5 && s < 0.6) {
+        rows.push(
+          `     ${label} ${iw}x${ih} @ 窗口 ${vw}x${vh}：scale=${s.toFixed(3)}` +
+            ` → 箭头容差 屏幕 ${screenSlop.toFixed(1)}px（应为 ${HIT_SLOP.arrow}px）`
+        );
+      }
+    }
+  }
+  console.log(`   ${n} 种组合（${SHOTS2.length} 种截图 × ${VIEWPORTS2.length} 种窗口）`);
+  console.log(`   旧实现：箭头容差在屏幕上最小只有 ${worst.toFixed(1)}px（目标是 ${HIT_SLOP.arrow}px）`);
+  console.log(`   旧实现：屏幕容差 <6px（基本点不中）的有 ${tooSmall}/${n} 例`);
+  for (const r of rows) console.log(r);
+
+  // 新实现：容差恒定 = 屏幕像素定义值（无论如何缩放）
+  let bad = 0;
+  for (const [vw, vh] of VIEWPORTS2) {
+    for (const [iw, ih] of SHOTS2) {
+      const box = contentArea(vw, vh - TOOLBAR_H, AREA_PAD, AREA_PAD);
+      const s = containScale({ availW: box.availW, availH: box.availH, imgW: iw, imgH: ih });
+      const m = slopPx(HIT_SLOP.arrow, s);
+      if (Math.abs(m * s - HIT_SLOP.arrow) > 0.01) {
+        bad++;
+        fail(`scale=${s} 时 屏幕容差 ${(m * s).toFixed(2)} != ${HIT_SLOP.arrow}`);
+      }
+    }
+  }
+  console.log(`   新实现：屏幕容差恒为 ${HIT_SLOP.arrow}px（${n} 例，违反 ${bad} 例）`);
+  if (bad > 0) fail(`命中容差换算 ${bad} 例错误`);
+
+  // slopPx 边界
+  for (const s of [0, -1, NaN, Infinity]) {
+    if (slopPx(8, s) !== 8) fail(`slopPx(8, ${s}) 应回落 8`);
+  }
+  if (slopPx(0, 0.5) !== 0) fail('slopPx(0) 应为 0');
+  if (!(slopPx(8, 1000) >= 1)) fail('极端缩小时容差不能塌到 0');
+
+  // 命中函数本身：容差内必须命中、容差外必须不命中
+  const box = { type: 'highlight', x: 100, y: 100, width: 80, height: 40 };
+  if (!hitAnnotation(box, 100, 100, 8)) fail('包围盒左上角应命中');
+  if (!hitAnnotation(box, 95, 96, 8)) fail('外扩 8px 内应命中');
+  if (hitAnnotation(box, 90, 100, 8)) fail('外扩 8px 外不应命中');
+  const arrow = { type: 'arrow', x: 0, y: 0, endX: 100, endY: 0 };
+  if (!hitAnnotation(arrow, 50, 5, 12)) fail('箭头线上方 5px 应命中');
+  if (hitAnnotation(arrow, 50, 20, 12)) fail('箭头线上方 20px 不应命中');
+  if (hitAnnotation(arrow, -50, 0, 12)) fail('箭头线段延长线外不应命中（t 必须 clamp）');
+
+  // 裁剪框：四角优先于四边；框内为 move
+  const cr = { x: 0, y: 0, width: 100, height: 100 };
+  if (hitCropHandle(cr, 2, 2, 14, 16) !== 'nw') fail('左上角应命中 nw');
+  if (hitCropHandle(cr, 50, 2, 14, 16) !== 'n') fail('上边中点应命中 n');
+  if (hitCropHandle(cr, 50, 50, 14, 16) !== 'move') fail('框内应命中 move');
+  if (hitCropHandle(cr, 200, 200, 14, 16) !== null) fail('框外不应命中');
+  console.log('   命中函数单元断言：通过');
+}
+
+/* ═══ 9. 静态防线：两个弹窗都必须走实测可用区 ═══════════════ */
+
+console.log('9. 静态防线：组件源码不得再出现「window 尺寸直接当可用区」');
 {
   const { readFileSync } = await import('node:fs');
   const readSrc = (p) => readFileSync(new URL(p, import.meta.url), 'utf8');
@@ -375,6 +465,13 @@ console.log('8. 静态防线：组件源码不得再出现「window 尺寸直接
         ['ref={areaRef}', '内容区容器必须挂 ref'],
       ],
       forbidden: [/window\.innerHeight\s*-\s*56/, /window\.innerWidth\s*\*\s*0\.995/],
+      // 按**函数体**断言：整个函数里必须出现容差换算调用。
+      // 早先的写法是 forbidden 正则匹配 `const m = 8;`，结果被 `? 12 : 8`
+      // 这种三元表达式绕过去了 —— 反向验证时才发现。改成摘函数体更稳。
+      bodies: [
+        ['const findAt = ', /annoSlop\(|slopPx\(/, 'findAt 必须用 annoSlop 换算容差'],
+        ['const hitTestCrop = ', /cropSlop\(|slopPx\(/, 'hitTestCrop 必须用 cropSlop 换算容差'],
+      ],
     },
     {
       file: '../src/components/CropOverlay.tsx',
@@ -398,6 +495,17 @@ console.log('8. 静态防线：组件源码不得再出现「window 尺寸直接
     const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
     for (const re of s.forbidden) {
       if (re.test(code)) fail(`${s.name} 源码出现禁用的硬编码 ${re}（应改用实测内容区）`);
+    }
+    // 摘出单个函数体做断言（从 `const fn = ` 到下一个顶层 `\n  };`）
+    for (const [head, must, why] of s.bodies ?? []) {
+      const i = code.indexOf(head);
+      if (i < 0) {
+        fail(`${s.name} 找不到函数 ${head}`);
+        continue;
+      }
+      const end = code.indexOf('\n  };', i);
+      const body = end > 0 ? code.slice(i, end) : code.slice(i, i + 600);
+      if (!must.test(body)) fail(`${s.name} 的 ${head.trim()} —— ${why}`);
     }
   }
 
