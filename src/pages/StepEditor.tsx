@@ -32,6 +32,7 @@ import CropOverlay, { type CropRectPx } from "../components/CropOverlay";
 import LoginSaveModal from "../components/LoginSaveModal";
 import type { Annotation } from "../lib/annotate";
 import { CROP_PAD, cropBoxFromAnchor, rectToCropAnchor } from "../lib/cropAnchor";
+import { previewBox } from "../lib/previewBox";
 import type { Recording, Step } from "../types";
 
 /* ── Export format options ─────────────────────────────────── */
@@ -1737,19 +1738,22 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                             alt={`步骤 ${selectedIndex + 1} 截图`}
                             onClick={() => openLightbox(selectedIndex)}
                             onLoad={(e) => {
-                              // 把图片实际宽高比写到容器上，消除 16:9 锁死留下的 letterbox 缝隙。
-                              // 同时把容器 max-height（420）也算进去：宽高比的"宽"按容器宽度、
-                              // "高"按 min(自然高, 420) 算，确保容器最终实际高宽比跟图片一致，
-                              // 否则窄窗口下 contain 会留下几像素左右 letterbox。
+                              // 让容器形状完全贴合图片，消除 object-fit: contain 的 letterbox 留白。
+                              //
+                              // 注意：只写 aspect-ratio 是不够的。容器是 width:100% + max-height:420，
+                              // 图片一旦被 max-height 压住，盒子仍是满宽、只是高度停在 420，
+                              // contain 按高度缩放后左右各留一条灰底（1920×1080 在 800px 容器里
+                              // 左右各 27px，在 1200px 里各 227px）——这正是"还是有缝隙"的来源。
+                              // 必须同时把 max-width 收到 maxHeight × 宽高比，让盒子整体缩成图片的
+                              // 形状；min-height 也要清掉，否则窄容器下的宽图会被撑高、重新出现
+                              // 上下留白。详见 lib/previewBox.ts。
                               const img = e.currentTarget;
                               const parent = img.parentElement;
-                              if (parent && img.naturalWidth > 0 && img.naturalHeight > 0) {
-                                const w = parent.clientWidth;
-                                const MAX_H = 420;
-                                const naturalH = (w * img.naturalHeight) / img.naturalWidth;
-                                const effectiveH = Math.min(naturalH, MAX_H);
-                                const effectiveAspect = w / effectiveH;
-                                parent.style.setProperty('--step-img-aspect', `${effectiveAspect}`);
+                              const box = previewBox(img.naturalWidth, img.naturalHeight);
+                              if (parent && box) {
+                                parent.style.setProperty("--step-img-aspect", `${box.aspect}`);
+                                parent.style.maxWidth = `${box.maxWidth}px`;
+                                parent.style.minHeight = `${box.minHeight}px`;
                               }
                             }}
                             style={{ cursor: "pointer" }}
