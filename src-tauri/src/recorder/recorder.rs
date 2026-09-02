@@ -29,7 +29,7 @@ extern "system" {
 
 /// Win32 RECT (screen coordinates, pixels).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
@@ -250,23 +250,46 @@ pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
             (&mut ctx as *mut (Vec<WindowCandidate>, &str)) as isize,
         );
     }
-    let candidates = ctx.0;
-    // 200 px wide × 100 px tall = 20 000 px². Well below any realistic main UI,
-    // well above auxiliary controls (favicon chips are 32×32, URL-bar
-    // suggestions ~1×20 px). A tighter floor (100×60) was considered but some
-    // legitimate dock-style apps are genuinely small.
-    const MIN_W: i32 = 200;
-    const MIN_H: i32 = 100;
+    pick_target_rect(&ctx.0).inspect(|r| {
+        capture_dbg_log(&format!(
+            "[CAPTURE] find_window_rect_by_process({}): chose {}x{} at ({},{})",
+            process_name,
+            r.width(),
+            r.height(),
+            r.left,
+            r.top
+        ));
+    }).or_else(|| {
+        capture_dbg_log(&format!(
+            "[CAPTURE] find_window_rect_by_process({}): no candidate passed the {}x{} floor",
+            process_name, MIN_W, MIN_H
+        ));
+        None
+    })
+}
 
-    // Rank = (has_title, area). Tuple comparison gives us "prefer windows that
-    // actually declare a title; among those, prefer the largest".
-    //
-    // `has_title` is deliberately a *soft* preference, not a filter: Chromium
-    // main windows sometimes report an empty `GetWindowText` while their
-    // auxiliary child windows do carry one. Hard-filtering on title would then
-    // discard the real app window and every frame would be skipped (the user
-    // sees no screenshots at all) — a worse failure than a slightly-off crop.
-    let mut best: Option<(bool, i64, Rect)> = None;
+/// Pure window-ranking logic, extracted from `find_window_rect_by_process`
+/// so it can be exercised without Win32. Drops candidates with rect below
+/// `MIN_W × MIN_H`, then scores the survivors as `area × TITLED_BONUS` when
+/// the window declares a title, and picks the highest score.
+///
+/// Returns `None` when every candidate is too small or the input is empty —
+/// the caller (capture thread) turns that into a frame skip, so the user
+/// never sees a screenshot that contains unrelated desktop content.
+///
+/// ## Why a multiplier and not a `(has_title, area)` lexicographic rank
+///
+/// Comparing the bool first makes the title an *absolute* preference:
+/// `true > false` short-circuits the area comparison, so a 32×32 titled
+/// favicon chip beats a 1920×1080 untitled main window. That is not
+/// hypothetical — Chromium main windows frequently report an empty
+/// `GetWindowText` while their auxiliary chips *do* carry titles, and that
+/// is precisely the "screenshot is an icon" failure this function exists to
+/// prevent. A 2× bonus keeps the title meaningful (it decides between two
+/// comparable windows) without ever letting it bridge an order of magnitude.
+fn pick_target_rect(candidates: &[WindowCandidate]) -> Option<Rect> {
+    const TITLED_BONUS: i64 = 2;
+    let mut best: Option<(i64, Rect)> = None;
     for c in candidates {
         let w = c.rect.width();
         let h = c.rect.height();
@@ -274,33 +297,16 @@ pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
             continue;
         }
         let area = (w as i64) * (h as i64);
+        let score = if c.has_title { area * TITLED_BONUS } else { area };
         let better = match &best {
             None => true,
-            Some((bh, ba, _)) => (c.has_title, area) > (*bh, *ba),
+            Some((bs, _)) => score > *bs,
         };
         if better {
-            best = Some((c.has_title, area, c.rect));
+            best = Some((score, c.rect));
         }
     }
-    if let Some((has_title, area, r)) = best {
-        capture_dbg_log(&format!(
-            "[CAPTURE] find_window_rect_by_process({}): chose {}x{} at ({},{}), area={}, has_title={}",
-            process_name,
-            r.width(),
-            r.height(),
-            r.left,
-            r.top,
-            area,
-            has_title
-        ));
-        Some(r)
-    } else {
-        capture_dbg_log(&format!(
-            "[CAPTURE] find_window_rect_by_process({}): no candidate passed the {}x{} floor",
-            process_name, MIN_W, MIN_H
-        ));
-        None
-    }
+    best.map(|(_, r)| r)
 }
 
 /// Append a one-line message to the Flowio debug log. Mirrors the inline
@@ -321,6 +327,14 @@ pub(super) fn capture_dbg_log(msg: &str) {
         let _ = writeln!(f, "{}", msg);
     }
 }
+
+/// Minimum window size that `pick_target_rect` accepts. Anything smaller is
+/// treated as a Chromium-style auxiliary control (favicon chip, URL-bar
+/// suggestion) — well below any realistic main UI, well above any helper
+/// control. Tighter floors (100×60) were considered but drop legitimate
+/// small dock-style apps; this is the broad-UX-friendly compromise.
+pub(super) const MIN_W: i32 = 200;
+pub(super) const MIN_H: i32 = 100;
 
 /// One visible window owned by the target process, collected during enumeration.
 struct WindowCandidate {
@@ -519,5 +533,133 @@ mod recorder_tests {
             "文件资源管理器（桌面/文件夹窗口）"
         );
         assert_eq!(process_description("unknownapp.exe"), "");
+    }
+
+    // ── pick_target_rect — regression tests for the "screenshot is a
+    //    favicon" bug.  All scenarios were observed on real machines and
+    //    each one bites a slightly different assumption. ──────────────────
+
+    fn make_candidate(left: i32, top: i32, w: i32, h: i32, has_title: bool) -> WindowCandidate {
+        WindowCandidate {
+            rect: Rect { left, top, right: left + w, bottom: top + h },
+            has_title,
+        }
+    }
+
+    #[test]
+    fn pick_target_rect_drops_favicon_chip_when_alone() {
+        // Only a 32x32 Chromium favicon chip is visible. Returning it would
+        // yield a 32x32 thumbnail for every recording step — the exact bug
+        // that shipped 2026-09-02 (v14).
+        let candidates = vec![make_candidate(0, 0, 32, 32, true)];
+        assert_eq!(pick_target_rect(&candidates), None);
+    }
+
+    #[test]
+    fn pick_target_rect_main_window_beats_favicon_chip() {
+        // Real layout observed during the bug: one 1920x1080 main window
+        // and one 32x32 favicon chip on the same process.
+        let candidates = vec![
+            make_candidate(0, 0, 32, 32, true),       // favicon chip
+            make_candidate(0, 0, 1920, 1080, true),   // main browser window
+        ];
+        let picked = pick_target_rect(&candidates).expect("main window should win");
+        assert_eq!(picked.width(), 1920);
+        assert_eq!(picked.height(), 1080);
+    }
+
+    #[test]
+    fn pick_target_rect_prefers_titled_at_equal_area() {
+        // Identical area: the titled candidate gets a 2x score bonus and
+        // wins. Distinct positions let us assert *which* one won, not just
+        // that some 1000x200 was returned.
+        let candidates = vec![
+            make_candidate(0, 0, 1000, 200, false),    // untitled
+            make_candidate(50, 50, 1000, 200, true),   // titled, offset
+        ];
+        let picked = pick_target_rect(&candidates).expect("titled must win");
+        assert_eq!((picked.left, picked.top), (50, 50), "titled window wins the tie");
+    }
+
+    #[test]
+    fn pick_target_rect_untitled_main_still_wins_over_titled_chip() {
+        // Chromium-empty-title case observed in 8/30 tarball: the real main
+        // window reports no title while a tiny chip does. The 2x title
+        // bonus must NOT let the chip beat a 35x larger window — this is
+        // exactly the regression a `(has_title, area)` lexicographic rank
+        // had (`true > false` short-circuits the area comparison) and the
+        // unit test was added to lock down.
+        let candidates = vec![
+            make_candidate(50, 50, 300, 200, true),   // titled chip (small)
+            make_candidate(0, 0, 1920, 1080, false),  // untitled main (huge)
+        ];
+        let picked = pick_target_rect(&candidates).expect("untitled main must win on area");
+        assert_eq!(picked.width(), 1920);
+        assert_eq!(picked.height(), 1080);
+    }
+
+    #[test]
+    fn pick_target_rect_crossover_2x_smaller_titled_still_wins() {
+        // The bonus exists to decide ties between comparable windows. A
+        // titled window that is *up to 2x smaller* than an untitled one
+        // must still win — that is the intended "soft preference" semantic.
+        // Below that crossover the area dominant takes over.
+        let candidates = vec![
+            make_candidate(0, 0, 800, 600, false),    // 480 000
+            make_candidate(0, 0, 800, 300, true),     // 240 000 × 2 = 480 000 (tie)
+        ];
+        // Equal scores — deterministic but the picker returns whichever it
+        // sees first; we instead drive the same scenario with a small
+        // asymmetry that *does* have a clear answer.
+        let candidates = vec![
+            make_candidate(0, 0, 800, 600, false),    // 480 000
+            make_candidate(0, 0, 700, 350, true),     // 245 000 × 2 = 490 000
+        ];
+        let picked = pick_target_rect(&candidates).expect("one of them must win");
+        // The titled one is half the area but its 2x bonus puts it just
+        // ahead; assert the titled coordinate we gave it to make sure.
+        assert_eq!(picked.width(), 700);
+        assert_eq!(picked.height(), 350);
+    }
+
+    #[test]
+    fn pick_target_rect_crossover_3x_smaller_titled_loses() {
+        // ...but a titled window that is *more than 2x* smaller must NOT
+        // win — that's the limit of the "soft preference" we promise.
+        let candidates = vec![
+            make_candidate(0, 0, 800, 600, false),    // 480 000
+            make_candidate(0, 0, 400, 400, true),     // 160 000 × 2 = 320 000 (loses)
+        ];
+        let picked = pick_target_rect(&candidates).expect("the larger wins");
+        assert_eq!(picked.width(), 800);
+        assert_eq!(picked.height(), 600);
+    }
+
+    #[test]
+    fn pick_target_rect_empty_returns_none() {
+        assert_eq!(pick_target_rect(&[]), None);
+    }
+
+    #[test]
+    fn pick_target_rect_all_too_small_returns_none() {
+        // Only tiny helpers, no main window — caller turns this into a
+        // skipped frame so the user sees no screenshot rather than a wrong
+        // one.
+        let candidates = vec![
+            make_candidate(0, 0, 32, 32, true),
+            make_candidate(100, 100, 100, 50, true),
+            make_candidate(0, 0, 150, 90, true),  // under MIN_W or MIN_H
+        ];
+        assert_eq!(pick_target_rect(&candidates), None);
+    }
+
+    #[test]
+    fn pick_target_rect_below_one_dimension_rejected() {
+        // Just tall enough in one dim but too narrow in the other — both
+        // safeguards must pass. 199 wide is just below MIN_W=200.
+        let candidates = vec![make_candidate(0, 0, 199, 500, true)];
+        assert_eq!(pick_target_rect(&candidates), None);
+        let candidates = vec![make_candidate(0, 0, 500, 99, true)];
+        assert_eq!(pick_target_rect(&candidates), None);
     }
 }
