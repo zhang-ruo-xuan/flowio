@@ -6,6 +6,10 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Annotation, AnnoType, drawAnnotation, flattenAnnotations } from '../lib/annotate';
 import { containScale, contentArea } from '../lib/fitBox';
 import { annoSlop, cropSlop, hitAnnotation, hitCropHandle } from '../lib/annoHit';
+import {
+  annoFont, annoStroke, contentScale, uiPx, uiScale,
+  UI_CROSS, UI_CROP_DASH, UI_CROP_LINE, UI_DASH, UI_HANDLE_R, UI_LINE, UI_LINE_STRONG, UI_PAD,
+} from '../lib/annoScale';
 
 export type ToolType = 'select' | 'text' | 'highlight' | 'arrow' | 'blur' | 'crop' | 'delete';
 
@@ -165,6 +169,10 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
     ctx.clearRect(0, 0, image.width, image.height);
     ctx.drawImage(image, 0, 0);
 
+    // 两种缩放系数：内容随图等比（vk），UI 装饰按屏幕像素恒定（uk）
+    const vk = contentScale(image.height);
+    const uk = uiScale(scale);
+
     for (const a of annotations) {
       drawAnnotation(ctx, a, { width: image.width, height: image.height });
     }
@@ -177,8 +185,8 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
         ctx.fillStyle = currentColor + '20';
         ctx.fillRect(rx, ry, rw, rh);
         ctx.strokeStyle = currentColor;
-        ctx.lineWidth = currentStrokeWidth;
-        ctx.setLineDash([5, 5]);
+        ctx.lineWidth = annoStroke(currentStrokeWidth, vk);
+        ctx.setLineDash([5 * uk, 5 * uk]);
         ctx.strokeRect(rx, ry, rw, rh);
         ctx.setLineDash([]);
       } else if (activeTool === 'arrow') {
@@ -186,8 +194,8 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
         ctx.moveTo(drawStart.x, drawStart.y);
         ctx.lineTo(drawCurrent.x, drawCurrent.y);
         ctx.strokeStyle = currentColor;
-        ctx.lineWidth = currentStrokeWidth;
-        ctx.setLineDash([5, 5]);
+        ctx.lineWidth = annoStroke(currentStrokeWidth, vk);
+        ctx.setLineDash([5 * uk, 5 * uk]);
         ctx.stroke();
         ctx.setLineDash([]);
       } else if (activeTool === 'blur') {
@@ -196,35 +204,37 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
         ctx.fillStyle = 'rgba(255,255,255,0.3)';
         ctx.fillRect(rx, ry, rw, rh);
         ctx.strokeStyle = currentColor;
-        ctx.lineWidth = 1;
-        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = UI_LINE * uk;
+        ctx.setLineDash([4 * uk, 4 * uk]);
         ctx.strokeRect(rx, ry, rw, rh);
         ctx.setLineDash([]);
       }
     }
 
-    // Text placement crosshair
+    // Text placement crosshair（UI 装饰：屏幕像素恒定）
     if (textPlacePos) {
+      const cr = uiPx(UI_CROSS, scale);
       ctx.strokeStyle = '#FF6B35';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = UI_LINE * uk;
+      ctx.setLineDash([UI_DASH * uk, UI_DASH * uk]);
       ctx.beginPath();
-      ctx.moveTo(textPlacePos.x - 10, textPlacePos.y);
-      ctx.lineTo(textPlacePos.x + 10, textPlacePos.y);
-      ctx.moveTo(textPlacePos.x, textPlacePos.y - 10);
-      ctx.lineTo(textPlacePos.x, textPlacePos.y + 10);
+      ctx.moveTo(textPlacePos.x - cr, textPlacePos.y);
+      ctx.lineTo(textPlacePos.x + cr, textPlacePos.y);
+      ctx.moveTo(textPlacePos.x, textPlacePos.y - cr);
+      ctx.lineTo(textPlacePos.x, textPlacePos.y + cr);
       ctx.stroke();
       ctx.setLineDash([]);
     }
 
-    // Selection highlight
+    // Selection highlight（UI 装饰：手柄/虚线在屏幕上的大小与命中容差同基准）
     if (selectedId && activeTool === 'select') {
       const sel = annotations.find(a => a.id === selectedId);
       if (sel) {
+        const handleR = uiPx(UI_HANDLE_R, scale);
         if (sel.type === 'arrow') {
           ctx.strokeStyle = '#999';
-          ctx.lineWidth = 1;
-          ctx.setLineDash([3, 3]);
+          ctx.lineWidth = UI_LINE * uk;
+          ctx.setLineDash([UI_DASH * uk, UI_DASH * uk]);
           ctx.beginPath();
           ctx.moveTo(sel.x, sel.y);
           ctx.lineTo(sel.endX ?? 0, sel.endY ?? 0);
@@ -233,18 +243,18 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
           const handles = [[sel.x, sel.y], [sel.endX ?? 0, sel.endY ?? 0]];
           for (const [px, py] of handles) {
             ctx.fillStyle = '#fff';
-            ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(px, py, handleR, 0, Math.PI * 2); ctx.fill();
             ctx.strokeStyle = '#999';
-            ctx.lineWidth = 1.5;
+            ctx.lineWidth = UI_LINE_STRONG * uk;
             ctx.stroke();
           }
         } else {
           // 灰色虚线框 + 四角圆形手柄（微信截图风格）
-          const pad = 4;
+          const pad = uiPx(UI_PAD, scale);
           const bx = sel.x, by = sel.y, bw = sel.width || 0, bh = sel.height || 0;
           ctx.strokeStyle = '#999';
-          ctx.lineWidth = 1;
-          ctx.setLineDash([3, 3]);
+          ctx.lineWidth = UI_LINE * uk;
+          ctx.setLineDash([UI_DASH * uk, UI_DASH * uk]);
           ctx.strokeRect(bx - pad, by - pad, bw + pad * 2, bh + pad * 2);
           ctx.setLineDash([]);
           const corners = [
@@ -255,9 +265,9 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
           ];
           for (const [cx, cy] of corners) {
             ctx.fillStyle = '#fff';
-            ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(cx, cy, handleR, 0, Math.PI * 2); ctx.fill();
             ctx.strokeStyle = '#999';
-            ctx.lineWidth = 1.5;
+            ctx.lineWidth = UI_LINE_STRONG * uk;
             ctx.stroke();
           }
         }
@@ -278,8 +288,8 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
       ctx.fillRect(0, c.y, c.x, c.height);
       ctx.fillRect(c.x + c.width, c.y, image.width - c.x - c.width, c.height);
       ctx.strokeStyle = '#fff';
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([6, 3]);
+      ctx.lineWidth = UI_CROP_LINE * uk;
+      ctx.setLineDash([UI_CROP_DASH[0] * uk, UI_CROP_DASH[1] * uk]);
       ctx.strokeRect(c.x, c.y, c.width, c.height);
       ctx.setLineDash([]);
       // 四边整条边可拖拽，不显示中心点/角手柄（仅框线）
@@ -408,9 +418,12 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
     if (canvas) {
       const ctx = canvas.getContext('2d');
       if (ctx) {
-        ctx.font = `bold ${currentFontSize}px "Noto Sans SC", "Microsoft YaHei", sans-serif`;
+        // 必须用与 drawAnnotation 同一个归一化字号测量，否则存进 width/height 的命中框会偏小
+        const k = contentScale(image?.height);
+        const fs = annoFont(currentFontSize, k);
+        ctx.font = `bold ${fs}px "Noto Sans SC", "Microsoft YaHei", sans-serif`;
         tw = ctx.measureText(textInput.trim()).width;
-        th = currentFontSize + 4;
+        th = fs + annoStroke(4, k);
       }
     }
     const na: Annotation = {
@@ -586,7 +599,8 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
         return a.x + (a.width || 0) > 0 && a.x < cropRect.width &&
                a.y + (a.height || 0) > 0 && a.y < cropRect.height;
       });
-    for (const a of adjusted) drawAnnotation(ctx, a, { width: cropRect.width, height: cropRect.height });
+    // ⚠️ dims 必须传【原图】尺寸：它是内容归一化的基准，传裁切尺寸会让标注粗细随裁切框突变
+    for (const a of adjusted) drawAnnotation(ctx, a, { width: image.width, height: image.height });
     setAnnotations(adjusted);
     setHistory([adjusted]);
     setHistoryIndex(0);

@@ -538,13 +538,17 @@ console.log('9. 静态防线：组件源码不得再出现「window 尺寸直接
  */
 console.log('10. 标注视觉权重：必须与截图原始分辨率无关');
 {
-  // annotate.ts 里写死的**图像像素**默认值
+  // 直接 import 真实实现，测的是线上跑的代码而不是脚本里的复刻
+  const { contentScale, annoStroke, annoFont, annoArrowHead, annoBlurRadius } = await import(
+    new URL('../src/lib/annoScale.ts', import.meta.url).href
+  );
+  // [名称, 修复前的写死值(图像像素), 修复后真实实现算出的图像像素]
   const STYLE = [
-    ['高亮边框', 2],
-    ['箭头线宽', 3],
-    ['箭头头部', 14 + 3 * 2],
-    ['模糊虚线', 4],
-    ['文字字号', 24],
+    ['高亮边框', 2, (h) => annoStroke(2, contentScale(h))],
+    ['箭头线宽', 3, (h) => annoStroke(3, contentScale(h))],
+    ['箭头头部', 20, (h) => annoArrowHead(3, contentScale(h))],
+    ['模糊半径', 8, (h) => annoBlurRadius(contentScale(h))],
+    ['文字字号', 24, (h) => annoFont(24, contentScale(h))],
   ];
   const REF_H = 1080; // 归一化基准：1080p 观感完全不变，只缩放其它分辨率
 
@@ -557,9 +561,9 @@ console.log('10. 标注视觉权重：必须与截图原始分辨率无关');
     for (const [iw, ih] of SHOTS) {
       const s = containScale({ availW: box.availW, availH: box.availH, imgW: iw, imgH: ih });
       const dispH = ih * s; // 图片在屏幕上的显示高度
-      for (const [name, px] of STYLE) {
-        const oldW = (px * s) / dispH;              // 现状
-        const newW = (px * (ih / REF_H) * s) / dispH; // 按图高等比
+      for (const [name, raw, f] of STYLE) {
+        const oldW = (raw * s) / dispH;   // 修复前：写死图像像素
+        const newW = (f(ih) * s) / dispH; // 修复后：真实实现
         const a = agg.get(name) ?? { oldMin: Infinity, oldMax: -Infinity, newMin: Infinity, newMax: -Infinity };
         a.oldMin = Math.min(a.oldMin, oldW); a.oldMax = Math.max(a.oldMax, oldW);
         a.newMin = Math.min(a.newMin, newW); a.newMax = Math.max(a.newMax, newW);
@@ -581,7 +585,17 @@ console.log('10. 标注视觉权重：必须与截图原始分辨率无关');
       ` → 归一化后 ${nRatio.toFixed(2)}×`
     );
   }
-  console.log(`     最大不一致 ${worst.toFixed(2)}× —— 同一张图放大分辨率，标注就变细 ${worst.toFixed(1)} 倍`);
+  console.log(`     修复前最大不一致 ${worst.toFixed(2)}× —— 同一张图放大分辨率，标注就变细 ${worst.toFixed(1)} 倍`);
+
+  // 基准必须锁在 1080p：该分辨率下的观感与修复前完全一致（老数据不漂移）
+  if (contentScale(1080) !== 1) {
+    fail(`contentScale(1080) 应为 1（1080p 观感零变化），实际 ${contentScale(1080)}`);
+  }
+  for (const [name, raw, f] of STYLE) {
+    if (Math.abs(f(1080) - raw) > 1e-9) {
+      fail(`${name} 在 1080p 下应为 ${raw}（保持原观感），实际 ${f(1080)}`);
+    }
+  }
 
   // ── (b) 具体观感：固定窗口 1366×768，各分辨率截图下的字号/线宽 ──
   const [vw, vh] = [1366, 768];
@@ -589,22 +603,167 @@ console.log('10. 标注视觉权重：必须与截图原始分辨率无关');
   console.log(`   (b) 编辑器里实际看到的尺寸（窗口 ${vw}×${vh}，可用 ${box.availW}×${box.availH}）：`);
   console.log('     注：宽度受限的图（如带鱼屏）整体显示得小，标注随之变小是**正确**的；');
   console.log('     判据是「相对权重是否恒定」，不是「绝对像素是否相同」。');
+  const tallFonts = [];
   for (const [iw, ih] of SHOTS) {
     const s = containScale({ availW: box.availW, availH: box.availH, imgW: iw, imgH: ih });
     const dispH = ih * s;
     const bound = dispH < box.availH - 0.5 ? '宽受限' : '高受限';
     const fontOld = 24 * s;
-    const fontNew = 24 * (ih / REF_H) * s;
+    const fontNew = annoFont(24, contentScale(ih)) * s;
     const lineOld = 3 * s;
-    const lineNew = 3 * (ih / REF_H) * s;
+    const lineNew = annoStroke(3, contentScale(ih)) * s;
     console.log(
       `     ${String(iw + '×' + ih).padEnd(10)} scale=${s.toFixed(3)} 显示高 ${dispH.toFixed(0).padStart(3)}px ${bound} → ` +
-      `字号 ${fontOld.toFixed(1).padStart(4)}px / 箭头线宽 ${lineOld.toFixed(2)}px` +
-      `　归一化后 ${fontNew.toFixed(1).padStart(4)}px / ${lineNew.toFixed(2)}px`
+      `字号 ${fontOld.toFixed(1).padStart(4)}→${fontNew.toFixed(1).padStart(4)}px  ` +
+      `箭头线宽 ${lineOld.toFixed(2).padStart(4)}→${lineNew.toFixed(2)}px`
     );
+    if (bound === '高受限') tallFonts.push(fontNew);
   }
-  console.log('     ⚠️ 高受限的几行显示高度都是 632px，但字号从 21.1px 一路掉到 7.0px —— 这就是观感不一致');
-  console.log('     ℹ️ 本段为度量段（暂不阻断）；确认方案后改为硬断言 + 静态防线');
+  // 高受限的几张图显示高度相同（都是 632px），修复前字号从 21.1px 一路掉到 7.0px
+  if (tallFonts.length >= 2) {
+    const spread = Math.max(...tallFonts) - Math.min(...tallFonts);
+    if (spread > 0.5) {
+      fail(`同为高受限的截图，字号观感仍相差 ${spread.toFixed(1)}px（应 ≤0.5px）`);
+    } else {
+      console.log(`     ✅ ${tallFonts.length} 张高受限截图字号观感一致（极差 ${spread.toFixed(2)}px）`);
+    }
+  }
+}
+
+/* ═══ 11. UI 装饰：屏幕像素恒定 + 静态防线 ═══════════════ */
+/**
+ * 标注画布是图像分辨率，UI 装饰（选中手柄 / 虚线 / 十字线 / 裁剪框）画在同一张图上。
+ * 它们不是内容，必须【屏幕像素恒定】—— 和 annoHit.ts 的命中容差同一基准，
+ * 否则「看到的手柄」和「点得中的范围」对不上（v29 只修了命中侧，绘制侧是这一轮补的）。
+ */
+console.log('11. UI 装饰（手柄/虚线/十字线）必须在屏幕上大小恒定');
+{
+  const { readFileSync } = await import('node:fs');
+  const readSrc = (p) => readFileSync(new URL(p, import.meta.url), 'utf8');
+  const A = await import(new URL('../src/lib/annoScale.ts', import.meta.url).href);
+  const { uiScale, uiPx, UI_HANDLE_R, UI_PAD, UI_CROSS, UI_LINE } = A;
+  const { HIT_SLOP } = await import(new URL('../src/lib/annoHit.ts', import.meta.url).href);
+
+  // (a) 手柄半径：画在图像分辨率上、再缩 scale 显示 → 屏幕大小 = 图像像素 × scale
+  const scales = [0.293, 0.439, 0.585, 0.75, 1]; // 4K/2K/1080p… 在各窗口下的显示比例
+  for (const s of scales) {
+    const screen = uiPx(UI_HANDLE_R, s) * s;
+    if (Math.abs(screen - UI_HANDLE_R) > 1e-9) {
+      fail(`选中手柄在 scale=${s} 时屏幕半径为 ${screen.toFixed(2)}px，应恒为 ${UI_HANDLE_R}px`);
+    }
+  }
+  const oldAt4k = 5 * 0.293; // 修复前：写死 5 图像像素
+  console.log(`   (a) 手柄半径：跨 ${scales.length} 种 scale 恒为 ${UI_HANDLE_R}px（修复前 4K 截图上只有 ${oldAt4k.toFixed(2)}px）`);
+
+  // (b) 画出来的手柄必须能被点中：命中容差 ≥ 手柄半径
+  const minSlop = Math.min(...Object.values(HIT_SLOP));
+  if (minSlop < UI_HANDLE_R) {
+    fail(`最小命中容差 ${minSlop}px < 手柄半径 ${UI_HANDLE_R}px —— 画得出来却点不中`);
+  } else {
+    console.log(`   (b) 最小命中容差 ${minSlop}px ≥ 手柄半径 ${UI_HANDLE_R}px（看到的都能点中）`);
+  }
+
+  // (c) 静态防线：不得再把图像像素当成绘制尺寸写死
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  const anno = strip(readSrc('../src/lib/annotate.ts'));
+  const comp = strip(readSrc('../src/components/AnnotationsOverlay.tsx'));
+
+  for (const [needle, why] of [
+    ['contentScale(', '必须按图高归一化内容尺寸'],
+    ['annoStroke(', '线宽必须走 annoStroke'],
+    ['annoFont(', '字号必须走 annoFont'],
+    ['annoArrowHead(', '箭头头部必须走 annoArrowHead'],
+    ['annoBlurRadius(', '马赛克半径必须走 annoBlurRadius'],
+  ]) {
+    if (!anno.includes(needle)) fail(`annotate.ts 缺少 ${needle}（${why}）`);
+  }
+  for (const [re, why] of [
+    // 只认「两个纯数字常量」——`[5 * uk, 5 * uk]` 这种带乘法的合法，别误伤
+    [/setLineDash\(\[\s*[\d.]+\s*,\s*[\d.]+\s*\]/, '虚线长度不能写死成图像像素'],
+  ]) {
+    if (re.test(anno)) fail(`annotate.ts 出现写死的绘制尺寸 ${re}（${why}）`);
+  }
+  // ⚠️ 对「赋值」下断言，不要对「使用处」下正则：
+  // 写成 `const handleR = 5;` 再传进 ctx.arc 就能绕开 /\d+/ 类正则
+  // （和第 9 段被 `? 12 : 8` 三元绕过是同一类假阴性）。
+  for (const [needle, why] of [
+    ['const vk = contentScale(', '内容缩放系数'],
+    ['const uk = uiScale(', 'UI 装饰缩放系数'],
+    ['const handleR = uiPx(', '手柄半径必须按屏幕像素换算'],
+    ['const pad = uiPx(', '选中框内缩必须按屏幕像素换算'],
+    ['const cr = uiPx(', '十字线长度必须按屏幕像素换算'],
+  ]) {
+    if (!comp.includes(needle)) fail(`AnnotationsOverlay.tsx 缺少 ${needle}（${why}）`);
+  }
+  for (const [re, why] of [
+    [/ctx\.lineWidth\s*=\s*[\d.]+\s*;/, '线宽不能写死成图像像素'],
+    [/ctx\.arc\([^,]+,[^,]+,\s*[\d.]+\s*,/, '手柄半径不能写死成图像像素'],
+    // 只认「两个纯数字常量」——`[5 * uk, 5 * uk]` 这种带乘法的合法，别误伤
+    [/setLineDash\(\[\s*[\d.]+\s*,\s*[\d.]+\s*\]/, '虚线长度不能写死成图像像素'],
+  ]) {
+    if (re.test(comp)) fail(`AnnotationsOverlay.tsx 出现写死的绘制尺寸 ${re}（${why}）`);
+  }
+  // 裁图时 dims 必须传【原图】尺寸：传裁切尺寸会让剩余标注的粗细随裁切框大小突变
+  const cropCall = comp.match(/for \(const a of adjusted\) drawAnnotation\([^;]*\);/);
+  if (!cropCall) fail('找不到 applyCrop 里的 drawAnnotation 调用（静态防线已失配）');
+  else if (cropCall[0].includes('cropRect.')) {
+    fail('applyCrop 的 drawAnnotation 传了 cropRect 尺寸（应传原图尺寸 image.width/height）');
+  }
+  console.log('   (c) 静态防线：无写死的图像像素绘制尺寸；裁图仍以原图尺寸为归一化基准');
+}
+
+/* ═══ 12. 跨端一致性：网站端必须与桌面端同步 ═══════════════ */
+/**
+ * 标注绘制在两端各有一份实现（桌面端 Tauri / 网站端 Next.js），
+ * 历史上出现过「同一份 bug 两份代码」的情况（v27 裁图、v30 绘制单位）。
+ * 跨端原则：纯函数模块必须逐字节相同，组件必须调用同一批语义入口。
+ */
+console.log('12. 跨端一致性：flowio-site-next 与桌面端必须同步');
+{
+  const { readFileSync, existsSync } = await import('node:fs');
+  const u = (p) => new URL(p, import.meta.url);
+  const SITE = '../../flowio-site-next';
+
+  if (!existsSync(u(`${SITE}/lib/annotate.ts`))) {
+    console.log('   ⚠️ 未找到 flowio-site-next，跳过跨端检查');
+  } else {
+    const read = (p) => readFileSync(u(p), 'utf8');
+    // 纯函数模块：必须逐字节相同（网站端是源头，桌面端多一行「来源」注释）
+    const pairs = [
+      [`${SITE}/lib/annoScale.ts`, '../src/lib/annoScale.ts', 'annoScale.ts'],
+      [`${SITE}/lib/annotate.ts`, '../src/lib/annotate.ts', 'annotate.ts'],
+    ];
+    for (const [a, b, name] of pairs) {
+      const sa = read(a).replace(/\r\n/g, '\n');
+      const sb = read(b).replace(/\r\n/g, '\n').replace('// 来源：flowio-site-next/lib/annotate.ts（桌面端同步移植）\n', '');
+      if (sa !== sb) fail(`${name} 两端不一致 —— 修了一端忘了另一端（见 v27/v30）`);
+    }
+    // 组件：必须调用同一批语义入口
+    const comp = read(`${SITE}/components/AnnotationsOverlay.tsx`);
+    for (const [needle, why] of [
+      ['@/lib/annoScale', '必须引入 annoScale'],
+      ['const vk = contentScale(', '内容缩放系数'],
+      ['const uk = uiScale(', 'UI 装饰缩放系数'],
+      ['const handleR = uiPx(', '手柄半径必须换算'],
+      ['const pad = uiPx(', '选中框内缩必须换算'],
+      ['const cr = uiPx(', '十字线长度必须换算'],
+    ]) {
+      if (!comp.includes(needle)) fail(`网站端 AnnotationsOverlay.tsx 缺少 ${needle}（${why}）`);
+    }
+    const code = comp.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    for (const [re, why] of [
+      [/ctx\.lineWidth\s*=\s*[\d.]+\s*;/, '线宽不能写死成图像像素'],
+      [/setLineDash\(\[\s*[\d.]+\s*,\s*[\d.]+\s*\]/, '虚线长度不能写死成图像像素'],
+    ]) {
+      if (re.test(code)) fail(`网站端 AnnotationsOverlay.tsx 出现写死的绘制尺寸 ${re}（${why}）`);
+    }
+    const cropCall = code.match(/for \(const a of adjusted\) drawAnnotation\([^;]*\);/);
+    if (!cropCall) fail('网站端找不到 applyCrop 的 drawAnnotation 调用（静态防线已失配）');
+    else if (cropCall[0].includes('cropRect.')) {
+      fail('网站端 applyCrop 传了 cropRect 尺寸（应传原图尺寸）');
+    }
+    console.log('   通过（annoScale.ts / annotate.ts 逐字节相同；组件走同一批语义入口）');
+  }
 }
 
 /* ═══ 结论 ════════════════════════════════════════════════ */
