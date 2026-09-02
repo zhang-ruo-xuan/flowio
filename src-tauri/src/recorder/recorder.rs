@@ -283,7 +283,7 @@ pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
         }
     }
     if let Some((has_title, area, r)) = best {
-        eprintln!(
+        capture_dbg_log(&format!(
             "[CAPTURE] find_window_rect_by_process({}): chose {}x{} at ({},{}), area={}, has_title={}",
             process_name,
             r.width(),
@@ -292,14 +292,33 @@ pub fn find_window_rect_by_process(process_name: &str) -> Option<Rect> {
             r.top,
             area,
             has_title
-        );
+        ));
         Some(r)
     } else {
-        eprintln!(
+        capture_dbg_log(&format!(
             "[CAPTURE] find_window_rect_by_process({}): no candidate passed the {}x{} floor",
             process_name, MIN_W, MIN_H
-        );
+        ));
         None
+    }
+}
+
+/// Append a one-line message to the Flowio debug log. Mirrors the inline
+/// pattern used in `commands.rs` for `[BG] target-filter:` and similar — keeps
+/// every cross-thread diagnostic on a single tail-this-file point that the
+/// user (and we) can grep through.
+///
+/// Why not just `eprintln!`: Tauri release builds are GUI-subsystem
+/// (no console), so stdout / stderr go nowhere. The debug log is the only
+/// place a deployed build ever leaves behind.
+pub(super) fn capture_dbg_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"D:\录步\flowio_debug.log")
+    {
+        let _ = writeln!(f, "{}", msg);
     }
 }
 

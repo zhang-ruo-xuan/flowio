@@ -101,10 +101,10 @@ pub fn start_capture_thread(
     target_window: Option<String>,
 ) {
     std::thread::spawn(move || {
-        eprintln!(
+        super::recorder::capture_dbg_log(&format!(
             "[CAPTURE] continuous capture thread started (interval: {:?}, target: {:?})",
             interval, target_window
-        );
+        ));
         while running.load(Ordering::Relaxed) {
             let loop_start = Instant::now();
 
@@ -150,12 +150,12 @@ pub fn start_capture_thread(
                         origin_y: oy,
                     };
                     if frame_tx.send(frame).is_err() {
-                        eprintln!("[CAPTURE] frame channel closed, exiting");
+                        super::recorder::capture_dbg_log("[CAPTURE] frame channel closed, exiting");
                         break;
                     }
                 }
                 Err(e) => {
-                    eprintln!("[CAPTURE] frame capture failed: {}", e);
+                    super::recorder::capture_dbg_log(&format!("[CAPTURE] frame capture failed: {}", e));
                 }
             }
 
@@ -164,7 +164,7 @@ pub fn start_capture_thread(
                 std::thread::sleep(interval - elapsed);
             }
         }
-        eprintln!("[CAPTURE] capture thread exiting");
+        super::recorder::capture_dbg_log("[CAPTURE] capture thread exiting");
     });
 }
 
