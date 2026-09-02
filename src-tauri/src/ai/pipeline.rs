@@ -426,10 +426,22 @@ fn crop_and_encode_typed(
 ///
 /// Uses substring matching against known vision model identifiers.
 /// Covers major providers: OpenAI (gpt-4o, gpt-4-turbo),
-/// Anthropic (claude-3/3.5), Google (gemini), Zhipu (glm-4v),
-/// Qwen (qwen-vl), Doubao (doubao-vision), Yi (yi-vision).
+/// Anthropic (claude-3/3.5), Google (gemini), Zhipu (glm-4v / glm-4.6v),
+/// Qwen (qwen-vl / qwen3.x-plus-flash-max), Doubao (doubao-vision), Yi (yi-vision).
+///
+/// Vision model list is kept in sync with the extension's
+/// `modelSupportsVision()` in modelEnum.ts.
 fn model_supports_vision(model: &str) -> bool {
     let lower = model.to_lowercase();
+
+    // Qwen 3.x series: qwen3.7-plus, qwen3.5-flash, qwen3.0-max etc.
+    // Matches extension regex: qwen3\.[\d.]+-(plus|flash|max)
+    if lower.starts_with("qwen3.")
+        && (lower.ends_with("-plus") || lower.ends_with("-flash") || lower.ends_with("-max"))
+    {
+        return true;
+    }
+
     let vision_keywords = [
         "gpt-4o",
         "gpt-4-vision",
@@ -561,6 +573,10 @@ mod pipeline_tests {
             "glm-4.6v-flash",
             "qwen-vl-plus",
             "qwen-vl-max",
+            // Qwen 3.x coding/vision models (aligned with extension's vision regex)
+            "qwen3.7-plus",
+            "qwen3.5-flash",
+            "qwen3.0-max",
             "doubao-vision-pro-32k",
             "yi-vision",
             "hunyuan-vision",
@@ -583,6 +599,9 @@ mod pipeline_tests {
             "hunyuan-lite",
             "text-davinci-003",
             "ernie-4.0-turbo-8k",
+            // qwen3.x without vision suffix = text-only
+            "qwen3.7",
+            "qwen3",
         ] {
             assert!(!model_supports_vision(m), "expected no vision: {}", m);
         }
