@@ -4,6 +4,7 @@ pub mod commands;
 pub mod ime;
 pub mod state;
 pub mod screenshot;
+pub mod selection_bridge;
 pub mod keyboard;
 pub mod mouse;
 pub mod hook;

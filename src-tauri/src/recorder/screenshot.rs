@@ -468,7 +468,7 @@ fn normalize_for_match(s: &str) -> String {
 
 /// 判定 UIA 选区文本是否就是剪贴板里被复制的内容。
 /// 双向包含（浏览器复制时可能在前后加换行/引号），最短边 ≥4 防止单字符误匹配。
-fn selection_matches_clipboard(sel_text: &str, clipboard: &str) -> bool {
+pub(crate) fn selection_matches_clipboard(sel_text: &str, clipboard: &str) -> bool {
     let ns = normalize_for_match(sel_text);
     let nc = normalize_for_match(clipboard);
     if ns.is_empty() || nc.is_empty() {

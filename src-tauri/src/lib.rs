@@ -125,6 +125,11 @@ pub fn run() {
             app.manage(RecordingManager(Mutex::new(HashMap::new())));
             app.manage(PendingDeepLink(Mutex::new(None)));
 
+            // 扩展 → 桌面端 选区上报通道：浏览器扩展在页面内读到精确 selection
+            // 矩形后 POST 到本机回环端口，COPY 步骤裁图优先用它（L0）。
+            // 仅监听 127.0.0.1；扩展未安装时静默无影响，自动回落到 UIA。
+            recorder::selection_bridge::start_server();
+
             // Deep-link handler: flowio://auth?token=...&id=...&email=...
             let handle = app.handle().clone();
             // Register the flowio:// scheme (Windows writes HKCU\Software\Classes\flowio)

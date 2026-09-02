@@ -32,6 +32,7 @@ use crate::recorder::keyboard::{self, KeyEvent};
 use crate::recorder::mouse::CapturedClick;
 use crate::recorder::recorder;
 use crate::recorder::screenshot;
+use crate::recorder::selection_bridge;
 use crate::recorder::state::RecordingState;
 use crate::recorder::StepData;
 use crate::RecordingManager;
@@ -586,8 +587,14 @@ fn flush_shortcut_step(
             // 重试窗口约 2s（递增退避，前段密集抢选区还在的窗口，后段等 a11y 树激活）。
             // 递增退避不影响录制主流程；配合录制启动时的 a11y 预热，
             // 稳态下应该第 1 次就命中。
+            // ── COPY L0（最高优先级）：浏览器扩展上报的 DOM selection 矩形 ──
+            // 扩展站在页面**里面**，直接读 window.getSelection() 的精确矩形，
+            // 不受 UIA a11y 惰性激活影响（浏览器场景下等价于 Scribe 的精度）。
+            // 没有上报时（原生应用 / 扩展未安装 / 上报已过期）自动回落 L1a，
+            // L0 是增益而非依赖。文本校验由 last_selection_matching 内部完成。
             let sel_rect = if is_copy_op {
-                screenshot::get_selected_text_rect_with_retry(10, 100, &text)
+                selection_bridge::last_selection_matching(&text, 3000)
+                    .or_else(|| screenshot::get_selected_text_rect_with_retry(10, 100, &text))
             } else {
                 None
             };
