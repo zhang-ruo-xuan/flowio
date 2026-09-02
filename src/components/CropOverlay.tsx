@@ -1,4 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  type CropHandle,
+  type CropRectPx,
+  clampRect,
+  moveRect,
+  newRect,
+  resizeRect,
+} from '../lib/cropDrag';
+
+export type { CropRectPx };
 
 /**
  * 手动框选裁图 —— 让用户把「自动裁图没对准」的步骤一框修好。
@@ -11,14 +21,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
  * 输出坐标 = 原图像素坐标（未受显示缩放影响），调用方负责换算/落库。
  */
 
-/** 图坐标矩形 */
-export interface CropRectPx {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
 interface Props {
   /** 全图 base64（不含 data: 前缀） */
   imageBase64: string;
@@ -28,14 +30,9 @@ interface Props {
   onCancel: () => void;
 }
 
-type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+const HANDLES: CropHandle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
 
-/** 选区最小边长（图坐标 px） */
-const MIN_SIZE = 20;
-
-const HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
-
-const HANDLE_STYLE: Record<Handle, React.CSSProperties> = {
+const HANDLE_STYLE: Record<CropHandle, React.CSSProperties> = {
   nw: { left: 0, top: 0, cursor: 'nwse-resize' },
   n: { left: '50%', top: 0, cursor: 'ns-resize' },
   ne: { left: '100%', top: 0, cursor: 'nesw-resize' },
@@ -47,7 +44,7 @@ const HANDLE_STYLE: Record<Handle, React.CSSProperties> = {
 };
 
 interface DragState {
-  mode: 'new' | 'move' | Handle;
+  mode: 'new' | 'move' | CropHandle;
   startX: number;
   startY: number;
   origin: CropRectPx;
@@ -102,7 +99,7 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
   );
 
   /* ── 拖拽 ───────────────────────────────────────── */
-  const beginDrag = (e: React.MouseEvent, mode: 'new' | 'move' | Handle) => {
+  const beginDrag = (e: React.MouseEvent, mode: 'new' | 'move' | CropHandle) => {
     if (!image || !rect) return;
     e.preventDefault();
     e.stopPropagation();
@@ -123,20 +120,14 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
       const W = image.naturalWidth;
       const H = image.naturalHeight;
 
-      let next: CropRectPx;
-      if (d.mode === 'new') {
-        next = {
-          x: Math.min(d.startX, p.x),
-          y: Math.min(d.startY, p.y),
-          width: Math.abs(dx),
-          height: Math.abs(dy),
-        };
-      } else if (d.mode === 'move') {
-        next = { ...d.origin, x: d.origin.x + dx, y: d.origin.y + dy };
-      } else {
-        next = resizeRect(d.origin, d.mode, dx, dy);
-      }
-      setRect(clampRect(next, W, H));
+      // 三个分支各自保证「对角固定 / 尺寸恒定 / 不越界」，无需再外层 clamp
+      const next: CropRectPx =
+        d.mode === 'new'
+          ? newRect(d.startX, d.startY, p.x, p.y, W, H)
+          : d.mode === 'move'
+            ? moveRect(d.origin, dx, dy, W, H)
+            : resizeRect(d.origin, d.mode, dx, dy, W, H);
+      setRect(next);
     };
 
     const onUp = () => {
@@ -270,38 +261,6 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
       </div>
     </div>
   );
-}
-
-/* ── 纯函数 helpers ────────────────────────────────── */
-
-/** 把矩形限制在图片范围内，并保证最小边长 */
-function clampRect(r: CropRectPx, W: number, H: number): CropRectPx {
-  const w = Math.min(Math.max(r.width, MIN_SIZE), W);
-  const h = Math.min(Math.max(r.height, MIN_SIZE), H);
-  const x = Math.min(Math.max(r.x, 0), Math.max(0, W - w));
-  const y = Math.min(Math.max(r.y, 0), Math.max(0, H - h));
-  return { x: Math.round(x), y: Math.round(y), width: Math.round(w), height: Math.round(h) };
-}
-
-/** 按控制点方向调整矩形（dx/dy 为图坐标位移） */
-function resizeRect(o: CropRectPx, h: Handle, dx: number, dy: number): CropRectPx {
-  let { x, y, width: w, height: ht } = o;
-  if (h.includes('w')) {
-    x = o.x + dx;
-    w = o.width - dx;
-  }
-  if (h.includes('e')) {
-    w = o.width + dx;
-  }
-  if (h.includes('n')) {
-    y = o.y + dy;
-    ht = o.height - dy;
-  }
-  if (h.includes('s')) {
-    ht = o.height + dy;
-  }
-  // 负宽/负高归零，交由 clampRect 兜到最小边长
-  return { x, y, width: Math.max(0, w), height: Math.max(0, ht) };
 }
 
 /* ── 样式 ──────────────────────────────────────────── */

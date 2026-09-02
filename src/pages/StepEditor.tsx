@@ -1939,6 +1939,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       {/* 手动框选裁图：只改裁图锚点，保留原图，可反复重裁 */}
       {cropPickerOpen && selectedStep?.screenshot_base64 && (
         <CropOverlay
+          // key 保证切换步骤时重建实例，不残留上一步骤的选区
+          key={selectedStep.id}
           imageBase64={selectedStep.screenshot_base64}
           initialRect={initialCropRect(selectedStep)}
           onConfirm={handleCropConfirm}
