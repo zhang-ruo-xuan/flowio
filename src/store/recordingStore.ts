@@ -45,7 +45,11 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
   },
 
   startRecording: async () => {
-    const id = await invoke<string>('start_recording');
+    const recordSelf = localStorage.getItem("flowio_record_self") === "1";
+    const recordTarget = localStorage.getItem("flowio_record_target") === "1";
+    const targetProcess = localStorage.getItem("flowio_record_target_process") || "";
+    const targetWindow = recordTarget && targetProcess ? targetProcess : null;
+    const id = await invoke<string>('start_recording', { recordSelf, targetWindow });
     return id;
   },
 

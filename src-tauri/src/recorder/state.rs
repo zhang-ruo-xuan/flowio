@@ -28,7 +28,7 @@ impl Recorder {
             running_flag: None,
             captured_steps: None,
             record_self: false,
-            app_name: String::new(),
+            target_window: None,
         }
     }
 

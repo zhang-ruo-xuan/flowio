@@ -1253,13 +1253,7 @@ fn build_click_step(
     let now_ms = current_time_millis();
 
     let window_title = activity::get_active_window_title();
-    let title = if window_title.as_deref().map(|t| !t.is_empty()).unwrap_or(false) {
-        activity::make_click_title(window_title.as_deref())
-    } else {
-        // 空标题（开始菜单/任务管理器等系统 UI）回退为前台应用显示名
-        let app = crate::recorder::recorder::get_foreground_app_display_name();
-        activity::make_click_title_with_app(window_title.as_deref(), app.as_deref())
-    };
+    let title = activity::make_click_title(window_title.as_deref());
 
     Some(StepData {
         id: Uuid::new_v4().to_string(),
@@ -1345,6 +1339,7 @@ fn spawn_event_thread(
     frame_rx: mpsc::Receiver<capture::CapturedFrame>,
     captured_steps: Arc<Mutex<Vec<StepData>>>,
     record_self: bool,
+    target_window: Option<String>,
 ) -> std::thread::JoinHandle<()> {
     let running_clone = Arc::clone(&running);
     let cs_for_thread = captured_steps;
@@ -1385,16 +1380,25 @@ fn spawn_event_thread(
             match mouse_rx.try_recv() {
                 Ok(click) => {
                     eprintln!(
-                        "[BG] mouse click: {} at ({}, {}), ts={:?}",
-                        click.button, click.x, click.y, click.timestamp
+                        "[BG] mouse click: {} at ({}, {}), ts={:?}, fg_pid={}",
+                        click.button, click.x, click.y, click.timestamp, click.foreground_pid
                     );
 
-                    // Self-filter: skip if foreground is Flowio itself
-                    // (process-name based; only skipped in default mode, not
-                    // when the user opted into recording Flowio's own window)
-                    if !record_self && recorder::foreground_is_flowio() {
-                        eprintln!("[BG] self-filter: skipping click in flowio window");
+                    // Self-filter using PID captured at hook time (not current foreground)
+                    if !record_self && recorder::pid_is_flowio(click.foreground_pid) {
+                        eprintln!("[BG] self-filter: skipping click in flowio window (pid={})", click.foreground_pid);
                         continue;
+                    }
+
+                    // Target-app filter using PID captured at hook time (录制指定软件)
+                    if let Some(ref target) = target_window {
+                        if !recorder::pid_is_target(click.foreground_pid, target) {
+                            eprintln!(
+                                "[BG] target-filter: skipping click (fg_pid={} != {})",
+                                click.foreground_pid, target
+                            );
+                            continue;
+                        }
                     }
 
                     // Flush pending keystrokes before the click step
@@ -1441,21 +1445,33 @@ fn spawn_event_thread(
                     shift: _,
                     alt,
                     ts: key_instant,
+                    foreground_pid: fg_pid,
                 }) => {
                     // DEBUG: combo-key diagnosis log
                     {
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(r"D:\录步\flowio_debug.log") {
-                            let _ = writeln!(f, "[PRESS] key={} ctrl={} alt={} t={:?}", key_name, ctrl, alt, std::time::Instant::now().elapsed().as_millis());
+                            let _ = writeln!(f, "[PRESS] key={} ctrl={} alt={} fg_pid={} t={:?}", key_name, ctrl, alt, fg_pid, std::time::Instant::now().elapsed().as_millis());
                         }
                     }
 
-                    // Self-filter (B4): 键盘分支此前未过滤 Flowio 自身窗口的输入，
-                    // 在 Flowio 内编辑标题/备注时会生成多余 type 步骤。
-                    // 按进程名判断；录制自身模式下不过滤。
-                    if !record_self && recorder::foreground_is_flowio() {
-                        eprintln!("[BG] self-filter: skipping keystroke in flowio window");
+                    // Self-filter using PID captured at hook time: 键盘分支此前
+                    // 未过滤 Flowio 自身窗口的输入，在 Flowio 内编辑标题/备注时
+                    // 会生成多余 type 步骤。录制自身模式下不过滤。
+                    if !record_self && recorder::pid_is_flowio(fg_pid) {
+                        eprintln!("[BG] self-filter: skipping keystroke in flowio window (pid={})", fg_pid);
                         continue;
+                    }
+
+                    // Target-app filter using PID captured at hook time (录制指定软件)
+                    if let Some(ref target) = target_window {
+                        if !recorder::pid_is_target(fg_pid, target) {
+                            eprintln!(
+                                "[BG] target-filter: skipping keystroke (fg_pid={} != {})",
+                                fg_pid, target
+                            );
+                            continue;
+                        }
                     }
 
                     // 修饰键自身不是"操作"。此前按下 Alt 会先生成一个
@@ -1808,7 +1824,6 @@ fn recording_title_or_default(title: &str) -> String {
 fn build_recording_save(
     id: String,
     title: &str,
-    app_name: &str,
     steps: &[StepData],
 ) -> (crate::db::RecordingSave, String) {
     let saves = steps_to_step_saves(steps);
@@ -1816,7 +1831,7 @@ fn build_recording_save(
     let save = crate::db::RecordingSave {
         id: id.clone(),
         title: recording_title_or_default(title),
-        app_name: app_name.to_string(),
+        app_name: String::new(),
         steps: saves,
     };
     (save, format!("{} ({} steps)", id, step_count))
@@ -1827,12 +1842,21 @@ fn is_active_recording_state(state: &RecordingState) -> bool {
     *state == RecordingState::Recording || *state == RecordingState::Paused
 }
 
+/// Enumerate visible top-level windows of running apps (录制指定软件 picker).
+#[tauri::command]
+pub fn list_target_windows() -> Vec<recorder::TargetWindow> {
+    recorder::list_target_windows()
+}
+
 #[tauri::command]
 pub fn start_recording(
     recording_manager: State<RecordingManager>,
     record_self: Option<bool>,
+    target_window: Option<String>,
 ) -> Result<String, String> {
     let record_self = record_self.unwrap_or(false);
+    // Normalize empty target to None (录制指定软件).
+    let target_window = target_window.filter(|t| !t.trim().is_empty());
 
     // --- 防重入：已有活跃录制时直接返回它的 id ---
     // 不拦的话，重复调用会再装一次 native hook、再起一个截图线程和一个事件线程。
@@ -1871,16 +1895,17 @@ pub fn start_recording(
     // --- Start continuous capture thread (4 FPS) ---
     let capture_running = Arc::clone(&running);
     let (frame_tx, frame_rx) = mpsc::channel::<capture::CapturedFrame>();
-    capture::start_capture_thread(capture_running, frame_tx, Duration::from_millis(250));
+    capture::start_capture_thread(
+        capture_running,
+        frame_tx,
+        Duration::from_millis(250),
+        target_window.clone(),
+    );
 
     // --- Create recorder ---
     let mut recorder = crate::recorder::Recorder::new(id.clone(), String::new());
     recorder.record_self = record_self;
-    // 识别启动录制时的前台应用（用户快捷键起录时所在的应用即录制目标）。
-    // Flowio 自身或未识别进程 → 空串，前端回退「网页应用」。
-    recorder.app_name = crate::recorder::recorder::get_foreground_app_display_name()
-        .unwrap_or_default();
-    eprintln!("[start] detected foreground app: {:?}", recorder.app_name);
+    recorder.target_window = target_window.clone();
     recorder.start()?;
 
     // --- Shared captured-steps buffer ---
@@ -1899,6 +1924,7 @@ pub fn start_recording(
         frame_rx,
         cs_for_thread,
         record_self,
+        target_window,
     );
 
     recorder.event_thread = Some(handle);
@@ -1940,6 +1966,16 @@ pub fn resume_recording(
         recorder.resume()?;
     }
 
+    // Re-read the target window (录制指定软件) so the restarted capture/event
+    // threads keep cropping & filtering to the same app.
+    let target_window = {
+        let manager = recording_manager.0.lock().map_err(|e| e.to_string())?;
+        manager
+            .get(&id)
+            .and_then(|r| r.target_window.clone())
+            .filter(|t| !t.trim().is_empty())
+    };
+
     // Step 2: Restart background threads (outside the lock)
     let (mouse_tx, mouse_rx) = mpsc::channel::<CapturedClick>();
     let (key_tx, key_rx) = mpsc::channel::<KeyEvent>();
@@ -1950,7 +1986,12 @@ pub fn resume_recording(
 
     let capture_running = Arc::clone(&running);
     let (frame_tx, frame_rx) = mpsc::channel::<capture::CapturedFrame>();
-    capture::start_capture_thread(capture_running, frame_tx, Duration::from_millis(250));
+    capture::start_capture_thread(
+        capture_running,
+        frame_tx,
+        Duration::from_millis(250),
+        target_window.clone(),
+    );
 
     let running_clone = Arc::clone(&running);
 
@@ -1988,6 +2029,7 @@ pub fn resume_recording(
             frame_rx,
             cs_for_thread,
             recorder.record_self,
+            target_window,
         );
 
         recorder.running_flag = Some(running);
@@ -2107,7 +2149,7 @@ pub fn finish_recording(
             msg
         })?;
 
-        build_recording_save(recorder.id.clone(), &recorder.title, &recorder.app_name, &recorder.steps)
+        build_recording_save(recorder.id.clone(), &recorder.title, &recorder.steps)
     };
 
     let conn = db.0.lock().map_err(|e| {
@@ -2590,10 +2632,10 @@ mod commands_tests {
     #[test]
     fn build_recording_save_basic() {
         let steps = vec![make_step(0), make_step(1), make_step(2)];
-        let (save, rec_id) = build_recording_save("rec-1".into(), "标题", "微信", &steps);
+        let (save, rec_id) = build_recording_save("rec-1".into(), "标题", &steps);
         assert_eq!(save.id, "rec-1");
         assert_eq!(save.title, "标题");
-        assert_eq!(save.app_name, "微信");
+        assert_eq!(save.app_name, "");
         assert_eq!(save.steps.len(), 3);
         assert_eq!(rec_id, "rec-1 (3 steps)");
     }
@@ -2601,7 +2643,7 @@ mod commands_tests {
     #[test]
     fn build_recording_save_empty_title_fallback() {
         let steps = vec![make_step(0)];
-        let (save, rec_id) = build_recording_save("rec-2".into(), "", "", &steps);
+        let (save, rec_id) = build_recording_save("rec-2".into(), "", &steps);
         assert!(save.title.starts_with("录制 "));
         assert_eq!(save.app_name, "");
         assert_eq!(rec_id, "rec-2 (1 steps)");
@@ -2609,7 +2651,7 @@ mod commands_tests {
 
     #[test]
     fn build_recording_save_zero_steps() {
-        let (save, rec_id) = build_recording_save("rec-0".into(), "空", "", &[]);
+        let (save, rec_id) = build_recording_save("rec-0".into(), "空", &[]);
         assert_eq!(save.steps.len(), 0);
         assert_eq!(rec_id, "rec-0 (0 steps)");
     }

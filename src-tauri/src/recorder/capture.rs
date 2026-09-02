@@ -88,21 +88,61 @@ impl FrameRing {
 ///
 /// Captures a fullscreen frame every `interval` (default 250ms = 4 FPS)
 /// and sends it via `frame_tx`. Runs until `running` is set to false.
+///
+/// When `target_window` is `Some(process_name)` (录制指定软件), each frame is
+/// cropped to the target window's screen rectangle and `origin_x/origin_y`
+/// record where in screen space the crop starts. If the target window is not
+/// visible/available, the frame is skipped entirely so the ring never holds
+/// unrelated desktop content.
 pub fn start_capture_thread(
     running: Arc<AtomicBool>,
     frame_tx: mpsc::Sender<CapturedFrame>,
     interval: Duration,
+    target_window: Option<String>,
 ) {
     std::thread::spawn(move || {
         eprintln!(
-            "[CAPTURE] continuous capture thread started (interval: {:?})",
-            interval
+            "[CAPTURE] continuous capture thread started (interval: {:?}, target: {:?})",
+            interval, target_window
         );
         while running.load(Ordering::Relaxed) {
             let loop_start = Instant::now();
 
             match screenshot::capture_fullscreen_with_origin() {
-                Ok((img, ox, oy)) => {
+                Ok((full, origin_x, origin_y)) => {
+                    let (img, ox, oy) = match &target_window {
+                        Some(target) => {
+                            match super::recorder::find_window_rect_by_process(target) {
+                                Some(rect) => {
+                                    // rect is in screen coordinates; convert to
+                                    // virtual-desktop image coordinates.
+                                    let x0 = (rect.left - origin_x) as u32;
+                                    let y0 = (rect.top - origin_y) as u32;
+                                    let x1 = (rect.right - origin_x) as u32;
+                                    let y1 = (rect.bottom - origin_y) as u32;
+                                    if x1 > x0 && y1 > y0 {
+                                        let cw = x1 - x0;
+                                        let ch = y1 - y0;
+                                        // offset keeps screen-space semantics: the
+                                        // cropped image's (0,0) maps to screen
+                                        // (rect.left, rect.top).
+                                        (full.crop_imm(x0, y0, cw, ch), rect.left, rect.top)
+                                    } else {
+                                        // Target window off-screen/minimized: skip frame.
+                                        skip_frame(&loop_start, interval);
+                                        continue;
+                                    }
+                                }
+                                None => {
+                                    // Target window closed/hidden: skip frame.
+                                    skip_frame(&loop_start, interval);
+                                    continue;
+                                }
+                            }
+                        }
+                        None => (full, origin_x, origin_y),
+                    };
+
                     let frame = CapturedFrame {
                         timestamp: Instant::now(),
                         image: img,
@@ -126,6 +166,14 @@ pub fn start_capture_thread(
         }
         eprintln!("[CAPTURE] capture thread exiting");
     });
+}
+
+/// Sleep out the rest of the interval (used when a target-mode frame is skipped).
+fn skip_frame(loop_start: &Instant, interval: Duration) {
+    let elapsed = loop_start.elapsed();
+    if elapsed < interval {
+        std::thread::sleep(interval - elapsed);
+    }
 }
 
 #[cfg(test)]

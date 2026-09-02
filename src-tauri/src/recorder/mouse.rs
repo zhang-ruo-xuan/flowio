@@ -15,6 +15,10 @@ pub struct CapturedClick {
     pub button: String,
     /// Instant captured inside the hook callback, before the click is dispatched.
     pub timestamp: std::time::Instant,
+    /// Foreground window PID captured inside the hook callback at click time.
+    /// Used for self-filter / target-filter so filtering decisions are based on
+    /// the foreground window at the moment of the click, not at processing time.
+    pub foreground_pid: u32,
 }
 
 // NOTE: mouse hook initialization has been moved into
@@ -33,10 +37,12 @@ mod tests {
             y: 88.25,
             button: "left".into(),
             timestamp: now,
+            foreground_pid: 1234,
         };
         assert_eq!(click.x, 12.5);
         assert_eq!(click.y, 88.25);
         assert_eq!(click.button, "left");
+        assert_eq!(click.foreground_pid, 1234);
         assert!(click.timestamp <= std::time::Instant::now());
     }
 
@@ -48,6 +54,7 @@ mod tests {
             y: 2.0,
             button: "right".into(),
             timestamp: now,
+            foreground_pid: 0,
         };
         let b = a.clone();
         assert_eq!(a.button, b.button);

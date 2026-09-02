@@ -11,7 +11,8 @@ use std::sync::Mutex;
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, SetWindowsHookExW,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetWindowThreadProcessId,
+    SetWindowsHookExW,
     UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
     WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -38,6 +39,19 @@ static KEY_TX: Mutex<Option<Sender<KeyEvent>>> = Mutex::new(None);
 /// 装新钩子前先把旧线程停掉并 join，可彻底杜绝这种情况。
 static HOOK_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 static HOOK_STOP: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+/// Capture the foreground window PID inside a hook callback.
+/// Called at event-capture time so the event thread can filter based on
+/// which window was foreground when the event actually happened.
+unsafe fn get_fg_pid() -> u32 {
+    let hwnd = GetForegroundWindow();
+    if hwnd.is_invalid() {
+        return 0;
+    }
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    pid
+}
 
 /// Modifier key down-state tracking (combo-key semantics for Ctrl+C/V, etc.).
 /// Updated inside the WH_KEYBOARD_LL callback before each Press is forwarded,
@@ -160,6 +174,7 @@ unsafe extern "system" fn keyboard_hook_proc(
             // 真实按键时刻（钩子触发的瞬间）。处理线程消费事件时也可能是
             // 几百毫秒之后，但帧环里要找的是这一刻的屏幕，所以必须带上。
             let ts = std::time::Instant::now();
+            let fg_pid = get_fg_pid();
             if let Ok(guard) = KEY_TX.lock() {
                 if let Some(ref tx) = *guard {
                     let _ = tx.send(KeyEvent::Press {
@@ -168,6 +183,7 @@ unsafe extern "system" fn keyboard_hook_proc(
                         shift: SHIFT_DOWN.load(Ordering::SeqCst),
                         alt: ALT_DOWN.load(Ordering::SeqCst),
                         ts,
+                        foreground_pid: fg_pid,
                     });
                 }
             }
@@ -203,6 +219,8 @@ unsafe extern "system" fn mouse_hook_proc(
             // The event thread will find the pre-click frame from
             // the continuous capture ring buffer using this timestamp.
             let click_ts = std::time::Instant::now();
+            // Capture foreground PID at click time for accurate filtering.
+            let fg_pid = get_fg_pid();
 
             if let Ok(guard) = MOUSE_TX.lock() {
                 if let Some(ref tx) = *guard {
@@ -211,6 +229,7 @@ unsafe extern "system" fn mouse_hook_proc(
                         y,
                         button: button.to_string(),
                         timestamp: click_ts,
+                        foreground_pid: fg_pid,
                     });
                 }
             }

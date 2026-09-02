@@ -157,6 +157,7 @@ pub fn run() {
             db::commands::save_recording,
             db::commands::update_recording_app_name,
             recorder::commands::start_recording,
+            recorder::commands::list_target_windows,
             recorder::commands::pause_recording,
             recorder::commands::resume_recording,
             recorder::commands::finish_recording,

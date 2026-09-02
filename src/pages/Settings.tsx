@@ -290,6 +290,37 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
     localStorage.setItem("flowio_record_self", value ? "1" : "0");
   };
 
+  /* ---- Record Target App（录制指定软件） ---- */
+  const [recordTarget, setRecordTarget] = useState(() => localStorage.getItem("flowio_record_target") === "1");
+  const [targetProcess, setTargetProcess] = useState(() => localStorage.getItem("flowio_record_target_process") || "");
+  const [targetWindows, setTargetWindows] = useState<{ hwnd: string; title: string; process_name: string; description: string }[]>([]);
+  const [targetRefreshing, setTargetRefreshing] = useState(false);
+  const [targetMsg, setTargetMsg] = useState("");
+
+  const refreshTargetWindows = async () => {
+    setTargetRefreshing(true);
+    setTargetMsg("");
+    try {
+      const list = await invoke<{ hwnd: string; title: string; process_name: string; description: string }[]>("list_target_windows");
+      setTargetWindows(list);
+      setTargetMsg(list.length ? `找到 ${list.length} 个正在运行的软件` : "未发现可见窗口，请先打开要录制的软件");
+    } catch (e) {
+      setTargetMsg("获取窗口列表失败：" + String(e));
+    }
+    setTargetRefreshing(false);
+  };
+
+  const handleRecordTargetToggle = (value: boolean) => {
+    setRecordTarget(value);
+    localStorage.setItem("flowio_record_target", value ? "1" : "0");
+    if (value) refreshTargetWindows();
+  };
+
+  const handleTargetProcessChange = (value: string) => {
+    setTargetProcess(value);
+    localStorage.setItem("flowio_record_target_process", value);
+  };
+
   /* ---- Profile State ---- */
   const [profileRefreshing, setProfileRefreshing] = useState(false);
   const [profileSyncMsg, setProfileSyncMsg] = useState("");
@@ -819,6 +850,52 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                 </span>
               </div>
               <p className="hint">开启后，录制过程中也会捕获录步窗口自身的操作，用于制作「录步使用手册」等教程。全局快捷键：Alt+Shift+S 开始/恢复录制，Alt+Shift+P 暂停/继续，Alt+Shift+E 停止录制。录制时窗口会自动最小化，按钮点击也会被如实录入。</p>
+            </div>
+
+            <div className="form-group">
+              <label>录制指定软件</label>
+              <div className="toggle-switch" onClick={() => handleRecordTargetToggle(!recordTarget)}>
+                <div className={`toggle-switch-track${recordTarget ? " active" : ""}`}>
+                  <div className="toggle-switch-thumb" />
+                </div>
+                <span className="toggle-switch-label">
+                  {recordTarget ? "开启" : "关闭"}
+                </span>
+              </div>
+              {recordTarget && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                    <button
+                      onClick={refreshTargetWindows}
+                      disabled={targetRefreshing}
+                      style={{ fontSize: 13, padding: "6px 14px", border: "1px solid var(--border)", borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--text-secondary)" }}
+                    >
+                      {targetRefreshing ? "刷新中..." : "刷新软件列表"}
+                    </button>
+                    {targetMsg && <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{targetMsg}</span>}
+                  </div>
+                  <select
+                    value={targetProcess}
+                    onChange={(e) => handleTargetProcessChange(e.target.value)}
+                    style={{ width: "100%", padding: "8px 10px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--bg)", color: "var(--text)", fontSize: 13 }}
+                  >
+                    <option value="">请选择要录制的软件...</option>
+                    {targetWindows.map((w) => (
+                      <option key={w.process_name} value={w.process_name}>
+                        {w.description
+                          ? `${w.process_name} — ${w.description}`
+                          : w.process_name}
+                      </option>
+                    ))}
+                  </select>
+                  {targetProcess && (
+                    <p className="hint" style={{ marginTop: 6, color: "var(--text-secondary)" }}>
+                      已选择：<b>{targetProcess}</b>。录制时只捕获该软件窗口画面，且需要保持该窗口在前台；该软件需处于运行状态。
+                    </p>
+                  )}
+                </div>
+              )}
+              <p className="hint">开启后，录制时只捕获所选软件（如 WPS、Chrome 等）单独的画面，用于单独录制某个软件的操作教程。</p>
             </div>
           </div>
         )}

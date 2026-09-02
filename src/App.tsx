@@ -191,9 +191,12 @@ function App() {
 
   const handleStartRecording = useCallback(async () => {
     try {
-      // record-self preference now lives in Settings (persisted in localStorage)
+      // record-self / record-target preferences live in Settings (persisted in localStorage)
       const recordSelf = localStorage.getItem("flowio_record_self") === "1";
-      const id = await invoke<string>("start_recording", { recordSelf });
+      const recordTarget = localStorage.getItem("flowio_record_target") === "1";
+      const targetProcess = localStorage.getItem("flowio_record_target_process") || "";
+      const targetWindow = recordTarget && targetProcess ? targetProcess : null;
+      const id = await invoke<string>("start_recording", { recordSelf, targetWindow });
       console.log("Recording started:", id);
       recordingIdRef.current = id;
       setRecordingId(id);

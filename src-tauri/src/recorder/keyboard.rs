@@ -9,6 +9,10 @@ pub enum KeyEvent {
         shift: bool,
         alt: bool,
         ts: std::time::Instant,
+        /// Foreground window PID captured inside the hook callback at key-press
+        /// time (self-filter / target-filter use it to decide whether the event
+        /// belongs to the recorded app).
+        foreground_pid: u32,
     },
     Release,
 }
