@@ -163,6 +163,34 @@ pub fn update_step(
     Ok(())
 }
 
+/// Update a step's crop anchor: center (x, y) + element rect (crop_w, crop_h).
+///
+/// Unlike `crop_step_screenshot`, this does **not** touch any stored image —
+/// the original full screenshot is preserved so the crop can be redone later.
+///
+/// Used by the editor's manual "re-crop" flow: the user drags a box on the full
+/// screenshot, the frontend inverts that box back into an anchor, and the
+/// existing adaptive-crop pipeline then reproduces exactly that box.
+///
+/// Passing `None` clears the anchor (step falls back to click-point cropping).
+#[tauri::command]
+pub fn update_step_crop(
+    db: State<DbState>,
+    step_id: String,
+    x: Option<i32>,
+    y: Option<i32>,
+    crop_w: Option<i32>,
+    crop_h: Option<i32>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE steps SET x = ?1, y = ?2, crop_w = ?3, crop_h = ?4 WHERE id = ?5",
+        params![x, y, crop_w, crop_h, step_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Delete a single step by its ID.
 #[tauri::command]
 pub fn delete_step(db: State<DbState>, step_id: String) -> Result<(), String> {

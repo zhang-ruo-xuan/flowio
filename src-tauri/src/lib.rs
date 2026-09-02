@@ -180,6 +180,7 @@ pub fn run() {
             ai::commands::remove_custom_provider,
             editor::commands::load_recording,
             editor::commands::update_step,
+            editor::commands::update_step_crop,
             editor::commands::delete_step,
             editor::commands::reorder_steps,
             editor::commands::add_step,
