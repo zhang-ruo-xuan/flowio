@@ -43,6 +43,12 @@ struct VoiceDoneEvent {
     summary: String,
 }
 
+/// 前端语音诊断写 debug log（release 无 console；voiceRecorder 看门狗用）。
+#[tauri::command]
+pub fn voice_dbg_log(message: String) {
+    crate::ai::commands::ai_dbg_log(&message);
+}
+
 /// 开始语音采集：建立（或重置）该录制的缓冲。
 #[tauri::command]
 pub fn voice_begin(

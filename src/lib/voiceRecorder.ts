@@ -6,8 +6,14 @@
  * WAV 头由 Rust 侧在送 ASR 前统一补齐（voice/audio.rs::pcm_to_wav）。
  *
  * 设计要点：
+ * - AudioContext 用 sinkId:"none" 创建（无输出设备，由系统时钟驱动渲染）。
+ *   🔴 录制开始后主窗口会被最小化，WebView2(Chromium) 会停掉指向真实输出
+ *   设备的渲染线程 —— ScriptProcessor 的 onaudioprocess 随之停止
+ *   （实测只采到 minimize() 前的 512ms 静音），这就是
+ *   「一直在说但检测不到」的根因。sinkId:"none" 不挂输出设备，
+ *   最小化/遮挡都不影响采集。不支持该选项的环境回退默认创建。
  * - ScriptProcessorNode 已废弃但 Chromium 完整支持；比 AudioWorklet 免去
- *   独立模块文件的加载时序问题，且 WebView2 最小化时音频回调不中断。
+ *   独立模块文件的加载时序问题。
  * - 暂停录制时调用 pause()/resume()：暂停期间的 PCM 直接丢弃
  *   （PRD：切片按绝对时间对齐，丢弃段自然静音，不影响步骤映射）。
  * - startedAt 取 AudioContext 成功创建并收到首帧数据的时刻（epoch ms），
@@ -34,6 +40,8 @@ export class VoiceRecorder {
   private ctx: AudioContext | null = null;
   private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
+  /** 采集是否依赖真实输出设备（true = 窗口最小化后回调会停，看门狗要盯） */
+  private deviceBoundCtx = false;
 
   private buffers: Float32Array[] = [];
   private pendingChunk: Float32Array[] = [];
@@ -57,6 +65,16 @@ export class VoiceRecorder {
     return this.paused;
   }
 
+  /** 已采集样本数（看门狗用：连续不变说明回调停了） */
+  get totalSamplesSoFar(): number {
+    return this.totalSamples;
+  }
+
+  /** AudioContext 是否绑定真实输出设备（true = 最小化后采集可能停摆） */
+  get isDeviceBound(): boolean {
+    return this.deviceBoundCtx;
+  }
+
   /**
    * 开始采集。解析失败 / 权限被拒时抛错（调用方按 PRD V3 降级为纯录制）。
    * 返回值即音频起点（epoch ms）。
@@ -71,9 +89,30 @@ export class VoiceRecorder {
         autoGainControl: true,
       },
     });
+    // 优先 sinkId:"none"：不占输出设备，最小化/遮挡时渲染照常（系统时钟驱动）。
+    // 实现不识别该选项时可能忽略或抛错 → 统一回退默认创建，并标记 deviceBoundCtx。
     // 采样率不满足期望时（设备不支持重采样）仍可工作，只是体积变大；
     // 后端 sample_rate 由 voice_begin 传入，无需两端强一致。
-    this.ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+    this.deviceBoundCtx = false;
+    let ctx: AudioContext | null = null;
+    try {
+      const c = new AudioContext({
+        sampleRate: TARGET_SAMPLE_RATE,
+        sinkId: "none",
+      } as AudioContextOptions);
+      if ("sinkId" in c && (c as AudioContext & { sinkId: unknown }).sinkId === "none") {
+        ctx = c;
+      } else {
+        void c.close();
+      }
+    } catch {
+      /* 不支持 sinkId:"none"，走回退 */
+    }
+    if (!ctx) {
+      ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+      this.deviceBoundCtx = true;
+    }
+    this.ctx = ctx;
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.processor = this.ctx.createScriptProcessor(4096, 1, 1);
     this.processor.onaudioprocess = (ev) => {

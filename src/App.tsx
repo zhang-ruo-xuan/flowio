@@ -32,6 +32,8 @@ function App() {
   const [voiceToast, setVoiceToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const voiceRecorderRef = useRef<VoiceRecorder | null>(null);
   const voiceChunkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 看门狗：采集样本数连续多秒不增长 = 音频回调停摆（最小化场景），记入 debug log
+  const voiceStallRef = useRef<{ last: number; ticks: number; logged: boolean }>({ last: 0, ticks: 0, logged: false });
   const voiceToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingIdRef = useRef<string | null>(null);
@@ -284,11 +286,30 @@ function App() {
       voiceRecorderRef.current = rec;
       setVoiceActive(true);
       await invoke("voice_begin", { recordingId: id, startedAtMs: startedAt, sampleRate: rec.sampleRateSafe });
+      if (rec.isDeviceBound) {
+        await invoke("voice_dbg_log", { message: "[VOICE] warn: AudioContext 绑定了真实输出设备（sinkId:none 不可用），窗口最小化后采集可能停摆" }).catch(() => {});
+      }
+      voiceStallRef.current = { last: 0, ticks: 0, logged: false };
       voiceChunkTimerRef.current = setInterval(async () => {
         const r = voiceRecorderRef.current;
         const b64 = r?.takeChunkIfReady();
         if (r && b64) {
           invoke("voice_append", { recordingId: recordingIdRef.current, chunkBase64: b64 }).catch((e) => console.warn("[voice] append:", e));
+        }
+        // 看门狗：非暂停状态下样本数 5 秒不增长 → 采集停摆（如被最小化挂起），只报一次
+        if (r && !r.isPaused) {
+          const s = voiceStallRef.current;
+          const now = r.totalSamplesSoFar;
+          if (now === s.last) {
+            s.ticks += 1;
+            if (s.ticks >= 5 && !s.logged) {
+              s.logged = true;
+              invoke("voice_dbg_log", { message: `[VOICE] 采集停摆：样本数 ${now} 已 5 秒未增长（窗口最小化后回调停止），本次录制语音将不完整` }).catch(() => {});
+            }
+          } else {
+            s.last = now;
+            s.ticks = 0;
+          }
         }
       }, 1000);
     } catch (err) {

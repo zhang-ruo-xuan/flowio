@@ -211,6 +211,7 @@ pub fn run() {
             redaction::commands::redact_step_screenshot,
             redaction::commands::scan_redact_screenshots,
             redaction::commands::cancel_scan_redact,
+            voice::commands::voice_dbg_log,
             voice::commands::voice_begin,
             voice::commands::voice_append,
             voice::commands::voice_finish,
