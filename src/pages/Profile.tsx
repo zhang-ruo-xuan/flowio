@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { ArrowLeft, Settings, LogOut, RefreshCw, User } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useAuthStore } from "../store/authStore";
+import { getCachedAvatar, cacheAvatar, avatarFileUrl } from "../lib/avatarCache";
 
 const PB_URL = "https://flowio.cn";
 
@@ -13,7 +14,9 @@ export default function ProfilePage() {
   const [syncMsg, setSyncMsg] = useState("");
   const [avatarError, setAvatarError] = useState(false);
 
-  const avatarUrl = siteUser?.avatar ? `${PB_URL}/api/files/users/${siteUser.id}/${siteUser.avatar}` : null;
+  const avatarUrl = siteUser?.avatar
+    ? getCachedAvatar(siteUser.id, siteUser.avatar) ?? avatarFileUrl(siteUser.id, siteUser.avatar)
+    : null;
   const name = siteUser?.display_name || siteUser?.id?.slice(-8) || "未登录";
 
   const doRefresh = async () => {
@@ -118,7 +121,16 @@ export default function ProfilePage() {
                 }}
               >
                 {avatarUrl && !avatarError ? (
-                  <img src={avatarUrl} alt={name} style={{ width: "100%", height: "100%", objectFit: "cover" }} onError={() => setAvatarError(true)} />
+                  <img
+                    src={avatarUrl}
+                    alt={name}
+                    style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                    onError={() => setAvatarError(true)}
+                    onLoad={() => {
+                      const f = siteUser?.avatar;
+                      if (f && !getCachedAvatar(siteUser!.id, f)) cacheAvatar(siteUser!.id, f);
+                    }}
+                  />
                 ) : (
                   <img src="https://flowio.cn/flowio-icon.png" alt="avatar" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                 )}

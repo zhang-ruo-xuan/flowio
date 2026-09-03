@@ -9,6 +9,7 @@ import SettingsPage from "./pages/Settings";
 import StepEditor from "./pages/StepEditor";
 import ProfilePage from "./pages/Profile";
 import { useAuthStore } from "./store/authStore";
+import { getCachedAvatar, cacheAvatar, avatarFileUrl } from "./lib/avatarCache";
 
 function App() {
   const [darkMode, setDarkMode] = useState(false);
@@ -393,12 +394,16 @@ function App() {
             >
               {siteToken ? (
                 (() => {
-                  return siteUser?.avatar && !avatarLoadFailed ? (
+                  const avatarFile = siteUser?.avatar || "";
+                  // 优先同步命中本地缓存（dataURL）→ 页面切换零网络、不闪绿色底
+                  const cached = avatarFile ? getCachedAvatar(siteUser!.id, avatarFile) : null;
+                  return avatarFile && !avatarLoadFailed ? (
                   <img
                     className="titlebar-avatar-img"
-                    src={`https://flowio.cn/api/files/users/${siteUser.id}/${siteUser.avatar}`}
-                    alt={siteUser.display_name || siteUser.email || "avatar"}
+                    src={cached ?? avatarFileUrl(siteUser!.id, avatarFile)}
+                    alt={siteUser?.display_name || siteUser?.email || "avatar"}
                     onError={() => setAvatarLoadFailed(true)}
+                    onLoad={() => { if (!cached) cacheAvatar(siteUser!.id, avatarFile); }}
                   />
                 ) : (
                   <img

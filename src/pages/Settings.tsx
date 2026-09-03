@@ -6,6 +6,7 @@ import {
   Star, Trash2, Check, Plus, Shield, Circle, User, LogOut, RefreshCw, Keyboard,
 } from "lucide-react";
 import { useAuthStore } from "../store/authStore";
+import { getCachedAvatar, cacheAvatar, avatarFileUrl } from "../lib/avatarCache";
 
 interface SettingsPageProps {
   darkMode: boolean;
@@ -335,7 +336,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
   const [profileAvatarError, setProfileAvatarError] = useState(false);
 
   const profileAvatarUrl = siteUser?.avatar
-    ? `${PB_URL}/api/files/users/${siteUser.id}/${siteUser.avatar}`
+    ? getCachedAvatar(siteUser.id, siteUser.avatar) ?? avatarFileUrl(siteUser.id, siteUser.avatar)
     : null;
 
   const profileName = siteUser?.display_name || siteUser?.email?.split("@")[0] || siteUser?.id?.slice(-8) || "?";
@@ -923,7 +924,16 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
               <div style={{ border: "1px solid var(--border)", borderRadius: 12, padding: "28px 32px", background: "var(--bg)", maxWidth: 460 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 20 }}>
                   {profileAvatarUrl && !profileAvatarError ? (
-                    <img src={profileAvatarUrl} alt="avatar" onError={() => setProfileAvatarError(true)} style={{ width: 56, height: 56, borderRadius: "50%", objectFit: "cover", border: "1px solid var(--border)" }} />
+                    <img
+                      src={profileAvatarUrl}
+                      alt="avatar"
+                      onError={() => setProfileAvatarError(true)}
+                      onLoad={() => {
+                        const f = siteUser?.avatar;
+                        if (f && !getCachedAvatar(siteUser.id, f)) cacheAvatar(siteUser.id, f);
+                      }}
+                      style={{ width: 56, height: 56, borderRadius: "50%", objectFit: "cover", border: "1px solid var(--border)" }}
+                    />
                   ) : (
                     <img src="https://flowio.cn/flowio-icon.png" alt="avatar" style={{ width: 56, height: 56, borderRadius: "50%", objectFit: "cover", border: "1px solid var(--border)" }} />
                   )}
