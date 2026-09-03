@@ -75,16 +75,16 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
         .as_deref()
         .map(crate::ai::domain::AppDomain::parse);
     // 录制指定软件：无论窗口标题如何，强制「整软件全图」喂图策略。
-    // 等价 Spreadsheet 领域 → full_image()=true，AI 始终看到整张软件截图
-    // （含所有浮层弹窗），而非聚焦裁图；before_after()=true 让模型对比前后
-    // 全图，识别仅在差异中显现的操作（如函数弹窗的确认/取消）。
+    // 用专属 TargetApp 域（full_image/skip_redaction/before_after 全开）而非
+    // Spreadsheet——避免把任意软件（VS Code/Chrome…）误当成表格、硬塞「表格软件」
+    // 专项提示；step hint 改由各步真实窗口标题检测出的领域给出。
     if job.target_app.is_some() {
-        force_domain = Some(AppDomain::Spreadsheet);
+        force_domain = Some(AppDomain::TargetApp);
     }
     for s in &mut job.steps {
-        // 表格软件（WPS 表格/Excel/Calc…）：用户录制自己的表格，且 AI 需看清
-        // 单元格内容（列标、函数名、数据表取值）才能写出精确步骤。跳过 OCR 脱敏
-        // 模糊，避免单元格文字被糊掉影响识别。
+        // 整软件全图模式（target_app）与表格软件：跳过 OCR 脱敏模糊，让 AI 看清
+        // 完整画面文字（表格的单元格/函数名/数据表取值，或指定软件的整体界面）。
+        // ⚠️ 隐私权衡：整图原样送往视觉模型——仅建议用于非敏感演示数据。
         // ⚠️ 隐私权衡：表格内容会原样送往视觉模型——仅建议用于非敏感演示数据；
         // 若含手机号/身份证等真实 PII，仍应由用户自行脱敏后再录制。
         let dom = force_domain.unwrap_or_else(|| crate::ai::domain::detect_domain(&s.window_title));
@@ -155,14 +155,15 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
             );
         }
 
-        // 表格软件：若同时有 before/after 截图，提示模型对比前后状态，
-        // 以便识别「向下填充到 B31」「整列复制」等仅在前后差异中显现的操作。
+        // 整软件全图 / 表格软件：若同时有 before/after 截图，提示模型对比前后状态。
         let dom = force_domain.unwrap_or_else(|| crate::ai::domain::detect_domain(&step.window_title));
         if dom.before_after() && !original_before[i].is_empty() {
-            step_prompt = format!(
-                "{}\n【表格软件】你将收到两张截图：第一张为操作前、第二张为操作后，请对比前后状态判断操作（如某区域被填充/复制）。",
-                step_prompt
-            );
+            let ba_hint = if matches!(dom, AppDomain::TargetApp) {
+                "【整软件】你将收到两张截图：第一张为操作前、第二张为操作后，请对比前后状态判断操作。"
+            } else {
+                "【表格软件】你将收到两张截图：第一张为操作前、第二张为操作后，请对比前后状态判断操作（如某区域被填充/复制）。"
+            };
+            step_prompt = format!("{}\n{}", step_prompt, ba_hint);
         }
 
         let mut messages = vec![Message {
@@ -622,6 +623,19 @@ mod pipeline_tests {
             ai_image_for_step(&step, &full, Some(AppDomain::Spreadsheet)),
             "FULL_REDACTED_BASE64",
             "手动表格模式应覆盖窗口标题关键词缺失"
+        );
+    }
+
+    #[test]
+    fn ai_image_for_step_force_target_app_full_image() {
+        let full = "FULL_REDACTED_BASE64".to_string();
+        let cropped = "CROPPED_BASE64".to_string();
+        // 录 VS Code，标题无任何表格关键词，但指定软件模式（TargetApp）→ 仍送整软件全图
+        let step = step_with_window("main.rs - Visual Studio Code", &cropped);
+        assert_eq!(
+            ai_image_for_step(&step, &full, Some(AppDomain::TargetApp)),
+            "FULL_REDACTED_BASE64",
+            "录制指定软件应强制整软件全图，不依赖标题关键词"
         );
     }
 

@@ -21,6 +21,10 @@ pub enum AppDomain {
     Terminal,
     /// 未识别（或无需特殊规则）
     Other,
+    /// 录制指定软件（target_app）：「整软件全图」模式。full_image / skip_redaction /
+    /// before_after 三项全开（整图原样送视觉模型、前后对比），但 step hint 不再硬塞
+    /// 「表格软件」，改由每步按真实窗口标题检测出的领域给出（识别不到则中性）。
+    TargetApp,
 }
 
 impl AppDomain {
@@ -32,6 +36,7 @@ impl AppDomain {
             AppDomain::Code => "code",
             AppDomain::Terminal => "terminal",
             AppDomain::Other => "other",
+            AppDomain::TargetApp => "target_app",
         }
     }
 
@@ -43,6 +48,7 @@ impl AppDomain {
             AppDomain::Code => "代码编辑器",
             AppDomain::Terminal => "终端",
             AppDomain::Other => "其他",
+            AppDomain::TargetApp => "指定软件",
         }
     }
 
@@ -53,6 +59,7 @@ impl AppDomain {
             "browser" => AppDomain::Browser,
             "code" => AppDomain::Code,
             "terminal" => AppDomain::Terminal,
+            "target_app" => AppDomain::TargetApp,
             _ => AppDomain::Other,
         }
     }
@@ -60,20 +67,20 @@ impl AppDomain {
     /// 该领域是否需要发送全图（而非聚焦裁剪图）给视觉模型。
     /// 仅表格软件跨整窗布局，需全图才能看清单元格/公式栏。
     pub fn full_image(&self) -> bool {
-        matches!(self, AppDomain::Spreadsheet)
+        matches!(self, AppDomain::Spreadsheet | AppDomain::TargetApp)
     }
 
     /// 该领域是否跳过 OCR 脱敏。
     /// 表格内容（列标/函数名/数据取值）需保持清晰，跳过脱敏以避免被糊掉。
     /// ⚠️ 隐私权衡：表格内容会原样送往视觉模型，仅建议用于非敏感演示数据。
     pub fn skip_redaction(&self) -> bool {
-        matches!(self, AppDomain::Spreadsheet)
+        matches!(self, AppDomain::Spreadsheet | AppDomain::TargetApp)
     }
 
     /// 该领域是否在有 before/after 双图时提示模型对比前后状态
     /// （如「向下填充到 B31」「整列复制」仅在前后差异中显现）。
     pub fn before_after(&self) -> bool {
-        matches!(self, AppDomain::Spreadsheet)
+        matches!(self, AppDomain::Spreadsheet | AppDomain::TargetApp)
     }
 
     /// 注入 step prompt 的【领域】强化指令（system prompt 之外的逐步骤补充）。
@@ -92,6 +99,7 @@ impl AppDomain {
             AppDomain::Terminal => {
                 "【终端/命令行】此步骤在终端/命令行中。标题/描述聚焦具体命令与输出（如「运行 npm install」「执行 git status 查看分支」）；若无可辨识命令，则描述界面操作（如「点击终端标签切换到 logs」）。\n".to_string()
             }
+            AppDomain::TargetApp => String::new(),
             AppDomain::Other => String::new(),
         }
     }
@@ -368,6 +376,7 @@ mod domain_tests {
             AppDomain::Code,
             AppDomain::Terminal,
             AppDomain::Other,
+            AppDomain::TargetApp,
         ] {
             assert_eq!(AppDomain::parse(d.key()), d);
         }
@@ -380,6 +389,10 @@ mod domain_tests {
         assert!(AppDomain::Spreadsheet.full_image());
         assert!(AppDomain::Spreadsheet.skip_redaction());
         assert!(AppDomain::Spreadsheet.before_after());
+        assert!(AppDomain::TargetApp.full_image());
+        assert!(AppDomain::TargetApp.skip_redaction());
+        assert!(AppDomain::TargetApp.before_after());
+        assert!(AppDomain::TargetApp.step_hint().is_empty());
         assert!(!AppDomain::Browser.full_image());
         assert!(!AppDomain::Browser.skip_redaction());
         assert!(!AppDomain::Other.full_image());

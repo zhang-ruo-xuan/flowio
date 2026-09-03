@@ -65,9 +65,14 @@ pub fn build_step_prompt(step: &StepInput, step_number: usize, force_domain: Opt
         String::new()
     };
 
-    // 自动模式按窗口标题推断领域，手动模式强制使用指定领域。
+    // 自动模式按窗口标题推断领域，手动/指定软件模式强制使用指定领域。
     let domain = force_domain.unwrap_or_else(|| detect_domain(&step.window_title));
-    let spreadsheet_hint = domain.step_hint();
+    // 录制指定软件（TargetApp）不硬塞「表格软件」提示，改按该步真实窗口标题
+    // 检测出的领域给对应提示（VS Code→代码、Chrome→浏览器，识别不到则中性）。
+    let spreadsheet_hint = match domain {
+        AppDomain::TargetApp => detect_domain(&step.window_title).step_hint(),
+        _ => domain.step_hint(),
+    };
 
     format!(
         r#"请为以下第 {step_number} 个操作步骤生成中文标题、描述、操作类型和提示。
@@ -184,6 +189,22 @@ mod prompt_tests {
         let p = build_step_prompt(&input("单击", "", "click", "销售表"), 2, Some(AppDomain::Spreadsheet));
         assert!(p.contains("【表格软件】"), "手动表格模式应注入表格软件强化指令");
         assert!(p.contains("B22") || p.contains("单元格"));
+    }
+
+    #[test]
+    fn build_step_prompt_target_app_uses_real_domain_hint() {
+        // 录 VS Code（指定软件模式）→ 注入「代码编辑器」提示，而非「表格软件」
+        let p = build_step_prompt(
+            &input("保存", "", "click", "main.rs - Visual Studio Code"),
+            2,
+            Some(AppDomain::TargetApp),
+        );
+        assert!(p.contains("【代码编辑器】"), "指定软件模式应按真实 app 类型给提示");
+        assert!(!p.contains("【表格软件】"), "指定软件模式不应注入表格软件提示");
+        // 标题无法识别领域 → 中性（无领域提示），仍不注入表格软件
+        let p2 = build_step_prompt(&input("点击", "", "click", "无标题窗口"), 3, Some(AppDomain::TargetApp));
+        assert!(!p2.contains("【表格软件】"));
+        assert!(!p2.contains("【代码编辑器】"));
     }
 
     #[test]
