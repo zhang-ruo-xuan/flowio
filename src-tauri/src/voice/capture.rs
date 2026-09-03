@@ -617,4 +617,55 @@ mod tests {
         downmix(&stereo, 2, &mut out, |s: f32| s);
         assert_eq!(out, vec![0.5, 0.0]);
     }
+
+    /// 真机麦克风 smoke 测试（需要真实设备，默认跳过）。
+    ///
+    /// ```text
+    /// cargo test --lib voice::capture::tests::mic_capture_smoke -- --ignored --nocapture
+    /// ```
+    /// 用来验证 cpal/WASAPI 这一层在本机确实能采到数据 —— 排查「采集停摆」
+    /// 时先跑它，能一眼区分是驱动/设备问题还是业务链路问题。
+    #[test]
+    #[ignore = "需要真实麦克风，手动跑"]
+    fn mic_capture_smoke() {
+        let (tx, rx) = mpsc::channel::<Vec<i16>>();
+        let paused = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(AtomicU64::new(0));
+        let (stream, info) =
+            build_stream_for_default_device(Arc::clone(&paused), Arc::clone(&samples), tx)
+                .expect("打开麦克风失败");
+        println!(
+            "设备={} 原始采样率={}Hz 声道={} 格式={:?}",
+            info.name, info.dev_rate, info.channels, info.format
+        );
+        stream.play().expect("play 失败");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = 0usize;
+        let mut peak: i16 = 0;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(chunk) => {
+                    for &s in &chunk {
+                        if s.abs() > peak.abs() {
+                            peak = s;
+                        }
+                    }
+                    got += chunk.len();
+                }
+                Err(_) => {}
+            }
+        }
+        println!(
+            "3 秒采集到 {} 样本（16kHz 下 = {:.2} 秒），峰值幅度 {}",
+            got,
+            got as f64 / 16_000.0,
+            peak
+        );
+        assert!(
+            got > 16_000,
+            "3 秒应至少采到 1 秒的量（16000 样本），实际 {} —— 设备没送数据？",
+            got
+        );
+    }
 }
