@@ -32,6 +32,14 @@ function App() {
   // 网站用户换了头像 / token 刷新后，旧的 url 失效 → 重新尝试加载图片
   useEffect(() => { setAvatarLoadFailed(false); }, [siteUser?.avatar, siteUser?.id]);
 
+  // 头像缓存预热：启动即回填（不等 img onLoad 再触发），杜绝「应用刚启动
+  // 就进出编辑器」时缓存未落地 → 重挂又走网络 → 闪绿底的竞态窗口
+  useEffect(() => {
+    if (siteToken && siteUser?.id && siteUser?.avatar) {
+      cacheAvatar(siteUser.id, siteUser.avatar);
+    }
+  }, [siteToken, siteUser?.id, siteUser?.avatar]);
+
   // 登录态同步到本地 DB：仅写 settings.current_user 隔离标记，不做批量迁移
   const syncLocalUser = useCallback((userId: string) => {
     invoke("set_current_user", { userId })
@@ -386,38 +394,37 @@ function App() {
               <button className="titlebar-btn titlebar-btn-stop" onClick={handleStopRecording} title="停止录制">STOP</button>
             </>
           )}
-          {!isEditor && (
-            <button
-              className="titlebar-btn titlebar-btn-login"
-              onClick={() => siteToken ? navigate("/profile") : invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" })}
-              title={siteToken ? `${siteUser?.display_name || siteUser?.email || '用户'}（点击进入个人中心）` : "登录网站账号"}
-            >
-              {siteToken ? (
-                (() => {
-                  const avatarFile = siteUser?.avatar || "";
-                  // 优先同步命中本地缓存（dataURL）→ 页面切换零网络、不闪绿色底
-                  const cached = avatarFile ? getCachedAvatar(siteUser!.id, avatarFile) : null;
-                  return avatarFile && !avatarLoadFailed ? (
-                  <img
-                    className="titlebar-avatar-img"
-                    src={cached ?? avatarFileUrl(siteUser!.id, avatarFile)}
-                    alt={siteUser?.display_name || siteUser?.email || "avatar"}
-                    onError={() => setAvatarLoadFailed(true)}
-                    onLoad={() => { if (!cached) cacheAvatar(siteUser!.id, avatarFile); }}
-                  />
-                ) : (
-                  <img
-                    className="titlebar-avatar-img"
-                    src="https://flowio.cn/flowio-icon.png"
-                    alt="avatar"
-                  />
-                );
-                })()
+          <button
+            className="titlebar-btn titlebar-btn-login"
+            style={isEditor ? { display: "none" } : undefined}
+            onClick={() => siteToken ? navigate("/profile") : invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" })}
+            title={siteToken ? `${siteUser?.display_name || siteUser?.email || '用户'}（点击进入个人中心）` : "登录网站账号"}
+          >
+            {siteToken ? (
+              (() => {
+                const avatarFile = siteUser?.avatar || "";
+                // 优先同步命中本地缓存（dataURL）→ 页面切换零网络、不闪绿色底
+                const cached = avatarFile ? getCachedAvatar(siteUser!.id, avatarFile) : null;
+                return avatarFile && !avatarLoadFailed ? (
+                <img
+                  className="titlebar-avatar-img"
+                  src={cached ?? avatarFileUrl(siteUser!.id, avatarFile)}
+                  alt={siteUser?.display_name || siteUser?.email || "avatar"}
+                  onError={() => setAvatarLoadFailed(true)}
+                  onLoad={() => { if (!cached) cacheAvatar(siteUser!.id, avatarFile); }}
+                />
               ) : (
-                <><User size={15} /><span className="titlebar-login-text">登录</span></>
-              )}
-            </button>
-          )}
+                <img
+                  className="titlebar-avatar-img"
+                  src="https://flowio.cn/flowio-icon.png"
+                  alt="avatar"
+                />
+              );
+              })()
+            ) : (
+              <><User size={15} /><span className="titlebar-login-text">登录</span></>
+            )}
+          </button>
           {!isEditor && (
             <button className="titlebar-win-btn" onClick={() => navigate("/settings")} title="设置"><Settings size={15} /></button>
           )}

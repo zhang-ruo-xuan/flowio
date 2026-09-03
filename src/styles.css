@@ -210,7 +210,8 @@ a:hover {
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  background: #4ade80;
+  /* 中性兜底色：图未加载完时不闪品牌绿（原 #4ade80） */
+  background: var(--border, #444);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -226,7 +227,8 @@ a:hover {
   border-radius: 50%;
   object-fit: cover;
   display: block;
-  background: #4ade80;
+  /* 中性兜底色：网络图加载期间不再露出绿色（原 #4ade80） */
+  background: var(--border, #444);
 }
 
 .titlebar-login-text {
