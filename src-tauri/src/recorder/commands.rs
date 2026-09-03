@@ -1897,7 +1897,14 @@ pub fn start_recording(
 ) -> Result<String, String> {
     let record_self = record_self.unwrap_or(false);
     // Normalize empty target to None (录制指定软件).
-    let target_window = target_window.filter(|t| !t.trim().is_empty());
+    let mut target_window = target_window.filter(|t| !t.trim().is_empty());
+    // B 层：未手动选择目标软件时，自动识别前台窗口进程名（Scribe 式免手动选）。
+    if target_window.is_none() {
+        if let Some(auto) = recorder::auto_detect_target_process() {
+            eprintln!("[start_recording] auto-detected target process: {}", auto);
+            target_window = Some(auto);
+        }
+    }
 
     // --- 防重入：已有活跃录制时直接返回它的 id ---
     // 不拦的话，重复调用会再装一次 native hook、再起一个截图线程和一个事件线程。

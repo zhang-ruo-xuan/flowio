@@ -164,6 +164,29 @@ fn process_name_of_pid(pid: u32) -> Option<String> {
     Some(path.rsplit(['\\', '/']).next().unwrap_or("").to_string())
 }
 
+/// 自动检测当前前台窗口的进程名（用于「录制指定软件」的自动识别）。
+///
+/// 当用户未在 Settings 手动选择目标软件时，录制开始时调用此函数，
+/// 取 GetForegroundWindow() 的进程名作为 target_app，实现 Scribe 式免手动选。
+///
+/// ⚠️ 若前台窗口是 Flowio 自身（用户点了 UI 按钮而非用全局热键启动录制），
+/// 返回 None 避免把 flowio.exe 误当目标软件。
+pub fn auto_detect_target_process() -> Option<String> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd == 0 {
+        return None;
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    let name = process_name_of_pid(pid)?;
+    // 排除 Flowio 自身：用户点 UI 按钮启动录制时前台窗口是 Flowio，
+    // 此时不应自动设 target_app（应留给用户手动选或等热键触发）。
+    if name.eq_ignore_ascii_case("flowio.exe") {
+        return None;
+    }
+    Some(name)
+}
+
 /// Enumerate visible top-level windows. Results are deduplicated by process
 /// name (keeps the window with the longest title for each process), which
 /// matches the "pick an app, not a window" UX of 录制指定软件.

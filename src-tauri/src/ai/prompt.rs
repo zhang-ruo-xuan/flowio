@@ -52,7 +52,9 @@ pub fn build_system_prompt() -> String {
 ///
 /// Includes step number, title, description (from recording metadata),
 /// and instructs the model to produce a structured JSON output.
-pub fn build_step_prompt(step: &StepInput, step_number: usize, force_domain: Option<AppDomain>) -> String {
+/// When `target_app` is provided, injects app identity + UI context so the AI
+/// knows which software it's analyzing and can correctly identify dialog fields.
+pub fn build_step_prompt(step: &StepInput, step_number: usize, force_domain: Option<AppDomain>, target_app: Option<&str>) -> String {
     let context_line = if !step.window_title.is_empty() {
         format!("操作窗口：{}\n", step.window_title)
     } else {
@@ -74,10 +76,15 @@ pub fn build_step_prompt(step: &StepInput, step_number: usize, force_domain: Opt
         _ => domain.step_hint(),
     };
 
+    // 录制目标软件身份 + UI 先验（解决 VLOOKUP 对话框字段认错等问题）
+    let app_ctx = target_app
+        .map(|name| crate::ai::domain::app_context(name))
+        .unwrap_or_default();
+
     format!(
         r#"请为以下第 {step_number} 个操作步骤生成中文标题、描述、操作类型和提示。
 
-{context}{action}{spreadsheet_hint}原始标题：{original_title}
+{app_ctx}{context}{action}{spreadsheet_hint}原始标题：{original_title}
 原始描述：{original_desc}
 
 请根据操作截图推断用户实际执行的操作，输出 JSON：
@@ -94,6 +101,7 @@ pub fn build_step_prompt(step: &StepInput, step_number: usize, force_domain: Opt
 特别注意：如果 after 截图显示的是一个完全不同的窗口或桌面（而非操作界面本身），说明用户的动作可能是关闭窗口、切换标签页、最小化窗口等窗口管理操作。此时必须根据录制的原始动作类型和标题来描述操作，严禁把"关闭浏览器"描述成网页内的操作（如投稿、点赞等）。
 "#,
         step_number = step_number,
+        app_ctx = app_ctx,
         context = context_line,
         action = action_hint,
         original_title = step.title,
@@ -158,7 +166,7 @@ mod prompt_tests {
 
     #[test]
     fn build_step_prompt_includes_metadata() {
-        let p = build_step_prompt(&input("点击保存", "描述", "click", "记事本"), 1, None);
+        let p = build_step_prompt(&input("点击保存", "描述", "click", "记事本"), 1, None, None);
         assert!(p.contains("第 1 个操作步骤"));
         assert!(p.contains("操作窗口：记事本"));
         assert!(p.contains("录制动作类型：click"));
@@ -172,6 +180,7 @@ mod prompt_tests {
             &input("单击", "", "click", "销售表.xlsx - WPS 表格"),
             2,
             None,
+            None,
         );
         assert!(p.contains("【表格软件】"), "表格窗口应注入表格软件强化指令");
         assert!(p.contains("B22") || p.contains("单元格"), "应提示精确单元格引用");
@@ -179,14 +188,14 @@ mod prompt_tests {
 
     #[test]
     fn build_step_prompt_omits_spreadsheet_hint_for_non_spreadsheet_window() {
-        let p = build_step_prompt(&input("点击", "", "click", "记事本"), 3, None);
+        let p = build_step_prompt(&input("点击", "", "click", "记事本"), 3, None, None);
         assert!(!p.contains("【表格软件】"), "非表格窗口不应注入表格软件指令");
     }
 
     #[test]
     fn build_step_prompt_force_spreadsheet_injects_hint_without_keyword() {
         // 窗口标题无任何表格关键词，但用户手动标记表格模式 → 仍注入强化指令
-        let p = build_step_prompt(&input("单击", "", "click", "销售表"), 2, Some(AppDomain::Spreadsheet));
+        let p = build_step_prompt(&input("单击", "", "click", "销售表"), 2, Some(AppDomain::Spreadsheet), None);
         assert!(p.contains("【表格软件】"), "手动表格模式应注入表格软件强化指令");
         assert!(p.contains("B22") || p.contains("单元格"));
     }
@@ -198,18 +207,19 @@ mod prompt_tests {
             &input("保存", "", "click", "main.rs - Visual Studio Code"),
             2,
             Some(AppDomain::TargetApp),
+            None,
         );
         assert!(p.contains("【代码编辑器】"), "指定软件模式应按真实 app 类型给提示");
         assert!(!p.contains("【表格软件】"), "指定软件模式不应注入表格软件提示");
         // 标题无法识别领域 → 中性（无领域提示），仍不注入表格软件
-        let p2 = build_step_prompt(&input("点击", "", "click", "无标题窗口"), 3, Some(AppDomain::TargetApp));
+        let p2 = build_step_prompt(&input("点击", "", "click", "无标题窗口"), 3, Some(AppDomain::TargetApp), None);
         assert!(!p2.contains("【表格软件】"));
         assert!(!p2.contains("【代码编辑器】"));
     }
 
     #[test]
     fn build_step_prompt_omits_empty_context() {
-        let p = build_step_prompt(&input("点击", "", "", ""), 3, None);
+        let p = build_step_prompt(&input("点击", "", "", ""), 3, None, None);
         assert!(p.contains("第 3 个操作步骤"));
         assert!(!p.contains("操作窗口："));
         assert!(!p.contains("录制动作类型："));
@@ -218,7 +228,7 @@ mod prompt_tests {
     #[test]
     fn build_step_prompt_no_placeholder_leftover() {
         // 步骤号占位符正确替换，不会残留模板变量
-        let p = build_step_prompt(&input("a", "b", "c", "d"), 7, None);
+        let p = build_step_prompt(&input("a", "b", "c", "d"), 7, None, None);
         assert!(!p.contains("{step_number}"));
         assert!(!p.contains("{context}"));
         assert!(!p.contains("{action}"));
@@ -228,7 +238,30 @@ mod prompt_tests {
 
     #[test]
     fn build_step_prompt_large_step_number() {
-        let p = build_step_prompt(&input("t", "d", "click", "w"), 999, None);
+        let p = build_step_prompt(&input("t", "d", "click", "w"), 999, None, None);
         assert!(p.contains("第 999 个操作步骤"));
+    }
+
+    #[test]
+    fn build_step_prompt_injects_target_app_context() {
+        // target_app=wps → 注入 WPS 身份 + VLOOKUP/IF 字段名先验
+        let p = build_step_prompt(&input("单击", "", "click", "函数参数"), 3, Some(AppDomain::TargetApp), Some("wps"));
+        assert!(p.contains("录制目标软件：WPS Office"), "应注入 WPS 软件身份");
+        assert!(p.contains("VLOOKUP"), "WPS 应包含 VLOOKUP 对话框字段先验");
+        assert!(p.contains("查找值"), "WPS 应包含查找值字段名");
+        assert!(p.contains("数据表"), "WPS 应包含数据表字段名");
+    }
+
+    #[test]
+    fn build_step_prompt_injects_excel_context() {
+        let p = build_step_prompt(&input("点击", "", "click", "函数参数"), 1, None, Some("excel"));
+        assert!(p.contains("录制目标软件：Microsoft Excel"), "应注入 Excel 身份");
+        assert!(p.contains("Lookup_value"), "Excel 应含英文字段名");
+    }
+
+    #[test]
+    fn build_step_prompt_omits_app_context_when_none() {
+        let p = build_step_prompt(&input("点击", "", "click", "记事本"), 1, None, None);
+        assert!(!p.contains("录制目标软件"), "无 target_app 时不应注入软件身份");
     }
 }

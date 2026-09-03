@@ -144,7 +144,7 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
 
     for (i, step) in preprocessed.iter().enumerate() {
         let step_number = i + 1;
-        let mut step_prompt = prompt::build_step_prompt(step, step_number, force_domain);
+        let mut step_prompt = prompt::build_step_prompt(step, step_number, force_domain, job.target_app.as_deref());
 
         // Detect dramatic window change between before/after screenshots
         // and prepend a hard override instruction when detected.

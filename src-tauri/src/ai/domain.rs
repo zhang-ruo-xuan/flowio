@@ -304,6 +304,50 @@ pub(crate) fn is_spreadsheet_window(title: &str) -> bool {
     detect_domain(title) == AppDomain::Spreadsheet
 }
 
+/// 根据 target_app 进程名生成「软件身份 + UI 先验」文本，注入 AI prompt。
+///
+/// 让 AI 知道正在分析哪款软件的截图，并给出该软件常见 UI 结构的先验知识，
+/// 帮助模型准确识别对话框字段名、面板名称等（解决 VLOOKUP 对话框「查找值」
+/// 与「数据表」认错等问题）。
+pub fn app_context(process_name: &str) -> String {
+    let p = process_name.to_lowercase();
+    if p.contains("wps") || p.contains("et") || p.contains("wpsoffice") {
+        "录制目标软件：WPS Office（电子表格/文字/演示）。\n\
+         WPS 表格常见对话框字段请严格按界面原文称呼：\n\
+         - VLOOKUP 函数：查找值 / 数据表 / 列序数 / 匹配条件\n\
+         - IF 函数：逻辑条件 / 真值 / 假值\n\
+         - 插入函数：函数搜索框 / 类别列表 / 选中函数说明\n\
+         - 单元格格式：数字 / 对齐 / 字体 / 边框 / 填充 / 保护\n\
+         - 页面设置：页面 / 页边距 / 页眉页脚 / 工作表\n\
+         请根据截图中的实际焦点位置判断用户操作的是哪个字段/按钮，不要猜测。\n"
+            .to_string()
+    } else if p.contains("excel") {
+        "录制目标软件：Microsoft Excel。\n\
+         Excel 常见对话框字段请严格按界面原文称呼：\n\
+         - VLOOKUP 函数：Lookup_value / Table_array / Col_index_num / Range_lookup\n\
+         - IF 函数：Logical_test / Value_if_true / Value_if_false\n\
+         - 单元格格式：Number / Alignment / Font / Border / Fill / Protection\n\
+         请根据截图中的实际焦点位置判断用户操作的是哪个字段/按钮，不要猜测。\n"
+            .to_string()
+    } else if p.contains("code") || p.contains("vscode") {
+        "录制目标软件：Visual Studio Code。\n\
+         VS Code 常见 UI 区域：侧边栏（资源管理器/搜索/源代码管理/调试/扩展）、\n\
+         编辑器分组、终端面板、输出面板、调试工具栏、状态栏。\n\
+         请根据截图中的实际焦点位置判断操作对象，使用界面原文术语。\n"
+            .to_string()
+    } else if p.contains("chrome") || p.contains("msedge") || p.contains("edge") {
+        "录制目标软件：浏览器（Chrome / Edge）。\n\
+         浏览器常见 UI 区域：地址栏、标签页栏、书签栏、开发者工具（Elements/Console/Network）、\n\
+         扩展弹出窗、下载栏。\n\
+         网页内的操作请聚焦网页内容本身，不要把浏览器控件误认为网页元素。\n"
+            .to_string()
+    } else if !p.is_empty() {
+        format!("录制目标软件：{}。\n", process_name)
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod domain_tests {
     use super::*;
