@@ -1,13 +1,21 @@
 //! 语音输入音频处理：PCM→WAV 封装、按步骤切片、静音检测。
 //!
-//! 前端（`src/lib/voiceRecorder.ts`）以 16kHz / 单声道 / i16 PCM 采集，
-//! 分块经 IPC 写入后端缓冲；本模块只做纯信号/几何处理，无 IO，
+//! 采集端是 `voice/capture.rs`（Rust + cpal/WASAPI），产出 16kHz / 单声道
+//! / i16 PCM，直接写入后端缓冲；本模块只做纯信号/几何处理，无 IO，
 //! 全部函数可独立单测。
 
 /// 采集采样率（与前端 AudioContext(sampleRate) 约定一致）
 pub const SAMPLE_RATE: u32 = 16_000;
-/// 单段送 ASR 的时长上限（GLM-ASR 单段 ≤60s，留 5s 余量）
-pub const MAX_SEGMENT_MS: i64 = 55_000;
+/// 单段送 ASR 的时长上限。
+///
+/// ⚠️ 智谱官方文档（docs.bigmodel.cn 语音转文本）写死的限制是
+/// **「文件大小 ≤ 25MB、音频时长 ≤ 30 秒」** —— 不是 60 秒。
+/// 早先按 60s 理解取了 55_000，导致连续讲超过 30 秒的段必然被服务端
+/// 拒绝（表现为「一直在说但一个字都没转出来」）。取 28_000（留 2s 余量）。
+///
+/// 体积校验：16kHz/16bit 单声道 = 32KB/s，28s ≈ 896KB，远低于 25MB。
+/// 改大这个值前先看 `max_segment_ms_respects_asr_limit` 那条测试。
+pub const MAX_SEGMENT_MS: i64 = 28_000;
 /// 短于该时长的切片直接丢弃（≈0.4s，无法成句）
 pub const MIN_SEGMENT_MS: i64 = 400;
 /// RMS 静音阈值（≈ -47 dBFS）：低于该值视为该步骤无有效语音
@@ -385,15 +393,50 @@ mod audio_tests {
     }
 
     #[test]
-    fn slice_v11_long_segment_is_split_into_55s_chunks() {
-        // 120 秒单步语音 → 3 段（55/55/10）
-        let pcm = sine_pcm(120_000, 16_000, 440.0, 0.5);
+    fn slice_v11_long_segment_is_split_into_max_chunks() {
+        // 70 秒单步语音 → 3 段（28/28/14），每段都必须 ≤ 智谱 30s 上限
+        let pcm = sine_pcm(70_000, 16_000, 440.0, 0.5);
         let out = slice_for_steps(&pcm, 16_000, &[0]);
         assert_eq!(out.len(), 1);
         let chunks = &out[0].1;
         assert_eq!(chunks.len(), 3);
         let durs: Vec<i64> = chunks.iter().map(|c| pcm_duration_ms(c.len(), 16_000)).collect();
-        assert_eq!(durs, vec![55_000, 55_000, 10_000]);
+        assert_eq!(durs, vec![28_000, 28_000, 14_000]);
+    }
+
+    /// 服务端硬限制：单段 ≤30 秒、文件 ≤25MB。改常量时这条会先炸。
+    #[test]
+    fn max_segment_respects_zhipu_asr_limits() {
+        assert!(
+            MAX_SEGMENT_MS <= 30_000,
+            "智谱语音转文本单段上限 30 秒，MAX_SEGMENT_MS={} 超限",
+            MAX_SEGMENT_MS
+        );
+        // 16kHz / 16bit / 单声道 → 32KB/s
+        let max_bytes = MAX_SEGMENT_MS as usize * SAMPLE_RATE as usize * 2 / 1000;
+        assert!(
+            max_bytes <= 25 * 1024 * 1024,
+            "单段 WAV {} 字节超过 25MB 上限",
+            max_bytes
+        );
+    }
+
+    /// 送出去的每一段（含 WAV 头）都要同时满足时长与体积上限。
+    #[test]
+    fn every_chunk_stays_within_asr_limits() {
+        // 一段 5 分钟不停顿的讲话（兜底路径会整段硬切）
+        let pcm = sine_pcm(300_000, 16_000, 440.0, 0.5);
+        let out = fallback_slice_all(&pcm, 16_000, &[0]);
+        let chunks: Vec<&Vec<u8>> = out.iter().flat_map(|(_, cs)| cs.iter()).collect();
+        assert!(!chunks.is_empty());
+        for c in chunks {
+            let ms = pcm_duration_ms(c.len(), 16_000);
+            assert!(ms <= 30_000, "段长 {}ms 超过 30s 上限", ms);
+            assert!(
+                pcm_to_wav(c, 16_000).len() <= 25 * 1024 * 1024,
+                "段 WAV 超过 25MB 上限"
+            );
+        }
     }
 
     #[test]
@@ -493,10 +536,11 @@ mod audio_tests {
 
     #[test]
     fn split_long_range_boundaries() {
-        assert_eq!(split_long_range(0, 55_000), vec![(0, 55_000)]);
+        // 正好等于上限 → 一段；超过 → 上限段 + 余量段
+        assert_eq!(split_long_range(0, 28_000), vec![(0, 28_000)]);
         assert_eq!(
-            split_long_range(0, 56_000),
-            vec![(0, 55_000), (55_000, 56_000)]
+            split_long_range(0, 29_000),
+            vec![(0, 28_000), (28_000, 29_000)]
         );
         assert!(split_long_range(5_000, 5_000).is_empty());
     }

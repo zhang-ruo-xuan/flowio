@@ -1,7 +1,8 @@
 //! 智谱 GLM-ASR 语音转写客户端。
 //!
 //! 接口：`POST https://open.bigmodel.cn/api/paas/v4/audio/transcriptions`
-//! （multipart：`model` + `file`，wav/mp3，单段 ≤60s / ≤25MB）。
+//! （multipart：`model` + `file`，wav/mp3，单段 **≤30s / ≤25MB**，
+//! 见 https://docs.bigmodel.cn/api-reference/模型-api/语音转文本 ）。
 //! 429 / 网络瞬断按 3s/6s/12s 指数退避重试 3 次（与 ai::http::call_llm 一致）；
 //! 但「余额/资源包」类 429 立即失败（见 `is_unrecoverable_quota_error`）。
 
@@ -43,7 +44,8 @@ struct AsrResponse {
     text: String,
 }
 
-/// 转写一段 WAV 音频（≤55s），返回识别文本。
+/// 转写一段 WAV 音频（≤ [`crate::voice::audio::MAX_SEGMENT_MS`]，当前 28s；
+/// 智谱服务端硬限 30s / 25MB），返回识别文本。
 ///
 /// # Errors
 /// HTTP 非 2xx 或重试耗尽时返回带原因的 String；响应体缺 `text` 字段时
