@@ -5,6 +5,7 @@ pub mod parse;
 pub mod pipeline;
 pub mod prompt;
 pub mod sanitize;
+pub mod translate;
 pub mod types;
 
 pub use pipeline::run_pipeline as AiPipeline;

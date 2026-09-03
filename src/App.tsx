@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route, useNavigate, useLocation } from "react-router-dom";
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Settings, Minus, Square, Copy, X, Pause, Play, User, LayoutDashboard } from "lucide-react";
+import { Settings, Minus, Square, Copy, X, Pause, Play, User, LayoutDashboard, Mic, MicOff } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -10,6 +10,7 @@ import StepEditor from "./pages/StepEditor";
 import ProfilePage from "./pages/Profile";
 import { useAuthStore } from "./store/authStore";
 import { getCachedAvatar, cacheAvatar, avatarFileUrl } from "./lib/avatarCache";
+import { VoiceRecorder } from "./lib/voiceRecorder";
 
 function App() {
   const [darkMode, setDarkMode] = useState(false);
@@ -24,6 +25,14 @@ function App() {
   const appWindow = getCurrentWindow();
   const [isMaximized, setIsMaximized] = useState(false);
   const [avatarLoadFailed, setAvatarLoadFailed] = useState(false);
+  // ── 语音输入（PRD F1）────────────────────────────────────────
+  const [voiceEnabled, setVoiceEnabled] = useState(() => localStorage.getItem("flowio_voice_input") === "1");
+  const [voiceActive, setVoiceActive] = useState(false);   // 麦克风是否采集中
+  const [voiceTranscribing, setVoiceTranscribing] = useState(false); // 停止后转写中
+  const [voiceToast, setVoiceToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const voiceRecorderRef = useRef<VoiceRecorder | null>(null);
+  const voiceChunkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingIdRef = useRef<string | null>(null);
   const isPausedRef = useRef(false);
@@ -205,6 +214,121 @@ function App() {
     }
   }, [recording]);
 
+  // ── 语音输入（PRD F1）────────────────────────────────────────
+  const showVoiceToast = useCallback((t: { type: "success" | "error"; message: string }) => {
+    setVoiceToast(t);
+    if (voiceToastTimerRef.current) clearTimeout(voiceToastTimerRef.current);
+    voiceToastTimerRef.current = setTimeout(() => setVoiceToast(null), t.type === "error" ? 6000 : 4000);
+  }, []);
+
+  // voice://done：转写完成 → 提示（StepEditor 自己监听并刷新步骤）
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      unlisten = await listen<{ recordingId: string; transcribed: number; failed: number; ok: boolean; summary: string }>(
+        "voice://done",
+        (ev) => {
+          setVoiceTranscribing(false);
+          showVoiceToast({
+            type: ev.payload.ok && ev.payload.failed === 0 ? "success" : "error",
+            message: ev.payload.summary,
+          });
+        }
+      );
+    })();
+    return () => { unlisten?.(); };
+  }, [showVoiceToast]);
+
+  // 语音开关：改 localStorage（V1 记忆）；录制中切换 → V13 语义
+  const toggleVoice = useCallback(async () => {
+    const next = !voiceEnabled;
+    setVoiceEnabled(next);
+    localStorage.setItem("flowio_voice_input", next ? "1" : "0");
+    const recId = recordingIdRef.current;
+    if (!recId) return; // 未在录制，仅记忆开关
+    if (!next && voiceRecorderRef.current?.isActive) {
+      // 录制中关麦：停止采集，已采集部分照常转写
+      voiceRecorderRef.current = null;
+      setVoiceActive(false);
+      if (voiceChunkTimerRef.current) { clearInterval(voiceChunkTimerRef.current); voiceChunkTimerRef.current = null; }
+    } else if (next && !voiceRecorderRef.current) {
+      // 录制中开麦：从现在开始采集
+      try {
+        const rec = new VoiceRecorder();
+        const startedAt = await rec.start();
+        voiceRecorderRef.current = rec;
+        setVoiceActive(true);
+        await invoke("voice_begin", { recordingId: recId, startedAtMs: startedAt, sampleRate: rec.sampleRateSafe });
+        voiceChunkTimerRef.current = setInterval(async () => {
+          const r = voiceRecorderRef.current;
+          const b64 = r?.takeChunkIfReady();
+          if (r && b64) {
+            invoke("voice_append", { recordingId: recordingIdRef.current, chunkBase64: b64 }).catch((e) => console.warn("[voice] append:", e));
+          }
+        }, 1000);
+      } catch (err) {
+        console.warn("[voice] mid-recording start failed:", err);
+        setVoiceEnabled(false);
+        localStorage.setItem("flowio_voice_input", "0");
+        showVoiceToast({ type: "error", message: "无法访问麦克风（检查系统麦克风权限），本次录制将以无语音方式继续" });
+      }
+    }
+  }, [voiceEnabled, showVoiceToast]);
+
+  // 开始录制前开麦（V2/V3）；失败降级为纯录制，不阻塞
+  const startVoiceIfEnabled = useCallback(async (id: string) => {
+    if (!voiceEnabled || voiceRecorderRef.current) return;
+    try {
+      const rec = new VoiceRecorder();
+      const startedAt = await rec.start();
+      voiceRecorderRef.current = rec;
+      setVoiceActive(true);
+      await invoke("voice_begin", { recordingId: id, startedAtMs: startedAt, sampleRate: rec.sampleRateSafe });
+      voiceChunkTimerRef.current = setInterval(async () => {
+        const r = voiceRecorderRef.current;
+        const b64 = r?.takeChunkIfReady();
+        if (r && b64) {
+          invoke("voice_append", { recordingId: recordingIdRef.current, chunkBase64: b64 }).catch((e) => console.warn("[voice] append:", e));
+        }
+      }, 1000);
+    } catch (err) {
+      console.warn("[voice] start failed:", err);
+      showVoiceToast({ type: "error", message: "无法访问麦克风（检查系统麦克风权限），本次录制将以无语音方式继续" });
+    }
+  }, [voiceEnabled, showVoiceToast]);
+
+  // 停止采集并触发转写（在 finish_recording 成功后调用；V5/V9 不阻塞）
+  const stopVoiceAndTranscribe = useCallback(async (id: string) => {
+    if (voiceChunkTimerRef.current) { clearInterval(voiceChunkTimerRef.current); voiceChunkTimerRef.current = null; }
+    const rec = voiceRecorderRef.current;
+    voiceRecorderRef.current = null;
+    setVoiceActive(false);
+    if (!rec) return;
+    try {
+      const res = await rec.stop();
+      // 尾块（不足一整块的剩余 PCM）也要上传
+      if (res.chunks.length > 0) {
+        for (const b64 of res.chunks) {
+          await invoke("voice_append", { recordingId: id, chunkBase64: b64 });
+        }
+      }
+      setVoiceTranscribing(true);
+      await invoke("voice_finish", { recordingId: id });
+    } catch (err) {
+      console.warn("[voice] finish failed:", err);
+      setVoiceTranscribing(false);
+      showVoiceToast({ type: "error", message: "语音转写失败: " + String(err) });
+    }
+  }, [showVoiceToast]);
+
+  // 卸载兜底清理
+  useEffect(() => {
+    return () => {
+      if (voiceChunkTimerRef.current) clearInterval(voiceChunkTimerRef.current);
+      voiceRecorderRef.current?.stop().catch(() => {});
+    };
+  }, []);
+
   const handleStartRecording = useCallback(async () => {
     try {
       // record-self / record-target preferences live in Settings (persisted in localStorage)
@@ -221,11 +345,12 @@ function App() {
       isPausedRef.current = false;
       setElapsed(0);
       setStepCount(0);
+      await startVoiceIfEnabled(id);
       appWindow.minimize();
     } catch (err) {
       console.error("Failed to start recording:", err);
     }
-  }, []);
+  }, [startVoiceIfEnabled]);
 
   const handlePauseRecording = useCallback(async () => {
     const id = recordingIdRef.current;
@@ -234,6 +359,7 @@ function App() {
       await invoke("pause_recording", { id });
       isPausedRef.current = true;
       setIsPaused(true);
+      voiceRecorderRef.current?.pause(); // 暂停期间丢弃 PCM
       await appWindow.unminimize();
       await appWindow.show();
       await appWindow.setFocus();
@@ -250,6 +376,7 @@ function App() {
       console.log("[resume] invoke succeeded, id=" + id);
       isPausedRef.current = false;
       setIsPaused(false);
+      voiceRecorderRef.current?.resume();
       // small delay to let resume_recording settle before minimizing
       await new Promise(r => setTimeout(r, 200));
       appWindow.minimize().catch(e => console.error("minimize on resume failed:", e));
@@ -291,6 +418,8 @@ function App() {
       setRecording(false);
       setIsPaused(false);
       isPausedRef.current = false;
+      // 语音转写（后台执行，不阻塞跳转编辑器；V5/V9）
+      await stopVoiceAndTranscribe(id);
       // 未登录时记录"录制完成"标记，编辑页自动弹出登录引导弹窗（LoginSaveModal）
       if (!siteToken) {
         sessionStorage.setItem("flowio_show_login_prompt", "1");
@@ -315,7 +444,7 @@ function App() {
       alert("停止录制失败: " + (err?.message || err));
       console.error("Failed to finish recording:", err);
     }
-  }, [navigate, siteToken]);
+  }, [navigate, siteToken, stopVoiceAndTranscribe]);
 
   const handleEdit = useCallback((id: string) => { navigate(`/editor/${id}`); }, [navigate]);
 
@@ -380,6 +509,22 @@ function App() {
         </div>
         <div className="titlebar-right">
           {isEditor && <div id="titlebar-editor-actions" className="titlebar-editor-actions" />}
+          {/* 语音输入开关（V1/V2/V13）：录制中=🎙指示灯；未录制=预设开关 */}
+          {!isEditor && (
+            <button
+              className={`titlebar-btn titlebar-btn-voice${voiceEnabled ? " on" : ""}`}
+              style={voiceActive && recording ? { color: "#ff5b5b" } : undefined}
+              onClick={toggleVoice}
+              title={
+                recording
+                  ? voiceActive ? "语音输入已开启（点击在本段录制中关闭，已采集内容照常转写）" : "语音输入已关闭（点击在本段录制中开启）"
+                  : voiceEnabled ? "语音输入：开（录制时边说边记，文字自动补充到对应步骤）" : "语音输入：关（点击开启）"
+              }
+            >
+              {voiceEnabled ? <Mic size={14} /> : <MicOff size={14} />}
+              <span className="titlebar-voice-text">{recording && voiceActive ? "语音" : voiceEnabled ? "语音开" : "语音关"}</span>
+            </button>
+          )}
           {!isEditor && recording && (
             <>
               {isPaused ? (
@@ -449,9 +594,25 @@ function App() {
         <span className="statusbar-left">Flowio v2.0</span>
         <span className="statusbar-right">
           <span className={`status-dot ${recording ? "" : "inactive"}`}></span>
-          <span>{recording ? "录制中" : "就绪"}</span>
+          <span>{voiceTranscribing ? "语音转写中…" : recording ? "录制中" : "就绪"}</span>
         </span>
       </div>
+
+      {/* 语音输入非阻塞 toast（V3/V9） */}
+      {voiceToast && (
+        <div
+          style={{
+            position: "fixed", bottom: 44, right: 20, zIndex: 9999,
+            padding: "8px 14px", borderRadius: 6, fontSize: 13, maxWidth: 360,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.18)",
+            background: voiceToast.type === "success" ? "#f0f9f0" : "#fdf0f0",
+            border: `1px solid ${voiceToast.type === "success" ? "#4caf50" : "#e57373"}`,
+            color: voiceToast.type === "success" ? "#2e7d32" : "#c62828",
+          }}
+        >
+          {voiceToast.message}
+        </div>
+      )}
     </div>
   );
 }

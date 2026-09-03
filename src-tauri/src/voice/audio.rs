@@ -1,0 +1,503 @@
+//! 语音输入音频处理：PCM→WAV 封装、按步骤切片、静音检测。
+//!
+//! 前端（`src/lib/voiceRecorder.ts`）以 16kHz / 单声道 / i16 PCM 采集，
+//! 分块经 IPC 写入后端缓冲；本模块只做纯信号/几何处理，无 IO，
+//! 全部函数可独立单测。
+
+/// 采集采样率（与前端 AudioContext(sampleRate) 约定一致）
+pub const SAMPLE_RATE: u32 = 16_000;
+/// 单段送 ASR 的时长上限（GLM-ASR 单段 ≤60s，留 5s 余量）
+pub const MAX_SEGMENT_MS: i64 = 55_000;
+/// 短于该时长的切片直接丢弃（≈0.4s，无法成句）
+pub const MIN_SEGMENT_MS: i64 = 400;
+/// RMS 静音阈值（≈ -47 dBFS）：低于该值视为该步骤无有效语音
+pub const SILENCE_RMS: f32 = 0.0045;
+/// 全局信号判定阈值（≈ -66 dBFS）：整段 RMS 低于该值视为「麦克风根本
+/// 没拾到声音」（数字静音/底噪水平），此时不做 ASR 兜底（送了也白送）。
+/// 高于它但 VAD 检不出区段（音量过低/短句被最小段过滤）→ 兜底整段送 ASR。
+pub const FALLBACK_MIN_RMS: f32 = 0.0005;
+/// 缓冲上限（字节）：30min@16k/i16 ≈ 57.6MB，超限停止追加
+pub const MAX_BUFFER_BYTES: usize = 96 * 1024 * 1024;
+
+/// 由原始 PCM（i16 LE）构造标准 44 字节头的 WAV 文件字节。
+///
+/// 前端分块上传的是裸 PCM；ASR 接口只收 .wav/.mp3，所以在送请求前
+/// 统一补 WAV 头。无 RIFF 额外块，绝大多数解析器都能接受。
+pub fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    let data_len = pcm.len() as u32;
+    let file_len = 36 + data_len;
+    let mut out = Vec::with_capacity(44 + pcm.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&file_len.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    // fmt chunk
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * 2; // mono * 2 bytes
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    // data chunk
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    out.extend_from_slice(pcm);
+    out
+}
+
+/// PCM 字节长度 → 时长（毫秒）
+pub fn pcm_duration_ms(pcm_len: usize, sample_rate: u32) -> i64 {
+    let samples = (pcm_len / 2) as i64;
+    samples * 1000 / sample_rate as i64
+}
+
+/// 毫秒 → PCM 字节偏移（2 字节对齐）
+fn ms_to_byte_offset(ms: i64, sample_rate: u32) -> usize {
+    let off = (ms * sample_rate as i64 * 2 / 1000) as usize;
+    off - (off % 2)
+}
+
+/// i16 样本序列的 RMS（归一化到 [-1,1]）
+pub fn rms_i16(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples
+        .iter()
+        .map(|&s| {
+            let v = s as f64 / 32768.0;
+            v * v
+        })
+        .sum();
+    (sum_sq / samples.len() as f64).sqrt() as f32
+}
+
+/// 整段 PCM 的 RMS（流式计算，不复制样本缓冲）。用于诊断「麦克风是否
+/// 拾到过任何声音」：数字静音 ≈ 0.0，正常人声 ≥ 0.01，过低音量在
+/// `FALLBACK_MIN_RMS` 与 `SILENCE_RMS` 之间。
+pub fn overall_rms(pcm: &[u8]) -> f32 {
+    let n = pcm.len() / 2;
+    if n == 0 {
+        return 0.0;
+    }
+    let sum_sq: f64 = pcm
+        .chunks_exact(2)
+        .map(|c| {
+            let v = i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0;
+            v * v
+        })
+        .sum();
+    (sum_sq / n as f64).sqrt() as f32
+}
+
+/// 帧长（毫秒）：语音区段检测的扫描精度
+const VAD_FRAME_MS: i64 = 50;
+/// 区段合并间隙（毫秒）：小于该值的静音间隙视为句内停顿，不拆区段
+const GAP_MERGE_MS: i64 = 300;
+
+fn slice_is_silent(pcm: &[u8]) -> bool {
+    let samples: Vec<i16> = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    rms_i16(&samples) < SILENCE_RMS
+}
+
+/// 检测语音区段（毫秒区间列表）。
+///
+/// 扫描流程：按 50ms 帧×滑动窗口计算每帧的 PCM 字节区间 → 单帧 RMS
+/// 判定 → 相邻语音帧按 `GAP_MERGE_MS` 合并成区段 → 丢弃短于
+/// `MIN_SEGMENT_MS` 的区段。
+pub fn speech_regions(pcm: &[u8], sample_rate: u32) -> Vec<(i64, i64)> {
+    if pcm.is_empty() {
+        return Vec::new();
+    }
+    let total_ms = pcm_duration_ms(pcm.len(), sample_rate);
+    let frame_samples = (sample_rate as i64 * VAD_FRAME_MS / 1000) as usize;
+    let frame_bytes = frame_samples * 2;
+
+    // 单帧语音判定
+    let mut speech_frames: Vec<bool> = Vec::new();
+    let mut pos = 0usize;
+    while pos < pcm.len() {
+        let end = (pos + frame_bytes).min(pcm.len());
+        speech_frames.push(!slice_is_silent(&pcm[pos..end]));
+        pos = end;
+    }
+
+    // 合并相邻语音帧（间隙 ≤ GAP_MERGE_MS 视为句内停顿）
+    let mut regions: Vec<(i64, i64)> = Vec::new();
+    let mut current: Option<(i64, i64)> = None; // (start_ms, last_speech_end_ms)
+    for (fi, &spoke) in speech_frames.iter().enumerate() {
+        let f_start = fi as i64 * VAD_FRAME_MS;
+        let f_end = (f_start + VAD_FRAME_MS).min(total_ms);
+        if spoke {
+            match &mut current {
+                Some((_, last_end)) => *last_end = f_end,
+                None => current = Some((f_start, f_end)),
+            }
+        } else if let Some((s, e)) = &mut current {
+            // 间隙超过 GAP_MERGE_MS → 结束当前区段
+            if f_end - *e > GAP_MERGE_MS {
+                let (s, e) = (*s, *e);
+                if e - s >= MIN_SEGMENT_MS {
+                    regions.push((s, e));
+                }
+                current = None;
+            }
+        }
+    }
+    if let Some((s, e)) = current {
+        if e - s >= MIN_SEGMENT_MS {
+            regions.push((s, e));
+        }
+    }
+    regions
+}
+
+/// 把一段毫秒区间切成不超过 `MAX_SEGMENT_MS` 的子区间。
+fn split_long_range(start_ms: i64, end_ms: i64) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    let mut s = start_ms;
+    while s < end_ms {
+        let e = (s + MAX_SEGMENT_MS).min(end_ms);
+        out.push((s, e));
+        s = e;
+    }
+    out
+}
+
+/// 按步骤时间戳把整段 PCM 切成「步骤 → 若干 PCM 段」。
+///
+/// `step_offsets_ms[i]` = 第 i 步截图时刻相对音频起点的毫秒偏移
+/// （`step.timestamp - audio_started_at_ms`，可为负，内部 clamp）。
+///
+/// 切片规则（对应 PRD V6/V7/V10/V11）：
+/// - 先做语音区段检测（句内停顿 ≤300ms 不拆），**整段区段归属其起点
+///   所在步骤**——一句话跨越多步时整句落在前一步，不拆句（V10）；
+/// - 该步骤没有任何区段 → 丢弃（无语音，V7）；
+/// - 区段超过 `MAX_SEGMENT_MS` → 等分细分，结果按顺序拼接（V11）。
+///
+/// 返回 `(step_index, chunks)`，step_index 为 `step_offsets_ms` 的下标，
+/// 只包含有有效语音的步骤，且按步骤顺序升序。
+pub fn slice_for_steps(
+    pcm: &[u8],
+    sample_rate: u32,
+    step_offsets_ms: &[i64],
+) -> Vec<(usize, Vec<Vec<u8>>)> {
+    if pcm.is_empty() || step_offsets_ms.is_empty() {
+        return Vec::new();
+    }
+    let total_ms = pcm_duration_ms(pcm.len(), sample_rate);
+
+    // 区段 → 起点所在步骤。步骤 i 覆盖 [offset_i, offset_{i+1})，
+    // 最后一步覆盖 [offset_last, ∞)。
+    let mut grouped: std::collections::BTreeMap<usize, Vec<(i64, i64)>> =
+        std::collections::BTreeMap::new();
+    for (rs, re) in speech_regions(pcm, sample_rate) {
+        let step_idx = step_offsets_ms
+            .iter()
+            .rposition(|&off| off.clamp(0, total_ms) <= rs)
+            .unwrap_or(0);
+        grouped.entry(step_idx).or_default().push((rs, re));
+    }
+
+    let mut out: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
+    for (step_idx, regions) in grouped {
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        for (rs, re) in regions {
+            for (s, e) in split_long_range(rs, re) {
+                let bs = ms_to_byte_offset(s, sample_rate);
+                let be = ms_to_byte_offset(e, sample_rate).min(pcm.len());
+                if be > bs {
+                    chunks.push(pcm[bs..be].to_vec());
+                }
+            }
+        }
+        if !chunks.is_empty() {
+            out.push((step_idx, chunks));
+        }
+    }
+    out
+}
+
+/// 兜底切片（VAD 兜底）：不做静音检测，直接按步骤时间戳把整段音频
+/// 切成「步骤 → 若干 PCM 段」。
+///
+/// 背景：VAD 阈值按正常人声标定（-47 dBFS），麦克风音量过低、或说话
+/// 全是 <400ms 的短句时，`slice_for_steps` 会返回空 → 「未检测到语音
+/// 内容」。此时若整段信号非数字静音，按时间戳硬切送 ASR 是最后一道
+/// 防线——真无声时 ASR 返回空文本，代价只是几次请求。
+///
+/// 切分规则：
+/// - 步骤 i 覆盖 `[clamp(offset_i), 下一个更大的边界)`，最后一步到音频末尾；
+/// - 边界相同的连续步骤只把语音归第一个（与 `slice_for_steps` 的归属
+///   语义一致：同一时刻的多个步骤不重复分配同一段音频）；
+/// - 负偏移 clamp 到 0，超过音频长度的步骤没有音频（丢弃）；
+/// - 单段超过 `MAX_SEGMENT_MS` 等分细分，短于 `MIN_SEGMENT_MS` 的段丢弃。
+pub fn fallback_slice_all(
+    pcm: &[u8],
+    sample_rate: u32,
+    step_offsets_ms: &[i64],
+) -> Vec<(usize, Vec<Vec<u8>>)> {
+    if pcm.is_empty() || step_offsets_ms.is_empty() {
+        return Vec::new();
+    }
+    let total_ms = pcm_duration_ms(pcm.len(), sample_rate);
+    let mut out: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
+    let mut prev_start: Option<i64> = None;
+    for (i, &off) in step_offsets_ms.iter().enumerate() {
+        let start = off.clamp(0, total_ms);
+        if let Some(p) = prev_start {
+            if start <= p {
+                continue; // 与上一步同界（或时间倒序）→ 语音归上一步
+            }
+        }
+        // 终点 = 后续步骤里第一个严格更大的边界；没有则到音频末尾
+        let mut end = total_ms;
+        for &nxt in &step_offsets_ms[i + 1..] {
+            let c = nxt.clamp(0, total_ms);
+            if c > start {
+                end = c;
+                break;
+            }
+        }
+        prev_start = Some(start);
+        if end <= start {
+            continue;
+        }
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        for (s, e) in split_long_range(start, end) {
+            if e - s < MIN_SEGMENT_MS {
+                continue;
+            }
+            let bs = ms_to_byte_offset(s, sample_rate);
+            let be = ms_to_byte_offset(e, sample_rate).min(pcm.len());
+            if be > bs {
+                chunks.push(pcm[bs..be].to_vec());
+            }
+        }
+        if !chunks.is_empty() {
+            out.push((i, chunks));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+
+    fn sine_pcm(ms: i64, sample_rate: u32, freq: f32, amp: f32) -> Vec<u8> {
+        let n = (sample_rate as f32 * ms as f32 / 1000.0) as usize;
+        let mut out = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let v = (amp * (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
+                .clamp(-1.0, 1.0);
+            out.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
+        }
+        out
+    }
+
+    // ── pcm_to_wav ─────────────────────────────────────────────
+
+    #[test]
+    fn wav_header_layout_is_standard() {
+        let pcm = vec![0u8; 8];
+        let wav = pcm_to_wav(&pcm, 16_000);
+        assert_eq!(wav.len(), 44 + 8);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        // fmt size = 16
+        assert_eq!(u32::from_le_bytes([wav[16], wav[17], wav[18], wav[19]]), 16);
+        // PCM mono
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        // sample rate + byte rate
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 16_000);
+        assert_eq!(u32::from_le_bytes([wav[28], wav[29], wav[30], wav[31]]), 32_000);
+        // bits per sample
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 8);
+    }
+
+    #[test]
+    fn wav_roundtrip_header_matches_hound_layout() {
+        // RIFF size 字段必须 = 36 + data 长度，读回时才能完整解出 payload
+        let pcm = vec![1u8; 1000];
+        let wav = pcm_to_wav(&pcm, 44_100);
+        let riff_size = u32::from_le_bytes([wav[4], wav[5], wav[6], wav[7]]);
+        assert_eq!(riff_size as usize, 36 + 1000);
+        assert_eq!(wav.len() - 44, 1000);
+    }
+
+    // ── duration / rms ─────────────────────────────────────────
+
+    #[test]
+    fn duration_math() {
+        assert_eq!(pcm_duration_ms(32_000, 16_000), 1_000); // 16000 samples * 2B
+        assert_eq!(pcm_duration_ms(0, 16_000), 0);
+        assert_eq!(pcm_duration_ms(31, 16_000), 0); // 不足一个样本
+    }
+
+    #[test]
+    fn rms_loud_vs_silent() {
+        let loud = sine_pcm(500, 16_000, 440.0, 0.5);
+        let samples: Vec<i16> = loud
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(rms_i16(&samples) > 0.3);
+        let quiet = vec![0u8; 32_000];
+        let qs: Vec<i16> = quiet
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(rms_i16(&qs), 0.0);
+    }
+
+    // ── slice_for_steps ────────────────────────────────────────
+
+    #[test]
+    fn slice_v7_silent_step_is_dropped() {
+        // 3 秒音频：0-1s 静音、1-2s 440Hz 语音、2-3s 静音
+        let mut pcm = vec![0u8; 16_000 * 2]; // 0-1s
+        pcm.extend(sine_pcm(1_000, 16_000, 440.0, 0.5)); // 1-2s
+        pcm.extend(vec![0u8; 16_000 * 2]); // 2-3s
+        let offsets = [0, 1_000, 2_000];
+        let out = slice_for_steps(&pcm, 16_000, &offsets);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![1], "只有第 2 步（下标 1）有语音");
+    }
+
+    #[test]
+    fn slice_v10_speech_crossing_boundary_lands_on_earlier_step() {
+        // 2 秒语音覆盖两步边界（0.5s 处第二步截图）→ 整段归属第 1 步
+        let pcm = sine_pcm(2_000, 16_000, 440.0, 0.5);
+        let offsets = [0, 500];
+        let out = slice_for_steps(&pcm, 16_000, &offsets);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0);
+    }
+
+    #[test]
+    fn slice_v11_long_segment_is_split_into_55s_chunks() {
+        // 120 秒单步语音 → 3 段（55/55/10）
+        let pcm = sine_pcm(120_000, 16_000, 440.0, 0.5);
+        let out = slice_for_steps(&pcm, 16_000, &[0]);
+        assert_eq!(out.len(), 1);
+        let chunks = &out[0].1;
+        assert_eq!(chunks.len(), 3);
+        let durs: Vec<i64> = chunks.iter().map(|c| pcm_duration_ms(c.len(), 16_000)).collect();
+        assert_eq!(durs, vec![55_000, 55_000, 10_000]);
+    }
+
+    #[test]
+    fn slice_negative_offset_clamps_to_zero() {
+        // 第 1 步截图早于音频启动（时间戳偏移为负）→ clamp 到 0；
+        // 连续语音 0-3s 整段归属起点所在步骤（V10，不拆句）→ 只有第 1 步
+        let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
+        let offsets = [-5_000, 1_000];
+        let out = slice_for_steps(&pcm, 16_000, &offsets);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![0]);
+        // 整段 3000ms 语音都归第 1 步
+        assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 3_000);
+    }
+
+    #[test]
+    fn slice_v7b_speech_across_pause_gap_stays_one_region() {
+        // 1s 语音 → 200ms 停顿（<300ms 句内停顿）→ 1s 语音：同一区段不拆
+        let mut pcm = sine_pcm(1_000, 16_000, 440.0, 0.5);
+        pcm.extend(vec![0u8; 200 * 16]); // 200ms 静音
+        pcm.extend(sine_pcm(1_000, 16_000, 440.0, 0.5));
+        let regions = speech_regions(&pcm, 16_000);
+        assert_eq!(regions.len(), 1);
+        assert!(regions[0].1 - regions[0].0 >= 2_000);
+    }
+
+    #[test]
+    fn slice_audio_shorter_than_offsets_clamps_to_end() {
+        // 音频中途用户关掉了开关（V13）：后面的步骤偏移超出音频长度 → 丢弃
+        let pcm = sine_pcm(1_000, 16_000, 440.0, 0.5);
+        let offsets = [0, 2_000, 4_000];
+        let out = slice_for_steps(&pcm, 16_000, &offsets);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![0]);
+    }
+
+    #[test]
+    fn slice_empty_inputs_are_safe() {
+        assert!(slice_for_steps(&[], 16_000, &[0]).is_empty());
+        let pcm = sine_pcm(500, 16_000, 440.0, 0.5);
+        assert!(slice_for_steps(&pcm, 16_000, &[]).is_empty());
+    }
+
+    // ── overall_rms / fallback_slice_all ───────────────────────
+
+    #[test]
+    fn overall_rms_loud_vs_digital_silence() {
+        let loud = overall_rms(&sine_pcm(1_000, 16_000, 440.0, 0.5));
+        assert!(loud > 0.3, "0.5 幅度正弦的 RMS 应 ≈0.35，实际 {}", loud);
+        assert_eq!(overall_rms(&vec![0u8; 32_000]), 0.0);
+        assert_eq!(overall_rms(&[]), 0.0);
+        // 奇数字节长度安全
+        assert_eq!(overall_rms(&[1u8, 0, 2]), overall_rms(&[1u8, 0]));
+    }
+
+    #[test]
+    fn fallback_assigns_segments_by_step() {
+        let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
+        let out = fallback_slice_all(&pcm, 16_000, &[0, 1_000, 2_000]);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![0, 1, 2]);
+        assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 1_000);
+        assert_eq!(pcm_duration_ms(out[1].1[0].len(), 16_000), 1_000);
+        assert_eq!(pcm_duration_ms(out[2].1[0].len(), 16_000), 1_000);
+    }
+
+    #[test]
+    fn fallback_equal_offsets_assign_to_first_step_only() {
+        let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
+        let out = fallback_slice_all(&pcm, 16_000, &[0, 0, 0]);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![0]);
+        assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 3_000);
+    }
+
+    #[test]
+    fn fallback_negative_offset_clamps_and_last_extends_to_end() {
+        let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
+        let out = fallback_slice_all(&pcm, 16_000, &[-5_000, 1_000]);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![0, 1]);
+        assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 1_000);
+        assert_eq!(pcm_duration_ms(out[1].1[0].len(), 16_000), 2_000);
+    }
+
+    #[test]
+    fn fallback_offset_beyond_audio_drops_step_and_drops_tiny_audio() {
+        // 第二步偏移超出音频长度 → 只有第一步
+        let pcm = sine_pcm(1_000, 16_000, 440.0, 0.5);
+        let out = fallback_slice_all(&pcm, 16_000, &[0, 5_000]);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![0]);
+        // 音频本身过短（<400ms）→ 全部丢弃
+        let tiny = sine_pcm(300, 16_000, 440.0, 0.5);
+        assert!(fallback_slice_all(&tiny, 16_000, &[0]).is_empty());
+    }
+
+    #[test]
+    fn split_long_range_boundaries() {
+        assert_eq!(split_long_range(0, 55_000), vec![(0, 55_000)]);
+        assert_eq!(
+            split_long_range(0, 56_000),
+            vec![(0, 55_000), (55_000, 56_000)]
+        );
+        assert!(split_long_range(5_000, 5_000).is_empty());
+    }
+}

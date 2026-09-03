@@ -299,6 +299,14 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
     localStorage.setItem("flowio_record_self", value ? "1" : "0");
   };
 
+  /* ---- 语音输入（PRD V1）：录制时边说边录，转写追加到步骤描述 ---- */
+  const [voiceEnabled, setVoiceEnabled] = useState(() => localStorage.getItem("flowio_voice_input") === "1");
+
+  const handleVoiceToggle = (value: boolean) => {
+    setVoiceEnabled(value);
+    localStorage.setItem("flowio_voice_input", value ? "1" : "0");
+  };
+
   /* ---- Record Target App（录制指定软件） ---- */
   const [recordTarget, setRecordTarget] = useState(() => localStorage.getItem("flowio_record_target") === "1");
   const [targetProcess, setTargetProcess] = useState(() => localStorage.getItem("flowio_record_target_process") || "");
@@ -913,6 +921,19 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                 </div>
               )}
               <p className="hint">开启后，录制时只捕获所选软件（如 WPS、Chrome 等）单独的画面，用于单独录制某个软件的操作教程。</p>
+            </div>
+
+            <div className="form-group">
+              <label>语音输入</label>
+              <div className="toggle-switch" onClick={() => handleVoiceToggle(!voiceEnabled)}>
+                <div className={`toggle-switch-track${voiceEnabled ? " active" : ""}`}>
+                  <div className="toggle-switch-thumb" />
+                </div>
+                <span className="toggle-switch-label">
+                  {voiceEnabled ? "开启" : "关闭"}
+                </span>
+              </div>
+              <p className="hint">开启后，录制时会同步收录麦克风语音；停止录制后自动识别，并把说的话追加到对应步骤的描述里（以「【语音】」开头）。也可在录制窗口顶栏随时开/关麦克风。需要 AI 设置使用智谱通道（默认免费通道已支持）。</p>
             </div>
           </div>
         )}
