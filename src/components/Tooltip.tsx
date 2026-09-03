@@ -64,10 +64,28 @@ export default function Tooltip() {
   }, [hide]);
 
   useEffect(() => {
-    const onOver = (e: MouseEvent) => {
-      const el = (e.target as HTMLElement | null)?.closest?.("[data-tip]") as
+    /**
+     * 找到鼠标底下真正该出提示的元素。
+     *
+     * ⚠️ 关键点：**disabled 的按钮在 Chromium 里完全不派发鼠标事件**，事件
+     * 目标会变成它的父元素。所以只做 `e.target.closest()` 时，禁用态的按钮
+     * （导出中、AI 精简中、大图首尾的上一张/下一张…）悬浮是没有任何提示的 ——
+     * 而这恰恰是用户最想知道「它现在为什么点不了」的时刻。
+     * 兜底用 elementFromPoint 按坐标再找一次，禁用元素照样能被命中。
+     */
+    const findTipTarget = (e: MouseEvent): HTMLElement | null => {
+      const byEvent = (e.target as HTMLElement | null)?.closest?.(
+        "[data-tip]",
+      ) as HTMLElement | null;
+      if (byEvent) return byEvent;
+      const under = document.elementFromPoint(e.clientX, e.clientY) as
         | HTMLElement
         | null;
+      return (under?.closest?.("[data-tip]") as HTMLElement | null) ?? null;
+    };
+
+    const onOver = (e: MouseEvent) => {
+      const el = findTipTarget(e);
       if (!el) {
         // 移到没有 tip 的区域 → 收起
         if (curRef.current) hide();
@@ -79,15 +97,33 @@ export default function Tooltip() {
     };
 
     const onOut = (e: MouseEvent) => {
-      const from = (e.target as HTMLElement | null)?.closest?.("[data-tip]") as
-        | HTMLElement
-        | null;
+      const from = findTipTarget(e);
       if (!from) return;
       // 仍在同一个 tip 元素内部（移到它的子元素上）→ 不收起
       const to = e.relatedTarget as Node | null;
       if (to && from.contains(to)) return;
       hide();
     };
+
+    // 键盘 Tab 到按钮上也出提示（focus 不触发 mouseover）。
+    // 只认 :focus-visible —— 鼠标点击也会让按钮获得焦点，若不加这个判断，
+    // 点击后的收起会被紧随的 focusin 抵消，气泡又会冒出来。
+    const onFocusIn = (e: FocusEvent) => {
+      const el = (e.target as HTMLElement | null)?.closest?.(
+        "[data-tip]",
+      ) as HTMLElement | null;
+      if (!el) return;
+      let keyboard = true;
+      try {
+        keyboard = el.matches(":focus-visible");
+      } catch {
+        // 老 WebView2 不支持该选择器 → 退回「一律显示」，最多是点完多冒一下
+      }
+      if (!keyboard) return;
+      curRef.current = el;
+      showFor(el);
+    };
+    const onFocusOut = () => hide();
 
     const onMove = (e: MouseEvent) => {
       mouseRef.current = { x: e.clientX, y: e.clientY };
@@ -111,11 +147,17 @@ export default function Tooltip() {
       }, RESHOW_MS);
     };
 
+    // 鼠标移出窗口：此时不会再有 mouseover，需主动收起，否则气泡会残留
+    const onLeaveDoc = () => hide();
+
     // 捕获阶段：防止被业务组件的 stopPropagation 吃掉
     document.addEventListener("mouseover", onOver, true);
     document.addEventListener("mouseout", onOut, true);
     document.addEventListener("mousemove", onMove, true);
     document.addEventListener("mousedown", onDown, true);
+    document.addEventListener("focusin", onFocusIn, true);
+    document.addEventListener("focusout", onFocusOut, true);
+    document.documentElement.addEventListener("mouseleave", onLeaveDoc);
     // 滚动时位置会失效（fixed 定位不跟随）→ 直接收起
     window.addEventListener("scroll", hide, true);
     window.addEventListener("resize", hide);
@@ -126,6 +168,9 @@ export default function Tooltip() {
       document.removeEventListener("mouseout", onOut, true);
       document.removeEventListener("mousemove", onMove, true);
       document.removeEventListener("mousedown", onDown, true);
+      document.removeEventListener("focusin", onFocusIn, true);
+      document.removeEventListener("focusout", onFocusOut, true);
+      document.documentElement.removeEventListener("mouseleave", onLeaveDoc);
       window.removeEventListener("scroll", hide, true);
       window.removeEventListener("resize", hide);
       window.removeEventListener("blur", hide);
