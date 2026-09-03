@@ -539,9 +539,10 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
   /* Preview mode */
   const [previewMode, setPreviewMode] = useState(false);
-  /* ── 步骤精简：自动合并（规则）/ AI 精简 / 撤销 ── */
+  /* ── 步骤精简：自动合并（规则）/ AI 精简 / 撤销（下拉合并为一个菜单）── */
   const [simplifying, setSimplifying] = useState<null | "rules" | "ai" | "undo">(null);
   const [canUndo, setCanUndo] = useState(false);
+  const [simplifyOpen, setSimplifyOpen] = useState(false);
   // handleAutoMerge / handleAiSimplify / handleUndoMerge 定义在 reloadRecording
   // 之后（它们的 deps 引用 reloadRecording，放在这里会 TDZ 崩溃）
 
@@ -1158,6 +1159,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     const closeDropdowns = () => {
       setExportOpen(false);
       setToolsOpen(false);
+      setSimplifyOpen(false);
     };
     window.addEventListener("mousedown", closeDropdowns);
     return () => window.removeEventListener("mousedown", closeDropdowns);
@@ -1981,38 +1983,57 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           <span style={{ marginRight: "auto" }}>{steps.length} 个步骤</span>
         </div>
 
-        {/* 步骤精简：自动合并（规则）/ AI 精简 / 撤销 */}
+        {/* 步骤精简：一个下拉入口收纳「AI 精简 / 仅规则合并 / 撤销」。
+            规则合并录完已自动跑过，这里的入口用于存量录制补跑与手动重跑。 */}
         {!previewMode && steps.length > 0 && (
           <div className="step-simplify-bar">
-            <button
-              className="step-simplify-btn"
-              title="自动合并重复点击、连续输入、点击后紧接着的输入，并删掉最后点「停止录制」那一步"
-              disabled={simplifying !== null}
-              onClick={() => void handleAutoMerge()}
-            >
-              {simplifying === "rules" ? <Loader2 size={12} className="spinner" /> : <Wand2 size={12} />}
-              {simplifying === "rules" ? "合并中…" : "自动合并"}
-            </button>
-            <button
-              className="step-simplify-btn primary"
-              title="交给 AI 判断哪些相邻步骤该合成一步（能压下弹框里那一串点击）。会先自动跑一遍规则合并再交 AI，通常需要几秒到十几秒；即使 AI 不可用，也仍会得到规则层的合并结果"
-              disabled={simplifying !== null}
-              onClick={() => void handleAiSimplify()}
-            >
-              {simplifying === "ai" ? <Loader2 size={12} className="spinner" /> : <Sparkles size={12} />}
-              {simplifying === "ai" ? "AI 精简中…" : "AI 精简"}
-            </button>
-            {canUndo && (
+            <div style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
               <button
-                className="step-simplify-btn ghost"
-                title="撤销最近一次精简，恢复精简前的全部步骤"
+                className="step-simplify-btn primary"
+                title="自动合并重复点击/连续输入，AI 再把语义上重复的步骤压成一步；可撤销"
                 disabled={simplifying !== null}
-                onClick={() => void handleUndoMerge()}
+                onClick={() => setSimplifyOpen(!simplifyOpen)}
               >
-                {simplifying === "undo" ? <Loader2 size={12} className="spinner" /> : <Undo2 size={12} />}
-                {simplifying === "undo" ? "撤销中…" : "撤销"}
+                {simplifying ? <Loader2 size={12} className="spinner" /> : <Sparkles size={12} />}
+                {simplifying === "ai" ? "AI 精简中…"
+                  : simplifying === "rules" ? "规则合并中…"
+                  : simplifying === "undo" ? "撤销中…"
+                  : "精简"}
+                <ChevronDown size={11} style={{ opacity: 0.8 }} />
               </button>
-            )}
+              {simplifyOpen && (
+                <div className="export-dropdown step-simplify-menu">
+                  <button
+                    className="export-dropdown-item"
+                    onClick={() => { setSimplifyOpen(false); void handleAiSimplify(); }}
+                    disabled={simplifying !== null}
+                  >
+                    {simplifying === "ai" ? <Loader2 size={14} className="spinner" /> : <Sparkles size={14} className="export-dropdown-item-icon" />}
+                    <span className="export-dropdown-item-label">AI 精简（推荐）</span>
+                  </button>
+                  <button
+                    className="export-dropdown-item"
+                    title="只跑本地规则（重复点击/连续输入/点错窗口），不联网、瞬间完成"
+                    onClick={() => { setSimplifyOpen(false); void handleAutoMerge(); }}
+                    disabled={simplifying !== null}
+                  >
+                    {simplifying === "rules" ? <Loader2 size={14} className="spinner" /> : <Wand2 size={14} className="export-dropdown-item-icon" />}
+                    <span className="export-dropdown-item-label">仅规则合并</span>
+                  </button>
+                  {canUndo && (
+                    <button
+                      className="export-dropdown-item"
+                      title="恢复最近一次精简前的全部步骤"
+                      onClick={() => { setSimplifyOpen(false); void handleUndoMerge(); }}
+                      disabled={simplifying !== null}
+                    >
+                      {simplifying === "undo" ? <Loader2 size={14} className="spinner" /> : <Undo2 size={14} className="export-dropdown-item-icon" />}
+                      <span className="export-dropdown-item-label">撤销精简</span>
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
 

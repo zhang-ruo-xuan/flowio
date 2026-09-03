@@ -3339,3 +3339,11 @@ select {
   opacity: 0.45;
   cursor: default;
 }
+/* 精简下拉菜单：export-dropdown 默认 right:0（顶栏用），
+   侧栏按钮靠左，菜单要跟着按钮左对齐展开。 */
+.step-simplify-menu {
+  left: 0;
+  right: auto;
+  top: calc(100% + 4px);
+  z-index: 9999;
+}
