@@ -658,6 +658,22 @@ fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], ss_dir: &s
 
 // ── DOCX export ──────────────────────────────────────────────
 
+/// 多行描述 → 单个 Run：按 \n 拆行，行间插 TextWrapping 软换行
+/// （Word 的 Shift+Enter）。docx XML 里字面 \n 会被 Word 折叠成一行，
+/// 必须显式 break。空行只产生 break 不产生空 text 节点。
+fn build_docx_desc_run(description: &str) -> Run {
+    let mut run = Run::new().size(21);
+    for (i, line) in description.split('\n').enumerate() {
+        if i > 0 {
+            run = run.add_break(BreakType::TextWrapping);
+        }
+        if !line.is_empty() {
+            run = run.add_text(line);
+        }
+    }
+    run
+}
+
 /// Generate a self-contained Word document (.docx) with embedded screenshots.
 /// Scribe-style layout: title → metadata → step cards with header, description,
 /// inline screenshot, and optional tip.
@@ -712,10 +728,7 @@ fn export_docx(
 
         // ── Description ───────────────────────────────────────
         if !s.description.is_empty() {
-            docx = docx.add_paragraph(
-                Paragraph::new()
-                    .add_run(Run::new().add_text(&s.description).size(21))
-            );
+            docx = docx.add_paragraph(Paragraph::new().add_run(build_docx_desc_run(&s.description)));
         }
 
         // ── Screenshot ────────────────────────────────────────
@@ -904,13 +917,14 @@ fn build_step_header_html(step_number: i32, action_type: &str, title: &str) -> S
 }
 
 /// Build the description block for HTML step card (empty → empty string).
+/// 多行描述：htmlescape 后把 \n 转为 <br />，保住粘贴文本的换行格式。
 fn build_step_desc_html(description: &str) -> String {
     if description.is_empty() {
         String::new()
     } else {
         format!(
             "      <p class=\"step-desc\">{}</p>\n",
-            htmlescape(description)
+            htmlescape(description).replace('\n', "<br />")
         )
     }
 }
@@ -995,11 +1009,12 @@ fn build_md_step_header(step_number: i32, action_type: &str, title: &str) -> Str
 }
 
 /// Build the description block for Markdown (empty → empty string).
+/// 段内单换行转 GFM 硬换行（行尾两空格），防止 Markdown 渲染时折叠成一行。
 fn build_md_desc_block(description: &str) -> String {
     if description.is_empty() {
         String::new()
     } else {
-        format!("{}\n\n", description)
+        format!("{}\n\n", description.replace('\n', "  \n"))
     }
 }
 
@@ -1475,6 +1490,35 @@ mod tests {
     }
 
     #[test]
+    fn test_docx_desc_run_multiline_breaks() {
+        // 多行描述：行间必须是显式软换行 break（docx 字面 \n 会被 Word 折叠）
+        let run = build_docx_desc_run("line1\nline2\n\nline4");
+        let json = serde_json::to_string(&run).unwrap();
+        assert_eq!(json.matches("\"type\":\"break\"").count(), 3);
+        assert!(json.contains("line1"));
+        assert!(json.contains("line4"));
+        // 单行描述：不应产生 break
+        let single = serde_json::to_string(&build_docx_desc_run("only")).unwrap();
+        assert!(!single.contains("\"type\":\"break\""));
+    }
+
+    #[test]
+    fn test_step_desc_html_converts_newlines() {
+        let html = build_step_desc_html("第一行\n第二行");
+        assert!(html.contains("第一行<br />第二行"));
+        assert!(!html.contains("第一行\n第二行"));
+        // 空描述返回空串
+        assert_eq!(build_step_desc_html(""), "");
+    }
+
+    #[test]
+    fn test_md_desc_block_hard_break() {
+        // GFM 段内硬换行：行尾两空格
+        let md = build_md_desc_block("line1\nline2");
+        assert!(md.contains("line1  \nline2"));
+    }
+
+    #[test]
     fn test_generate_export_path_extensions() {
         let dir = std::path::Path::new("out");
         assert_eq!(
@@ -1575,10 +1619,10 @@ mod tests {
             build_step_desc_html("<b>&\"'"),
             "      <p class=\"step-desc\">&lt;b&gt;&amp;&quot;&#39;</p>\n"
         );
-        // 多行描述保留换行
+        // 多行描述：\n 转 <br />（HTML 渲染时保留换行）
         assert_eq!(
             build_step_desc_html("line1\nline2"),
-            "      <p class=\"step-desc\">line1\nline2</p>\n"
+            "      <p class=\"step-desc\">line1<br />line2</p>\n"
         );
     }
 
@@ -1647,7 +1691,7 @@ mod tests {
     fn test_build_md_desc_tip_blocks() {
         assert_eq!(build_md_desc_block(""), "");
         assert_eq!(build_md_desc_block("描述"), "描述\n\n");
-        assert_eq!(build_md_desc_block("line1\nline2"), "line1\nline2\n\n");
+        assert_eq!(build_md_desc_block("line1\nline2"), "line1  \nline2\n\n");
         assert_eq!(build_md_tip_block(""), "");
         assert_eq!(build_md_tip_block("提示"), "> **Tip:** 提示\n");
         // tip 含 > 等特殊字符原样
