@@ -76,10 +76,62 @@ fn run_ai_pipeline_sync(
 
 // ── Tauri Commands ────────────────────────────────────────────
 
+/// 归一化并聚合错误：剥离「Step N 」前缀让同类错误合并，按出现次数降序取前 3 条，
+/// 格式「消息（×N）」，总长按字符安全截断到 160。
+fn summarize_error_reasons(errors: &[String]) -> String {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for err in errors {
+        // 剥离 "Step 12 " 前缀（LLM error / parse error / validation 共用）
+        let norm = match err.strip_prefix("Step ") {
+            Some(rest) => match rest.find(' ') {
+                Some(pos) => &rest[pos + 1..],
+                None => err.as_str(),
+            },
+            None => err.as_str(),
+        };
+        match counts.iter_mut().find(|(m, _)| m == norm) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((norm.to_string(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    let parts: Vec<String> = counts
+        .iter()
+        .take(3)
+        .map(|(m, c)| {
+            if *c > 1 {
+                format!("{}（×{}）", m, c)
+            } else {
+                m.clone()
+            }
+        })
+        .collect();
+    let detail = parts.join("；");
+    if detail.chars().count() > 160 {
+        format!("{}...", detail.chars().take(157).collect::<String>())
+    } else {
+        detail
+    }
+}
+
+/// Append AI pipeline errors to the Flowio debug log (same file as the
+/// recorder's capture log; release builds have no console/stderr).
+fn ai_dbg_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"D:\录步\flowio_debug.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 /// 汇总 AI 生成结果，返回面向用户的状态提示语。
-/// - 全部失败：去重（最多 3 条）并截断（120 字符）后返回 Err
+/// - 全部失败：聚合原因（最多 3 条）后返回 Err
 /// - 未生成任何步骤：返回固定 Err
-/// - 部分失败 / 全部成功：返回 Ok 摘要
+/// - 部分失败：返回 Ok 摘要 + 聚合原因（不再黑箱只报数量）
+/// - 全部成功：返回 Ok 摘要
 fn summarize_generate_result(
     generated: usize,
     total_steps: usize,
@@ -87,32 +139,20 @@ fn summarize_generate_result(
     errors: &[String],
 ) -> Result<String, String> {
     if generated == 0 && error_count > 0 {
-        let mut unique_errors: Vec<&str> = Vec::new();
-        for err in errors {
-            let msg = err.as_str();
-            if !unique_errors.contains(&msg) && unique_errors.len() < 3 {
-                unique_errors.push(msg);
-            }
-        }
-        let detail = unique_errors.join("；");
-        let trunc_detail = if detail.len() > 120 {
-            format!(
-                "{}...",
-                detail.chars().take(117).collect::<String>()
-            )
-        } else {
-            detail
-        };
         Err(format!(
             "{} 个步骤全部失败。原因：{}",
-            error_count, trunc_detail
+            error_count,
+            summarize_error_reasons(errors)
         ))
     } else if generated == 0 {
         Err("未生成任何步骤。请检查 AI 服务商配置".to_string())
     } else if error_count > 0 {
         Ok(format!(
-            "AI 生成完成：{} / {} 个步骤已生成（{} 个失败）",
-            generated, total_steps, error_count
+            "AI 生成完成：{} / {} 个步骤已生成（{} 个失败）。原因：{}",
+            generated,
+            total_steps,
+            error_count,
+            summarize_error_reasons(errors)
         ))
     } else {
         Ok(format!("AI 生成完成：全部 {} 个步骤已生成", generated))
@@ -304,6 +344,11 @@ pub async fn generate_ai_steps(
 
     let generated = result.steps.len();
     let error_count = result.errors.len();
+
+    // 逐条落调试日志（release 无 console，log:: 宏无处可去）
+    for err in &result.errors {
+        ai_dbg_log(&format!("[AI] {}", err));
+    }
 
     // ── Phase 3: Persist results to DB (back on main thread) ──
     apply_pipeline_result(db.inner(), &recording_id, &result);
@@ -1300,7 +1345,29 @@ mod ai_commands_tests {
     #[test]
     fn summarize_generate_result_partial() {
         let ok = summarize_generate_result(3, 5, 2, &["x".to_string()]).unwrap();
-        assert_eq!(ok, "AI 生成完成：3 / 5 个步骤已生成（2 个失败）");
+        assert!(
+            ok.starts_with("AI 生成完成：3 / 5 个步骤已生成（2 个失败）。原因："),
+            "{}",
+            ok
+        );
+        assert!(ok.contains("x"), "部分失败也应透出原因: {}", ok);
+    }
+
+    #[test]
+    fn summarize_error_reasons_aggregates_step_prefix() {
+        // 15 个同类 429 错误（不同步骤号）应聚合成一条「（×15）」
+        let errors: Vec<String> = (1..=15)
+            .map(|i| format!("Step {} LLM error: LLM API 返回错误（HTTP 429）：该模型当前访问量过大", i))
+            .chain(std::iter::once("Step 16 parse error: bad json".to_string()))
+            .collect();
+        let reasons = summarize_error_reasons(&errors);
+        assert!(reasons.contains("（×15）"), "{}", reasons);
+        assert!(reasons.contains("HTTP 429"), "{}", reasons);
+        assert!(reasons.starts_with("LLM error"), "{}", reasons);
+        // 次数降序：429 在前，parse error 在后
+        let pos429 = reasons.find("HTTP 429").unwrap();
+        let pos_parse = reasons.find("parse error").unwrap();
+        assert!(pos429 < pos_parse);
     }
 
     #[test]

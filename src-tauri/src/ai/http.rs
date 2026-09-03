@@ -41,7 +41,12 @@ struct ChoiceMessage {
 /// Call the LLM API synchronously using `reqwest::blocking`.
 ///
 /// Sends a POST request to `cfg.provider.base_url` with a Bearer token
-/// (`cfg.api_key`). Timeout is 60 seconds.
+/// (`cfg.api_key`). Single-attempt timeout is 60 seconds.
+///
+/// # 429 限流重试
+/// 免费通道（glm-4.6v-flash）高峰期高频返回 HTTP 429「1305 该模型当前访问量
+/// 过大」（实测连续 17 步生成时 15 步被限流）。此处按 3s/6s/12s 指数退避
+/// 重试最多 3 次；网络瞬断（send Err）同样重试。其他非 2xx 立即失败。
 ///
 /// # Errors
 /// Returns a `String` error that includes HTTP status code and response
@@ -59,34 +64,58 @@ pub fn call_llm(cfg: &AiConfig, messages: Vec<Message>) -> Result<String, String
         temperature: 0.3,
     };
 
-    let response = client
-        .post(normalize_chat_url(&cfg.provider.base_url))
-        .header("Authorization", format!("Bearer {}", cfg.api_key))
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+    const MAX_RETRIES: usize = 3;
+    let mut last_err = String::new();
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            // 3s / 6s / 12s 指数退避
+            std::thread::sleep(Duration::from_secs(3 << (attempt - 1)));
+        }
+        let response = match client
+            .post(normalize_chat_url(&cfg.provider.base_url))
+            .header("Authorization", format!("Bearer {}", cfg.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("HTTP request failed: {}", e);
+                continue;
+            }
+        };
 
-    let status = response.status();
+        let status = response.status();
 
-    if !status.is_success() {
-        let status_code = status.as_u16();
-        let body = response
-            .text()
-            .unwrap_or_else(|_| "<unable to read body>".to_string());
-        return Err(classify_llm_error(status_code, &body, &cfg.provider.model));
+        if status.as_u16() == 429 {
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<unable to read body>".to_string());
+            last_err = classify_llm_error(429, &body, &cfg.provider.model);
+            continue;
+        }
+
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            let body = response
+                .text()
+                .unwrap_or_else(|_| "<unable to read body>".to_string());
+            return Err(classify_llm_error(status_code, &body, &cfg.provider.model));
+        }
+
+        let chat_response: ChatResponse = response
+            .json()
+            .map_err(|e| format!("Failed to parse LLM response JSON: {}", e))?;
+
+        return chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .ok_or_else(|| "LLM response contained no choices".to_string());
     }
 
-    let chat_response: ChatResponse = response
-        .json()
-        .map_err(|e| format!("Failed to parse LLM response JSON: {}", e))?;
-
-    chat_response
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .ok_or_else(|| "LLM response contained no choices".to_string())
+    Err(format!("{}（已重试 {} 次仍失败）", last_err, MAX_RETRIES))
 }
 
 /// Classify a non-2xx LLM API response into a user-friendly error,
