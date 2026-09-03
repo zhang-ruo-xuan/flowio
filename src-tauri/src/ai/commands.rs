@@ -200,11 +200,63 @@ pub(crate) fn get_builtin_free_config() -> AiConfig {
     }
 }
 
+/// 解析一条 AI 配置 JSON。先按标准 JSON 解析；失败则修正非法转义后重试。
+///
+/// 历史上（旧版本）写入过一批转义坏掉的 JSON，例如把 `{"custom_patterns":[]}`
+/// 写成 `{" custom_patterns\:[],...}`。这类脏数据至今仍留在老用户的 settings
+/// 表里，所以读取侧必须容错，不能因为一行脏数据就把整份配置判死。
+fn parse_ai_config_json(json: &str) -> Option<AiConfig> {
+    if json.is_empty() {
+        return None;
+    }
+    if let Ok(cfg) = serde_json::from_str::<AiConfig>(json) {
+        return Some(cfg);
+    }
+    let sanitized = crate::ai::parse::sanitize_json_escapes(json);
+    serde_json::from_str::<AiConfig>(&sanitized).ok()
+}
+
+/// 扫描 `ai_config_%` 行，返回**第一条能解析**的配置。
+///
+/// ⚠️ 不能只取查询结果的第一行：SQLite 无 ORDER BY 时按 rowid 返回，而老库里
+/// 那些脏行（`ai_config::__local__::custom_xxx`）的 rowid 往往比用户真正配置的
+/// `ai_config_<provider_id>` 更小，直接 `.next()` 会拿脏行当有效配置，
+/// 轻则静默回退到内置免费通道、重则直接报错说"配置损坏"。
+fn scan_first_usable_ai_config(
+    conn: &rusqlite::Connection,
+) -> Option<(String, AiConfig)> {
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM settings WHERE key LIKE 'ai_config_%'")
+        .ok()?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut skipped = 0usize;
+    for (key, json) in rows {
+        if let Some(cfg) = parse_ai_config_json(&json) {
+            return Some((key, cfg));
+        }
+        skipped += 1;
+        log::warn!(
+            "跳过无法解析的 AI 配置行 {}（前 120 字符：{}）",
+            key,
+            &json[..json.len().min(120)]
+        );
+    }
+    if skipped > 0 {
+        log::warn!("共 {} 条 AI 配置行损坏且无可用配置", skipped);
+    }
+    None
+}
+
 /// Resolve the effective AI configuration from the settings table.
 ///
-/// 优先级：默认服务商（`default_ai_provider`）→ 任意已存配置 → 内置免费通道。
-/// `flowio-free` 且 key 为空时填入内置 key；配置 JSON 损坏时 sanitize 后
-/// 重试，仍失败则回退内置免费通道（不阻塞用户）。
+/// 优先级：默认服务商（`default_ai_provider`）→ 任意**可解析的**已存配置 → 内置免费通道。
+/// `flowio-free` 且 key 为空时填入内置 key；配置 JSON 损坏时 sanitize 后重试，
+/// 仍失败则跳过该行继续找下一条；一条可用的都没有才回退内置免费通道。
 pub(crate) fn resolve_ai_config(conn: &rusqlite::Connection) -> AiConfig {
     let default_id: Option<String> = conn
         .prepare("SELECT value FROM settings WHERE key = 'default_ai_provider'")
@@ -216,9 +268,7 @@ pub(crate) fn resolve_ai_config(conn: &rusqlite::Connection) -> AiConfig {
         let key = format!("ai_config_{}", id);
         if let Ok(mut stmt) = conn.prepare("SELECT value FROM settings WHERE key = ?1") {
             if let Ok(json) = stmt.query_row(params![key], |row| row.get::<_, String>(0)) {
-                if !json.is_empty() {
-                    maybe_cfg = serde_json::from_str::<AiConfig>(&json).ok();
-                }
+                maybe_cfg = parse_ai_config_json(&json);
             }
         }
     }
@@ -231,40 +281,10 @@ pub(crate) fn resolve_ai_config(conn: &rusqlite::Connection) -> AiConfig {
         return cfg;
     }
 
-    let rows: Vec<(String, String)> = match conn
-        .prepare("SELECT key, value FROM settings WHERE key LIKE 'ai_config_%'")
-    {
-        Ok(mut stmt) => match stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
-            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            Err(_) => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-    };
-
-    match rows.into_iter().next() {
-        Some((_, json)) if !json.is_empty() => {
-            // Try normal parse first
-            if let Ok(cfg) = serde_json::from_str::<AiConfig>(&json) {
-                cfg
-            } else {
-                // Config JSON may have invalid escapes (corrupted DB or
-                // legacy data). Try sanitizing escapes then re-parsing.
-                let sanitized = crate::ai::parse::sanitize_json_escapes(&json);
-                if let Ok(cfg) = serde_json::from_str::<AiConfig>(&sanitized) {
-                    cfg
-                } else {
-                    // Still can't parse — fall back to built-in free tier
-                    // rather than blocking the user entirely.
-                    log::warn!(
-                        "AI config JSON corrupt (first 300 chars): {} | falling back to flowio-free",
-                        &json[..json.len().min(300)]
-                    );
-                    get_builtin_free_config()
-                }
-            }
-        }
-        _ => {
-            // No user-configured AI provider → use built-in free tier
+    match scan_first_usable_ai_config(conn) {
+        Some((_, cfg)) => cfg,
+        None => {
+            // No usable user-configured AI provider → use built-in free tier
             get_builtin_free_config()
         }
     }
@@ -378,48 +398,26 @@ pub fn get_ai_config(db: State<DbState>, provider_id: String) -> Result<Option<A
     let json: Option<String> = stmt.query_row(params![key], |row| row.get(0)).ok();
 
     match json {
-        Some(s) if !s.is_empty() => {
-            match serde_json::from_str::<AiConfig>(&s) {
-                Ok(config) => Ok(Some(config)),
-                Err(e) => {
-                    let sanitized = crate::ai::parse::sanitize_json_escapes(&s);
-                    serde_json::from_str::<AiConfig>(&sanitized)
-                        .map(Some)
-                        .map_err(|_| format!("AI 配置数据损坏，请重新保存配置。原始错误：{}", e))
-                }
-            }
-        }
+        Some(s) if !s.is_empty() => match parse_ai_config_json(&s) {
+            Some(config) => Ok(Some(config)),
+            None => Err(format!(
+                "AI 配置数据损坏，请重新保存配置（key={}）。原文前 120 字符：{}",
+                key,
+                &s[..s.len().min(120)]
+            )),
+        },
         _ => Ok(None),
     }
 }
 
-/// Retrieve the first available AI configuration across all providers.
+/// Retrieve the first **usable** AI configuration across all providers.
+///
+/// 扫描顺序同 [`scan_first_usable_ai_config`]：跳过解析不了的历史脏行，
+/// 而不是拿第一行（很可能是脏行）直接判"配置损坏"。
 #[tauri::command]
 pub fn get_first_ai_config(db: State<DbState>) -> Result<Option<AiConfig>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare("SELECT key, value FROM settings WHERE key LIKE 'ai_config_%'")
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    match rows.into_iter().next() {
-        Some((_, json)) if !json.is_empty() => {
-            match serde_json::from_str::<AiConfig>(&json) {
-                Ok(config) => Ok(Some(config)),
-                Err(e) => {
-                    let sanitized = crate::ai::parse::sanitize_json_escapes(&json);
-                    serde_json::from_str::<AiConfig>(&sanitized)
-                        .map(Some)
-                        .map_err(|_| format!("AI 配置数据损坏，请重新保存配置。原始错误：{}", e))
-                }
-            }
-        }
-        _ => Ok(None),
-    }
+    Ok(scan_first_usable_ai_config(&conn).map(|(_, cfg)| cfg))
 }
 
 /// Persist the AI configuration into the settings table.
@@ -1043,6 +1041,90 @@ mod ai_commands_tests {
         assert!(serde_json::from_str::<AiConfig>(bad).is_err());
         let empty = "";
         assert!(serde_json::from_str::<AiConfig>(empty).is_err());
+    }
+
+    // ── 历史脏数据防线 ────────────────────────────────────────
+    //
+    // 老版本曾把「脱敏配置」序列化错（引号被写成反斜杠）后，批量写进了一批
+    // 不相干的 settings key，其中就包括 `ai_config::__local__::custom_*`。
+    // 这些行的 rowid 比用户真正的 `ai_config_<provider_id>` 更小，
+    // 早先 `rows.into_iter().next()` 会先拿到它们并判死。
+    // 下面三条锁住「跳过脏行、取真正可用的那条」这个行为。
+
+    /// 真实脏数据原文（199 字节，取自老用户库）。引号全被替换成反斜杠，
+    /// 连 sanitize 都救不回来 —— 只能跳过，不能当有效配置。
+    const CORRUPT_LEGACY_VALUE: &str = "{\" custom_patterns\\:[],\\enabled\\:[\\id_card\\,\\phone\\,\
+        \\bank_card\\,\\email\\,\\api_key\\,\\credit_code\\,\\qq_wechat\\,\\password_field\\,\
+        \\ip_mac\\,\\url_param\\,\\custom\\],\\mode\\:\\blur\\,\\redact_before_export\\:false}";
+
+    #[test]
+    fn corrupt_legacy_value_is_unrecoverable() {
+        assert!(parse_ai_config_json(CORRUPT_LEGACY_VALUE).is_none());
+    }
+
+    #[test]
+    fn scan_skips_corrupt_rows_and_returns_usable_config() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn);
+        // 先插脏行（rowid 更小），再插用户真实配置
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('ai_config::__local__::custom_1787202913961', ?1)",
+            params![CORRUPT_LEGACY_VALUE],
+        )
+        .unwrap();
+        let good = AiConfig { provider: text_provider(), api_key: "sk-real".into() };
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('ai_config_zhipu', ?1)",
+            params![serde_json::to_string(&good).unwrap()],
+        )
+        .unwrap();
+
+        let (key, cfg) = scan_first_usable_ai_config(&conn).expect("应跳过脏行找到可用配置");
+        assert_eq!(key, "ai_config_zhipu");
+        assert_eq!(cfg.api_key, "sk-real");
+    }
+
+    #[test]
+    fn resolve_ai_config_ignores_corrupt_legacy_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn);
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('ai_config::__local__::custom_1', ?1)",
+            params![CORRUPT_LEGACY_VALUE],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('ai_config::__local__::custom_2', ?1)",
+            params![CORRUPT_LEGACY_VALUE],
+        )
+        .unwrap();
+        let good = AiConfig { provider: text_provider(), api_key: "sk-real".into() };
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('ai_config_zhipu', ?1)",
+            params![serde_json::to_string(&good).unwrap()],
+        )
+        .unwrap();
+
+        // 没设 default_ai_provider 时走扫描兜底：必须拿到真实配置，
+        // 而不是被脏行顶掉后回退内置免费通道。
+        let cfg = resolve_ai_config(&conn);
+        assert_eq!(cfg.provider.id, "zhipu", "脏行不得顶掉用户真实配置");
+        assert_eq!(cfg.api_key, "sk-real");
+    }
+
+    #[test]
+    fn resolve_ai_config_falls_back_to_free_when_all_rows_corrupt() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn);
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('ai_config::__local__::custom_1', ?1)",
+            params![CORRUPT_LEGACY_VALUE],
+        )
+        .unwrap();
+
+        let cfg = resolve_ai_config(&conn);
+        assert_eq!(cfg.provider.id, "flowio-free", "全坏时应回退内置免费通道");
+        assert!(!cfg.api_key.is_empty(), "回退时必须带上内置 key");
     }
 
     // ── read_file_base64 / row_to_step_input ─────────────────

@@ -25,8 +25,14 @@ export const useAiStore = create<AiState>((set, get) => ({
 
   getAiConfig: async () => {
     // Fetch config for the first available provider by scanning all ai_config_% keys
-    const config = await invoke<AiConfig | null>('get_first_ai_config');
-    set({ aiConfig: config });
+    // 读不到就当"未配置"，不要让异常冒到调用方（AI 是可选能力，不能挡住主流程）
+    try {
+      const config = await invoke<AiConfig | null>('get_first_ai_config');
+      set({ aiConfig: config });
+    } catch (e) {
+      console.warn('[AI] 读取配置失败，按未配置处理：', e);
+      set({ aiConfig: null });
+    }
   },
 
   setAiConfig: async (config) => {
