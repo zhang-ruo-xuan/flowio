@@ -53,6 +53,7 @@ pub async fn export_recording(
     format: String,
     output_path: Option<String>,
     crop_step_ids: Option<Vec<String>>,
+    lang: Option<String>,
 ) -> Result<String, String> {
     // async 命令运行在异步运行时线程，不阻塞 UI 主线程。内部 catch_unwind 防 panic 崩掉 IPC。
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -62,13 +63,25 @@ pub async fn export_recording(
                 serde_json::json!({ "done": done, "total": total }),
             );
         };
-        export_recording_inner(&db, &id, &format, output_path, crop_step_ids.as_deref(), Some(&progress))
+        export_recording_inner(
+            &db,
+            &id,
+            &format,
+            output_path,
+            crop_step_ids.as_deref(),
+            Some(&progress),
+            lang.as_deref(),
+        )
     }))
     .map_err(|_| "export_recording panicked".to_string())?
 }
 
 /// 实际导出逻辑（在独立线程内执行，避免长任务占用 IPC / 阻塞 UI）。
 /// 导出前强制自动脱敏：文本替换 + 截图生成脱敏副本，原图与数据库数据保持不动。
+///
+/// `lang`：非 None 时把标题/步骤文本替换为对应语言的译文副本
+/// （PRD T6；缺失的步骤回退原文，截图永不翻译）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn export_recording_inner(
     db: &State<DbState>,
     id: &str,
@@ -76,8 +89,12 @@ pub(crate) fn export_recording_inner(
     output_path: Option<String>,
     crop_step_ids: Option<&[String]>,
     progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    lang: Option<&str>,
 ) -> Result<String, String> {
-    let (recording, steps) = load_export_data(db, id)?;
+    let (mut recording, mut steps) = load_export_data(db, id)?;
+    if let Some(lang) = lang {
+        apply_translation_override(db, id, lang, &mut recording, &mut steps)?;
+    }
     // 构建 crop ID 集合用于 O(1) 查找
     let crop_set: std::collections::HashSet<&str> = crop_step_ids
         .map(|ids| ids.iter().map(|s| s.as_str()).collect())
@@ -213,6 +230,50 @@ fn load_export_data(
     }
 
     Ok((recording, steps))
+}
+
+/// 把译文副本覆盖到导出数据上（PRD T6）。
+///
+/// 只替换 recording.title 与每个步骤的 title/description；截图、坐标、
+/// action_type 等一律不动。译文副本按 order_index（字符串键）映射，
+/// 某步骤缺译文时回退原文。译文不存在时返回错误（前端不应出现该状态）。
+fn apply_translation_override(
+    db: &State<DbState>,
+    id: &str,
+    lang: &str,
+    recording: &mut ExportRecording,
+    steps: &mut Vec<ExportStep>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let raw = crate::db::get_recording_translations_raw(&conn, id)?
+        .ok_or_else(|| format!("该教程没有译文副本（lang={}) ", lang))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("译文 JSON 损坏：{}", e))?;
+    let Some(lang_obj) = parsed.get(lang) else {
+        return Err(format!("没有 {} 语言的译文副本", lang));
+    };
+
+    if let Some(t) = lang_obj.get("title").and_then(|v| v.as_str()) {
+        if !t.trim().is_empty() {
+            recording.title = t.to_string();
+        }
+    }
+    let steps_obj = lang_obj.get("steps").and_then(|v| v.as_object());
+    for step in steps.iter_mut() {
+        let key = step.order_index.to_string();
+        let Some(entry) = steps_obj.and_then(|o| o.get(&key)) else {
+            continue; // 缺译文 → 回退原文
+        };
+        if let Some(t) = entry.get("title").and_then(|v| v.as_str()) {
+            if !t.trim().is_empty() {
+                step.title = t.to_string();
+            }
+        }
+        if let Some(d) = entry.get("description").and_then(|v| v.as_str()) {
+            step.description = d.to_string();
+        }
+    }
+    Ok(())
 }
 
 fn sanitize_filename(name: &str) -> String {

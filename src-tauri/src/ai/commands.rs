@@ -116,7 +116,7 @@ fn summarize_error_reasons(errors: &[String]) -> String {
 
 /// Append AI pipeline errors to the Flowio debug log (same file as the
 /// recorder's capture log; release builds have no console/stderr).
-fn ai_dbg_log(msg: &str) {
+pub(crate) fn ai_dbg_log(msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -188,7 +188,7 @@ pub fn get_default_provider(db: State<DbState>) -> Result<String, String> {
 /// Uses Zhipu GLM-4.6V-Flash (vision-capable) with a built-in API key.
 /// New users get this out-of-the-box — no setup required.
 /// Matches the extension's `flowio-free` provider in modelEnum.ts.
-fn get_builtin_free_config() -> AiConfig {
+pub(crate) fn get_builtin_free_config() -> AiConfig {
     AiConfig {
         provider: AiProvider {
             id: "flowio-free".into(),
@@ -197,6 +197,76 @@ fn get_builtin_free_config() -> AiConfig {
             model: "glm-4.6v-flash".into(),
         },
         api_key: "874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U".into(),
+    }
+}
+
+/// Resolve the effective AI configuration from the settings table.
+///
+/// 优先级：默认服务商（`default_ai_provider`）→ 任意已存配置 → 内置免费通道。
+/// `flowio-free` 且 key 为空时填入内置 key；配置 JSON 损坏时 sanitize 后
+/// 重试，仍失败则回退内置免费通道（不阻塞用户）。
+pub(crate) fn resolve_ai_config(conn: &rusqlite::Connection) -> AiConfig {
+    let default_id: Option<String> = conn
+        .prepare("SELECT value FROM settings WHERE key = 'default_ai_provider'")
+        .ok()
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
+
+    let mut maybe_cfg: Option<AiConfig> = None;
+    if let Some(ref id) = default_id {
+        let key = format!("ai_config_{}", id);
+        if let Ok(mut stmt) = conn.prepare("SELECT value FROM settings WHERE key = ?1") {
+            if let Ok(json) = stmt.query_row(params![key], |row| row.get::<_, String>(0)) {
+                if !json.is_empty() {
+                    maybe_cfg = serde_json::from_str::<AiConfig>(&json).ok();
+                }
+            }
+        }
+    }
+
+    if let Some(mut cfg) = maybe_cfg {
+        // flowio-free with empty key → fill in built-in key
+        if cfg.provider.id == "flowio-free" && cfg.api_key.is_empty() {
+            cfg.api_key = get_builtin_free_config().api_key;
+        }
+        return cfg;
+    }
+
+    let rows: Vec<(String, String)> = match conn
+        .prepare("SELECT key, value FROM settings WHERE key LIKE 'ai_config_%'")
+    {
+        Ok(mut stmt) => match stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+
+    match rows.into_iter().next() {
+        Some((_, json)) if !json.is_empty() => {
+            // Try normal parse first
+            if let Ok(cfg) = serde_json::from_str::<AiConfig>(&json) {
+                cfg
+            } else {
+                // Config JSON may have invalid escapes (corrupted DB or
+                // legacy data). Try sanitizing escapes then re-parsing.
+                let sanitized = crate::ai::parse::sanitize_json_escapes(&json);
+                if let Ok(cfg) = serde_json::from_str::<AiConfig>(&sanitized) {
+                    cfg
+                } else {
+                    // Still can't parse — fall back to built-in free tier
+                    // rather than blocking the user entirely.
+                    log::warn!(
+                        "AI config JSON corrupt (first 300 chars): {} | falling back to flowio-free",
+                        &json[..json.len().min(300)]
+                    );
+                    get_builtin_free_config()
+                }
+            }
+        }
+        _ => {
+            // No user-configured AI provider → use built-in free tier
+            get_builtin_free_config()
+        }
     }
 }
 
@@ -216,67 +286,7 @@ pub async fn generate_ai_steps(
     // ── Phase 1: Load config and steps from DB (main thread) ──
     let config: AiConfig = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-
-        let default_id: Option<String> = conn
-            .prepare("SELECT value FROM settings WHERE key = 'default_ai_provider'")
-            .ok()
-            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).ok());
-
-        let mut maybe_cfg: Option<AiConfig> = None;
-        if let Some(ref id) = default_id {
-            let key = format!("ai_config_{}", id);
-            if let Ok(mut stmt) = conn.prepare("SELECT value FROM settings WHERE key = ?1") {
-                if let Ok(json) = stmt.query_row(params![key], |row| row.get::<_, String>(0)) {
-                    if !json.is_empty() {
-                        maybe_cfg = serde_json::from_str::<AiConfig>(&json).ok();
-                    }
-                }
-            }
-        }
-
-        if let Some(mut cfg) = maybe_cfg {
-            // flowio-free with empty key → fill in built-in key
-            if cfg.provider.id == "flowio-free" && cfg.api_key.is_empty() {
-                cfg.api_key = get_builtin_free_config().api_key;
-            }
-            cfg
-        } else {
-            let rows: Vec<(String, String)> = conn
-                .prepare("SELECT key, value FROM settings WHERE key LIKE 'ai_config_%'")
-                .map_err(|e| e.to_string())?
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            match rows.into_iter().next() {
-                Some((_, json)) if !json.is_empty() => {
-                    // Try normal parse first
-                    if let Ok(cfg) = serde_json::from_str::<AiConfig>(&json) {
-                        cfg
-                    } else {
-                        // Config JSON may have invalid escapes (corrupted DB or
-                        // legacy data). Try sanitizing escapes then re-parsing.
-                        let sanitized = crate::ai::parse::sanitize_json_escapes(&json);
-                        if let Ok(cfg) = serde_json::from_str::<AiConfig>(&sanitized) {
-                            cfg
-                        } else {
-                            // Still can't parse — fall back to built-in free tier
-                            // rather than blocking the user entirely.
-                            log::warn!(
-                                "AI config JSON corrupt (first 300 chars): {} | falling back to flowio-free",
-                                &json[..json.len().min(300)]
-                            );
-                            get_builtin_free_config()
-                        }
-                    }
-                }
-                _ => {
-                    // No user-configured AI provider → use built-in free tier
-                    get_builtin_free_config()
-                }
-            }
-        }
+        resolve_ai_config(&conn)
     };
 
     let step_rows: Vec<StepRow> = {

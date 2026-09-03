@@ -41,7 +41,7 @@ struct ChoiceMessage {
 /// Call the LLM API synchronously using `reqwest::blocking`.
 ///
 /// Sends a POST request to `cfg.provider.base_url` with a Bearer token
-/// (`cfg.api_key`). Single-attempt timeout is 60 seconds.
+/// (`cfg.api_key`). Single-attempt timeout is 120 seconds.
 ///
 /// # 429 限流重试
 /// 免费通道（glm-4.6v-flash）高峰期高频返回 HTTP 429「1305 该模型当前访问量
@@ -52,15 +52,27 @@ struct ChoiceMessage {
 /// Returns a `String` error that includes HTTP status code and response
 /// body when the server returns a non-2xx status.
 pub fn call_llm(cfg: &AiConfig, messages: Vec<Message>) -> Result<String, String> {
+    call_llm_with_tokens(cfg, messages, 1024)
+}
+
+/// [`call_llm`] 的可调 `max_tokens` 版本。
+///
+/// 默认 1024 对「逐步生成标题/描述」够用；翻译整本教程（全部步骤打包
+/// 一次请求输出完整 JSON）必须放宽到数千 token，否则 JSON 会被截断。
+pub fn call_llm_with_tokens(
+    cfg: &AiConfig,
+    messages: Vec<Message>,
+    max_tokens: u32,
+) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     let request_body = ChatRequest {
         model: &cfg.provider.model,
         messages: &messages,
-        max_tokens: 1024,
+        max_tokens,
         temperature: 0.3,
     };
 

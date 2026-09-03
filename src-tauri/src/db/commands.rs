@@ -144,10 +144,9 @@ fn collect_step_screenshot_paths(rows: Vec<(String, Option<String>)>) -> Vec<Str
         .collect()
 }
 
-#[tauri::command]
-pub fn delete_recording(db: State<DbState>, id: String) -> Result<(), String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-
+/// 单条删除的共用实现（供 delete_recording / delete_recordings 复用）。
+/// 返回是否真的删除了一条录制（id 不存在时为 false，视为 noop）。
+fn delete_recording_conn(conn: &rusqlite::Connection, id: &str) -> Result<bool, String> {
     // Collect screenshot paths before deleting rows
     let mut stmt = conn
         .prepare("SELECT screenshot_path, after_screenshot_path FROM steps WHERE recording_id = ?1")
@@ -169,8 +168,9 @@ pub fn delete_recording(db: State<DbState>, id: String) -> Result<(), String> {
     conn.execute("DELETE FROM steps WHERE recording_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
 
-    // Delete recording
-    conn.execute("DELETE FROM recordings WHERE id = ?1", params![id])
+    // Delete recording（记录是否真的删除了行：id 不存在 = noop）
+    let deleted = conn
+        .execute("DELETE FROM recordings WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
 
     // Delete screenshot files from disk
@@ -180,7 +180,28 @@ pub fn delete_recording(db: State<DbState>, id: String) -> Result<(), String> {
         }
     }
 
+    Ok(deleted > 0)
+}
+
+#[tauri::command]
+pub fn delete_recording(db: State<DbState>, id: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    delete_recording_conn(&conn, &id)?;
     Ok(())
+}
+
+/// ★ 批量删除录制：逐条复用单条删除逻辑（收集截图路径 → 删 steps → 删 recordings → 删截图文件）。
+/// 返回实际删除的条数；不存在的 id 静默跳过（幂等），任何一条失败即整体报错。
+#[tauri::command]
+pub fn delete_recordings(db: State<DbState>, ids: Vec<String>) -> Result<u32, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut deleted: u32 = 0;
+    for id in &ids {
+        if delete_recording_conn(&conn, id)? {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -421,6 +442,67 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM recordings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn delete_recordings_conn_batch_removes_multiple_and_skips_unknown() {
+        let conn = mem_db();
+        for id in ["b1", "b2", "b3"] {
+            crate::db::save_recording_to_db(&conn, &recording(id, 2)).unwrap();
+        }
+
+        // 批量删除 2 条存在的 + 1 条不存在的（幂等跳过）
+        let mut deleted = 0;
+        for id in ["b1", "b2", "ghost"] {
+            if delete_recording_conn(&conn, id).unwrap() {
+                deleted += 1;
+            }
+        }
+        assert_eq!(deleted, 2);
+
+        let remain: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM recordings ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        assert_eq!(remain, vec!["b3".to_string()]);
+
+        // 步骤级联清理：b1/b2 的 steps 必须为 0，b3 的保留
+        let orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steps WHERE recording_id IN ('b1','b2')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan, 0);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steps WHERE recording_id = 'b3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 2);
+    }
+
+    #[test]
+    fn delete_recordings_conn_empty_ids_is_noop() {
+        let conn = mem_db();
+        crate::db::save_recording_to_db(&conn, &recording("keep", 1)).unwrap();
+        // 空列表：不触发任何删除
+        let ids: Vec<String> = vec![];
+        let mut deleted = 0;
+        for id in &ids {
+            if delete_recording_conn(&conn, id).unwrap() {
+                deleted += 1;
+            }
+        }
+        assert_eq!(deleted, 0);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recordings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     // ---------- update_recording_app_name ----------

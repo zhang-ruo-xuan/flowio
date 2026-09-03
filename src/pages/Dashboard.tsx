@@ -83,6 +83,8 @@ export default function Dashboard({
     });
   };
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  // ★ 批量删除：选中 id 集合（跨页保留，删除后清空）
+  const [selected, setSelected] = useState<string[]>([]);
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -171,6 +173,32 @@ export default function Dashboard({
     }
   };
 
+  // ★ 批量删除：确认后一次性调用 delete_recordings（Rust 端逐条复用单删逻辑）
+  const handleBatchDelete = async () => {
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    const confirmed = await confirm(`确定要删除选中的 ${ids.length} 条录制吗？此操作不可恢复。`, {
+      kind: 'warning',
+      title: '批量删除',
+      cancelLabel: '取消',
+      okLabel: `删除 ${ids.length} 条`,
+    });
+    if (!confirmed) return;
+    try {
+      const n = await invoke<number>('delete_recordings', { ids });
+      setRecordings((prev) => prev.filter((r) => !ids.includes(r.id)));
+      setSelected([]);
+      setToast({ type: 'success', message: `已删除 ${n} 条录制` });
+    } catch (err) {
+      console.error('Batch delete failed:', err);
+      setToast({ type: 'error', message: '批量删除失败: ' + String(err) });
+    }
+  };
+
+  const toggleSelected = (id: string) => {
+    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
   const handleRename = async () => {
     if (!renamingId || !renameDraft.trim()) {
       setRenamingId(null);
@@ -227,6 +255,17 @@ export default function Dashboard({
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const paged = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  // ★ 全选/反选当前页（跨页选择保留；放在 paged 定义之后避免 TDZ）
+  const pagedIds = paged.map((r) => r.id);
+  const allPageSelected = pagedIds.length > 0 && pagedIds.every((id) => selected.includes(id));
+  const toggleSelectPage = () => {
+    setSelected((prev) =>
+      allPageSelected
+        ? prev.filter((id) => !pagedIds.includes(id))
+        : [...new Set([...prev, ...pagedIds])]
+    );
+  };
 
   // 删除录制 / 搜索后总页数可能少于当前页：自动回弹到合法页码
   useEffect(() => {
@@ -312,6 +351,19 @@ export default function Dashboard({
           <span className="dashboard-table-count">
             共 {filtered.length} 条记录
           </span>
+          {/* ★ 批量操作栏：有选中项时显示 */}
+          {selected.length > 0 && (
+            <div className="dash-batchbar">
+              <span className="dash-batchbar-count">已选 {selected.length} 条</span>
+              <button className="dash-batchbar-btn dash-batchbar-del" onClick={() => void handleBatchDelete()}>
+                <Trash2 size={13} />
+                批量删除
+              </button>
+              <button className="dash-batchbar-btn" onClick={() => setSelected([])}>
+                取消选择
+              </button>
+            </div>
+          )}
         </div>
 
         {paged.length === 0 ? (
@@ -364,6 +416,15 @@ export default function Dashboard({
               <table className="table">
                 <thead>
                   <tr>
+                    <th style={{ width: 36 }}>
+                      <input
+                        type="checkbox"
+                        className="dash-check"
+                        checked={allPageSelected}
+                        onChange={toggleSelectPage}
+                        title="全选本页"
+                      />
+                    </th>
                     <th>标题</th>
                     <th style={{ width: 120 }}>应用</th>
                     <th style={{ width: 100 }}>状态</th>
@@ -377,7 +438,16 @@ export default function Dashboard({
                       key={r.id}
                       onClick={() => onEdit(r.id)}
                       style={{ cursor: "pointer" }}
+                      className={selected.includes(r.id) ? "dash-row-selected" : ""}
                     >
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          className="dash-check"
+                          checked={selected.includes(r.id)}
+                          onChange={() => toggleSelected(r.id)}
+                        />
+                      </td>
                       <td onClick={(e) => renamingId === r.id && e.stopPropagation()}>
                         {renamingId === r.id ? (
                           <input
