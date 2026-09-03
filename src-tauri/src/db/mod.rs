@@ -2,6 +2,8 @@ pub mod commands;
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// 本地未归属录制的账号标识（未登录录制的教程均归属该账号）
 pub const LOCAL_USER: &str = "__local__";
@@ -152,6 +154,17 @@ pub fn init_db(conn: &Connection) {
             is_active     INTEGER NOT NULL DEFAULT 0,
             created_at    TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        -- 步骤精简（自动合并 / AI 精简）前的全量快照，用于「撤销」。
+        -- 每个录制只保留最近 3 条（写入时清理更旧的）。
+        CREATE TABLE IF NOT EXISTS step_snapshots (
+            id           TEXT PRIMARY KEY,
+            recording_id TEXT NOT NULL,
+            kind         TEXT NOT NULL DEFAULT 'merge',
+            payload      TEXT NOT NULL,
+            step_count   INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )
     .expect("Failed to create database tables");
@@ -198,11 +211,66 @@ pub fn init_db(conn: &Connection) {
     let _ = conn.execute_batch(
         "ALTER TABLE recordings ADD COLUMN target_app TEXT",
     );
+
+    // ── Migrations: 教程译文副本（JSON，按语言存储；NULL = 从未翻译过）──
+    let _ = conn.execute_batch(
+        "ALTER TABLE recordings ADD COLUMN translations TEXT",
+    );
+}
+
+/// 读取译文本来的 JSON 字符串（旧库/未翻译 → None；必须 Option 读，NULL 安全）。
+pub fn get_recording_translations_raw(
+    conn: &Connection,
+    recording_id: &str,
+) -> Result<Option<String>, String> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT translations FROM recordings WHERE id = ?1",
+            params![recording_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("read translations failed: {}", e))?;
+    Ok(json.filter(|s| !s.is_empty()))
+}
+
+/// 写入译文副本 JSON（整体覆盖；同时刷新 updated_at）。
+pub fn set_recording_translations_raw(
+    conn: &Connection,
+    recording_id: &str,
+    json: &str,
+) -> Result<(), String> {
+    let n = conn
+        .execute(
+            "UPDATE recordings SET translations = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![json, recording_id],
+        )
+        .map_err(|e| format!("write translations failed: {}", e))?;
+    if n == 0 {
+        return Err(format!("recording {} not found", recording_id));
+    }
+    Ok(())
+}
+
+/// 后台线程专用 DB 绝对路径（由 setup 阶段注入）。
+///
+/// 🔴 历史坑（2026-09-03）：`init_db_file()` 曾用相对路径 `"flowio.db"`，
+/// 从桌面快捷方式启动时 cwd = 桌面 → 语音转写/后台翻译线程在桌面另开一个
+/// 空库，步骤读到 0 条（「本次录制没有步骤」）、翻译结果写丢。
+/// 主连接用 `app_data_dir/flowio.db` 绝对路径，这里必须保持一致。
+static DB_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// 注入后台线程使用的 DB 绝对路径（lib.rs setup 阶段调用一次）。
+pub fn set_db_path(path: PathBuf) {
+    let _ = DB_PATH_OVERRIDE.set(path);
 }
 
 /// Open (or create) the database file and run migrations.
 pub fn init_db_file() -> Connection {
-    let conn = Connection::open("flowio.db").expect("Failed to open database");
+    let conn = match DB_PATH_OVERRIDE.get() {
+        Some(p) => Connection::open(p),
+        None => Connection::open("flowio.db"), // 兜底：未注入时保持旧行为（仅测试场景）
+    }
+    .expect("Failed to open database");
     init_db(&conn);
     conn
 }

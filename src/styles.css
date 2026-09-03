@@ -187,6 +187,24 @@ a:hover {
   background: #dc2626;
 }
 
+/* ── 语音输入开关（titlebar）────────────────────────────────── */
+.titlebar-btn-voice {
+  background: transparent;
+  border: 1px solid var(--border, #444);
+  color: #9aa4b2;
+}
+.titlebar-btn-voice:hover {
+  border-color: #ff6b35;
+  color: #ff8a5c;
+}
+.titlebar-btn-voice.on {
+  border-color: #ff6b35;
+  color: #ff8a5c;
+}
+.titlebar-btn-voice.on:hover {
+  color: #ffa07c;
+}
+
 .titlebar-btn-login {
   display: inline-flex;
   align-items: center;
@@ -3226,4 +3244,98 @@ select {
 .annotation-text-popover-cancel:hover {
   background: rgba(255, 255, 255, 0.08);
   color: #fff;
+}
+
+/* ===== ★ 批量删除（Dashboard 多选） ===== */
+.dash-check {
+  width: 15px;
+  height: 15px;
+  accent-color: #ff6b35;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.dash-row-selected td {
+  background: rgba(255, 107, 53, 0.05);
+}
+.dash-batchbar {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dash-batchbar-count {
+  font-size: 12px;
+  color: #c2410c;
+  font-weight: 500;
+}
+.dash-batchbar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid #e5e7eb;
+  background: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  color: #374151;
+}
+.dash-batchbar-btn:hover {
+  border-color: #ff6b35;
+  color: #ff6b35;
+}
+.dash-batchbar-del {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #dc2626;
+}
+.dash-batchbar-del:hover {
+  background: #dc2626;
+  border-color: #dc2626;
+  color: #fff;
+}
+
+/* ── 步骤精简（自动合并 / AI 精简 / 撤销），2026-09-03 ──
+   替代此前的手动多选合并：用户明确要求「不要手动选，录完自动就是干净的」。 */
+.step-simplify-bar {
+  margin: 0 16px 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.step-simplify-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-secondary, #6b7280);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.step-simplify-btn:hover:not(:disabled) {
+  border-color: #ff6b35;
+  color: #ff6b35;
+}
+.step-simplify-btn.primary {
+  border-color: rgba(255, 107, 53, 0.5);
+  background: rgba(255, 107, 53, 0.08);
+  color: #ff6b35;
+}
+.step-simplify-btn.primary:hover:not(:disabled) {
+  background: #ff6b35;
+  color: #fff;
+}
+.step-simplify-btn.ghost {
+  margin-left: auto;
+  border-style: dashed;
+}
+.step-simplify-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }

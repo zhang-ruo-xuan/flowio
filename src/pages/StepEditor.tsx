@@ -22,6 +22,10 @@ import {
   ScanSearch,
   Wrench,
   Upload,
+  Languages,
+  PencilLine,
+  Wand2,
+  Undo2,
 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -48,6 +52,23 @@ interface RecordingWithSteps {
   recording: Recording;
   steps: Step[];
 }
+
+/* ── Translation types（与 Rust 端 translations JSON 结构对应）── */
+
+interface TranslatedGuide {
+  title: string;
+  steps: Record<string, { title: string; description: string }>;
+}
+/** key = 语言代码（en/ja/ko/es），见 Rust 端 TARGET_LANGS */
+type TranslationsMap = Record<string, TranslatedGuide>;
+
+/** 语言代码 → 显示名（与 Rust 端 TARGET_LANGS 保持一致） */
+const LANG_LABELS: Record<string, string> = {
+  en: "English",
+  ja: "日本語",
+  ko: "한국어",
+  es: "Español",
+};
 
 /* ── Publish form constants ───────────────────────────────── */
 
@@ -316,6 +337,29 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const [aiGenerating, setAiGenerating] = useState(false);
   const [domainMode, setDomainMode] = useState<"auto" | "spreadsheet" | "browser" | "code" | "terminal">("auto");
 
+  /* Translation state（译文副本：不覆盖原文，预览/导出可切语言，PRD T1-T9） */
+  const [translations, setTranslations] = useState<TranslationsMap>({});
+  const [translating, setTranslating] = useState(false);
+  const [translateModalOpen, setTranslateModalOpen] = useState(false);
+  // ★ T8 译文可编辑：编辑弹窗状态（语言 + 草稿）
+  const [editTransOpen, setEditTransOpen] = useState(false);
+  const [editTransLang, setEditTransLang] = useState<string>("en");
+  const [editDraftTitle, setEditDraftTitle] = useState("");
+  const [editDraftSteps, setEditDraftSteps] = useState<{ i: number; title: string; description: string }[]>([]);
+  const [savingTranslation, setSavingTranslation] = useState(false);
+  const [translateLang, setTranslateLang] = useState<string>("en");
+  /* 导出语言：null = 原文 */
+  const [exportLang, setExportLang] = useState<string | null>(null);
+
+  const loadTranslations = useCallback(async () => {
+    try {
+      const t = await invoke<TranslationsMap | null>("get_recording_translations", { recordingId });
+      setTranslations(t ?? {});
+    } catch {
+      /* 译文加载失败不阻塞编辑器，保持 {} 即可 */
+    }
+  }, [recordingId]);
+
   // 未登录 + 录制完成后自动弹出「保存到云端」登录引导弹窗（LoginSaveModal）
   const [showLoginSaveModal, setShowLoginSaveModal] = useState(false);
   useEffect(() => {
@@ -405,8 +449,101 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     return () => clearTimeout(timer);
   }, [toast]);
 
+  /* ── translate://done（翻译完成 → 刷新译文副本，PRD T4）── */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen<{ recordingId: string; lang: string; ok: boolean; summary: string }>(
+      "translate://done",
+      (ev) => {
+        if (ev.payload.recordingId !== recordingId) return;
+        setTranslating(false);
+        if (ev.payload.ok) {
+          loadTranslations();
+          setToast({ type: "success", message: `已生成${LANG_LABELS[ev.payload.lang] || ev.payload.lang}译文，可在预览/导出中切换语言` });
+        } else {
+          setToast({ type: "error", message: "翻译失败: " + (ev.payload.summary || "未知错误") });
+        }
+      }
+    ).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [recordingId, loadTranslations]);
+
+  /* ── 翻译（PRD T2/T3）：只翻标题+步骤描述，存译文副本不覆盖原文 ── */
+  const handleTranslate = useCallback(
+    async (lang: string) => {
+      setTranslateModalOpen(false);
+      if (steps.length === 0) {
+        setToast({ type: "error", message: "没有可翻译的步骤" });
+        return;
+      }
+      setTranslating(true);
+      try {
+        await invoke("translate_recording", { recordingId, lang });
+        // 完成后由 translate://done 事件收尾（toast + 刷新译文）
+      } catch (err) {
+        setTranslating(false);
+        setToast({ type: "error", message: "翻译失败: " + String(err) });
+      }
+    },
+    [recordingId, steps.length]
+  );
+
+  /* ── ★ T8 译文可编辑：打开编辑弹窗（按当前步骤顺序构建草稿，缺失字段回退原文） ── */
+  const transLangs = Object.keys(translations);
+  const openEditTrans = useCallback((lang: string) => {
+    const t = translations[lang];
+    setEditTransLang(lang);
+    setEditDraftTitle(t?.title ?? "");
+    setEditDraftSteps(
+      steps.map((s, idx) => {
+        const st = t?.steps?.[String(s.order_index ?? idx)];
+        return {
+          i: s.order_index ?? idx,
+          title: st?.title ?? s.title ?? "",
+          description: st?.description ?? s.description ?? "",
+        };
+      })
+    );
+    setEditTransOpen(true);
+  }, [translations, steps]);
+
+  const handleSaveTranslation = useCallback(async () => {
+    if (!recordingId || savingTranslation) return;
+    setSavingTranslation(true);
+    try {
+      const stepsMap: Record<string, { title: string; description: string }> = {};
+      for (const s of editDraftSteps) {
+        stepsMap[String(s.i)] = { title: s.title, description: s.description };
+      }
+      const next: TranslationsMap = {
+        ...translations,
+        [editTransLang]: { title: editDraftTitle, steps: stepsMap },
+      };
+      await invoke("save_recording_translations", { recordingId, translations: next });
+      setTranslations(next);
+      setEditTransOpen(false);
+      setToast({ type: "success", message: `已保存${LANG_LABELS[editTransLang] || editTransLang}译文` });
+    } catch (err) {
+      setToast({ type: "error", message: "保存译文失败: " + String(err) });
+    } finally {
+      setSavingTranslation(false);
+    }
+  }, [recordingId, translations, editTransLang, editDraftTitle, editDraftSteps, savingTranslation]);
+
   /* Preview mode */
   const [previewMode, setPreviewMode] = useState(false);
+  /* ── 步骤精简：自动合并（规则）/ AI 精简 / 撤销 ── */
+  const [simplifying, setSimplifying] = useState<null | "rules" | "ai" | "undo">(null);
+  const [canUndo, setCanUndo] = useState(false);
+  // handleAutoMerge / handleAiSimplify / handleUndoMerge 定义在 reloadRecording
+  // 之后（它们的 deps 引用 reloadRecording，放在这里会 TDZ 崩溃）
 
   /* Delete target for overlay */
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
@@ -479,7 +616,132 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     if (data.steps.length > 0 && !data.steps.find((s) => s.id === selectedStepId)) {
       setSelectedStepId(data.steps[0].id);
     }
+    return data.steps;
   }, [recordingId, selectedStepId]);
+
+  /**
+   * 重建裁图缓存。
+   *
+   * 🔴 精简/撤销后**必须**调用：合并会把末步的主图写到承载步上，但 step.id 不变，
+   * 缓存里的还是合并前那张旧图 → 界面会显示「张冠李戴」的截图。
+   * 与首次加载共用同一套预生成逻辑（先算完再一次提交，避免逐帧跳变）。
+   */
+  const rebuildCropCache = useCallback(async (list: Step[]) => {
+    const cache: Record<string, string> = {};
+    await Promise.all(
+      list
+        .filter((s) => s.screenshot_base64)
+        .map(async (s) => {
+          try {
+            cache[s.id] = await cropAdaptiveBase64(
+              s.screenshot_base64 as string,
+              s.x, s.y, s.crop_w, s.crop_h, s.action_type,
+            );
+          } catch {
+            cache[s.id] = "";
+          }
+        }),
+    );
+    setCropCache(cache);
+  }, []);
+
+  /* ── voice://done（语音转写完成 → 刷新步骤显示【语音】内容，PRD V8）── */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen<{
+      recordingId: string;
+      transcribed: number;
+      failed: number;
+      ok: boolean;
+      summary: string;
+    }>("voice://done", (ev) => {
+      if (ev.payload.recordingId !== recordingId) return;
+      if (ev.payload.ok && ev.payload.transcribed > 0) {
+        reloadRecording().catch(() => {});
+        setToast({ type: "success", message: `语音转写完成：${ev.payload.summary}` });
+      } else {
+        setToast({ type: "error", message: `语音转写失败：${ev.payload.summary || "无可识别语音"}` });
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [recordingId, reloadRecording, rebuildCropCache]);
+
+  /* ── ★ 步骤自动精简（规则层 / AI 层 / 撤销），定义在 reloadRecording 之后避免 deps TDZ ── */
+  const handleAutoMerge = useCallback(async () => {
+    if (!recordingId) return;
+    setSimplifying("rules");
+    try {
+      const r = await invoke<{ before: number; after: number; reduced: number }>(
+        "auto_merge_steps",
+        { recordingId }
+      );
+      const list = await reloadRecording();
+      await rebuildCropCache(list);
+      setCanUndo(true);
+      setToast({
+        type: "success",
+        message:
+          r.reduced > 0
+            ? `已自动合并：${r.before} 步 → ${r.after} 步（省 ${r.reduced} 步）`
+            : "没有检测到可合并的冗余步骤",
+      });
+    } catch (err) {
+      setToast({ type: "error", message: "自动合并失败: " + String(err) });
+    } finally {
+      setSimplifying(null);
+    }
+  }, [recordingId, reloadRecording, rebuildCropCache]);
+
+  const handleAiSimplify = useCallback(async () => {
+    if (!recordingId) return;
+    setSimplifying("ai");
+    try {
+      const r = await invoke<{
+        before: number; after: number; reduced: number; kind: string;
+      }>("simplify_steps_ai", { recordingId });
+      const list = await reloadRecording();
+      await rebuildCropCache(list);
+      setCanUndo(true);
+      setToast({
+        type: "success",
+        // kind 为 "rules" 表示 AI 那一层没生效（剩余步骤太少，不值得再调一次），
+        // 但规则层已经先跑过了，用户仍然拿到收益 —— 必须说清楚，别让人以为没反应。
+        message:
+          r.reduced > 0
+            ? r.kind === "ai"
+              ? `AI 精简完成：${r.before} 步 → ${r.after} 步（省 ${r.reduced} 步）`
+              : `已自动合并：${r.before} 步 → ${r.after} 步（AI 判断无需再合并）`
+            : "没有检测到可合并的冗余步骤",
+      });
+    } catch (err) {
+      setToast({ type: "error", message: "AI 精简失败: " + String(err) });
+    } finally {
+      setSimplifying(null);
+    }
+  }, [recordingId, reloadRecording, rebuildCropCache]);
+
+  const handleUndoMerge = useCallback(async () => {
+    if (!recordingId) return;
+    setSimplifying("undo");
+    try {
+      const n = await invoke<number>("undo_last_merge", { recordingId });
+      const list = await reloadRecording();
+      await rebuildCropCache(list);
+      setCanUndo(false);
+      setToast({ type: "success", message: `已撤销，恢复到 ${n} 个步骤` });
+    } catch (err) {
+      setToast({ type: "error", message: "撤销失败: " + String(err) });
+    } finally {
+      setSimplifying(null);
+    }
+  }, [recordingId, reloadRecording, rebuildCropCache]);
 
   useEffect(() => {
     let cancelled = false;
@@ -522,6 +784,14 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         // 此处不再重复 setState（否则新对象引用触发重渲染会破坏首屏一致性）。
         // 只需标记恢复完成以允许后续持久化写入。
         viewLoadedRef.current = true;
+
+        // 译文副本（翻译功能 T1）：并行加载，失败不阻塞编辑器
+        loadTranslations();
+
+        // 是否有可撤销的精简记录（决定「撤销」按钮显隐）
+        invoke<boolean>("can_undo_merge", { recordingId })
+          .then((v) => { if (!cancelled) setCanUndo(v); })
+          .catch(() => { if (!cancelled) setCanUndo(false); });
       } catch (err) {
         if (!cancelled) setError(String(err));
       } finally {
@@ -923,6 +1193,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           format,
           outputPath: savedPath,
           cropStepIds: Object.keys(stepViewCropped).filter(id => stepViewCropped[id]),
+          // 导出语言（PRD T9）：null = 原文，否则用对应语言的译文副本覆盖标题/描述
+          lang: exportLang ?? undefined,
         });
         setToast({ type: "success", message: `导出成功: ${path}` });
       } catch (err) {
@@ -933,7 +1205,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         unlisten();
       }
     },
-    [recordingId, showSaveDialog]
+    [recordingId, showSaveDialog, exportLang, stepViewCropped]
   );
 
   /* ── Publish to website ──────────────────────────────────── */
@@ -991,6 +1263,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         status: targetStatus,
         downloadable: pubDownloadable,
         steps,
+        // ★ T7 多语言上传：已有译文副本时随教程一起上传到网站
+        translations: Object.keys(translations).length > 0 ? translations : undefined,
       };
       if (pubCoverBase64) uploadData.cover_base64 = pubCoverBase64;
 
@@ -1038,7 +1312,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     } finally {
       setPublishing(false);
     }
-  }, [siteToken, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSceneSelect]);
+  }, [siteToken, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSceneSelect, translations]);
 
   /* ── 隐私脱敏 ────────────────────────────────────────────── */
 
@@ -1048,13 +1322,14 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     try {
       const changed = await invoke<number>("redact_recording_text", { recordingId });
       setToast({ type: "success", message: changed > 0 ? "文本脱敏完成" : "未检测到敏感信息" });
-      await reloadRecording();
+      const list = await reloadRecording();
+      await rebuildCropCache(list);
     } catch (err) {
       setToast({ type: "error", message: "隐私脱敏失败: " + String(err) });
     } finally {
       setRedacting(false);
     }
-  }, [recordingId, reloadRecording]);
+  }, [recordingId, reloadRecording, rebuildCropCache]);
 
   // 扫描全部截图中的敏感文字区域并自动脱敏（OCR）
   const showScanToast = useCallback((toast: { type: "success" | "error"; message: string }) => {
@@ -1106,7 +1381,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         } else {
           showScanToast({ type: "success", message: "扫描脱敏完成" });
         }
-        await reloadRecording();
+        const list = await reloadRecording();
+        await rebuildCropCache(list);
       } finally {
         unlisten();
         unlistenDone();
@@ -1117,7 +1393,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       setScanRedacting(false);
       setScanProgress({ done: 0, total: 0, currentStepId: "" });
     }
-  }, [recordingId, reloadRecording, steps.length, showScanToast]);
+  }, [recordingId, reloadRecording, rebuildCropCache, steps.length, showScanToast]);
 
   const handleCancelScanRedact = useCallback(async () => {
     try {
@@ -1144,7 +1420,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         domainMode: domainMode === "auto" ? null : domainMode,
       });
       alert(result);
-      await reloadRecording();
+      const list = await reloadRecording();
+      await rebuildCropCache(list);
     } catch (err) {
       const msg = String(err);
       if (msg.includes("AI 配置") || msg.includes("配置 AI 服务商")) {
@@ -1163,7 +1440,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     } finally {
       setAiGenerating(false);
     }
-  }, [recordingId, reloadRecording]);
+  }, [recordingId, reloadRecording, rebuildCropCache]);
 
   /* ── Lightbox helpers ────────────────────────────────────── */
 
@@ -1303,6 +1580,31 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         </button>
         {exportOpen && (
           <div className="export-dropdown" style={{ right: 0 }}>
+            {/* 导出语言（PRD T9）：原文 + 已生成译文的语言 */}
+            {Object.keys(translations).length > 0 && (
+              <div style={{ padding: "6px 10px", borderBottom: "1px solid #30363d" }}>
+                <div style={{ fontSize: 11, color: "#8b949e", marginBottom: 4 }}>导出语言</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                  <button
+                    className={`export-dropdown-item${exportLang === null ? " active" : ""}`}
+                    onClick={() => setExportLang(null)}
+                    style={{ padding: "3px 8px", fontSize: 12 }}
+                  >
+                    原文
+                  </button>
+                  {Object.keys(translations).map((lang) => (
+                    <button
+                      key={lang}
+                      className={`export-dropdown-item${exportLang === lang ? " active" : ""}`}
+                      onClick={() => setExportLang(lang)}
+                      style={{ padding: "3px 8px", fontSize: 12 }}
+                    >
+                      {LANG_LABELS[lang] || lang}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             {EXPORT_FORMATS.map((fmt) => {
               const Icon = fmt.icon;
               return (
@@ -1401,6 +1703,25 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               </button>
               <button
                 className="export-dropdown-item"
+                onClick={() => { setToolsOpen(false); setTranslateModalOpen(true); }}
+                disabled={translating}
+              >
+                {translating ? <Loader2 size={14} className="spinner" /> : <Languages size={14} className="export-dropdown-item-icon" />}
+                <span className="export-dropdown-item-label">{translating ? "翻译中..." : "翻译教程"}</span>
+              </button>
+              {/* ★ T8 译文可编辑：编辑已有译文副本 */}
+              <button
+                className="export-dropdown-item"
+                onClick={() => { setToolsOpen(false); openEditTrans(transLangs[0] || "en"); }}
+                disabled={transLangs.length === 0 || steps.length === 0}
+                style={{ opacity: transLangs.length === 0 ? 0.5 : 1 }}
+                title={transLangs.length === 0 ? "尚无译文，请先翻译" : "编辑已有译文"}
+              >
+                <PencilLine size={14} className="export-dropdown-item-icon" />
+                <span className="export-dropdown-item-label">编辑译文</span>
+              </button>
+              <button
+                className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleScanRedact(); }}
                 disabled={scanRedacting || steps.length === 0}
                 style={{ opacity: steps.length === 0 ? 0.5 : 1 }}
@@ -1435,6 +1756,18 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   );
 
   /* ── Render ──────────────────────────────────────────────── */
+
+  /* 预览模式取文案（PRD T6/T8）：exportLang 有译文时用译文，缺步骤回退原文 */
+  const previewStepText = (step: Step): { title: string; description: string } => {
+    if (exportLang && translations[exportLang]) {
+      const t = translations[exportLang].steps[String(step.order_index)];
+      return {
+        title: t?.title || step.title,
+        description: t?.description || step.description || "",
+      };
+    }
+    return { title: step.title, description: step.description || "" };
+  };
 
   return (
     <div className="editor-layout">
@@ -1517,11 +1850,171 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         </div>
       )}
 
+      {/* 翻译确认弹窗（PRD T3）：选语言 + 提示译文副本不覆盖原文 */}
+      {translateModalOpen && (
+        <div
+          style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
+          onMouseDown={() => setTranslateModalOpen(false)}
+        >
+          <div
+            style={{ background: "#fff", borderRadius: 10, padding: "20px 22px", width: 340, boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div style={{ fontSize: 15, fontWeight: 600, color: "#24292e", display: "flex", alignItems: "center", gap: 6 }}>
+              <Languages size={16} /> 翻译教程
+            </div>
+            <div style={{ fontSize: 12.5, color: "#57606a", marginTop: 8, lineHeight: 1.6 }}>
+              将翻译教程标题和各步骤的文字描述（共 {steps.length} 个步骤）。截图与标注不会被修改，译文以副本保存，原文始终保留。
+            </div>
+            <label style={{ display: "block", margin: "14px 0 4px", fontSize: 13, color: "#57606a" }}>目标语言</label>
+            <select
+              value={translateLang}
+              onChange={(e) => setTranslateLang(e.target.value)}
+              style={{ width: "100%", boxSizing: "border-box", padding: "7px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13 }}
+            >
+              {Object.entries(LANG_LABELS).map(([code, label]) => (
+                <option key={code} value={code}>
+                  {label}{translations[code] ? "（已有译文，将覆盖）" : ""}
+                </option>
+              ))}
+            </select>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+              <button
+                onClick={() => setTranslateModalOpen(false)}
+                style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", cursor: "pointer", fontSize: 13 }}
+              >
+                取消
+              </button>
+              <button
+                onClick={() => handleTranslate(translateLang)}
+                style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: "pointer", fontSize: 13 }}
+              >
+                开始翻译
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ★ T8 译文可编辑弹窗 */}
+      {editTransOpen && (
+        <div
+          style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
+          onMouseDown={() => setEditTransOpen(false)}
+        >
+          <div
+            style={{ background: "#fff", borderRadius: 10, padding: "20px 22px", width: 560, maxHeight: "80vh", overflowY: "auto", boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div style={{ fontSize: 15, fontWeight: 600, color: "#24292e", display: "flex", alignItems: "center", gap: 6 }}>
+              <PencilLine size={16} /> 编辑译文（{LANG_LABELS[editTransLang] || editTransLang}）
+            </div>
+            <div style={{ fontSize: 12.5, color: "#57606a", marginTop: 8, lineHeight: 1.6 }}>
+              直接修改译文文本，保存后覆盖该语言副本。截图与原文不受影响。
+            </div>
+            <label style={{ display: "block", margin: "14px 0 4px", fontSize: 13, color: "#57606a" }}>语言</label>
+            <select
+              value={editTransLang}
+              onChange={(e) => openEditTrans(e.target.value)}
+              style={{ width: "100%", boxSizing: "border-box", padding: "7px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13 }}
+            >
+              {transLangs.map((code) => (
+                <option key={code} value={code}>
+                  {LANG_LABELS[code] || code}
+                </option>
+              ))}
+            </select>
+
+            <label style={{ display: "block", margin: "14px 0 4px", fontSize: 13, color: "#57606a" }}>教程标题</label>
+            <input
+              value={editDraftTitle}
+              onChange={(e) => setEditDraftTitle(e.target.value)}
+              style={{ width: "100%", boxSizing: "border-box", padding: "7px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13 }}
+            />
+
+            {editDraftSteps.map((s, idx) => (
+              <div key={idx} style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid #eaeef2" }}>
+                <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>步骤 {idx + 1}</div>
+                <input
+                  value={s.title}
+                  onChange={(e) =>
+                    setEditDraftSteps((prev) => prev.map((p, i) => (i === idx ? { ...p, title: e.target.value } : p)))
+                  }
+                  placeholder="步骤标题"
+                  style={{ width: "100%", boxSizing: "border-box", padding: "6px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13, marginBottom: 6 }}
+                />
+                <textarea
+                  value={s.description}
+                  onChange={(e) =>
+                    setEditDraftSteps((prev) => prev.map((p, i) => (i === idx ? { ...p, description: e.target.value } : p)))
+                  }
+                  placeholder="步骤描述"
+                  rows={2}
+                  style={{ width: "100%", boxSizing: "border-box", padding: "6px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13, resize: "vertical" }}
+                />
+              </div>
+            ))}
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+              <button
+                onClick={() => setEditTransOpen(false)}
+                style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", cursor: "pointer", fontSize: 13 }}
+              >
+                取消
+              </button>
+              <button
+                onClick={() => void handleSaveTranslation()}
+                disabled={savingTranslation}
+                style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: savingTranslation ? "default" : "pointer", fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}
+              >
+                {savingTranslation && <Loader2 size={13} className="spinner" />}
+                {savingTranslation ? "保存中..." : "保存译文"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Left: Step List */}
       <div className="editor-sidebar">
-        <div className="text-sm text-secondary mb-2" style={{ padding: "0 16px" }}>
-          {steps.length} 个步骤
+        <div className="text-sm text-secondary mb-2" style={{ padding: "0 16px", display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ marginRight: "auto" }}>{steps.length} 个步骤</span>
         </div>
+
+        {/* 步骤精简：自动合并（规则）/ AI 精简 / 撤销 */}
+        {!previewMode && steps.length > 0 && (
+          <div className="step-simplify-bar">
+            <button
+              className="step-simplify-btn"
+              title="自动合并重复点击、连续输入、点击后紧接着的输入，并删掉最后点「停止录制」那一步"
+              disabled={simplifying !== null}
+              onClick={() => void handleAutoMerge()}
+            >
+              {simplifying === "rules" ? <Loader2 size={12} className="spinner" /> : <Wand2 size={12} />}
+              {simplifying === "rules" ? "合并中…" : "自动合并"}
+            </button>
+            <button
+              className="step-simplify-btn primary"
+              title="交给 AI 判断哪些相邻步骤该合成一步（能压下弹框里那一串点击）。会先自动跑一遍规则合并再交 AI，通常需要几秒到十几秒；即使 AI 不可用，也仍会得到规则层的合并结果"
+              disabled={simplifying !== null}
+              onClick={() => void handleAiSimplify()}
+            >
+              {simplifying === "ai" ? <Loader2 size={12} className="spinner" /> : <Sparkles size={12} />}
+              {simplifying === "ai" ? "AI 精简中…" : "AI 精简"}
+            </button>
+            {canUndo && (
+              <button
+                className="step-simplify-btn ghost"
+                title="撤销最近一次精简，恢复精简前的全部步骤"
+                disabled={simplifying !== null}
+                onClick={() => void handleUndoMerge()}
+              >
+                {simplifying === "undo" ? <Loader2 size={12} className="spinner" /> : <Undo2 size={12} />}
+                {simplifying === "undo" ? "撤销中…" : "撤销"}
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Step list */}
         <div className="step-list">
@@ -1636,7 +2129,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                     <div className="sop-preview-step-header">
                       <span className="sop-preview-step-num"><span className="step-num-circle">{idx + 1}</span>步骤</span>
                     </div>
-                    <h3 className="sop-preview-step-title">{step.title || "(无标题)"}</h3>
+                    <h3 className="sop-preview-step-title">{previewStepText(step).title || "(无标题)"}</h3>
 
                     {/* Screenshot */}
                     {(() => {
@@ -1653,8 +2146,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                     })()}
 
                     {/* Description */}
-                    {step.description && (
-                      <div className="sop-preview-desc">{step.description}</div>
+                    {previewStepText(step).description && (
+                      <div className="sop-preview-desc">{previewStepText(step).description}</div>
                     )}
 
                     {/* Tip */}

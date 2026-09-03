@@ -8,6 +8,7 @@ mod export;
 mod file_browser;
 mod redaction;
 mod hotkey;
+mod voice;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -118,12 +119,16 @@ pub fn run() {
             let app_data_dir = app.path().app_data_dir().expect("failed to get app data dir");
             std::fs::create_dir_all(&app_data_dir).ok();
             let db_path = app_data_dir.join("flowio.db");
+            // 后台线程（语音转写/翻译）也必须用同一个绝对路径，
+            // 否则相对路径会在 cwd 另开空库（历史 bug：语音「没有步骤」）
+            db::set_db_path(db_path.clone());
             let conn = Connection::open(db_path).expect("Failed to open database");
             db::init_db(&conn);
             settings::commands::refresh_auto_redact_policy(&conn);
             app.manage(DbState(Mutex::new(conn)));
             app.manage(RecordingManager(Mutex::new(HashMap::new())));
             app.manage(PendingDeepLink(Mutex::new(None)));
+            app.manage(voice::commands::VoiceCaptureState(Default::default()));
 
             // 扩展 → 桌面端 选区上报通道：浏览器扩展在页面内读到精确 selection
             // 矩形后 POST 到本机回环端口，COPY 步骤裁图优先用它（L0）。
@@ -159,6 +164,7 @@ pub fn run() {
             db::commands::set_current_user,
             db::commands::claim_recording,
             db::commands::delete_recording,
+            db::commands::delete_recordings,
             db::commands::save_recording,
             db::commands::update_recording_app_name,
             recorder::commands::start_recording,
@@ -188,6 +194,11 @@ pub fn run() {
             editor::commands::update_step_crop,
             editor::commands::delete_step,
             editor::commands::reorder_steps,
+            editor::commands::merge_steps,
+            editor::commands::auto_merge_steps,
+            editor::commands::simplify_steps_ai,
+            editor::commands::undo_last_merge,
+            editor::commands::can_undo_merge,
             editor::commands::add_step,
             editor::commands::update_recording_title,
             editor::commands::crop_step_screenshot,
@@ -200,6 +211,13 @@ pub fn run() {
             redaction::commands::redact_step_screenshot,
             redaction::commands::scan_redact_screenshots,
             redaction::commands::cancel_scan_redact,
+            voice::commands::voice_begin,
+            voice::commands::voice_append,
+            voice::commands::voice_finish,
+            voice::commands::voice_cancel,
+            ai::translate::translate_recording,
+            ai::translate::get_recording_translations,
+            ai::translate::save_recording_translations,
             file_browser::list_directory,
             file_browser::get_drives,
             file_browser::get_known_folders,

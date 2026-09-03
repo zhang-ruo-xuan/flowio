@@ -127,6 +127,10 @@ fn build_typed_step(
 /// - Capture fullscreen → save as both before_screenshot and screenshot (no annotation, no crop).
 /// - Text priority: uia_text (captured while focus was on input) → get_focused_element_text() → keystroke buffer.
 /// - 密码字段（UIA IsPassword）：明文不入录，描述统一替换为 `[密码已隐藏]`，步骤标记 is_sensitive。
+///
+/// P1 降噪（`allow_merge`）：仅 idle 停顿触发的 flush 允许把新一轮输入并进
+/// 上一步（同一窗口同一输入框因停顿 >1.5s 被拆成多步的历史问题）。
+/// 点击 / 快捷键 / 导航键 / 切窗触发的 flush 一律 `allow_merge=false`。
 fn flush_key_step(
     typed: &str,
     window_title: Option<String>,
@@ -135,6 +139,7 @@ fn flush_key_step(
     before_path: Option<String>,
     ring: &FrameRing,
     key_ts: Instant,
+    allow_merge: bool,
 ) {
     if typed.is_empty() {
         return;
@@ -191,6 +196,11 @@ fn flush_key_step(
             typed,
         )
     };
+    // P1 降噪：本轮描述是否来自 UIA（读到的是整个输入框的最终内容，
+    // 合并时可直接覆盖旧描述；否则只能按按键流拼接）
+    let desc_from_uia = !sensitive
+        && (uia_text.as_ref().map(|(t, _)| !t.is_empty()).unwrap_or(false)
+            || current_uia.as_ref().map(|t| !t.is_empty()).unwrap_or(false));
 
     let now_ms = current_time_millis();
 
@@ -237,8 +247,22 @@ fn flush_key_step(
     );
 
     if let Ok(mut steps) = captured.lock() {
-        // B5: 200 步上限（spec.md:160）；超出后停止累积，避免内存与导出体积失控
-        if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
+        // P1 降噪：连续输入合并 —— idle 停顿把同一次输入拆成多步时并回上一步
+        let can_merge = allow_merge
+            && steps
+                .last()
+                .map(|prev| should_merge_type_steps(prev, &step.window_title, step.is_sensitive))
+                .unwrap_or(false);
+        if can_merge {
+            let prev = steps.last_mut().unwrap();
+            merge_typed_step(prev, &step, desc_from_uia, typed);
+            eprintln!(
+                "[BG] type merge: merged into step {} (desc {} chars)",
+                prev.id,
+                prev.description.chars().count()
+            );
+        } else if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
+            // B5: 200 步上限（spec.md:160）；超出后停止累积，避免内存与导出体积失控
             steps.push(step);
         } else {
             eprintln!(
@@ -247,6 +271,51 @@ fn flush_key_step(
             );
         }
     }
+}
+
+/// P1 降噪：判断新一轮输入步骤能否并进上一步（纯函数，便于单测）。
+/// 条件：上一步也是输入步骤、双方都非敏感（密码输入绝不合并）、同一窗口。
+fn should_merge_type_steps(prev: &StepData, new_window_title: &str, new_sensitive: bool) -> bool {
+    prev.action_type == "type"
+        && !prev.is_sensitive
+        && !new_sensitive
+        && !prev.window_title.is_empty()
+        && prev.window_title == new_window_title
+}
+
+/// P1 降噪：把新一轮输入并进上一步（纯函数，便于单测）。
+/// - 描述：UIA 可用时直接用本轮文本（读的是整个输入框的最终内容，天然
+///   包含前几轮输入）；UIA 不可用时退化为「旧描述 + 本轮按键」拼接。
+/// - 截图：主图换成本轮（最终状态）；操作前图保留上一步的（第一次输入前）。
+/// - 裁剪框取本轮焦点区域；timestamp / title / window_title 保留上一步。
+fn merge_typed_step(prev: &mut StepData, new: &StepData, desc_from_uia: bool, new_typed: &str) {
+    prev.description = if desc_from_uia {
+        new.description.clone()
+    } else {
+        format!("{}{}", prev.description, new_typed)
+    };
+    if !new.screenshot_path.is_empty() {
+        prev.screenshot_path = new.screenshot_path.clone();
+    }
+    prev.x = new.x;
+    prev.y = new.y;
+    prev.crop_w = new.crop_w;
+    prev.crop_h = new.crop_h;
+}
+
+/// P1 降噪：两次物理点击是否判为「双击」（纯函数，便于单测）。
+/// `dx`/`dy` 为两次点击坐标差，`gap_ms` 为间隔，`dbl_ms` 为系统双击速度
+/// （GetDoubleClickTime()，通常 500ms）。距离阈值 8px（略宽于系统 4px，
+/// 触屏/高 DPI 下更稳）。
+fn is_double_click(dx: f64, dy: f64, gap_ms: u64, dbl_ms: u64) -> bool {
+    gap_ms <= dbl_ms && dx.abs() <= 8.0 && dy.abs() <= 8.0
+}
+
+/// 系统双击速度（ms）；读不到时用 500ms 默认值。
+fn double_click_time_ms() -> u64 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+    let t = unsafe { GetDoubleClickTime() };
+    if t == 0 { 500 } else { t as u64 }
 }
 
 /// Human-readable label for a shortcut key (KeyC → C, Comma → ,, Space → Space).
@@ -1239,6 +1308,7 @@ fn build_click_step(
     click_ts: Instant,
     ring: &FrameRing,
     step_no: i32,
+    is_double: bool,
 ) -> Option<StepData> {
     let frame = ring
         .closest_to(click_ts)
@@ -1293,6 +1363,9 @@ fn build_click_step(
         .map(crate::ai::domain::detect_domain)
         .unwrap_or(AppDomain::Other);
     let title = activity::make_click_title_for_domain(window_title.as_deref(), click_domain);
+    // P1 降噪：双击合并——标题改为「双击」，action_type 保持 "click"
+    // （前端/导出/AI 均按 click 渲染，不引入未知类型）。
+    let title = if is_double { title.replacen("点击", "双击", 1) } else { title };
 
     Some(StepData {
         id: Uuid::new_v4().to_string(),
@@ -1398,6 +1471,11 @@ fn spawn_event_thread(
         // 按住 Alt 连按 Tab 时，把多次切换合并进同一个步骤：
         // (最后一次 Tab 的时刻, 该步骤在 captured 中的下标)
         let mut last_alt_tab: Option<(Instant, usize)> = None;
+        // P1 降噪：上一次通过过滤的左键点击 (x, y, 时刻, 步骤id, fg_pid)
+        let mut last_click: Option<(f64, f64, Instant, String, u32)> = None;
+        // P1 降噪：上一步骤是否为「可续并」的输入步骤（仅 idle flush 置 true，
+        // 点击/快捷键/导航键/切窗 flush 置 false）
+        let mut can_merge_type = false;
         let flush_interval = Duration::from_millis(1500);
 
         loop {
@@ -1405,7 +1483,7 @@ fn spawn_event_thread(
                 eprintln!("[BG] running flag cleared, exiting");
                 if !accumulated_keys.is_empty() {
                     let typed = std::mem::take(&mut accumulated_keys);
-                    flush_key_step(&typed, None, &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time);
+                    flush_key_step(&typed, None, &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
                 }
                 break;
             }
@@ -1444,21 +1522,49 @@ fn spawn_event_thread(
                     if !accumulated_keys.is_empty() {
                         let typed = std::mem::take(&mut accumulated_keys);
                         let win_title = typing_window_title.take().unwrap_or_default();
-                        flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time);
+                        flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
                     }
                     last_key_time = Instant::now();
+                    can_merge_type = false; // 点击打断输入连续性
 
-                    // Build click step from ring frame closest to click timestamp
-                    let click_step_no = {
-                        let s = cs_for_thread.lock().unwrap();
-                        s.len() as i32 + 1
+                    // ── P1 降噪：双击识别与合并 ──
+                    // 与上一次「通过过滤的左键点击」间隔 < 系统双击速度、
+                    // 位置 ≤8px、同前台窗口 → 撤掉上一步，用第二次点击重建
+                    // 为「双击」步骤（如 WPS 单元格「点两下才进编辑」）。
+                    let dbl_prev_id = match last_click {
+                        Some((lx, ly, lts, ref lid, lpid))
+                            if click.button == "left"
+                                && lpid == click.foreground_pid
+                                && is_double_click(
+                                    click.x - lx,
+                                    click.y - ly,
+                                    lts.elapsed().as_millis() as u64,
+                                    double_click_time_ms(),
+                                ) =>
+                        {
+                            Some(lid.clone())
+                        }
+                        _ => None,
                     };
-                    if let Some(step) = build_click_step(
-                        click.x, click.y, click.timestamp, &ring, click_step_no,
-                    ) {
-                        if let Ok(mut steps) = cs_for_thread.lock() {
-                            // B5: 200 步上限（spec.md:160）
+                    let mut new_click_id: Option<String> = None;
+                    {
+                        let mut steps = cs_for_thread.lock().unwrap();
+                        if let Some(ref prev_id) = dbl_prev_id {
+                            if let Some(pos) = steps
+                                .iter()
+                                .position(|s| &s.id == prev_id && s.action_type == "click")
+                            {
+                                steps.remove(pos);
+                                eprintln!("[BG] double-click: removed single-click step {}", prev_id);
+                            }
+                        }
+                        let click_step_no = steps.len() as i32 + 1;
+                        if let Some(step) = build_click_step(
+                            click.x, click.y, click.timestamp, &ring, click_step_no,
+                            dbl_prev_id.is_some(),
+                        ) {
                             if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
+                                new_click_id = Some(step.id.clone());
                                 steps.push(step);
                             } else {
                                 eprintln!(
@@ -1468,6 +1574,18 @@ fn spawn_event_thread(
                             }
                         }
                     }
+                    last_click = match (dbl_prev_id, new_click_id) {
+                        // 双击合并后清空：三连击不再继续链（第三次点击按新点击算）
+                        (Some(_), _) => None,
+                        (None, Some(id)) => Some((
+                            click.x,
+                            click.y,
+                            click.timestamp,
+                            id,
+                            click.foreground_pid,
+                        )),
+                        _ => last_click,
+                    };
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1540,11 +1658,12 @@ fn spawn_event_thread(
                         if !accumulated_keys.is_empty() {
                             let typed = std::mem::take(&mut accumulated_keys);
                             let win_title = typing_window_title.take().unwrap_or_default();
-                            flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time);
+                            flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
                         }
                         typing_window_title = None;
                         keyboard_before_path = None;
                         last_uia_text = None;
+                        can_merge_type = false; // 快捷键打断输入连续性
 
                         let _pushed: Option<usize> = if ctrl {
                             match key_name.as_str() {
@@ -1696,11 +1815,12 @@ fn spawn_event_thread(
                             );
                             let typed = std::mem::take(&mut accumulated_keys);
                             let win_title = typing_window_title.take().unwrap_or_default();
-                            flush_key_step(&typed, Some(win_title), &cs_for_thread, final_uia, keyboard_before_path.take(), &ring, last_key_time);
+                            flush_key_step(&typed, Some(win_title), &cs_for_thread, final_uia, keyboard_before_path.take(), &ring, last_key_time, false);
                         }
                         typing_window_title = None;
                         keyboard_before_path = None;
                         last_uia_text = None;
+                        can_merge_type = false; // Enter/Tab/Esc 切换了输入上下文
                         last_key_time = Instant::now();
                         continue;
                     }
@@ -1744,7 +1864,9 @@ fn spawn_event_thread(
                 );
                 let typed = std::mem::take(&mut accumulated_keys);
                 let win_title = typing_window_title.take().unwrap_or_default();
-                flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time);
+                flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, can_merge_type);
+                // P1 降噪：本步允许下一轮输入继续并进来（连续停顿不拆步）
+                can_merge_type = true;
             }
 
             // ── Foreground window change flush ─────────────
@@ -1764,7 +1886,8 @@ fn spawn_event_thread(
                         );
                         let typed = std::mem::take(&mut accumulated_keys);
                         let win_title = typing_window_title.take().unwrap_or_default();
-                        flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time);
+                        flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
+                        can_merge_type = false; // 切窗打断输入连续性
                     } else if last != curr {
                         // Guard: don't flush on window-change within 500ms of last keystroke.
                         // Chrome auto-completes can change the title immediately after typing;
@@ -2223,6 +2346,19 @@ pub fn finish_recording(
         e
     })?;
     eprintln!("[finish] step3 OK: saved to DB (rec_id: {})", rec_id);
+
+    // --- Block 3.5: 规则降噪（自动合并，2026-09-03）---
+    // 用户要求「不要手动合并，录完自动就是干净的」。规则层是纯本地计算
+    // （不联网、不调 AI），几十步 <1ms，失败也不影响录制已落库，因此
+    // 只记日志不上抛。弹框里那一串点击要靠编辑器里的「AI 精简」按钮。
+    match crate::editor::commands::auto_merge_steps_conn(&conn, &rec_id) {
+        Ok(r) if r.reduced > 0 => eprintln!(
+            "[finish] step3.5 OK: 自动精简 {} → {} 步（省 {} 步）",
+            r.before, r.after, r.reduced
+        ),
+        Ok(_) => eprintln!("[finish] step3.5 OK: 无需自动精简"),
+        Err(e) => eprintln!("[finish] step3.5 WARN: 自动精简失败（录制已保存）: {}", e),
+    }
 
     // Remove from manager
     {
@@ -2883,5 +3019,85 @@ mod commands_tests {
         }
         let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
         digits.len() == 14 && s.len() == expect.len()
+    }
+
+    // ── P1 降噪：连续输入合并 ──
+
+    fn typed_step(id: &str, window_title: &str, desc: &str) -> StepData {
+        let mut s = make_step(0);
+        s.id = id.to_string();
+        s.action_type = "type".into();
+        s.window_title = window_title.to_string();
+        s.description = desc.to_string();
+        s.screenshot_path = format!("{}.jpg", id);
+        s.before_screenshot_path = format!("{}.before.jpg", id);
+        s
+    }
+
+    #[test]
+    fn should_merge_type_steps_same_window_merges() {
+        let prev = typed_step("a", "WPS 表格", "XLOOKUP(");
+        assert!(should_merge_type_steps(&prev, "WPS 表格", false));
+    }
+
+    #[test]
+    fn should_merge_type_steps_rejects_sensitive_or_other_window_or_type() {
+        // 敏感步骤（旧/新任一）绝不合并
+        let mut prev = typed_step("a", "WPS 表格", "pw");
+        prev.is_sensitive = true;
+        assert!(!should_merge_type_steps(&prev, "WPS 表格", false));
+        let prev = typed_step("a", "WPS 表格", "x");
+        assert!(!should_merge_type_steps(&prev, "WPS 表格", true));
+        // 窗口不同（换了应用）不合并
+        let prev = typed_step("a", "WPS 表格", "x");
+        assert!(!should_merge_type_steps(&prev, "Chrome - 百度", false));
+        // 上一步不是输入步骤不合并
+        let prev = make_step(0); // click
+        assert!(!should_merge_type_steps(&prev, "WPS 表格", false));
+        // 旧步骤窗口标题为空（兜底构造）不合并
+        let prev = typed_step("a", "", "x");
+        assert!(!should_merge_type_steps(&prev, "", false));
+    }
+
+    #[test]
+    fn merge_typed_step_uia_overrides_desc_and_keeps_before() {
+        let mut prev = typed_step("a", "WPS 表格", "XLOOKUP(");
+        prev.x = Some(10);
+        prev.timestamp = 111;
+        let mut new = typed_step("b", "WPS 表格", "XLOOKUP(*,C2,*)");
+        new.screenshot_path = "final.jpg".to_string();
+        new.x = Some(20);
+        new.timestamp = 999;
+
+        merge_typed_step(&mut prev, &new, true, "*,C2,*)");
+        assert_eq!(prev.description, "XLOOKUP(*,C2,*)"); // UIA 最终内容直接覆盖
+        assert_eq!(prev.screenshot_path, "final.jpg"); // 主图 = 最终状态
+        assert_eq!(prev.before_screenshot_path, "a.before.jpg"); // 操作前图保留
+        assert_eq!(prev.x, Some(20)); // 裁剪框取本轮焦点
+        assert_eq!(prev.timestamp, 111); // 时间戳保留步骤起点
+        assert_eq!(prev.id, "a");
+    }
+
+    #[test]
+    fn merge_typed_step_fallback_concatenates_keystrokes() {
+        let mut prev = typed_step("a", "WPS 表格", "XLOOKUP(");
+        let new = typed_step("b", "WPS 表格", "*,C2,*)");
+        merge_typed_step(&mut prev, &new, false, "*,C2,*)");
+        assert_eq!(prev.description, "XLOOKUP(*,C2,*)"); // 无 UIA：按键流拼接
+    }
+
+    // ── P1 降噪：双击合并 ──
+
+    #[test]
+    fn double_click_detection_time_and_distance() {
+        let dbl = 500u64;
+        // 同点 + 快速 → 双击
+        assert!(is_double_click(0.0, 0.0, 180, dbl));
+        assert!(is_double_click(3.0, -4.0, 499, dbl));
+        // 间隔超时 → 不是
+        assert!(!is_double_click(0.0, 0.0, 501, dbl));
+        // 距离超阈 → 不是
+        assert!(!is_double_click(9.0, 0.0, 100, dbl));
+        assert!(!is_double_click(0.0, 8.1, 100, dbl));
     }
 }
