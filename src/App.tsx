@@ -255,25 +255,34 @@ function App() {
       setVoiceActive(false);
       if (voiceChunkTimerRef.current) { clearInterval(voiceChunkTimerRef.current); voiceChunkTimerRef.current = null; }
     } else if (next && !voiceRecorderRef.current) {
-      // 录制中开麦：从现在开始采集
+      // 录制中开麦：从现在开始采集（Rust 侧 cpal，PCM 直接进后端缓冲）
       try {
         const rec = new VoiceRecorder();
-        const startedAt = await rec.start();
+        await rec.start(recId);
         voiceRecorderRef.current = rec;
         setVoiceActive(true);
-        await invoke("voice_begin", { recordingId: recId, startedAtMs: startedAt, sampleRate: rec.sampleRateSafe });
+        voiceStallRef.current = { last: 0, ticks: 0, logged: false };
         voiceChunkTimerRef.current = setInterval(async () => {
           const r = voiceRecorderRef.current;
-          const b64 = r?.takeChunkIfReady();
-          if (r && b64) {
-            invoke("voice_append", { recordingId: recordingIdRef.current, chunkBase64: b64 }).catch((e) => console.warn("[voice] append:", e));
+          if (!r || r.isPaused) return;
+          const now = await r.samples();
+          const s = voiceStallRef.current;
+          if (now === s.last) {
+            s.ticks += 1;
+            if (s.ticks >= 5 && !s.logged) {
+              s.logged = true;
+              invoke("voice_dbg_log", { message: `[VOICE] 采集停摆：样本数 ${now} 已 5 秒未增长，本次录制语音将不完整` }).catch(() => {});
+            }
+          } else {
+            s.last = now;
+            s.ticks = 0;
           }
         }, 1000);
       } catch (err) {
         console.warn("[voice] mid-recording start failed:", err);
         setVoiceEnabled(false);
         localStorage.setItem("flowio_voice_input", "0");
-        showVoiceToast({ type: "error", message: "无法访问麦克风（检查系统麦克风权限），本次录制将以无语音方式继续" });
+        showVoiceToast({ type: "error", message: `麦克风开启失败：${String(err)}，本次录制将以无语音方式继续` });
       }
     }
   }, [voiceEnabled, showVoiceToast]);
@@ -283,39 +292,31 @@ function App() {
     if (!voiceEnabled || voiceRecorderRef.current) return;
     try {
       const rec = new VoiceRecorder();
-      const startedAt = await rec.start();
+      await rec.start(id);
       voiceRecorderRef.current = rec;
       setVoiceActive(true);
-      await invoke("voice_begin", { recordingId: id, startedAtMs: startedAt, sampleRate: rec.sampleRateSafe });
-      if (rec.isDeviceBound) {
-        await invoke("voice_dbg_log", { message: "[VOICE] warn: AudioContext 绑定了真实输出设备（sinkId:none 不可用），窗口最小化后采集可能停摆" }).catch(() => {});
-      }
       voiceStallRef.current = { last: 0, ticks: 0, logged: false };
+      // 看门狗：非暂停状态下样本数 5 秒不增长 → 采集停摆，只报一次。
+      // （Rust 侧采集不受窗口最小化影响；真停了说明设备被拔掉/被独占）
       voiceChunkTimerRef.current = setInterval(async () => {
         const r = voiceRecorderRef.current;
-        const b64 = r?.takeChunkIfReady();
-        if (r && b64) {
-          invoke("voice_append", { recordingId: recordingIdRef.current, chunkBase64: b64 }).catch((e) => console.warn("[voice] append:", e));
-        }
-        // 看门狗：非暂停状态下样本数 5 秒不增长 → 采集停摆（如被最小化挂起），只报一次
-        if (r && !r.isPaused) {
-          const s = voiceStallRef.current;
-          const now = r.totalSamplesSoFar;
-          if (now === s.last) {
-            s.ticks += 1;
-            if (s.ticks >= 5 && !s.logged) {
-              s.logged = true;
-              invoke("voice_dbg_log", { message: `[VOICE] 采集停摆：样本数 ${now} 已 5 秒未增长（窗口最小化后回调停止），本次录制语音将不完整` }).catch(() => {});
-            }
-          } else {
-            s.last = now;
-            s.ticks = 0;
+        if (!r || r.isPaused) return;
+        const now = await r.samples();
+        const s = voiceStallRef.current;
+        if (now === s.last) {
+          s.ticks += 1;
+          if (s.ticks >= 5 && !s.logged) {
+            s.logged = true;
+            invoke("voice_dbg_log", { message: `[VOICE] 采集停摆：样本数 ${now} 已 5 秒未增长（麦克风被占用或设备异常），本次录制语音将不完整` }).catch(() => {});
           }
+        } else {
+          s.last = now;
+          s.ticks = 0;
         }
       }, 1000);
     } catch (err) {
       console.warn("[voice] start failed:", err);
-      showVoiceToast({ type: "error", message: "无法访问麦克风（检查系统麦克风权限），本次录制将以无语音方式继续" });
+      showVoiceToast({ type: "error", message: `麦克风开启失败：${String(err)}，本次录制将以无语音方式继续` });
     }
   }, [voiceEnabled, showVoiceToast]);
 
@@ -327,13 +328,8 @@ function App() {
     setVoiceActive(false);
     if (!rec) return;
     try {
-      const res = await rec.stop();
-      // 尾块（不足一整块的剩余 PCM）也要上传
-      if (res.chunks.length > 0) {
-        for (const b64 of res.chunks) {
-          await invoke("voice_append", { recordingId: id, chunkBase64: b64 });
-        }
-      }
+      // Rust 侧采集会把剩余 PCM 全部落进缓冲后再返回，前端无需补传
+      await rec.stop();
       setVoiceTranscribing(true);
       await invoke("voice_finish", { recordingId: id });
     } catch (err) {
@@ -381,7 +377,7 @@ function App() {
       await invoke("pause_recording", { id });
       isPausedRef.current = true;
       setIsPaused(true);
-      voiceRecorderRef.current?.pause(); // 暂停期间丢弃 PCM
+      void voiceRecorderRef.current?.pause(); // 暂停期间的音频不进缓冲（恢复时补等长静音）
       await appWindow.unminimize();
       await appWindow.show();
       await appWindow.setFocus();
@@ -398,7 +394,7 @@ function App() {
       console.log("[resume] invoke succeeded, id=" + id);
       isPausedRef.current = false;
       setIsPaused(false);
-      voiceRecorderRef.current?.resume();
+      void voiceRecorderRef.current?.resume();
       // small delay to let resume_recording settle before minimizing
       await new Promise(r => setTimeout(r, 200));
       appWindow.minimize().catch(e => console.error("minimize on resume failed:", e));
@@ -465,6 +461,9 @@ function App() {
     } catch (err: any) {
       alert("停止录制失败: " + (err?.message || err));
       console.error("Failed to finish recording:", err);
+      // 兜底：流程异常中断时也要把麦克风收掉，否则采集线程一直跑
+      voiceRecorderRef.current?.stop().catch(() => {});
+      voiceRecorderRef.current = null;
     }
   }, [navigate, siteToken, stopVoiceAndTranscribe]);
 

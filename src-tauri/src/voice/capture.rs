@@ -1,0 +1,586 @@
+//! 麦克风采集（cpal：Windows 走 WASAPI，macOS 走 CoreAudio）。
+//!
+//! ## 为什么不用浏览器的 getUserMedia + AudioContext
+//! 录制一开始主窗口就会 `minimize()`（把屏幕让给被录的应用），WebView2 随即
+//! 停掉指向真实输出设备的音频渲染线程 —— ScriptProcessorNode 的
+//! `onaudioprocess` 跟着停（实测只采到最小化前的 512ms），这就是
+//! 「一直在说但检测不到」的根因。
+//! 试过 `AudioContext({ sinkId: "none" })` 让上下文不挂输出设备，结果更糟：
+//! null sink 没有设备时钟驱动渲染，**一次回调都没跑**（样本数全程 0）。
+//! 结论：采集不能寄生在渲染进程里，搬到 Rust 侧。
+//!
+//! ## 代价
+//! 丢掉 getUserMedia 的 echoCancellation / noiseSuppression（浏览器侧信号
+//! 处理），麦克风会拾到喇叭外放的声音。戴耳机或调低外放音量即可。
+//!
+//! ## 线程模型
+//! ```text
+//! cpal 音频回调（高优先级，不碰锁/IO）
+//!   → 降混单声道 → 重采样到 16kHz → i16
+//!   → mpsc::channel（无界，不丢）
+//!   → 采集线程（每 50ms 排空一次）→ VoiceCaptureState 的 VoiceBuffer
+//! ```
+//! cpal 的 `Stream` 由采集线程持有（drop 即停止），不进 Tauri State。
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
+use tauri::State;
+
+use super::audio;
+use super::commands::{VoiceBuffer, VoiceCaptureState};
+
+/// 采集线程收到的控制命令。
+enum MicCmd {
+    /// 停止采集并退出线程
+    Stop,
+    /// 暂停 / 恢复（暂停期间丢弃 PCM，恢复时补等长静音）
+    SetPaused(bool),
+}
+
+/// 已启动的采集句柄（进 Tauri State，需要 Send + Sync，所以要 pub）。
+///
+/// 注意：`cpal::Stream` 不在这里 —— 它由采集线程持有，线程退出即释放。
+pub struct MicHandle {
+    cmd_tx: Mutex<Sender<MicCmd>>,
+    done_rx: Mutex<Receiver<()>>,
+    /// 已采集样本数（看门狗 / 停止时统计时长）
+    samples: Arc<AtomicU64>,
+}
+
+/// 全局麦克风采集状态（同时只允许一路）。
+#[derive(Default)]
+pub struct MicCaptureState(pub Mutex<Option<MicHandle>>);
+
+/// 采集排空周期：50ms 足够，通道无界不会丢数据。
+const DRAIN_INTERVAL: Duration = Duration::from_millis(50);
+/// 启动握手超时（枚举设备 + 打开 WASAPI 流偶尔要几秒）
+const START_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 开始采集并建立该录制的缓冲。
+///
+/// 返回实际采集起点（epoch ms），由 Rust 在流真正 `play()` 的瞬间取，
+/// 与步骤的 `timestamp`（epoch ms）同源。
+#[tauri::command]
+pub fn voice_mic_start(
+    state: State<'_, MicCaptureState>,
+    buffers: State<'_, VoiceCaptureState>,
+    recording_id: String,
+) -> Result<i64, String> {
+    {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        if guard.is_some() {
+            return Err("麦克风已在采集中".to_string());
+        }
+    }
+    let buffers = buffers.inner().clone();
+
+    let (init_tx, init_rx) = mpsc::channel::<Result<i64, String>>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<MicCmd>();
+    let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<i16>>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+
+    let paused = Arc::new(AtomicBool::new(false));
+    let samples = Arc::new(AtomicU64::new(0));
+
+    let t_paused = Arc::clone(&paused);
+    let t_samples = Arc::clone(&samples);
+    thread::spawn(move || {
+        let _com = ComGuard::init();
+        run_capture(
+            buffers,
+            recording_id,
+            t_paused,
+            t_samples,
+            pcm_tx,
+            pcm_rx,
+            cmd_rx,
+            init_tx,
+            done_tx,
+        );
+    });
+
+    let started_at = init_rx
+        .recv_timeout(START_TIMEOUT)
+        .map_err(|_| "麦克风启动超时（15 秒内没有响应）".to_string())??;
+
+    let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+    *guard = Some(MicHandle {
+        cmd_tx: Mutex::new(cmd_tx),
+        done_rx: Mutex::new(done_rx),
+        samples,
+    });
+    Ok(started_at)
+}
+
+/// 暂停 / 恢复采集。暂停期间丢弃 PCM（不写入缓冲）。
+#[tauri::command]
+pub fn voice_mic_set_paused(state: State<'_, MicCaptureState>, paused: bool) -> Result<(), String> {
+    let guard = state.0.lock().map_err(|e| e.to_string())?;
+    if let Some(h) = guard.as_ref() {
+        if let Ok(tx) = h.cmd_tx.lock() {
+            let _ = tx.send(MicCmd::SetPaused(paused));
+        }
+    }
+    Ok(())
+}
+
+/// 已采集样本数（前端看门狗用：连续不变 = 采集停摆）。
+#[tauri::command]
+pub fn voice_mic_samples(state: State<'_, MicCaptureState>) -> Result<u64, String> {
+    let guard = state.0.lock().map_err(|e| e.to_string())?;
+    Ok(guard
+        .as_ref()
+        .map(|h| h.samples.load(Ordering::Relaxed))
+        .unwrap_or(0))
+}
+
+/// 停止采集。会等采集线程把管道里剩余 PCM 全部落进缓冲后才返回。
+#[tauri::command]
+pub fn voice_mic_stop(state: State<'_, MicCaptureState>) -> Result<u64, String> {
+    let handle = {
+        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        guard.take()
+    };
+    let Some(h) = handle else {
+        return Ok(0);
+    };
+    if let Ok(tx) = h.cmd_tx.lock() {
+        let _ = tx.send(MicCmd::Stop);
+    }
+    // 等线程排空收尾，避免最后几百毫秒的音频丢失
+    if let Ok(rx) = h.done_rx.lock() {
+        let _ = rx.recv_timeout(Duration::from_secs(3));
+    }
+    Ok(h.samples.load(Ordering::Relaxed))
+}
+
+/// 采集线程主体：建流 → play → 排空 PCM + 处理命令 → 退出。
+#[allow(clippy::too_many_arguments)]
+fn run_capture(
+    buffers: VoiceCaptureState,
+    recording_id: String,
+    paused: Arc<AtomicBool>,
+    samples: Arc<AtomicU64>,
+    pcm_tx: Sender<Vec<i16>>,
+    pcm_rx: Receiver<Vec<i16>>,
+    cmd_rx: Receiver<MicCmd>,
+    init_tx: Sender<Result<i64, String>>,
+    done_tx: Sender<()>,
+) {
+    let setup = build_stream_for_default_device(Arc::clone(&paused), Arc::clone(&samples), pcm_tx);
+    let (stream, info) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = init_tx.send(Err(e));
+            let _ = done_tx.send(());
+            return;
+        }
+    };
+
+    // 先建缓冲再 play：回调可能在 play 返回前就投递数据
+    {
+        if let Ok(mut map) = buffers.0.lock() {
+            map.insert(
+                recording_id.clone(),
+                VoiceBuffer {
+                    started_at_ms: chrono::Utc::now().timestamp_millis(),
+                    sample_rate: audio::SAMPLE_RATE,
+                    pcm: Vec::new(),
+                    last_heartbeat_len: 0,
+                },
+            );
+        }
+    }
+    if let Err(e) = stream.play() {
+        if let Ok(mut map) = buffers.0.lock() {
+            map.remove(&recording_id);
+        }
+        let _ = init_tx.send(Err(format!("启动麦克风失败: {}", e)));
+        let _ = done_tx.send(());
+        return;
+    }
+    let started_at = chrono::Utc::now().timestamp_millis();
+    crate::ai::commands::ai_dbg_log(&format!(
+        "[VOICE] mic started: device={} dev_rate={} ch={} fmt={:?} -> {}Hz mono i16",
+        info.name, info.dev_rate, info.channels, info.format, audio::SAMPLE_RATE
+    ));
+    let _ = init_tx.send(Ok(started_at));
+
+    let mut paused_since: Option<Instant> = None;
+    loop {
+        // 1) 排空已采集的 PCM
+        while let Ok(chunk) = pcm_rx.try_recv() {
+            append_pcm(&buffers, &recording_id, &chunk);
+        }
+        // 2) 处理命令（50ms 超时后回到 1）
+        match cmd_rx.recv_timeout(DRAIN_INTERVAL) {
+            Ok(MicCmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(MicCmd::SetPaused(true)) => {
+                if paused_since.is_none() {
+                    paused_since = Some(Instant::now());
+                }
+                paused.store(true, Ordering::Relaxed);
+            }
+            Ok(MicCmd::SetPaused(false)) => {
+                // 补等长静音：直接丢 PCM 会让缓冲比墙钟短，步骤偏移会整体前移
+                if let Some(t) = paused_since.take() {
+                    let ms = t.elapsed().as_millis() as u64;
+                    let n = (ms * audio::SAMPLE_RATE as u64 / 1000) as usize;
+                    if n > 0 {
+                        append_pcm(&buffers, &recording_id, &vec![0i16; n]);
+                    }
+                }
+                paused.store(false, Ordering::Relaxed);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    // 收尾：排空剩余
+    while let Ok(chunk) = pcm_rx.try_recv() {
+        append_pcm(&buffers, &recording_id, &chunk);
+    }
+    drop(stream);
+    let _ = done_tx.send(());
+}
+
+/// 实际选中的设备参数（只用于日志）
+struct StreamInfo {
+    name: String,
+    dev_rate: u32,
+    channels: u16,
+    format: SampleFormat,
+}
+
+/// 用系统默认麦克风建一条输入流。
+fn build_stream_for_default_device(
+    paused: Arc<AtomicBool>,
+    samples: Arc<AtomicU64>,
+    tx: Sender<Vec<i16>>,
+) -> Result<(Stream, StreamInfo), String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| "系统里没有可用的麦克风（没有默认输入设备）".to_string())?;
+    let name = device.name().unwrap_or_else(|_| "(未知设备)".to_string());
+    let cfg = pick_input_config(&device)?;
+    let info = StreamInfo {
+        name,
+        dev_rate: cfg.sample_rate().0,
+        channels: cfg.channels(),
+        format: cfg.sample_format(),
+    };
+    let stream = build_stream(&device, &cfg, paused, samples, tx)?;
+    Ok((stream, info))
+}
+
+/// 挑一个能用的输入配置：优先 16kHz 原生，否则用设备默认配置（回调里重采样）。
+fn pick_input_config(device: &Device) -> Result<SupportedStreamConfig, String> {
+    let wanted = SampleRate(audio::SAMPLE_RATE);
+    match device.supported_input_configs() {
+        Ok(mut ranges) => {
+            if let Some(range) = ranges.find(|r| {
+                r.channels() >= 1 && r.min_sample_rate() <= wanted && wanted <= r.max_sample_rate()
+            }) {
+                return Ok(range.with_sample_rate(wanted));
+            }
+        }
+        Err(e) => {
+            crate::ai::commands::ai_dbg_log(&format!(
+                "[VOICE] supported_input_configs 查询失败（用默认配置兜底）: {}",
+                e
+            ));
+        }
+    }
+    device
+        .default_input_config()
+        .map_err(|e| format!("取不到麦克风默认格式: {}", e))
+}
+
+/// 建 cpal 输入流。回调只做纯计算 + 无锁 channel 投递，不碰 Mutex / IO。
+fn build_stream(
+    device: &Device,
+    cfg: &SupportedStreamConfig,
+    paused: Arc<AtomicBool>,
+    samples: Arc<AtomicU64>,
+    tx: Sender<Vec<i16>>,
+) -> Result<Stream, String> {
+    let sc: StreamConfig = cfg.config();
+    let channels = cfg.channels() as usize;
+    let dev_rate = cfg.sample_rate().0;
+    let fmt = cfg.sample_format();
+    let err_fn = move |e: cpal::StreamError| {
+        crate::ai::commands::ai_dbg_log(&format!("[VOICE] cpal 采集流错误: {}", e));
+    };
+
+    match fmt {
+        SampleFormat::F32 => device.build_input_stream::<f32, _, _>(
+            &sc,
+            make_callback::<f32>(channels, dev_rate, |s| s, Arc::clone(&paused), Arc::clone(&samples), tx),
+            err_fn,
+            None,
+        ),
+        SampleFormat::I16 => device.build_input_stream::<i16, _, _>(
+            &sc,
+            make_callback::<i16>(channels, dev_rate, |s| s as f32 / 32768.0, Arc::clone(&paused), Arc::clone(&samples), tx),
+            err_fn,
+            None,
+        ),
+        SampleFormat::U16 => device.build_input_stream::<u16, _, _>(
+            &sc,
+            make_callback::<u16>(channels, dev_rate, |s| (s as f32 - 32768.0) / 32768.0, Arc::clone(&paused), Arc::clone(&samples), tx),
+            err_fn,
+            None,
+        ),
+        other => return Err(format!("麦克风的采样格式 {:?} 暂不支持", other)),
+    }
+    .map_err(|e| format!("打开麦克风失败（可能被系统权限或其他程序占用）: {}", e))
+}
+
+/// 造一个 cpal 数据回调：降混 → 重采样 → i16 → 投进 channel。
+fn make_callback<T>(
+    channels: usize,
+    dev_rate: u32,
+    to_f32: fn(T) -> f32,
+    paused: Arc<AtomicBool>,
+    samples: Arc<AtomicU64>,
+    tx: Sender<Vec<i16>>,
+) -> impl FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static
+where
+    T: Copy + Send + 'static,
+{
+    let mut res = Resampler::new(dev_rate, audio::SAMPLE_RATE);
+    let mut mono: Vec<f32> = Vec::new();
+    move |data: &[T], _: &cpal::InputCallbackInfo| {
+        if paused.load(Ordering::Relaxed) {
+            return;
+        }
+        mono.clear();
+        downmix(data, channels, &mut mono, to_f32);
+        let mut out: Vec<i16> = Vec::with_capacity(mono.len() + 8);
+        res.push(&mono, &mut out);
+        if out.is_empty() {
+            return;
+        }
+        samples.fetch_add(out.len() as u64, Ordering::Relaxed);
+        let _ = tx.send(out);
+    }
+}
+
+/// 把 PCM 落进该录制的缓冲（采集线程侧调用）。
+fn append_pcm(state: &VoiceCaptureState, recording_id: &str, samples: &[i16]) {
+    let Ok(mut map) = state.0.lock() else {
+        return;
+    };
+    let Some(buf) = map.get_mut(recording_id) else {
+        return;
+    };
+    let mut bytes: Vec<u8> = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    super::commands::append_pcm_bytes(buf, &bytes, recording_id);
+}
+
+/// 多声道降混为单声道（取各声道均值）。
+fn downmix<T: Copy>(data: &[T], channels: usize, out: &mut Vec<f32>, to_f32: fn(T) -> f32) {
+    if channels <= 1 {
+        out.extend(data.iter().map(|&s| to_f32(s)));
+        return;
+    }
+    for frame in data.chunks(channels) {
+        let sum: f32 = frame.iter().map(|&s| to_f32(s)).sum();
+        out.push(sum / frame.len() as f32);
+    }
+}
+
+/// 线性插值重采样（设备采样率 → 16kHz）。ratio == 1 时直通。
+///
+/// 约定：输入样本 k 位于连续坐标 k，输出第 j 个样本取自坐标 `j * ratio`，
+/// 由左右两个相邻输入样本线性插值得到。
+/// 跨块边界用一个 `pending` 队列兜住「本块还没消费完」的样本，
+/// 这样插值始终是标准的两点插值（不依赖上一块的尾样本做近似）。
+pub struct Resampler {
+    /// 每输出一个样本要前进的输入样本数（dev_rate / 16000）
+    ratio: f64,
+    /// 下一个输出样本在 `pending` 中的浮点位置
+    pos: f64,
+    /// 未消费的输入样本（跨块保留）
+    pending: VecDeque<f32>,
+}
+
+impl Resampler {
+    pub fn new(src_rate: u32, dst_rate: u32) -> Self {
+        Self {
+            ratio: src_rate as f64 / dst_rate.max(1) as f64,
+            pos: 0.0,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// 输入一段单声道 f32，输出重采样后的 i16 PCM。
+    pub fn push(&mut self, input: &[f32], out: &mut Vec<i16>) {
+        if input.is_empty() {
+            return;
+        }
+        self.pending.extend(input.iter().copied());
+        if (self.ratio - 1.0).abs() < 1e-9 {
+            // 同采样率：直通，不做插值
+            for s in self.pending.drain(..) {
+                out.push(to_i16(s));
+            }
+            self.pos = 0.0;
+            return;
+        }
+        let n = self.pending.len();
+        let mut i = self.pos;
+        // 需要 i0 与 i0+1 两个点，所以要求 i + 1 < n
+        while (i + 1.0) < n as f64 {
+            let i0 = i.floor() as usize;
+            let frac = (i - i0 as f64) as f32;
+            let s0 = self.pending[i0];
+            let s1 = self.pending[i0 + 1];
+            out.push(to_i16(s0 + (s1 - s0) * frac));
+            i += self.ratio;
+        }
+        // 丢掉已消费完的样本，并把位置换算到剩余队列
+        let consumed = (i.floor() as usize).min(self.pending.len());
+        if consumed > 0 {
+            self.pending.drain(..consumed);
+            i -= consumed as f64;
+        }
+        self.pos = i;
+    }
+}
+
+fn to_i16(s: f32) -> i16 {
+    let s = if s > 1.0 {
+        1.0
+    } else if s < -1.0 {
+        -1.0
+    } else {
+        s
+    };
+    (if s < 0.0 { s * 32768.0 } else { s * 32767.0 }) as i16
+}
+
+/// Windows 下 WASAPI 需要 COM 初始化（新线程不继承主线程的 COM）。
+struct ComGuard(bool);
+
+impl ComGuard {
+    fn init() -> Self {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+            let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            // S_OK / S_FALSE（本线程已初始化过）都算成功
+            return Self(hr.is_ok());
+        }
+        #[cfg(not(windows))]
+        Self(false)
+    }
+}
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.0 {
+            use windows::Win32::System::Com::CoUninitialize;
+            unsafe { CoUninitialize() };
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self.0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampler_passthrough_when_rates_match() {
+        let mut r = Resampler::new(16_000, 16_000);
+        let input = vec![0.0f32, 0.5, -0.5, 1.0];
+        let mut out = Vec::new();
+        r.push(&input, &mut out);
+        assert_eq!(out, vec![0, 16_383, -16_384, 32_767]);
+    }
+
+    #[test]
+    fn resampler_downsamples_by_two() {
+        // 32kHz → 16kHz：步长 2，坐标落在整数位 → 插值结果等于该点本身
+        let mut r = Resampler::new(32_000, 16_000);
+        let input: Vec<f32> = (0..8).map(|i| i as f32 / 100.0).collect();
+        let mut out = Vec::new();
+        r.push(&input, &mut out);
+        assert_eq!(out.len(), 4, "32k→16k 应减半，实际 {}", out.len());
+        assert_eq!(out[0], to_i16(0.00));
+        assert_eq!(out[1], to_i16(0.02));
+        assert_eq!(out[2], to_i16(0.04));
+    }
+
+    #[test]
+    fn resampler_upsamples_without_drift() {
+        // 8kHz → 16kHz：10 秒输入应产出 20 秒（16 万样本）
+        let mut r = Resampler::new(8_000, 16_000);
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            let block: Vec<f32> = (0..8000).map(|i| (i % 100) as f32 / 100.0).collect();
+            r.push(&block, &mut out);
+        }
+        let expected = 160_000usize;
+        let diff = (out.len() as i64 - expected as i64).abs();
+        assert!(
+            diff <= 4,
+            "8k→16k 10 秒应得 ~{} 样本，实际 {}",
+            expected,
+            out.len()
+        );
+    }
+
+    #[test]
+    fn resampler_interpolates_midpoint() {
+        // 24k→16k：步长 1.5，第二个输出落在坐标 1.5 → 取 p[1]、p[2] 的中点
+        let mut r = Resampler::new(24_000, 16_000);
+        let input = vec![0.0f32, 0.2, 0.6, 1.0];
+        let mut out = Vec::new();
+        r.push(&input, &mut out);
+        assert_eq!(out.len(), 2, "24k→16k 4 个样本应得 2 个，实际 {}", out.len());
+        assert_eq!(out[0], to_i16(0.0), "坐标 0 处");
+        assert_eq!(out[1], to_i16(0.4), "坐标 1.5 处应为 0.2 与 0.6 的中点");
+    }
+
+    #[test]
+    fn resampler_is_continuous_across_blocks() {
+        // 同一段信号切成小块喂，结果应与整块喂一致（跨块不能丢/重样本）
+        let signal: Vec<f32> = (0..6000).map(|i| (i % 97) as f32 / 97.0).collect();
+        let mut whole = Resampler::new(48_000, 16_000);
+        let mut a = Vec::new();
+        whole.push(&signal, &mut a);
+
+        let mut chunked = Resampler::new(48_000, 16_000);
+        let mut b = Vec::new();
+        for blk in signal.chunks(331) {
+            chunked.push(blk, &mut b);
+        }
+        let diff = (a.len() as i64 - b.len() as i64).abs();
+        assert!(diff <= 2, "分块与整块样本数应基本一致：{} vs {}", a.len(), b.len());
+        assert_eq!(&a[..b.len().min(a.len())], &b[..b.len().min(a.len())]);
+    }
+
+    #[test]
+    fn downmix_averages_channels() {
+        let stereo = [1.0f32, 0.0, -0.5, 0.5];
+        let mut out = Vec::new();
+        downmix(&stereo, 2, &mut out, |s: f32| s);
+        assert_eq!(out, vec![0.5, 0.0]);
+    }
+}

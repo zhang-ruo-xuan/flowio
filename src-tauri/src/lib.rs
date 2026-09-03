@@ -129,6 +129,7 @@ pub fn run() {
             app.manage(RecordingManager(Mutex::new(HashMap::new())));
             app.manage(PendingDeepLink(Mutex::new(None)));
             app.manage(voice::commands::VoiceCaptureState(Default::default()));
+            app.manage(voice::capture::MicCaptureState(Default::default()));
 
             // 扩展 → 桌面端 选区上报通道：浏览器扩展在页面内读到精确 selection
             // 矩形后 POST 到本机回环端口，COPY 步骤裁图优先用它（L0）。
@@ -214,6 +215,10 @@ pub fn run() {
             voice::commands::voice_dbg_log,
             voice::commands::voice_begin,
             voice::commands::voice_append,
+            voice::capture::voice_mic_start,
+            voice::capture::voice_mic_set_paused,
+            voice::capture::voice_mic_samples,
+            voice::capture::voice_mic_stop,
             voice::commands::voice_finish,
             voice::commands::voice_cancel,
             ai::translate::translate_recording,

@@ -51,6 +51,7 @@ tauri-plugin-deep-link = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 url = "2"
+cpal = "0.15"
 
 [patch.crates-io]
 rfd = { path = "../patches/rfd" }

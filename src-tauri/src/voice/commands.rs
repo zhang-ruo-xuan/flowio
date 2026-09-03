@@ -1,8 +1,10 @@
 //! 语音输入 Tauri 命令：采集缓冲（begin/append/finish/cancel）+ 后台转写。
 //!
 //! 流程（对应 PRD《voice-and-translation-prd.md》F1）：
-//! 1. 前端在 start_recording 前开麦，`voice_begin` 记录音频起点（epoch ms）；
-//! 2. PCM 以 ~1MB base64 分块 `voice_append`（暂停期间前端不上传）；
+//! 1. 前端在 start_recording 前开麦，`voice_mic_start`（voice/capture.rs，
+//!    走 cpal 原生采集）建缓冲并记录音频起点（epoch ms）；
+//! 2. PCM 由采集线程直接写入缓冲；`voice_append` 保留为手工追加入口
+//!    （base64 分块，暂停期间的音频由采集侧补静音而非丢弃）；
 //! 3. `voice_finish` 立即返回，后台线程读 DB 步骤时间戳 → 切片 → GLM-ASR
 //!    → 文字以「【语音】…」追加进对应步骤描述 → emit `voice://done`；
 //! 4. 转写失败不阻塞教程生成（V9），原因落 debug log 并聚合进事件。
@@ -10,7 +12,7 @@
 use base64::Engine;
 use rusqlite::params;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
 use super::asr;
@@ -30,8 +32,11 @@ pub struct VoiceBuffer {
 }
 
 /// 全部进行中的语音采集缓冲（recording_id → buffer）。
-#[derive(Default)]
-pub struct VoiceCaptureState(pub Mutex<HashMap<String, VoiceBuffer>>);
+///
+/// 用 Arc 包一层：cpal 采集线程（voice/capture.rs）需要持有一份克隆，
+/// 而 Tauri State 只能给出引用。
+#[derive(Clone, Default)]
+pub struct VoiceCaptureState(pub Arc<Mutex<HashMap<String, VoiceBuffer>>>);
 
 /// `voice://done` 事件载荷。
 #[derive(Clone, serde::Serialize)]
@@ -84,6 +89,14 @@ pub fn voice_append(
     let buffer = map
         .get_mut(&recording_id)
         .ok_or_else(|| "voice buffer not found (did you call voice_begin?)".to_string())?;
+    append_pcm_bytes(buffer, &bytes, &recording_id);
+    Ok(())
+}
+
+/// 把裸 PCM（i16 LE）写进缓冲，并打采集心跳。
+///
+/// 采集线程（voice/capture.rs）与 `voice_append` 共用这一份实现。
+pub(crate) fn append_pcm_bytes(buffer: &mut VoiceBuffer, bytes: &[u8], recording_id: &str) {
     if buffer.pcm.len() + bytes.len() > audio::MAX_BUFFER_BYTES {
         // 超上限：丢弃多余数据（30 分钟语音已覆盖绝大多数场景），不报错中断录制
         crate::ai::commands::ai_dbg_log(&format!(
@@ -91,11 +104,11 @@ pub fn voice_append(
             recording_id,
             bytes.len()
         ));
-        return Ok(());
+        return;
     }
-    buffer.pcm.extend_from_slice(&bytes);
+    buffer.pcm.extend_from_slice(bytes);
     // 采集心跳：每 ~10s（16kHz/16bit 单声道 ≈ 320KB）打一条，用于发现
-    // 「开麦成功但采集回调停摆」（如窗口最小化后 WebView2 节流）的问题
+    // 「开麦成功但采集停摆」这类问题
     const HEARTBEAT_BYTES: usize = 320_000;
     let hb_slot = buffer.pcm.len() / HEARTBEAT_BYTES;
     if hb_slot > buffer.last_heartbeat_len {
@@ -107,7 +120,6 @@ pub fn voice_append(
             buffer.pcm.len() / 1024
         ));
     }
-    Ok(())
 }
 
 /// 取消采集（用户放弃本次录制）：直接丢弃缓冲。

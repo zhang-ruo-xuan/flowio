@@ -1,56 +1,42 @@
 /**
- * 语音输入采集器（桌面端）。
+ * 语音输入采集器（桌面端）—— 薄封装，真正的采集在 Rust 侧。
  *
- * 管线：getUserMedia → AudioContext(16kHz) → ScriptProcessorNode 收集
- * Float32 PCM → 停止时转 i16 → 打包裸 PCM 分块（base64）交给 Rust。
- * WAV 头由 Rust 侧在送 ASR 前统一补齐（voice/audio.rs::pcm_to_wav）。
+ * 🔴 为什么不用 getUserMedia + AudioContext（历史包袱，别再走回头路）：
+ * 录制一开始主窗口就 minimize()（把屏幕让给被录的应用），WebView2 会停掉
+ * 指向真实输出设备的音频渲染线程 —— ScriptProcessorNode 的 onaudioprocess
+ * 随之停止（实测只采到最小化前的 512ms）。试过 AudioContext({sinkId:"none"})
+ * 让上下文不挂输出设备，结果更糟：null sink 没有设备时钟驱动渲染，
+ * **一次回调都没跑**（样本数全程 0）。
+ * 采集不该依赖渲染进程，所以搬到了 Rust：`src-tauri/src/voice/capture.rs`
+ * 用 cpal（Windows 走 WASAPI）直接采，窗口最小化/遮挡/隐藏都不影响。
  *
- * 设计要点：
- * - AudioContext 用 sinkId:"none" 创建（无输出设备，由系统时钟驱动渲染）。
- *   🔴 录制开始后主窗口会被最小化，WebView2(Chromium) 会停掉指向真实输出
- *   设备的渲染线程 —— ScriptProcessor 的 onaudioprocess 随之停止
- *   （实测只采到 minimize() 前的 512ms 静音），这就是
- *   「一直在说但检测不到」的根因。sinkId:"none" 不挂输出设备，
- *   最小化/遮挡都不影响采集。不支持该选项的环境回退默认创建。
- * - ScriptProcessorNode 已废弃但 Chromium 完整支持；比 AudioWorklet 免去
- *   独立模块文件的加载时序问题。
- * - 暂停录制时调用 pause()/resume()：暂停期间的 PCM 直接丢弃
- *   （PRD：切片按绝对时间对齐，丢弃段自然静音，不影响步骤映射）。
- * - startedAt 取 AudioContext 成功创建并收到首帧数据的时刻（epoch ms），
- *   与步骤的 timestamp（epoch ms）同源，偏移计算无需时钟换算。
+ * 代价：丢掉 getUserMedia 的 echoCancellation / noiseSuppression，麦克风
+ * 会拾到喇叭外放的声音 —— 戴耳机或调低外放音量即可。
+ *
+ * 本类只负责：起停采集（voice_mic_start/stop）、暂停恢复（补静音保时间轴）、
+ * 以及给看门狗查样本数（voice_mic_samples）。PCM 直接进 Rust 的缓冲，
+ * 不再经 IPC 传 base64 分块。
  */
 
+import { invoke } from "@tauri-apps/api/core";
+
 const TARGET_SAMPLE_RATE = 16000;
-/** 每 ~0.5s 上传一块（16k × i16 × 0.5s ≈ 16KB） */
-const CHUNK_UPLOAD_INTERVAL_MS = 500;
 
 export interface VoiceStopResult {
-  /** 裸 PCM 分块（base64），按顺序 voice_append */
+  /** 保留字段：Rust 侧采集不再经前端上传，恒为空 */
   chunks: string[];
   /** 采集起点（epoch ms） */
   startedAtMs: number;
-  /** 采样率（与后端 audio.rs 约定一致） */
+  /** 采样率（与后端 voice/audio.rs::SAMPLE_RATE 约定一致） */
   sampleRate: number;
   /** 采集总时长（毫秒） */
   durationMs: number;
 }
 
 export class VoiceRecorder {
-  private stream: MediaStream | null = null;
-  private ctx: AudioContext | null = null;
-  private processor: ScriptProcessorNode | null = null;
-  private source: MediaStreamAudioSourceNode | null = null;
-  /** 采集是否依赖真实输出设备（true = 窗口最小化后回调会停，看门狗要盯） */
-  private deviceBoundCtx = false;
-
-  private buffers: Float32Array[] = [];
-  private pendingChunk: Float32Array[] = [];
-  private pendingChunkSamples = 0;
-  private totalSamples = 0;
-
-  private startedAtMs = 0;
-  private paused = false;
   private active = false;
+  private pausedFlag = false;
+  private startedAtMs = 0;
 
   /** 采样率（与后端 voice/audio.rs::SAMPLE_RATE 约定一致） */
   readonly sampleRateSafe = TARGET_SAMPLE_RATE;
@@ -60,170 +46,65 @@ export class VoiceRecorder {
     return this.active;
   }
 
-  /** 是否处于暂停（暂停期间丢弃 PCM） */
+  /** 是否处于暂停（暂停期间丢弃 PCM，恢复时补等长静音） */
   get isPaused(): boolean {
-    return this.paused;
+    return this.pausedFlag;
   }
 
-  /** 已采集样本数（看门狗用：连续不变说明回调停了） */
-  get totalSamplesSoFar(): number {
-    return this.totalSamples;
-  }
-
-  /** AudioContext 是否绑定真实输出设备（true = 最小化后采集可能停摆） */
-  get isDeviceBound(): boolean {
-    return this.deviceBoundCtx;
+  /**
+   * 已采集样本数（看门狗用：连续不变说明采集停摆）。
+   * 异步是因为计数在 Rust 侧的原子变量里。
+   */
+  async samples(): Promise<number> {
+    try {
+      return await invoke<number>("voice_mic_samples");
+    } catch {
+      return 0;
+    }
   }
 
   /**
    * 开始采集。解析失败 / 权限被拒时抛错（调用方按 PRD V3 降级为纯录制）。
-   * 返回值即音频起点（epoch ms）。
+   * 返回值即音频起点（epoch ms，由 Rust 在流真正启动的瞬间取）。
    */
-  async start(): Promise<number> {
+  async start(recordingId: string): Promise<number> {
     if (this.active) return this.startedAtMs;
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-    // 优先 sinkId:"none"：不占输出设备，最小化/遮挡时渲染照常（系统时钟驱动）。
-    // 实现不识别该选项时可能忽略或抛错 → 统一回退默认创建，并标记 deviceBoundCtx。
-    // 采样率不满足期望时（设备不支持重采样）仍可工作，只是体积变大；
-    // 后端 sample_rate 由 voice_begin 传入，无需两端强一致。
-    this.deviceBoundCtx = false;
-    let ctx: AudioContext | null = null;
-    try {
-      const c = new AudioContext({
-        sampleRate: TARGET_SAMPLE_RATE,
-        sinkId: "none",
-      } as AudioContextOptions);
-      if ("sinkId" in c && (c as AudioContext & { sinkId: unknown }).sinkId === "none") {
-        ctx = c;
-      } else {
-        void c.close();
-      }
-    } catch {
-      /* 不支持 sinkId:"none"，走回退 */
-    }
-    if (!ctx) {
-      ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
-      this.deviceBoundCtx = true;
-    }
-    this.ctx = ctx;
-    this.source = this.ctx.createMediaStreamSource(this.stream);
-    this.processor = this.ctx.createScriptProcessor(4096, 1, 1);
-    this.processor.onaudioprocess = (ev) => {
-      if (!this.active || this.paused) return;
-      const input = ev.inputBuffer.getChannelData(0);
-      const copy = new Float32Array(input.length);
-      copy.set(input);
-      this.buffers.push(copy);
-      this.pendingChunk.push(copy);
-      this.pendingChunkSamples += copy.length;
-      this.totalSamples += copy.length;
-    };
-    this.source.connect(this.processor);
-    // ScriptProcessor 需要连接到 destination 才会驱动回调；接一个零增益
-    // 节点避免把采集声音外放。
-    const mute = this.ctx.createGain();
-    mute.gain.value = 0;
-    this.processor.connect(mute);
-    mute.connect(this.ctx.destination);
-
-    await this.ctx.resume();
-    this.buffers = [];
-    this.pendingChunk = [];
-    this.pendingChunkSamples = 0;
-    this.totalSamples = 0;
-    this.paused = false;
-    this.startedAtMs = Date.now();
+    this.startedAtMs = await invoke<number>("voice_mic_start", { recordingId });
     this.active = true;
+    this.pausedFlag = false;
     return this.startedAtMs;
   }
 
-  /** 暂停采集：丢弃后续 PCM（暂停期间不上传） */
-  pause(): void {
-    this.paused = true;
+  /** 暂停采集：暂停期间的音频不写入缓冲（恢复时补等长静音保住时间轴） */
+  async pause(): Promise<void> {
+    this.pausedFlag = true;
+    await invoke("voice_mic_set_paused", { paused: true }).catch(() => {});
   }
 
   /** 恢复采集 */
-  resume(): void {
-    this.paused = false;
+  async resume(): Promise<void> {
+    this.pausedFlag = false;
+    await invoke("voice_mic_set_paused", { paused: false }).catch(() => {});
   }
 
-  /** 停止采集并产出 PCM 分块 */
+  /** 停止采集（会等 Rust 把管道里剩余 PCM 落进缓冲） */
   async stop(): Promise<VoiceStopResult> {
+    if (!this.active) {
+      return { chunks: [], startedAtMs: this.startedAtMs, sampleRate: TARGET_SAMPLE_RATE, durationMs: 0 };
+    }
     this.active = false;
+    this.pausedFlag = false;
+    let totalSamples = 0;
     try {
-      this.processor?.disconnect();
-      this.source?.disconnect();
-    } catch {
-      /* noop */
+      totalSamples = await invoke<number>("voice_mic_stop");
+    } catch (err) {
+      console.warn("[voice] mic stop failed:", err);
     }
-    try {
-      await this.ctx?.close();
-    } catch {
-      /* noop */
-    }
-    this.stream?.getTracks().forEach((t) => t.stop());
-    this.processor = null;
-    this.source = null;
-    this.ctx = null;
-    this.stream = null;
-
-    const sampleRate = TARGET_SAMPLE_RATE;
-    const durationMs = Math.round((this.totalSamples * 1000) / sampleRate);
-    const chunks = this.pendingChunk.map(encodeChunkB64);
-    this.buffers = [];
-    this.pendingChunk = [];
-    this.pendingChunkSamples = 0;
-    this.totalSamples = 0;
-    return { chunks, startedAtMs: this.startedAtMs, sampleRate, durationMs };
+    return {
+      chunks: [],
+      startedAtMs: this.startedAtMs,
+      sampleRate: TARGET_SAMPLE_RATE,
+      durationMs: Math.round((totalSamples * 1000) / TARGET_SAMPLE_RATE),
+    };
   }
-
-  /**
-   * 判断 pendingChunk 是否该上传（由调用方定时驱动）。
-   * 返回 null 表示不足一块；否则返回 base64 并清空 pending。
-   */
-  takeChunkIfReady(): string | null {
-    const readySamples = Math.round((CHUNK_UPLOAD_INTERVAL_MS / 1000) * TARGET_SAMPLE_RATE);
-    if (this.pendingChunkSamples < readySamples) return null;
-    return this.takePendingChunk();
-  }
-
-  /** 立即取走 pending 数据（不足一块时也取） */
-  takePendingChunk(): string | null {
-    if (this.pendingChunkSamples === 0) return null;
-    const b64 = this.pendingChunk.map(encodeChunkB64).join("");
-    this.pendingChunk = [];
-    this.pendingChunkSamples = 0;
-    return b64;
-  }
-}
-
-/** Float32Array → base64（i16 LE PCM） */
-function encodeChunkB64(chunk: Float32Array): string {
-  const pcm = float32ToInt16(chunk);
-  let binary = "";
-  const bytes = new Uint8Array(pcm.buffer);
-  const STEP = 0x8000;
-  for (let i = 0; i < bytes.length; i += STEP) {
-    binary += String.fromCharCode.apply(
-      null,
-      Array.from(bytes.subarray(i, Math.min(i + STEP, bytes.length))) as unknown as number[]
-    );
-  }
-  return btoa(binary);
-}
-
-function float32ToInt16(input: Float32Array): Int16Array {
-  const out = new Int16Array(input.length);
-  for (let i = 0; i < input.length; i++) {
-    const s = Math.max(-1, Math.min(1, input[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out;
 }
