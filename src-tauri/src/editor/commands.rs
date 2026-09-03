@@ -82,7 +82,8 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
                     id: row.get(0)?,
                     title: row.get(1)?,
                     app_name: row.get(2)?,
-                    target_app: row.get(3)?,
+                    // target_app 列对旧录制为 NULL（v66 之前的记录），必须按 Option 读
+                    target_app: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                     status: row.get(4)?,
                     total_steps: row.get(5)?,
                     duration_secs: row.get(6)?,
