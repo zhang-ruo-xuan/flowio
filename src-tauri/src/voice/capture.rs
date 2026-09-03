@@ -271,13 +271,47 @@ fn build_stream_for_default_device(
     let name = device.name().unwrap_or_else(|_| "(未知设备)".to_string());
     let cfg = pick_input_config(&device)?;
     let info = StreamInfo {
-        name,
+        name: name.clone(),
         dev_rate: cfg.sample_rate().0,
         channels: cfg.channels(),
         format: cfg.sample_format(),
     };
-    let stream = build_stream(&device, &cfg, paused, samples, tx)?;
-    Ok((stream, info))
+    match build_stream(
+        &device,
+        &cfg,
+        Arc::clone(&paused),
+        Arc::clone(&samples),
+        tx.clone(),
+    ) {
+        Ok(stream) => Ok((stream, info)),
+        Err(first_err) => {
+            // 有的声卡在枚举里声称支持 16kHz，真正建流却失败（尤其 USB 耳机）。
+            // 退回设备默认格式，靠回调里的重采样补到 16kHz，别让麦克风直接开不了。
+            let fallback = device
+                .default_input_config()
+                .map_err(|e| format!("{}（退回设备默认格式也失败：{}）", first_err, e))?;
+            if fallback.sample_rate() == cfg.sample_rate()
+                && fallback.sample_format() == cfg.sample_format()
+            {
+                // 默认配置跟刚才失败的是同一个，重试没意义
+                return Err(first_err);
+            }
+            crate::ai::commands::ai_dbg_log(&format!(
+                "[VOICE] 16kHz 建流失败，退回默认格式 {}Hz/{:?}：{}",
+                fallback.sample_rate().0,
+                fallback.sample_format(),
+                first_err
+            ));
+            let info = StreamInfo {
+                name,
+                dev_rate: fallback.sample_rate().0,
+                channels: fallback.channels(),
+                format: fallback.sample_format(),
+            };
+            let stream = build_stream(&device, &fallback, paused, samples, tx)?;
+            Ok((stream, info))
+        }
+    }
 }
 
 /// 挑一个能用的输入配置：优先 16kHz 原生，否则用设备默认配置（回调里重采样）。
