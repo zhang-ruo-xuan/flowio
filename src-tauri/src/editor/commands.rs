@@ -74,8 +74,8 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
 
     let recording = conn
         .query_row(
-            "SELECT id, title, app_name, status, total_steps, duration_secs, \
-             created_at, updated_at, target_app FROM recordings WHERE id = ?1",
+            "SELECT id, title, app_name, target_app, status, total_steps, duration_secs, \
+             created_at, updated_at FROM recordings WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Recording {
