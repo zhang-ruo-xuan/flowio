@@ -3347,3 +3347,40 @@ select {
   top: calc(100% + 4px);
   z-index: 9999;
 }
+
+/* ============================================================
+   全局悬浮提示（给元素加 data-tip="说明" 即可，见 components/Tooltip.tsx）
+   ============================================================ */
+.ui-tip {
+  position: fixed;
+  z-index: 100000;
+  max-width: 280px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #24292e;
+  color: #e6edf3;
+  border: 1px solid #444c56;
+  font-size: 12px;
+  line-height: 1.6;
+  /* data-tip 里可写 \n 换行 */
+  white-space: pre-line;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  /* 关键：气泡本身不能吃鼠标事件，否则会把目标元素的 mouseout 触发成抖动 */
+  pointer-events: none;
+  animation: ui-tip-in 0.12s ease;
+}
+/* top：底边贴着目标上沿 → 需再上移自身高度；bottom：顶边贴目标下沿 */
+.ui-tip-top {
+  transform: translateX(-50%) translateY(-100%);
+}
+.ui-tip-bottom {
+  transform: translateX(-50%);
+}
+@keyframes ui-tip-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

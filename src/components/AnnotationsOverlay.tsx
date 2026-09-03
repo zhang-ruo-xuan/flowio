@@ -22,14 +22,14 @@ interface Props {
   onClose: () => void;
 }
 
-const TOOLS: { id: ToolType; label: string; icon: string }[] = [
-  { id: 'select', label: '选择', icon: '⇲' },
-  { id: 'text', label: '文字', icon: 'T' },
-  { id: 'highlight', label: '高亮', icon: '□' },
-  { id: 'arrow', label: '箭头', icon: '↗' },
-  { id: 'blur', label: '模糊', icon: '▦' },
-  { id: 'crop', label: '裁剪', icon: '⌗' },
-  { id: 'delete', label: '删除标注', icon: '✕' },
+const TOOLS: { id: ToolType; label: string; icon: string; tip: string }[] = [
+  { id: 'select', label: '选择', icon: '⇲', tip: '选择\n点选已画好的标注，再拖动调整位置' },
+  { id: 'text', label: '文字', icon: 'T', tip: '文字\n在图上点一下，输入要写的说明文字' },
+  { id: 'highlight', label: '高亮', icon: '□', tip: '高亮\n拖出半透明色块强调某块区域，底下的内容仍看得见' },
+  { id: 'arrow', label: '箭头', icon: '↗', tip: '箭头\n从起点拖到终点，指向要操作的位置' },
+  { id: 'blur', label: '模糊', icon: '▦', tip: '模糊\n把要遮住的区域涂成马赛克，用来给敏感信息打码' },
+  { id: 'crop', label: '裁剪', icon: '⌗', tip: '裁剪\n框出要保留的区域，点「应用裁剪」后其余部分被裁掉' },
+  { id: 'delete', label: '删除标注', icon: '✕', tip: '删除标注\n点一下要删的那条标注就删掉，可以连续删' },
 ];
 
 const COLOR_PRESETS = ['#FF4235', '#FF6B35', '#FFC107', '#4CAF50', '#2196F3', '#9C27B0', '#FFFFFF', '#24292E'];
@@ -709,7 +709,7 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
                   cancelCrop();
                 }
               }}
-              title={t.label}
+              data-tip={t.tip}
             >
               <span className="annotation-tool-icon">{t.icon}</span>
             </button>
@@ -730,7 +730,7 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
                     className={`annotation-color-swatch ${currentColor === c ? 'active' : ''}`}
                     style={{ background: c }}
                     onClick={() => setCurrentColor(c)}
-                    title={c}
+                    data-tip={`画笔颜色 ${c}`}
                   />
                 ))}
               </div>
@@ -744,6 +744,7 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
                       key={s}
                       className={`annotation-size-btn ${currentFontSize === s ? 'active' : ''}`}
                       onClick={() => setCurrentFontSize(s)}
+                      data-tip={`字号 ${s}px`}
                     >
                       {s}
                     </button>
@@ -759,6 +760,7 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
                       key={s.val}
                       className={`annotation-size-btn ${currentStrokeWidth === s.val ? 'active' : ''}`}
                       onClick={() => setCurrentStrokeWidth(s.val)}
+                      data-tip={`线条粗细 ${s.label}（${s.val}px）`}
                     >
                       {s.label}
                     </button>
@@ -770,16 +772,16 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
         )}
 
         <div className="annotation-actions">
-          <button className="annotation-history-btn" onClick={handleStepBack} disabled={historyIndex <= 0} title="上一步">←</button>
-          <button className="annotation-history-btn" onClick={handleStepForward} disabled={historyIndex >= history.length - 1} title="下一步">→</button>
+          <button className="annotation-history-btn" onClick={handleStepBack} disabled={historyIndex <= 0} data-tip="撤销上一步">←</button>
+          <button className="annotation-history-btn" onClick={handleStepForward} disabled={historyIndex >= history.length - 1} data-tip="重做（撤销多了往回走）">→</button>
           {cropRect && (
             <>
-              <button className="annotation-crop-apply-btn" onClick={handleSave}>应用裁剪</button>
-              <button className="annotation-crop-cancel-btn" onClick={cancelCrop}>取消裁剪</button>
+              <button className="annotation-crop-apply-btn" onClick={handleSave} data-tip="按当前选框裁掉其余部分">应用裁剪</button>
+              <button className="annotation-crop-cancel-btn" onClick={cancelCrop} data-tip="放弃这次裁剪，保留整张图">取消裁剪</button>
             </>
           )}
-          <button className="annotation-save-btn" onClick={handleSave}>完成</button>
-          <button className="annotation-close-btn" onClick={onClose}>✕</button>
+          <button className="annotation-save-btn" onClick={handleSave} data-tip="保存标注，覆盖这一步的截图">完成</button>
+          <button className="annotation-close-btn" onClick={onClose} data-tip="放弃所有改动并关闭">✕</button>
         </div>
       </div>
       <div className="annotation-canvas-area" ref={areaRef}>
@@ -812,8 +814,8 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
                     if (e.key === 'Escape') { setTextPlacePos(null); setTextInput(''); }
                   }}
                 />
-                <button className="annotation-text-popover-confirm" onClick={confirmText} title="确认">✓</button>
-                <button className="annotation-text-popover-cancel" onClick={() => { setTextPlacePos(null); setTextInput(''); }} title="取消">✕</button>
+                <button className="annotation-text-popover-confirm" onClick={confirmText} data-tip="把这行文字放到图上">✓</button>
+                <button className="annotation-text-popover-cancel" onClick={() => { setTextPlacePos(null); setTextInput(''); }} data-tip="不写了">✕</button>
               </div>
             </div>
           )}

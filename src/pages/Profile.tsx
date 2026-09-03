@@ -68,6 +68,7 @@ export default function ProfilePage() {
       <div style={{ display: "flex", alignItems: "center", padding: "8px 0" }}>
         <button
           onClick={() => navigate("/")}
+          data-tip="返回录制列表"
           style={{
             display: "inline-flex", alignItems: "center", gap: 4,
             background: "transparent", border: "none", cursor: "pointer",
@@ -147,6 +148,7 @@ export default function ProfilePage() {
 
               <button
                 onClick={doLogout}
+                data-tip="退出网站账号；本地录制内容不受影响"
                 style={{
                   flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 4,
                   padding: "6px 10px", borderRadius: 6, fontSize: 12,
@@ -163,6 +165,7 @@ export default function ProfilePage() {
               <button
                 onClick={doRefresh}
                 disabled={refreshing}
+                data-tip="从 flowio.cn 重新拉取头像、昵称等信息"
                 style={{
                   display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
                   padding: "10px 16px", borderRadius: 8, fontSize: 14, fontWeight: 500,
@@ -180,6 +183,7 @@ export default function ProfilePage() {
               )}
               <button
                 onClick={() => navigate("/settings")}
+                data-tip="AI 配置、脱敏规则、快捷键等"
                 style={{
                   display: "flex", alignItems: "center", gap: 10,
                   padding: "12px 16px", borderRadius: 8, fontSize: 14,
@@ -222,6 +226,7 @@ export default function ProfilePage() {
             </div>
             <button
               onClick={login}
+              data-tip="登录后可把教程上传到 flowio.cn"
               style={{
                 padding: "8px 24px", borderRadius: 6, fontSize: 14, fontWeight: 500,
                 border: "none", background: "var(--blue)", color: "#fff",

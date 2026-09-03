@@ -499,8 +499,8 @@ export default function FileSaveDialog({
                 {overwriteTarget.split("\\").pop()} 已存在。<br />是否覆盖？
               </p>
               <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
-                <button style={{ ...s.btn, ...s.btnPrimary }} onClick={confirmOverwrite}>是(Y)</button>
-                <button style={s.btn} onClick={cancelOverwrite}>否(N)</button>
+                <button style={{ ...s.btn, ...s.btnPrimary }} onClick={confirmOverwrite} data-tip="覆盖掉原来的文件">是(Y)</button>
+                <button style={s.btn} onClick={cancelOverwrite} data-tip="不覆盖，换个名字或位置再存">否(N)</button>
               </div>
             </div>
           </div>
@@ -634,10 +634,11 @@ export default function FileSaveDialog({
               style={{ ...s.btn, ...s.btnPrimary, width: 80 }}
               onClick={handleSave}
               disabled={!fileName.trim()}
+              data-tip="保存到当前文件夹"
             >
               保存(S)
             </button>
-            <button style={{ ...s.btn, width: 80 }} onClick={onClose}>
+            <button style={{ ...s.btn, width: 80 }} onClick={onClose} data-tip="不保存，关闭">
               取消
             </button>
           </div>

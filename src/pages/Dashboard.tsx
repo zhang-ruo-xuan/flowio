@@ -312,6 +312,7 @@ export default function Dashboard({
               <button
                 className="btn dashboard-action-btn rec-btn rec-resume"
                 onClick={() => onResumeRecording?.()}
+                data-tip={"恢复录制\n继续截图、记录你的操作"}
               >
                 <Play size={14} fill="currentColor" />
                 恢复
@@ -320,6 +321,7 @@ export default function Dashboard({
               <button
                 className="btn dashboard-action-btn rec-btn rec-pause"
                 onClick={() => onPauseRecording?.()}
+                data-tip={"暂停录制\n暂停期间不再截图，语音也一并停止"}
               >
                 <Pause size={14} />
                 暂停
@@ -328,6 +330,7 @@ export default function Dashboard({
             <button
               className="btn dashboard-action-btn rec-btn rec-stop"
               onClick={() => onStopRecording?.()}
+              data-tip={"停止录制并保存\n停止后会自动合并重复点击/连续输入，并把语音转成文字补进步骤"}
             >
               <Square size={13} fill="currentColor" />
               停止
@@ -337,6 +340,7 @@ export default function Dashboard({
           <button
             className="btn btn-primary dashboard-action-btn"
             onClick={() => onStartRecording()}
+            data-tip={"开始录制\n之后在任何软件里正常操作即可，录步会自动截图并记录每一步"}
           >
             <Circle size={14} fill="currentColor" />
             开始录制
@@ -355,11 +359,11 @@ export default function Dashboard({
           {selected.length > 0 && (
             <div className="dash-batchbar">
               <span className="dash-batchbar-count">已选 {selected.length} 条</span>
-              <button className="dash-batchbar-btn dash-batchbar-del" onClick={() => void handleBatchDelete()}>
+              <button className="dash-batchbar-btn dash-batchbar-del" onClick={() => void handleBatchDelete()} data-tip={"删除选中的所有录制\n连同截图一起删除，无法恢复"}>
                 <Trash2 size={13} />
                 批量删除
               </button>
-              <button className="dash-batchbar-btn" onClick={() => setSelected([])}>
+              <button className="dash-batchbar-btn" onClick={() => setSelected([])} data-tip="清空选中，不删除任何东西">
                 取消选择
               </button>
             </div>
@@ -379,6 +383,7 @@ export default function Dashboard({
                   <button
                     className="btn rec-btn rec-resume"
                     onClick={() => onResumeRecording?.()}
+                    data-tip={"恢复录制\n继续截图、记录你的操作"}
                   >
                     <Play size={14} fill="currentColor" />
                     恢复
@@ -387,6 +392,7 @@ export default function Dashboard({
                   <button
                     className="btn rec-btn rec-pause"
                     onClick={() => onPauseRecording?.()}
+                    data-tip={"暂停录制\n暂停期间不再截图，语音也一并停止"}
                   >
                     <Pause size={14} />
                     暂停
@@ -395,6 +401,7 @@ export default function Dashboard({
                 <button
                   className="btn rec-btn rec-stop"
                   onClick={() => onStopRecording?.()}
+                  data-tip={"停止录制并保存\n停止后会自动合并重复点击/连续输入，并把语音转成文字补进步骤"}
                 >
                   <Square size={13} fill="currentColor" />
                   停止
@@ -404,6 +411,7 @@ export default function Dashboard({
               <button
                 className="empty-state-btn"
                 onClick={() => onStartRecording()}
+                data-tip={"开始录制\n之后在任何软件里正常操作即可，录步会自动截图并记录每一步"}
               >
                 <Circle size={8} fill="currentColor" />
                 开始录制
@@ -422,7 +430,7 @@ export default function Dashboard({
                         className="dash-check"
                         checked={allPageSelected}
                         onChange={toggleSelectPage}
-                        title="全选本页"
+                        data-tip="全选/取消本页"
                       />
                     </th>
                     <th>标题</th>
@@ -488,7 +496,7 @@ export default function Dashboard({
                               setEditingAppId(r.id);
                               setAppNameDraft(r.app_name || "");
                             }}
-                            title="点击编辑应用名"
+                            data-tip="点击修改识别到的应用名"
                           >
                             {r.app_name || "—"}
                           </span>
@@ -514,6 +522,7 @@ export default function Dashboard({
                       <td>
                         <button
                           className="btn-icon"
+                          data-tip="更多操作：重命名、导出、删除"
                           onClick={(e) => {
                             e.stopPropagation();
                             if (openMenuId === r.id) {
@@ -541,6 +550,7 @@ export default function Dashboard({
                   className="pagination-btn"
                   disabled={page <= 1}
                   onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  data-tip="上一页"
                 >
                   上一页
                 </button>
@@ -552,6 +562,7 @@ export default function Dashboard({
                         p === page ? "active" : ""
                       }`}
                       onClick={() => setPage(p)}
+                      data-tip={`第 ${p} 页`}
                     >
                       {p}
                     </button>
@@ -563,6 +574,7 @@ export default function Dashboard({
                   onClick={() =>
                     setPage((p) => Math.min(totalPages, p + 1))
                   }
+                  data-tip="下一页"
                 >
                   下一页
                 </button>
@@ -582,6 +594,7 @@ export default function Dashboard({
           <button
             className="dropdown-item"
             onClick={() => handleDelete(openMenuId)}
+            data-tip="删除这条录制（连同截图，无法恢复）"
           >
             <Trash2 size={14} />
             删除
@@ -594,6 +607,7 @@ export default function Dashboard({
               setRenameDraft(rec?.title || "");
               setOpenMenuId(null);
             }}
+            data-tip="给这条录制改个名字"
           >
             <Pencil size={14} />
             重命名
@@ -602,6 +616,7 @@ export default function Dashboard({
           <button
             className="dropdown-item"
             onClick={() => handleExport(openMenuId, "pdf")}
+            data-tip="导出成 PDF，适合直接发给别人看或打印"
           >
             <FileText size={14} />
             导出 PDF
@@ -609,6 +624,7 @@ export default function Dashboard({
           <button
             className="dropdown-item"
             onClick={() => handleExport(openMenuId, "html")}
+            data-tip="导出成单个 HTML 文件，带目录，双击即可打开"
           >
             <Code size={14} />
             导出 HTML
@@ -616,6 +632,7 @@ export default function Dashboard({
           <button
             className="dropdown-item"
             onClick={() => handleExport(openMenuId, "docx")}
+            data-tip="导出成 Word 文档，方便交给同事继续编辑"
           >
             <FileType size={14} />
             导出 Word 文档

@@ -278,13 +278,13 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
             {rect ? `${rect.width} × ${rect.height} px @ (${rect.x}, ${rect.y})` : ''}
           </span>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn" onClick={onCancel}>
+            <button className="btn" onClick={onCancel} data-tip="放弃裁剪，保留原来的截图">
               取消
             </button>
             <button
               className="btn"
               onClick={() => setRect({ x: 0, y: 0, width: W, height: H })}
-              title="选区铺满整张截图"
+              data-tip="把选区铺满整张截图（等于不裁）"
             >
               全选
             </button>
@@ -292,6 +292,7 @@ export default function CropOverlay({ imageBase64, initialRect, onConfirm, onCan
               className="btn btn-primary"
               disabled={!rect}
               onClick={() => rect && onConfirm(rect)}
+              data-tip="按当前选框裁出这一步的截图"
             >
               应用裁图
             </button>

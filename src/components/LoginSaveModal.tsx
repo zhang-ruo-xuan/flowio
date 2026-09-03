@@ -134,7 +134,7 @@ export default function LoginSaveModal({ open, onClose, onLogin }: LoginSaveModa
   return createPortal(
     <div style={s.overlay} onClick={onClose}>
       <div style={s.dialog} onClick={(e) => e.stopPropagation()}>
-        <button style={s.close} onClick={onClose} title="关闭">
+        <button style={s.close} onClick={onClose} data-tip="关闭，只留在这台电脑上">
           <X size={18} />
         </button>
 
@@ -164,12 +164,12 @@ export default function LoginSaveModal({ open, onClose, onLogin }: LoginSaveModa
           </li>
         </ul>
 
-        <button style={s.primaryBtn} onClick={onLogin}>
+        <button style={s.primaryBtn} onClick={onLogin} data-tip="去 flowio.cn 登录，之后把这份录制同步到云端">
           <ArrowRight size={16} />
           登录并保存
         </button>
 
-        <button style={s.secondaryBtn} onClick={onClose}>
+        <button style={s.secondaryBtn} onClick={onClose} data-tip="不上传，继续留在本地（之后想传随时可以）">
           暂不需要
         </button>
 

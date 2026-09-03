@@ -11,6 +11,7 @@ import ProfilePage from "./pages/Profile";
 import { useAuthStore } from "./store/authStore";
 import { getCachedAvatar, cacheAvatar, avatarFileUrl } from "./lib/avatarCache";
 import { VoiceRecorder } from "./lib/voiceRecorder";
+import Tooltip from "./components/Tooltip";
 
 function App() {
   const [darkMode, setDarkMode] = useState(false);
@@ -536,7 +537,7 @@ function App() {
               className={`titlebar-btn titlebar-btn-voice${voiceEnabled ? " on" : ""}`}
               style={voiceActive && recording ? { color: "#ff5b5b" } : undefined}
               onClick={toggleVoice}
-              title={
+              data-tip={
                 recording
                   ? voiceActive ? "语音输入已开启（点击在本段录制中关闭，已采集内容照常转写）" : "语音输入已关闭（点击在本段录制中开启）"
                   : voiceEnabled ? "语音输入：开（录制时边说边记，文字自动补充到对应步骤）" : "语音输入：关（点击开启）"
@@ -549,22 +550,22 @@ function App() {
           {!isEditor && recording && (
             <>
               {isPaused ? (
-                <button className="titlebar-btn titlebar-btn-resume" onClick={handleResumeRecording} title="恢复录制">
+                <button className="titlebar-btn titlebar-btn-resume" onClick={handleResumeRecording} data-tip={"恢复录制\n继续截图、记录你的操作"}>
                   <Play size={13} /> 恢复
                 </button>
               ) : (
-                <button className="titlebar-btn titlebar-btn-pause" onClick={handlePauseRecording} title="暂停录制">
+                <button className="titlebar-btn titlebar-btn-pause" onClick={handlePauseRecording} data-tip={"暂停录制\n暂停期间不再截图，语音也一并停止；用来中场休息或处理别的事"}>
                   <Pause size={13} /> 暂停
                 </button>
               )}
-              <button className="titlebar-btn titlebar-btn-stop" onClick={handleStopRecording} title="停止录制">STOP</button>
+              <button className="titlebar-btn titlebar-btn-stop" onClick={handleStopRecording} data-tip={"停止录制并保存\n停止后会自动合并重复点击/连续输入，并把你说的语音转成文字补进步骤"}>STOP</button>
             </>
           )}
           <button
             className="titlebar-btn titlebar-btn-login"
             style={isEditor ? { display: "none" } : undefined}
             onClick={() => siteToken ? navigate("/profile") : invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" })}
-            title={siteToken ? `${siteUser?.display_name || siteUser?.email || '用户'}（点击进入个人中心）` : "登录网站账号"}
+            data-tip={siteToken ? `${siteUser?.display_name || siteUser?.email || '用户'}（点击进入个人中心）` : "登录网站账号"}
           >
             {siteToken ? (
               (() => {
@@ -592,11 +593,11 @@ function App() {
             )}
           </button>
           {!isEditor && (
-            <button className="titlebar-win-btn" onClick={() => navigate("/settings")} title="设置"><Settings size={15} /></button>
+            <button className="titlebar-win-btn" onClick={() => navigate("/settings")} data-tip={"设置\nAI 服务商、快捷键、截图与隐私选项"}><Settings size={15} /></button>
           )}
-          <button className="titlebar-win-btn" onClick={() => appWindow.minimize()} title="最小化"><Minus size={15} /></button>
-          <button className="titlebar-win-btn" onClick={() => appWindow.toggleMaximize()} title={isMaximized ? "还原" : "最大化"}>{isMaximized ? <Copy size={13} /> : <Square size={13} />}</button>
-          <button className="titlebar-win-btn titlebar-close-btn" onClick={() => appWindow.close()} title="关闭"><X size={15} /></button>
+          <button className="titlebar-win-btn" onClick={() => appWindow.minimize()} data-tip={"最小化\n缩到任务栏，录制会继续进行"}><Minus size={15} /></button>
+          <button className="titlebar-win-btn" onClick={() => appWindow.toggleMaximize()} data-tip={isMaximized ? "还原窗口" : "最大化窗口"}>{isMaximized ? <Copy size={13} /> : <Square size={13} />}</button>
+          <button className="titlebar-win-btn titlebar-close-btn" onClick={() => appWindow.close()} data-tip={"关闭\n录制中的内容会自动保存"}><X size={15} /></button>
         </div>
       </div>
 
@@ -634,6 +635,9 @@ function App() {
           {voiceToast.message}
         </div>
       )}
+
+      {/* 全局悬浮提示层：任何元素加 data-tip="…" 即可出气泡 */}
+      <Tooltip />
     </div>
   );
 }

@@ -46,6 +46,13 @@ const EXPORT_FORMATS = [
   { value: "pdf", label: "PDF", ext: "", icon: File },
 ] as const;
 
+/** 各导出格式的悬浮说明（说清「导出来能干嘛」，而不是重复格式名） */
+const EXPORT_TIPS: Record<string, string> = {
+  html: "导出单个 HTML 文件，带目录；双击即可打开，也能直接放到网站上",
+  docx: "导出 Word 文档，方便交给同事继续编辑排版",
+  pdf: "导出 PDF，适合直接发给别人看或打印",
+};
+
 /* ── Backend response types ────────────────────────────────── */
 
 interface RecordingWithSteps {
@@ -227,7 +234,7 @@ function Lightbox({
       <div className="lightbox-content" onClick={(e) => e.stopPropagation()}>
         {/* Top bar: 关闭叉（右上角） */}
         <div className="lightbox-topbar">
-          <button className="lightbox-close" onClick={onClose}>
+          <button className="lightbox-close" onClick={onClose} data-tip="关闭大图（也可按 Esc）">
             <X size={24} />
           </button>
         </div>
@@ -239,6 +246,7 @@ function Lightbox({
               className="lightbox-nav lightbox-prev"
               onClick={onPrev}
               disabled={currentIndex === 0}
+              data-tip="上一张（←）"
             >
               <ChevronLeft size={28} />
             </button>
@@ -246,6 +254,7 @@ function Lightbox({
               className="lightbox-nav lightbox-next"
               onClick={onNext}
               disabled={currentIndex === steps.length - 1}
+              data-tip="下一张（→）"
             >
               <ChevronRightIcon size={28} />
             </button>
@@ -1519,7 +1528,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     return (
       <div className="editor-loading">
         <p className="text-red">加载失败：{error}</p>
-        <button className="btn mt-3" onClick={() => navigate("/")}>
+        <button className="btn mt-3" onClick={() => navigate("/")} data-tip="返回录制列表">
           <ArrowLeft size={14} /> 返回 Dashboard
         </button>
       </div>
@@ -1532,7 +1541,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     <div style={{ display: "flex", alignItems: "center", gap: 8, height: "100%" }}>
       <button
         onClick={() => navigate("/")}
-        title="返回"
+        data-tip={"返回录制列表\n改动已自动保存"}
         style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
       >
         <ArrowLeft size={14} /> 返回
@@ -1561,7 +1570,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           data-tauri-drag-region
           onClick={() => { setRecTitleDraft(recording?.title || ""); setRecTitleEditing(true); }}
           style={{ color: "#e6edf3", fontSize: 14, fontWeight: 600, userSelect: "none", cursor: "pointer", padding: "2px 6px", borderRadius: 4 }}
-          title="点击编辑名称"
+          data-tip="点击编辑名称"
         >
           {recording?.title || "Untitled"}
         </span>
@@ -1575,7 +1584,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         <button
           onClick={() => setExportOpen(!exportOpen)}
           disabled={exporting}
-          title="导出"
+          data-tip={"导出教程\n导出为 Word / PDF / HTML；如果有译文，可以先在上面选语言"}
           style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
         >
           <Download size={14} /> {exportProgress ? exportProgress : exporting ? "导出中..." : "导出"} <ChevronDown size={12} />
@@ -1591,6 +1600,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                     className={`export-dropdown-item${exportLang === null ? " active" : ""}`}
                     onClick={() => setExportLang(null)}
                     style={{ padding: "3px 8px", fontSize: 12 }}
+                    data-tip="用录制时的原始语言导出"
                   >
                     原文
                   </button>
@@ -1600,6 +1610,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                       className={`export-dropdown-item${exportLang === lang ? " active" : ""}`}
                       onClick={() => setExportLang(lang)}
                       style={{ padding: "3px 8px", fontSize: 12 }}
+                      data-tip={`用${LANG_LABELS[lang] || lang}译文导出`}
                     >
                       {LANG_LABELS[lang] || lang}
                     </button>
@@ -1614,6 +1625,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                   key={fmt.value}
                   className="export-dropdown-item"
                   onClick={() => handleExport(fmt.value)}
+                  data-tip={EXPORT_TIPS[fmt.value]}
                 >
                   <Icon size={14} className="export-dropdown-item-icon" />
                   <span className="export-dropdown-item-label">{fmt.label}</span>
@@ -1638,7 +1650,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
             setPubStep("pick");
             setPubTitle(recording?.title || "");
           }}
-          title={siteToken ? "上传到 flowio.cn" : "登录后可上传到网站"}
+          data-tip={siteToken
+            ? "把这篇教程上传到 flowio.cn\n可先存草稿，也可填写标题/应用/分类后直接发布"
+            : "登录后才能上传到 flowio.cn（点击去登录）"}
           style={{
             background: siteToken ? "#3366CC" : "rgba(51,102,204,0.15)",
             border: "none",
@@ -1661,7 +1675,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
           <button
             onClick={() => setToolsOpen(!toolsOpen)}
-            title="更多工具"
+            data-tip={"更多工具\nAI 生成步骤说明、敏感信息脱敏、整篇翻译"}
             style={{ background: "transparent", border: "1px solid #ff6b35", color: "#ff8a5c", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
           >
             <Wrench size={14} /> 工具 <ChevronDown size={12} />
@@ -1673,9 +1687,10 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
                 onClick={(e) => e.stopPropagation()}
               >
-                <span className="export-dropdown-item-label">识别场景</span>
+                <span className="export-dropdown-item-label" data-tip={"识别场景\n告诉 AI 你录的是什么软件，它才知道该看整张图还是只看点击处、要不要跳过脱敏\n表格/代码/终端 → 看整图并跳过 OCR 脱敏；自动 → 按窗口标题自己判断"}>识别场景</span>
                 <select
                   value={domainMode}
+                  data-tip="选「自动」即可；只有 AI 生成时才会用到"
                   onChange={(e) => setDomainMode(e.target.value as typeof domainMode)}
                   onClick={(e) => e.stopPropagation()}
                   style={{ cursor: "pointer", fontSize: 12, padding: "2px 4px", borderRadius: 4, border: "1px solid #555", background: "#2a2a2a", color: "#fff" }}
@@ -1691,6 +1706,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleAiGenerate(); }}
                 disabled={aiGenerating}
+                data-tip={"AI 生成步骤说明\n让 AI 看每一步的截图，自动写出标题和操作描述；已有的描述会被覆盖"}
               >
                 {aiGenerating ? <Loader2 size={14} className="spinner" /> : <Sparkles size={14} className="export-dropdown-item-icon" />}
                 <span className="export-dropdown-item-label">{aiGenerating ? "生成中..." : "AI 生成"}</span>
@@ -1699,6 +1715,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleRedact(); }}
                 disabled={redacting}
+                data-tip={"文本脱敏\n把步骤文字里的手机号、身份证、邮箱、银行卡等换成占位符（截图不变）"}
               >
                 {redacting ? <Loader2 size={14} className="spinner" /> : <ShieldCheck size={14} className="export-dropdown-item-icon" />}
                 <span className="export-dropdown-item-label">{redacting ? "脱敏中..." : "文本脱敏"}</span>
@@ -1707,6 +1724,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); setTranslateModalOpen(true); }}
                 disabled={translating}
+                data-tip={"翻译教程\n把标题和每一步描述翻译成别的语言；译文存成副本，原文一直保留"}
               >
                 {translating ? <Loader2 size={14} className="spinner" /> : <Languages size={14} className="export-dropdown-item-icon" />}
                 <span className="export-dropdown-item-label">{translating ? "翻译中..." : "翻译教程"}</span>
@@ -1717,7 +1735,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 onClick={() => { setToolsOpen(false); openEditTrans(transLangs[0] || "en"); }}
                 disabled={transLangs.length === 0 || steps.length === 0}
                 style={{ opacity: transLangs.length === 0 ? 0.5 : 1 }}
-                title={transLangs.length === 0 ? "尚无译文，请先翻译" : "编辑已有译文"}
+                data-tip={transLangs.length === 0
+                  ? "还没有译文，请先点「翻译教程」"
+                  : "编辑已有译文\n逐句修改翻译结果，不影响原文"}
               >
                 <PencilLine size={14} className="export-dropdown-item-icon" />
                 <span className="export-dropdown-item-label">编辑译文</span>
@@ -1726,6 +1746,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleScanRedact(); }}
                 disabled={scanRedacting || steps.length === 0}
+                data-tip={"扫描截图脱敏\n用 OCR 找出截图画面里的敏感信息并打码，比「文本脱敏」更彻底，也更慢"}
                 style={{ opacity: steps.length === 0 ? 0.5 : 1 }}
               >
                 {scanRedacting ? <Loader2 size={14} className="spinner" /> : <ScanSearch size={14} className="export-dropdown-item-icon" />}
@@ -1737,21 +1758,23 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       )}
       <button
         onClick={() => setPreviewMode(!previewMode)}
-        title={previewMode ? "退出预览" : "预览"}
+        data-tip={previewMode ? "退出预览，回到编辑" : "预览成品效果\n按读者看到的样子通篇预览（导出/上传前先看一眼）"}
         style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
       >
         {previewMode ? <><X size={14} /> 退出预览</> : <><Eye size={14} /> 预览</>}
       </button>
 
       {/* 全图 / 裁图 统一切换：作用于全部步骤（选择教程主要截图风格） */}
-      <div className="titlebar-view-segmented" title="选择教程主要截图风格（作用于所有步骤）">
+      <div className="titlebar-view-segmented" data-tip="选择教程主要截图风格（作用于所有步骤）">
         <button
           className={`titlebar-view-segmented-btn${globalView === 'full' ? ' active' : ''}`}
           onClick={() => applyGlobalView('full')}
+          data-tip={"全部步骤都用完整截图\n画面完整，适合读者需要先看清整个界面的教程"}
         >全图</button>
         <button
           className={`titlebar-view-segmented-btn${globalView === 'crop' ? ' active' : ''}`}
           onClick={() => applyGlobalView('crop')}
+          data-tip={"全部步骤只截取操作区域\n重点突出、体积小，适合步骤密集的教程"}
         >裁图</button>
       </div>
     </div>
@@ -1822,6 +1845,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           </div>
           <button
             onClick={handleCancelScanRedact}
+            data-tip="停止扫描，已处理的部分会保留"
             style={{ flexShrink: 0, background: "transparent", border: "1px solid #ddd", borderRadius: 4, padding: "4px 10px", fontSize: 12, cursor: "pointer", color: "#666" }}
           >
             取消
@@ -1883,12 +1907,14 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
               <button
                 onClick={() => setTranslateModalOpen(false)}
+                data-tip="不翻译，关闭"
                 style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", cursor: "pointer", fontSize: 13 }}
               >
                 取消
               </button>
               <button
                 onClick={() => handleTranslate(translateLang)}
+                data-tip="开始翻译，会调用 AI，需要几十秒"
                 style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: "pointer", fontSize: 13 }}
               >
                 开始翻译
@@ -1960,6 +1986,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
               <button
                 onClick={() => setEditTransOpen(false)}
+                data-tip="放弃这次修改并关闭"
                 style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", cursor: "pointer", fontSize: 13 }}
               >
                 取消
@@ -1967,6 +1994,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               <button
                 onClick={() => void handleSaveTranslation()}
                 disabled={savingTranslation}
+                data-tip="保存译文修改（原文不受影响）"
                 style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: savingTranslation ? "default" : "pointer", fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}
               >
                 {savingTranslation && <Loader2 size={13} className="spinner" />}
@@ -1990,7 +2018,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
             <div style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
               <button
                 className="step-simplify-btn primary"
-                title="自动合并重复点击/连续输入，AI 再把语义上重复的步骤压成一步；可撤销"
+                data-tip={"把啰嗦的步骤合并掉\n录完会自动跑一遍；这里也可以手动重跑或换用 AI，随时能撤销"}
                 disabled={simplifying !== null}
                 onClick={() => setSimplifyOpen(!simplifyOpen)}
               >
@@ -2007,13 +2035,14 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                     className="export-dropdown-item"
                     onClick={() => { setSimplifyOpen(false); void handleAiSimplify(); }}
                     disabled={simplifying !== null}
+                    data-tip={"AI 精简（推荐）\n先跑本地规则，再让 AI 按语义把重复步骤压成一步\n能处理规则看不懂的情况（比如弹框里坐标各异的一串点击），需要几秒到十几秒"}
                   >
                     {simplifying === "ai" ? <Loader2 size={14} className="spinner" /> : <Sparkles size={14} className="export-dropdown-item-icon" />}
                     <span className="export-dropdown-item-label">AI 精简（推荐）</span>
                   </button>
                   <button
                     className="export-dropdown-item"
-                    title="只跑本地规则（重复点击/连续输入/点错窗口），不联网、瞬间完成"
+                    data-tip={"仅规则合并\n只跑本地规则：重复点击→双击、连续输入合并、删掉误点到自己窗口的末步\n不联网、瞬间完成，但看不懂语义上的重复"}
                     onClick={() => { setSimplifyOpen(false); void handleAutoMerge(); }}
                     disabled={simplifying !== null}
                   >
@@ -2023,7 +2052,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                   {canUndo && (
                     <button
                       className="export-dropdown-item"
-                      title="恢复最近一次精简前的全部步骤"
+                      data-tip={"撤销精简\n回到最近一次精简之前的样子，一个步骤都不会少"}
                       onClick={() => { setSimplifyOpen(false); void handleUndoMerge(); }}
                       disabled={simplifying !== null}
                     >
@@ -2042,7 +2071,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           {/* Insert zone before first step */}
           <div className="step-insert-point">
             <div className="step-insert-line" />
-            <div className="step-insert-btn" onClick={() => handleInsertStep(-1)}>
+            <div className="step-insert-btn" onClick={() => handleInsertStep(-1)} data-tip="在最前面插入一个步骤">
               <Plus size={12} />
             </div>
           </div>
@@ -2067,7 +2096,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                   <button
                     onClick={(e) => { e.stopPropagation(); setDeleteTarget(step.id); }}
                     className="step-action-btn step-action-delete"
-                    title="删除步骤"
+                    data-tip="删除步骤"
                   >
                     <Trash2 className="step-action-icon" />
                   </button>
@@ -2086,12 +2115,14 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                         <button
                           className="step-delete-cancel"
                           onClick={(e) => { e.stopPropagation(); setDeleteTarget(null); }}
+                          data-tip="不删了"
                         >
                           取消
                         </button>
                         <button
                           className="step-delete-confirm"
                           onClick={(e) => { e.stopPropagation(); handleDeleteStep(step.id); }}
+                          data-tip="删除这一步，后面的步骤序号自动前移"
                         >
                           删除
                         </button>
@@ -2127,7 +2158,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               {/* Insert zone after this step */}
               <div className="step-insert-point">
                 <div className="step-insert-line" />
-                <div className="step-insert-btn" onClick={() => handleInsertStep(index)}>
+                <div className="step-insert-btn" onClick={() => handleInsertStep(index)} data-tip={`在步骤 ${index + 1} 后面插入一个步骤`}>
                   <Plus size={12} />
                 </div>
               </div>
@@ -2214,14 +2245,16 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 return (
                   <div className="step-detail-image">
                     {/* 全图 / 裁图 切换 */}
-                    <div className="step-detail-view-segmented" title="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
+                    <div className="step-detail-view-segmented" data-tip="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
                       <button
                         className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep.id) ? ' active' : ''}`}
                         onClick={() => setViewCropped(selectedStep.id, false)}
+                        data-tip="这一步用完整截图"
                       >全图</button>
                       <button
                         className={`step-detail-view-segmented-btn${getViewCropped(selectedStep.id) ? ' active' : ''}`}
                         onClick={() => setViewCropped(selectedStep.id, true)}
+                        data-tip="这一步只截取操作区域（只影响当前步骤）"
                       >裁图</button>
                     </div>
                     <img
@@ -2247,7 +2280,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                         e.stopPropagation();
                         openAnnotate(selectedStep.id);
                       }}
-                      title="裁剪/添加文字/高亮/箭头/模糊标注"
+                      data-tip={"标注这张截图\n裁剪、加文字、高亮、箭头、模糊；标完覆盖当前步骤的图"}
                     >
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
                         <path d="M8 2v12M2 8h12" />
@@ -2278,7 +2311,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                           }
                         }
                       }}
-                      title="删除当前截图"
+                      data-tip={"删除当前这张图\n只在「裁图」模式下是删裁图，全图模式下删整张截图"}
                     >
                       ✕
                     </button>
@@ -2315,6 +2348,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                   <button
                     className="tip-toggle"
                     onClick={() => setTipExpanded(!tipExpanded)}
+                    data-tip={tipExpanded ? "收起 AI 给出的补充说明" : "展开 AI 给出的补充说明"}
                   >
                     {tipExpanded ? (
                       <ChevronDown size={14} />
@@ -2458,7 +2492,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               >
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
                   <div style={{ fontSize: 17, fontWeight: 600 }}>上传到 flowio.cn</div>
-                  <button onClick={closePub} title="关闭" style={{ background: "transparent", border: "none", color: "#8b949e", cursor: "pointer", padding: 4, borderRadius: 4 }}>
+                  <button onClick={closePub} data-tip="关闭" style={{ background: "transparent", border: "none", color: "#8b949e", cursor: "pointer", padding: 4, borderRadius: 4 }}>
                     <X size={18} />
                   </button>
                 </div>
@@ -2472,6 +2506,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                       <button
                         onClick={() => setPubStep("form")}
                         disabled={publishing}
+                        data-tip="填写标题、涉及应用和分类后对外发布"
                         style={{
                           padding: "12px 16px", borderRadius: 8, border: "none",
                           background: "#3366CC", color: "#fff", cursor: publishing ? "default" : "pointer",
@@ -2484,6 +2519,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                       <button
                         onClick={() => handlePublish("draft")}
                         disabled={publishing}
+                        data-tip="用录制信息兜底，先存到网站草稿箱，之后再去网站补充发布"
                         style={{
                           padding: "12px 16px", borderRadius: 8,
                           border: "1px solid #30363d", background: "transparent", color: "#e6edf3",
@@ -2501,7 +2537,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                     {pubCoverPreview ? (
                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                         <img src={pubCoverPreview} alt="封面预览" style={{ width: 120, height: 72, objectFit: "cover", borderRadius: 6, border: "1px solid #30363d" }} />
-                        <button type="button" onClick={() => { setPubCoverBase64(null); setPubCoverPreview(null); }} style={pubDialogStyles.addBtn}>移除</button>
+                        <button type="button" onClick={() => { setPubCoverBase64(null); setPubCoverPreview(null); }} style={pubDialogStyles.addBtn} data-tip="移除封面，改用默认截图">移除</button>
                       </div>
                     ) : (
                       <input
@@ -2548,7 +2584,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                         onChange={(e) => setPubAppInput(e.target.value)}
                         onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addApp(); } }}
                       />
-                      <button style={pubDialogStyles.addBtn} onClick={addApp}>添加</button>
+                      <button style={pubDialogStyles.addBtn} onClick={addApp} data-tip="把输入框里的应用名加进去（也可直接回车）">添加</button>
                     </div>
 
                     <label style={pubDialogStyles.label}>标签（可选）</label>
@@ -2568,7 +2604,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                         onChange={(e) => setPubTagInput(e.target.value)}
                         onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addTag(); } }}
                       />
-                      <button style={pubDialogStyles.addBtn} onClick={addTag}>添加</button>
+                      <button style={pubDialogStyles.addBtn} onClick={addTag} data-tip="把输入框里的标签加进去（也可直接回车）">添加</button>
                     </div>
 
                     <label style={pubDialogStyles.label}>适用场景</label>
@@ -2604,6 +2640,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                       <button
                         onClick={() => setPubStep("pick")}
                         disabled={publishing}
+                        data-tip="回到上一步（已填的内容会保留）"
                         style={{ flex: 1, padding: "10px 0", borderRadius: 8, border: "1px solid #30363d", background: "transparent", color: "#e6edf3", cursor: publishing ? "default" : "pointer", fontSize: 14 }}
                       >
                         返回
@@ -2611,6 +2648,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                       <button
                         onClick={() => handlePublish("published")}
                         disabled={publishing}
+                        data-tip="按上面填的信息发布到 flowio.cn，别人立刻能搜到"
                         style={{ flex: 2, padding: "10px 0", borderRadius: 8, border: "none", background: "#3366CC", color: "#fff", cursor: publishing ? "default" : "pointer", fontSize: 14, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
                       >
                         {publishing && <Loader2 size={14} className="spinner" />}

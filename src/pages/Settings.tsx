@@ -513,7 +513,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
     <div className="page">
       {/* 返回栏 */}
       <div style={{ display: "flex", alignItems: "center", padding: "8px 0" }}>
-        <button onClick={() => navigate("/")} style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "transparent", border: "none", cursor: "pointer", padding: "6px 12px", borderRadius: 6, fontSize: 14, color: "var(--blue)" }}
+        <button onClick={() => navigate("/")} data-tip="返回录制列表" style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "transparent", border: "none", cursor: "pointer", padding: "6px 12px", borderRadius: 6, fontSize: 14, color: "var(--blue)" }}
           onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(0,0,0,0.06)")} onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
           <ArrowLeft size={16} />返回
         </button>
@@ -523,22 +523,22 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
 
       {/* Tabs */}
       <div className="tabs">
-        <button className={`tab ${activeTab === "ai" ? "active" : ""}`} onClick={() => setActiveTab("ai")}>
+        <button className={`tab ${activeTab === "ai" ? "active" : ""}`} onClick={() => setActiveTab("ai")} data-tip="选哪家 AI、填 API Key；AI 生成/翻译/精简都走这里">
           <Zap size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />AI 配置
         </button>
-        <button className={`tab ${activeTab === "appearance" ? "active" : ""}`} onClick={() => setActiveTab("appearance")}>
+        <button className={`tab ${activeTab === "appearance" ? "active" : ""}`} onClick={() => setActiveTab("appearance")} data-tip="界面主题与显示相关设置">
           <Palette size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />外观
         </button>
-        <button className={`tab ${activeTab === "redaction" ? "active" : ""}`} onClick={() => setActiveTab("redaction")}>
+        <button className={`tab ${activeTab === "redaction" ? "active" : ""}`} onClick={() => setActiveTab("redaction")} data-tip="设置哪些信息算敏感（手机号、身份证…），脱敏时自动打码">
           <Shield size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />脱敏
         </button>
-        <button className={`tab ${activeTab === "recording" ? "active" : ""}`} onClick={() => setActiveTab("recording")}>
+        <button className={`tab ${activeTab === "recording" ? "active" : ""}`} onClick={() => setActiveTab("recording")} data-tip="截图质量、是否限定只录某个软件">
           <Circle size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />录制
         </button>
-        <button className={`tab ${activeTab === "hotkeys" ? "active" : ""}`} onClick={() => setActiveTab("hotkeys")}>
+        <button className={`tab ${activeTab === "hotkeys" ? "active" : ""}`} onClick={() => setActiveTab("hotkeys")} data-tip="开始/停止/暂停录制的全局快捷键">
           <Keyboard size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />快捷键
         </button>
-        <button className={`tab ${activeTab === "profile" ? "active" : ""}`} onClick={() => setActiveTab("profile")}>
+        <button className={`tab ${activeTab === "profile" ? "active" : ""}`} onClick={() => setActiveTab("profile")} data-tip="网站账号的登录状态与个人信息">
           <User size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />个人中心
         </button>
       </div>
@@ -571,13 +571,13 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                       <Star size={13} style={{ color: "#f5a623" }} />默认
                     </span>
                   ) : selectedId !== "__custom__" ? (
-                    <button onClick={handleSetDefault} style={{ fontSize: 12, padding: "4px 10px", border: "1px solid var(--border)", borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--text-secondary)" }}>
+                    <button onClick={handleSetDefault} data-tip="把这家服务商设为默认，AI 功能优先用它" style={{ fontSize: 12, padding: "4px 10px", border: "1px solid var(--border)", borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--text-secondary)" }}>
                       设为默认
                     </button>
                   ) : null}
 
                   {selectedProv?.custom && (
-                    <button onClick={() => handleRemoveCustom(selectedId)} style={{ fontSize: 12, padding: "4px 8px", border: "1px solid var(--red)", borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--red)", display: "inline-flex", alignItems: "center", gap: 3 }}>
+                    <button onClick={() => handleRemoveCustom(selectedId)} data-tip="删除这个自定义服务商（连同保存的 Key）" style={{ fontSize: 12, padding: "4px 8px", border: "1px solid var(--red)", borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--red)", display: "inline-flex", alignItems: "center", gap: 3 }}>
                       <Trash2 size={13} />删除
                     </button>
                   )}
@@ -590,7 +590,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                     {providers.filter(p => p.custom).map((p) => (
                       <div key={p.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "4px 0", fontSize: 13 }}>
                         <span>{p.name}</span>
-                        <button onClick={() => handleRemoveCustom(p.id)} style={{ display: "inline-flex", alignItems: "center", gap: 2, background: "transparent", border: "none", cursor: "pointer", color: "var(--red)", fontSize: 12 }}>
+                        <button onClick={() => handleRemoveCustom(p.id)} data-tip={`删除「${p.name}」`} style={{ display: "inline-flex", alignItems: "center", gap: 2, background: "transparent", border: "none", cursor: "pointer", color: "var(--red)", fontSize: 12 }}>
                           <Trash2 size={12} />
                         </button>
                       </div>
@@ -630,7 +630,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           <input type={showCustomKey ? "text" : "password"} placeholder="输入 API Key" value={customApiKey}
                             onChange={(e) => setCustomApiKey(e.target.value)} style={{ flex: 1 }} />
-                          <button onClick={() => setShowCustomKey(!showCustomKey)} style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", cursor: "pointer", display: "inline-flex", alignItems: "center", color: "var(--text-secondary)" }}>
+                          <button onClick={() => setShowCustomKey(!showCustomKey)} data-tip={showCustomKey ? "隐藏 Key" : "显示 Key（确认周围没人）"} style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", cursor: "pointer", display: "inline-flex", alignItems: "center", color: "var(--text-secondary)" }}>
                             {showCustomKey ? <EyeOff size={16} /> : <Eye size={16} />}
                           </button>
                         </div>
@@ -639,6 +639,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                         <button onClick={handleAddCustom} disabled={customSaving}
                           className="btn btn-primary"
+                          data-tip="保存这个服务商，之后可在下拉里选它"
                           style={{ background: "var(--green)", fontSize: 13 }}>
                           {customSaving ? "保存中..." : "保存配置"}
                         </button>
@@ -661,7 +662,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                           <input type={showKey ? "text" : "password"} placeholder="输入 API Key" value={editApiKey}
                             onChange={(e) => setEditApiKey(e.target.value)} style={{ flex: 1 }} />
-                          <button onClick={() => setShowKey(!showKey)} style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", cursor: "pointer", display: "inline-flex", alignItems: "center", color: "var(--text-secondary)" }}>
+                          <button onClick={() => setShowKey(!showKey)} data-tip={showKey ? "隐藏 Key" : "显示 Key（确认周围没人）"} style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", cursor: "pointer", display: "inline-flex", alignItems: "center", color: "var(--text-secondary)" }}>
                             {showKey ? <EyeOff size={16} /> : <Eye size={16} />}
                           </button>
                         </div>
@@ -685,11 +686,11 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                       )}
 
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <button className="btn btn-primary" onClick={handleSave} disabled={saving} style={{ background: "var(--green)", fontSize: 13 }}>
+                        <button className="btn btn-primary" onClick={handleSave} disabled={saving} data-tip="保存 Key 与模型选择" style={{ background: "var(--green)", fontSize: 13 }}>
                           {saving ? "保存中..." : "保存配置"}
                         </button>
                         {providerConfigs[selectedId]?.configured && (
-                          <button onClick={handleDeleteConfig} style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "transparent", border: "1px solid var(--red)", borderRadius: 6, padding: "6px 12px", cursor: "pointer", color: "var(--red)", fontSize: 13 }}>
+                          <button onClick={handleDeleteConfig} data-tip="清除已保存的 Key（服务商本身保留）" style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "transparent", border: "1px solid var(--red)", borderRadius: 6, padding: "6px 12px", cursor: "pointer", color: "var(--red)", fontSize: 13 }}>
                             <Trash2 size={14} />删除配置
                           </button>
                         )}
@@ -810,6 +811,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   />
                   <button
                     onClick={() => handleRedactRemovePattern(i)}
+                    data-tip="删除这条自定义规则"
                     style={{ fontSize: 12, padding: "4px 10px", border: "1px solid var(--border)", borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--red)" }}
                   >
                     删除
@@ -818,6 +820,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
               ))}
               <button
                 onClick={handleRedactAddPattern}
+                data-tip={"新增一条正则规则\n比如公司内部的工号、项目代号，脱敏时会一并打码"}
                 style={{ fontSize: 13, padding: "6px 14px", border: "1px dashed var(--border)", borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--text-secondary)", marginTop: 4 }}
               >
                 + 添加正则
@@ -893,6 +896,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                     <button
                       onClick={refreshTargetWindows}
                       disabled={targetRefreshing}
+                      data-tip="重新读取当前已打开的软件列表"
                       style={{ fontSize: 13, padding: "6px 14px", border: "1px solid var(--border)", borderRadius: 4, background: "transparent", cursor: "pointer", color: "var(--text-secondary)" }}
                     >
                       {targetRefreshing ? "刷新中..." : "刷新软件列表"}
@@ -965,14 +969,14 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   </div>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  <button className="btn btn-primary" onClick={doProfileRefresh} disabled={profileRefreshing} style={{ background: "var(--green)", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                  <button className="btn btn-primary" onClick={doProfileRefresh} disabled={profileRefreshing} data-tip="从 flowio.cn 重新拉取头像、昵称等信息" style={{ background: "var(--green)", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
                     <RefreshCw size={15} style={{ animation: profileRefreshing ? "spin 1s linear infinite" : "none" }} />{profileRefreshing ? "同步中..." : "刷新用户信息"}
                   </button>
                   {profileSyncMsg && <span style={{ fontSize: 13, color: profileSyncMsg === "已同步" ? "var(--green)" : "var(--red)" }}>{profileSyncMsg}</span>}
-                  <button className="btn" onClick={() => navigate("/profile")} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                  <button className="btn" onClick={() => navigate("/profile")} data-tip="查看和修改个人资料、已发布的教程" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
                     <User size={15} />进入个人中心
                   </button>
-                  <button onClick={doProfileLogout} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, background: "transparent", border: "1px solid var(--red)", borderRadius: 6, padding: "9px 14px", cursor: "pointer", color: "var(--red)", fontSize: 14 }}>
+                  <button onClick={doProfileLogout} data-tip="退出网站账号；本地录制内容不受影响" style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, background: "transparent", border: "1px solid var(--red)", borderRadius: 6, padding: "9px 14px", cursor: "pointer", color: "var(--red)", fontSize: 14 }}>
                     <LogOut size={15} />退出登录
                   </button>
                 </div>
@@ -980,7 +984,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
             ) : (
               <div style={{ border: "1px dashed var(--border)", borderRadius: 12, padding: "28px 32px", maxWidth: 460, textAlign: "center" }}>
                 <div style={{ fontSize: 15, color: "var(--text-secondary)", marginBottom: 14 }}>未登录网站账号</div>
-                <button className="btn btn-primary" onClick={() => invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" })} style={{ background: "var(--green)" }}>
+                <button className="btn btn-primary" onClick={() => invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" })} data-tip="登录后可把教程上传到 flowio.cn" style={{ background: "var(--green)" }}>
                   登录网站账号
                 </button>
               </div>
