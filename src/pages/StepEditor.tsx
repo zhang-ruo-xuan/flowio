@@ -1640,8 +1640,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         <span
           data-tauri-drag-region
           onClick={() => { setRecTitleDraft(recording?.title || ""); setRecTitleEditing(true); }}
-          style={{ color: "#e6edf3", fontSize: 14, fontWeight: 600, userSelect: "none", cursor: "pointer", padding: "2px 6px", borderRadius: 4 }}
-          data-tip="点击编辑名称"
+          style={{ color: "#e6edf3", fontSize: 14, fontWeight: 600, userSelect: "none", cursor: "pointer", padding: "2px 6px", borderRadius: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 420 }}
+          data-tip={recording?.title || "Untitled"}
+          title={recording?.title || ""}
         >
           {recording?.title || "Untitled"}
         </span>

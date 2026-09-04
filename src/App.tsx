@@ -606,9 +606,9 @@ function App() {
           {!isEditor && (
             <button className="titlebar-win-btn" onClick={() => navigate("/settings")} data-tip={"设置\nAI 服务商、快捷键、截图与隐私选项"}><Settings size={15} /></button>
           )}
-          <button className="titlebar-win-btn" onClick={() => appWindow.minimize()} data-tip={"最小化\n缩到任务栏，录制会继续进行"}><Minus size={15} /></button>
-          <button className="titlebar-win-btn" onClick={() => appWindow.toggleMaximize()} data-tip={isMaximized ? "还原窗口" : "最大化窗口"}>{isMaximized ? <Copy size={13} /> : <Square size={13} />}</button>
-          <button className="titlebar-win-btn titlebar-close-btn" onClick={() => appWindow.close()} data-tip={"关闭\n录制中的内容会自动保存"}><X size={15} /></button>
+          <button className="titlebar-win-btn" onClick={() => appWindow.minimize()}><Minus size={15} /></button>
+          <button className="titlebar-win-btn" onClick={() => appWindow.toggleMaximize()}>{isMaximized ? <Copy size={13} /> : <Square size={13} />}</button>
+          <button className="titlebar-win-btn titlebar-close-btn" onClick={() => appWindow.close()}><X size={15} /></button>
         </div>
       </div>
 
