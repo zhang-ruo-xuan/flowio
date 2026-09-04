@@ -305,6 +305,8 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
   const handleVoiceToggle = (value: boolean) => {
     setVoiceEnabled(value);
     localStorage.setItem("flowio_voice_input", value ? "1" : "0");
+    // 通知 App.tsx 标题栏同步语音开关状态（避免两处显示不一致）
+    window.dispatchEvent(new CustomEvent("flowio:voice-toggle", { detail: { enabled: value } }));
   };
 
   /* ---- Record Target App（录制指定软件） ---- */

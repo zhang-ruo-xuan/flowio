@@ -1740,26 +1740,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 <Upload size={14} className="export-dropdown-item-icon" />
                 <span className="export-dropdown-item-label">{siteToken ? "上传网站" : "登录后上传"}</span>
               </button>
-              <label
-                className="export-dropdown-item"
-                style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
-                onClick={(e) => e.stopPropagation()}
-              >
-                <span className="export-dropdown-item-label" data-tip={"识别场景\n告诉 AI 你录的是什么软件，它才知道该看整张图还是只看点击处、要不要跳过脱敏\n表格/代码/终端 → 看整图并跳过 OCR 脱敏；自动 → 按窗口标题自己判断"}>识别场景</span>
-                <select
-                  value={domainMode}
-                  data-tip="选「自动」即可；只有 AI 生成时才会用到"
-                  onChange={(e) => setDomainMode(e.target.value as typeof domainMode)}
-                  onClick={(e) => e.stopPropagation()}
-                  style={{ cursor: "pointer", fontSize: 12, padding: "2px 4px", borderRadius: 4, border: "1px solid #555", background: "#2a2a2a", color: "#fff" }}
-                >
-                  <option value="auto">自动</option>
-                  <option value="spreadsheet">表格</option>
-                  <option value="browser">浏览器</option>
-                  <option value="code">代码</option>
-                  <option value="terminal">终端</option>
-                </select>
-              </label>
               <button
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleAiGenerate(); }}
@@ -1768,6 +1748,18 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               >
                 {aiGenerating ? <Loader2 size={14} className="spinner" /> : <Sparkles size={14} className="export-dropdown-item-icon" />}
                 <span className="export-dropdown-item-label">{aiGenerating ? "生成中..." : "AI 生成"}</span>
+                <select
+                  value={domainMode}
+                  onChange={(e) => setDomainMode(e.target.value as typeof domainMode)}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ cursor: "pointer", fontSize: 11, padding: "1px 4px", borderRadius: 4, border: "1px solid #555", background: "#333", color: "#ccc", marginLeft: 4 }}
+                >
+                  <option value="auto">自动</option>
+                  <option value="spreadsheet">表格</option>
+                  <option value="browser">浏览器</option>
+                  <option value="code">代码</option>
+                  <option value="terminal">终端</option>
+                </select>
               </button>
               <button
                 className="export-dropdown-item"

@@ -242,11 +242,22 @@ function App() {
     return () => { unlisten?.(); };
   }, [showVoiceToast]);
 
+  // 监听设置页语音开关切换，同步标题栏显示（避免「设置页开 / 标题栏显示关」）
+  useEffect(() => {
+    const handler = (e: CustomEvent<{ enabled: boolean }>) => {
+      setVoiceEnabled(e.detail.enabled);
+    };
+    window.addEventListener("flowio:voice-toggle", handler as EventListener);
+    return () => window.removeEventListener("flowio:voice-toggle", handler as EventListener);
+  }, []);
+
   // 语音开关：改 localStorage（V1 记忆）；录制中切换 → V13 语义
   const toggleVoice = useCallback(async () => {
     const next = !voiceEnabled;
     setVoiceEnabled(next);
     localStorage.setItem("flowio_voice_input", next ? "1" : "0");
+    // 通知设置页同步（如果设置页正挂载着）
+    window.dispatchEvent(new CustomEvent("flowio:voice-toggle", { detail: { enabled: next } }));
     const recId = recordingIdRef.current;
     if (!recId) return; // 未在录制，仅记忆开关
     if (!next && voiceRecorderRef.current?.isActive) {
@@ -282,6 +293,7 @@ function App() {
         console.warn("[voice] mid-recording start failed:", err);
         setVoiceEnabled(false);
         localStorage.setItem("flowio_voice_input", "0");
+        window.dispatchEvent(new CustomEvent("flowio:voice-toggle", { detail: { enabled: false } }));
         showVoiceToast({ type: "error", message: `麦克风开启失败：${String(err)}，本次录制将以无语音方式继续` });
       }
     }
