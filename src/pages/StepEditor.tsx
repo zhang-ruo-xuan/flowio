@@ -1396,6 +1396,20 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       if (result.guide?.id) {
         try { localStorage.setItem(`flowio_pub_${recordingId}`, String(result.guide.id)); } catch { /* ignore */ }
       }
+      // ★ 保存发布表单快照：下次重发同一录制时自动恢复填写内容，免重复输入
+      try {
+        const formSnap = {
+          guideId: result.guide?.id || "",
+          title: pubTitle,
+          applications: pubApplications,
+          category: pubCategory,
+          tags: pubTags,
+          downloadable: pubDownloadable,
+          scene: pubSceneSelect,
+          coverBase64: pubCoverBase64 && pubCoverBase64.length <= 1_500_000 ? pubCoverBase64 : null,
+        };
+        localStorage.setItem(`flowio_pubform_${recordingId}`, JSON.stringify(formSnap));
+      } catch { /* 配额不足等忽略 */ }
       setShowPublishDialog(false);
       setPubStep("pick");
       setToast({ type: "success", message: isDraft ? "草稿已保存！" : "发布成功！教程已上传到网站" });
@@ -1766,7 +1780,35 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                   }
                   setShowPublishDialog(true);
                   setPubStep("pick");
-                  setPubTitle(recording?.title || "");
+                  // ★ 恢复上次发布填写的表单信息（重发免重填）；无快照时用默认值
+                  let pubFormRestored = false;
+                  try {
+                    const raw = localStorage.getItem(`flowio_pubform_${recordingId}`);
+                    if (raw) {
+                      const f = JSON.parse(raw);
+                      setPubTitle(f.title || recording?.title || "");
+                      setPubApplications(Array.isArray(f.applications) ? f.applications : []);
+                      setPubCategory(f.category || "");
+                      setPubTags(Array.isArray(f.tags) ? f.tags : []);
+                      setPubDownloadable(f.downloadable === "no" ? "no" : "yes");
+                      setPubSceneSelect(f.scene || "");
+                      setPubCoverBase64(f.coverBase64 || null);
+                      setPubCoverPreview(f.coverBase64 || null);
+                      pubFormRestored = true;
+                    }
+                  } catch { /* 快照损坏则忽略 */ }
+                  if (!pubFormRestored) {
+                    setPubTitle(recording?.title || "");
+                    setPubApplications([]);
+                    setPubCategory("");
+                    setPubTags([]);
+                    setPubDownloadable("yes");
+                    setPubSceneSelect("");
+                    setPubCoverBase64(null);
+                    setPubCoverPreview(null);
+                  }
+                  setPubAppInput("");
+                  setPubTagInput("");
                 }}
                 data-tip={siteToken
                   ? "把这篇教程上传到 flowio.cn\n可先存草稿，也可填写标题/应用/分类后直接发布"
