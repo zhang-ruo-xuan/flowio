@@ -3,6 +3,19 @@ pub enum MouseEvent {
     Click { x: f64, y: f64, button: String },
 }
 
+/// Whether a captured mouse event is the button press or release.
+///
+/// The recorder only hooked `WM_*BUTTONDOWN` originally, so drags collapsed
+/// into a single "click" at the press point and the crop missed the whole
+/// dragged region. Capturing both phases lets the event thread pair a
+/// down+up and, when the two points differ, treat the gesture as a *drag*
+/// and crop the bounding box of the two points instead of the press point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickPhase {
+    Down,
+    Up,
+}
+
 /// A click event captured by the native WH_MOUSE_LL hook.
 ///
 /// The timestamp is recorded inside the hook callback BEFORE CallNextHookEx
@@ -13,6 +26,9 @@ pub struct CapturedClick {
     pub x: f64,
     pub y: f64,
     pub button: String,
+    /// Press (`Down`) or release (`Up`). Both phases are captured so drag
+    /// gestures can be detected (see `ClickPhase` doc).
+    pub phase: ClickPhase,
     /// Instant captured inside the hook callback, before the click is dispatched.
     pub timestamp: std::time::Instant,
     /// Foreground window PID captured inside the hook callback at click time.
@@ -36,6 +52,7 @@ mod tests {
             x: 12.5,
             y: 88.25,
             button: "left".into(),
+            phase: ClickPhase::Down,
             timestamp: now,
             foreground_pid: 1234,
         };
@@ -43,6 +60,7 @@ mod tests {
         assert_eq!(click.y, 88.25);
         assert_eq!(click.button, "left");
         assert_eq!(click.foreground_pid, 1234);
+        assert_eq!(click.phase, ClickPhase::Down);
         assert!(click.timestamp <= std::time::Instant::now());
     }
 
@@ -53,6 +71,7 @@ mod tests {
             x: 1.0,
             y: 2.0,
             button: "right".into(),
+            phase: ClickPhase::Up,
             timestamp: now,
             foreground_pid: 0,
         };

@@ -14,8 +14,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetWindowThreadProcessId,
     SetWindowsHookExW,
     UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::recorder::keyboard::KeyEvent;
@@ -205,33 +205,43 @@ unsafe extern "system" fn mouse_hook_proc(
 ) -> LRESULT {
     if code >= 0 {
         let msg = wparam.0 as u32;
-        if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
-            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            let x = info.pt.x as f64;
-            let y = info.pt.y as f64;
-            let button = match msg {
-                WM_LBUTTONDOWN => "Left",
-                WM_RBUTTONDOWN => "Right",
-                _ => "Middle",
-            };
+        // Press (down) AND release (up) are captured so the event thread can
+        // pair them and detect drags. See `ClickPhase` in mouse.rs.
+        let phase = if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP || msg == WM_MBUTTONUP {
+            crate::recorder::mouse::ClickPhase::Up
+        } else if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
+            crate::recorder::mouse::ClickPhase::Down
+        } else {
+            // Not a button press/release we care about (e.g. wheel). Skip.
+            CallNextHookEx(None, code, wparam, lparam);
+            return LRESULT(0);
+        };
+        let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        let x = info.pt.x as f64;
+        let y = info.pt.y as f64;
+        let button = match msg {
+            WM_LBUTTONDOWN | WM_LBUTTONUP => "Left",
+            WM_RBUTTONDOWN | WM_RBUTTONUP => "Right",
+            _ => "Middle",
+        };
 
-            // Record timestamp BEFORE dispatching click.
-            // The event thread will find the pre-click frame from
-            // the continuous capture ring buffer using this timestamp.
-            let click_ts = std::time::Instant::now();
-            // Capture foreground PID at click time for accurate filtering.
-            let fg_pid = get_fg_pid();
+        // Record timestamp BEFORE dispatching click.
+        // The event thread will find the pre-click frame from
+        // the continuous capture ring buffer using this timestamp.
+        let click_ts = std::time::Instant::now();
+        // Capture foreground PID at click time for accurate filtering.
+        let fg_pid = get_fg_pid();
 
-            if let Ok(guard) = MOUSE_TX.lock() {
-                if let Some(ref tx) = *guard {
-                    let _ = tx.send(CapturedClick {
-                        x,
-                        y,
-                        button: button.to_string(),
-                        timestamp: click_ts,
-                        foreground_pid: fg_pid,
-                    });
-                }
+        if let Ok(guard) = MOUSE_TX.lock() {
+            if let Some(ref tx) = *guard {
+                let _ = tx.send(CapturedClick {
+                    x,
+                    y,
+                    button: button.to_string(),
+                    phase,
+                    timestamp: click_ts,
+                    foreground_pid: fg_pid,
+                });
             }
         }
     }

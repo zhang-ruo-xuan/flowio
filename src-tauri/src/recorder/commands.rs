@@ -29,7 +29,7 @@ use crate::recorder::activity;
 use crate::recorder::capture::{self, FrameRing};
 use crate::recorder::hook;
 use crate::recorder::keyboard::{self, KeyEvent};
-use crate::recorder::mouse::CapturedClick;
+use crate::recorder::mouse::{CapturedClick, ClickPhase};
 use crate::recorder::recorder;
 use crate::recorder::screenshot;
 use crate::recorder::selection_bridge;
@@ -1390,6 +1390,110 @@ fn build_click_step(
     })
 }
 
+/// Build a drag step: the fullscreen frame captured at *release* time (so the
+/// selection is fully drawn), annotated with a red selection rectangle spanning
+/// the dragged region, and cropped to the bounding box of the press→release
+/// points (+ a small margin) rather than centering on a single click point.
+///
+/// This is what fixes "drag steps crop to an empty area": the old path only
+/// recorded the button-press coordinate as a plain click, so the crop landed on
+/// the drag's start point and missed the selected region entirely.
+fn build_drag_step(
+    dx: f64,
+    dy: f64,
+    ux: f64,
+    uy: f64,
+    release_ts: Instant,
+    ring: &FrameRing,
+    step_no: i32,
+) -> Option<StepData> {
+    let frame = ring
+        .closest_to(release_ts)
+        .map(|f| (f.image.clone(), f.origin_x, f.origin_y))
+        .or_else(|| {
+            eprintln!("[BG] drag: ring empty, direct capture");
+            screenshot::capture_fullscreen_with_origin().ok()
+        })?;
+    let (frame_img, origin_x, origin_y) = frame;
+
+    // Press/release points in image coordinates (subtract monitor origin).
+    let (dx_i, dy_i) = (dx.round() as i32 - origin_x, dy.round() as i32 - origin_y);
+    let (ux_i, uy_i) = (ux.round() as i32 - origin_x, uy.round() as i32 - origin_y);
+
+    // Red selection rectangle drawn on the fullscreen image.
+    let mut annotated = frame_img.clone();
+    screenshot::draw_drag_marker(&mut annotated, dx_i, dy_i, ux_i, uy_i);
+
+    // Crop Flowio's own recording status bar off the top of both images; the
+    // stored coordinates must shift up by the cropped height.
+    let mut clean_before = frame_img;
+    let watermark_cut = screenshot::crop_watermark(&mut clean_before) as i32;
+    screenshot::crop_watermark(&mut annotated);
+
+    // Bounding box of the drag in origin-shifted image coords, then shift up by
+    // the watermark cut so it lines up with the cropped screenshot space.
+    let bx0 = (dx_i.min(ux_i)) - watermark_cut;
+    let by0 = (dy_i.min(uy_i)) - watermark_cut;
+    let bw = (dx_i - ux_i).abs();
+    let bh = (dy_i - uy_i).abs();
+
+    // Small margin so the selection edges aren't flush against the crop border.
+    const DRAG_PAD: i32 = 16;
+    let (img_w, img_h) = (annotated.width() as i32, annotated.height() as i32);
+    let left = (bx0 - DRAG_PAD).clamp(0, img_w);
+    let top = (by0 - DRAG_PAD).clamp(0, img_h);
+    let right = (bx0 + bw + DRAG_PAD).clamp(0, img_w);
+    let bottom = (by0 + bh + DRAG_PAD).clamp(0, img_h);
+    let crop_w = (right - left).max(1);
+    let crop_h = (bottom - top).max(1);
+    let (win_cx, win_cy) = (left + crop_w / 2, top + crop_h / 2);
+
+    // Save clean before screenshot (no annotation)
+    let before_path = screenshot::next_screenshot_path("drag_before");
+    let before_str = match screenshot::capture_frame_jpeg(&clean_before, &before_path) {
+        Ok(()) => before_path.to_string_lossy().to_string(),
+        Err(e) => {
+            eprintln!("[BG] drag before screenshot write failed: {}", e);
+            return None;
+        }
+    };
+
+    // Save annotated screenshot
+    let ss_path = screenshot::next_screenshot_path("drag");
+    let ss_str = match screenshot::capture_frame_jpeg(&annotated, &ss_path) {
+        Ok(()) => ss_path.to_string_lossy().to_string(),
+        Err(e) => {
+            eprintln!("[BG] drag screenshot write failed: {}", e);
+            return None;
+        }
+    };
+
+    let now_ms = current_time_millis();
+    let window_title = activity::get_active_window_title();
+
+    Some(StepData {
+        id: Uuid::new_v4().to_string(),
+        order_index: 0,
+        step_number: 0,
+        action_type: "drag".to_string(),
+        title: "拖拽选中".to_string(),
+        description: String::new(),
+        tip: None,
+        screenshot_path: ss_str.clone(),
+        screenshot_base64: None,
+        annotated_path: String::new(),
+        before_screenshot_path: before_str,
+        x: Some(win_cx),
+        y: Some(win_cy),
+        crop_w: Some(crop_w),
+        crop_h: Some(crop_h),
+        after_screenshot_path: None,
+        timestamp: now_ms,
+        window_title: window_title.unwrap_or_default(),
+        is_sensitive: false,
+    })
+}
+
 // ── Spawn event-processing thread (extracted for reuse in start & resume) ──
 
 /// 当前 Unix 时间戳（毫秒）。
@@ -1473,6 +1577,9 @@ fn spawn_event_thread(
         let mut last_alt_tab: Option<(Instant, usize)> = None;
         // P1 降噪：上一次通过过滤的左键点击 (x, y, 时刻, 步骤id, fg_pid)
         let mut last_click: Option<(f64, f64, Instant, String, u32)> = None;
+        // 拖拽配对：记录最近一次按下（及为其创建的点击步骤 id），
+        // 待松开时若两点相距超过阈值则改为拖拽步骤。
+        let mut pending_down: Option<(CapturedClick, Option<String>)> = None;
         // P1 降噪：上一步骤是否为「可续并」的输入步骤（仅 idle flush 置 true，
         // 点击/快捷键/导航键/切窗 flush 置 false）
         let mut can_merge_type = false;
@@ -1496,8 +1603,10 @@ fn spawn_event_thread(
             // ── Mouse events ───────────────────────────────
             match mouse_rx.try_recv() {
                 Ok(click) => {
+                    let is_down = click.phase == ClickPhase::Down;
                     eprintln!(
-                        "[BG] mouse click: {} at ({}, {}), ts={:?}, fg_pid={}",
+                        "[BG] mouse {}: {} at ({}, {}), ts={:?}, fg_pid={}",
+                        if is_down { "down" } else { "up" },
                         click.button, click.x, click.y, click.timestamp, click.foreground_pid
                     );
 
@@ -1518,74 +1627,122 @@ fn spawn_event_thread(
                         }
                     }
 
-                    // Flush pending keystrokes before the click step
-                    if !accumulated_keys.is_empty() {
-                        let typed = std::mem::take(&mut accumulated_keys);
-                        let win_title = typing_window_title.take().unwrap_or_default();
-                        flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
-                    }
-                    last_key_time = Instant::now();
-                    can_merge_type = false; // 点击打断输入连续性
+                    if is_down {
+                        // Flush pending keystrokes before the click step
+                        if !accumulated_keys.is_empty() {
+                            let typed = std::mem::take(&mut accumulated_keys);
+                            let win_title = typing_window_title.take().unwrap_or_default();
+                            flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
+                        }
+                        last_key_time = Instant::now();
+                        can_merge_type = false; // 点击打断输入连续性
 
-                    // ── P1 降噪：双击识别与合并 ──
-                    // 与上一次「通过过滤的左键点击」间隔 < 系统双击速度、
-                    // 位置 ≤8px、同前台窗口 → 撤掉上一步，用第二次点击重建
-                    // 为「双击」步骤（如 WPS 单元格「点两下才进编辑」）。
-                    let dbl_prev_id = match last_click {
-                        Some((lx, ly, lts, ref lid, lpid))
-                            if click.button == "left"
-                                && lpid == click.foreground_pid
-                                && is_double_click(
-                                    click.x - lx,
-                                    click.y - ly,
-                                    lts.elapsed().as_millis() as u64,
-                                    double_click_time_ms(),
-                                ) =>
-                        {
-                            Some(lid.clone())
+                        // 拖拽配对：若上一轮按下还没收到松开（极少见，如鼠标移出窗口），
+                        // 先把那次按下当成点击落成步骤，避免漏步。
+                        if let Some((stale_down, _)) = pending_down.take() {
+                            let step_no = { let s = cs_for_thread.lock().unwrap(); s.len() as i32 + 1 };
+                            if let Some(step) = build_click_step(stale_down.x, stale_down.y, stale_down.timestamp, &ring, step_no, false) {
+                                let mut steps = cs_for_thread.lock().unwrap();
+                                if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
+                                    steps.push(step);
+                                }
+                            }
                         }
-                        _ => None,
-                    };
-                    let mut new_click_id: Option<String> = None;
-                    {
-                        let mut steps = cs_for_thread.lock().unwrap();
-                        if let Some(ref prev_id) = dbl_prev_id {
-                            if let Some(pos) = steps
-                                .iter()
-                                .position(|s| &s.id == prev_id && s.action_type == "click")
+
+                        // ── P1 降噪：双击识别与合并 ──
+                        // 与上一次「通过过滤的左键点击」间隔 < 系统双击速度、
+                        // 位置 ≤8px、同前台窗口 → 撤掉上一步，用第二次点击重建
+                        // 为「双击」步骤（如 WPS 单元格「点两下才进编辑」）。
+                        let dbl_prev_id = match last_click {
+                            Some((lx, ly, lts, ref lid, lpid))
+                                if click.button == "left"
+                                    && lpid == click.foreground_pid
+                                    && is_double_click(
+                                        click.x - lx,
+                                        click.y - ly,
+                                        lts.elapsed().as_millis() as u64,
+                                        double_click_time_ms(),
+                                    ) =>
                             {
-                                steps.remove(pos);
-                                eprintln!("[BG] double-click: removed single-click step {}", prev_id);
+                                Some(lid.clone())
+                            }
+                            _ => None,
+                        };
+                        let mut new_click_id: Option<String> = None;
+                        {
+                            let mut steps = cs_for_thread.lock().unwrap();
+                            if let Some(ref prev_id) = dbl_prev_id {
+                                if let Some(pos) = steps
+                                    .iter()
+                                    .position(|s| &s.id == prev_id && s.action_type == "click")
+                                {
+                                    steps.remove(pos);
+                                    eprintln!("[BG] double-click: removed single-click step {}", prev_id);
+                                }
+                            }
+                            let click_step_no = steps.len() as i32 + 1;
+                            if let Some(step) = build_click_step(
+                                click.x, click.y, click.timestamp, &ring, click_step_no,
+                                dbl_prev_id.is_some(),
+                            ) {
+                                if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
+                                    new_click_id = Some(step.id.clone());
+                                    steps.push(step);
+                                } else {
+                                    eprintln!(
+                                        "[BG] 录制步骤数已达上限 {}，本次点击步骤已丢弃",
+                                        crate::recorder::state::MAX_RECORDING_STEPS
+                                    );
+                                }
                             }
                         }
-                        let click_step_no = steps.len() as i32 + 1;
-                        if let Some(step) = build_click_step(
-                            click.x, click.y, click.timestamp, &ring, click_step_no,
-                            dbl_prev_id.is_some(),
-                        ) {
-                            if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
-                                new_click_id = Some(step.id.clone());
-                                steps.push(step);
-                            } else {
-                                eprintln!(
-                                    "[BG] 录制步骤数已达上限 {}，本次点击步骤已丢弃",
-                                    crate::recorder::state::MAX_RECORDING_STEPS
-                                );
+                        // 记录本次按下，供松开阶段判定拖拽
+                        pending_down = Some((click.clone(), new_click_id.clone()));
+                        last_click = match (dbl_prev_id, new_click_id) {
+                            // 双击合并后清空：三连击不再继续链（第三次点击按新点击算）
+                            (Some(_), _) => None,
+                            (None, Some(id)) => Some((
+                                click.x,
+                                click.y,
+                                click.timestamp,
+                                id,
+                                click.foreground_pid,
+                            )),
+                            _ => last_click,
+                        };
+                    } else {
+                        // ── 松开阶段：判定拖拽 ──
+                        const DRAG_THRESHOLD_PX: f64 = 8.0; // 超过即视为拖拽
+                        if let Some((down, down_step_id)) = pending_down.take() {
+                            let dist_x = click.x - down.x;
+                            let dist_y = click.y - down.y;
+                            let dist = (dist_x * dist_x + dist_y * dist_y).sqrt();
+                            if click.button == down.button && dist > DRAG_THRESHOLD_PX {
+                                // 拖拽：用按下→松开包围盒裁图，并覆盖掉刚才落的点击步骤
+                                let step_no = { let s = cs_for_thread.lock().unwrap(); s.len() as i32 + 1 };
+                                if let Some(drag_step) = build_drag_step(
+                                    down.x, down.y, click.x, click.y, click.timestamp, &ring, step_no,
+                                ) {
+                                    let mut steps = cs_for_thread.lock().unwrap();
+                                    if let Some(pos) = down_step_id
+                                        .as_ref()
+                                        .and_then(|id| steps.iter().position(|s| &s.id == id))
+                                    {
+                                        steps.remove(pos);
+                                        eprintln!(
+                                            "[BG] drag: removed click step {} (converted to drag, dist={:.1}px)",
+                                            down_step_id.as_ref().unwrap(), dist
+                                        );
+                                    }
+                                    if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
+                                        steps.push(drag_step);
+                                    }
+                                }
+                                last_click = None;
                             }
+                            // 否则保持原点击步骤，不做任何改动
                         }
                     }
-                    last_click = match (dbl_prev_id, new_click_id) {
-                        // 双击合并后清空：三连击不再继续链（第三次点击按新点击算）
-                        (Some(_), _) => None,
-                        (None, Some(id)) => Some((
-                            click.x,
-                            click.y,
-                            click.timestamp,
-                            id,
-                            click.foreground_pid,
-                        )),
-                        _ => last_click,
-                    };
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {

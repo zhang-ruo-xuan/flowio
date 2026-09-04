@@ -516,6 +516,54 @@ fn draw_circle_stroke(
     }
 }
 
+/// Stroke the outline of an axis-aligned rectangle `(x0,y0)`→`(x1,y1)` with
+/// the given stroke width and color. Used for drag-selection annotations.
+fn draw_rect_stroke(
+    img: &mut DynamicImage,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    stroke: f64,
+    color: [u8; 3],
+) {
+    let w = img.width() as i32;
+    let h = img.height() as i32;
+    let (lx, rx) = (x0.min(x1), x0.max(x1));
+    let (ty, by) = (y0.min(y1), y0.max(y1));
+    // Expand by half the stroke thickness so the line sits centered on the edge.
+    let t = (stroke / 2.0).ceil() as i32;
+    let i0 = lx - t;
+    let i1 = rx + t;
+    let j0 = ty - t;
+    let j1 = by + t;
+    let buf = img.as_mut_rgba8().expect("xcap produces RGBA8");
+    let px = image::Rgba([color[0], color[1], color[2], 255]);
+    // Top & bottom edges.
+    for x in i0..=i1 {
+        for y in [j0, j1] {
+            if x >= 0 && x < w && y >= 0 && y < h {
+                buf.put_pixel(x as u32, y as u32, px);
+            }
+        }
+    }
+    // Left & right edges.
+    for y in j0..=j1 {
+        for x in [i0, i1] {
+            if x >= 0 && x < w && y >= 0 && y < h {
+                buf.put_pixel(x as u32, y as u32, px);
+            }
+        }
+    }
+}
+
+/// Draw a drag-selection annotation: a red hollow rectangle spanning the
+/// dragged region `(dx,dy)`→`(ux,uy)`, website editor style (#E74C3C, 2.5px).
+pub fn draw_drag_marker(img: &mut DynamicImage, dx: i32, dy: i32, ux: i32, uy: i32) {
+    const RED: [u8; 3] = [0xE7, 0x4C, 0x3C]; // #E74C3C
+    draw_rect_stroke(img, dx, dy, ux, uy, 2.5, RED);
+}
+
 /// Draw the click annotation on the image:
 ///   - a red thin hollow circle centered at the click point (website editor
 ///     style: #E74C3C, 2.5px stroke, no number badge, no center dot).
