@@ -1172,6 +1172,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           return next.map((s, i) => ({ ...s, step_number: i + 1, order_index: i }));
         });
         setSelectedStepId(newStep.id);
+        refreshHist();
         setTimeout(() => {
           // 滚动到新添加的步骤本身（可见即可），避免滚到列表末尾把新步骤滑出页面
           const el = document.getElementById(`step-item-${newStep.id}`);
@@ -1183,7 +1184,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         console.error("Add step failed:", err);
       }
     },
-    [recordingId]
+    [recordingId, refreshHist]
   );
 
   /* ── Move step ──────────────────────────────────────────── */
@@ -1376,12 +1377,13 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       setToast({ type: "success", message: changed > 0 ? "文本脱敏完成" : "未检测到敏感信息" });
       const list = await reloadRecording();
       await rebuildCropCache(list);
+      refreshHist();
     } catch (err) {
       setToast({ type: "error", message: "隐私脱敏失败: " + String(err) });
     } finally {
       setRedacting(false);
     }
-  }, [recordingId, reloadRecording, rebuildCropCache]);
+  }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
 
   // 扫描全部截图中的敏感文字区域并自动脱敏（OCR）
   const showScanToast = useCallback((toast: { type: "success" | "error"; message: string }) => {
@@ -1474,6 +1476,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       alert(result);
       const list = await reloadRecording();
       await rebuildCropCache(list);
+      refreshHist();
     } catch (err) {
       const msg = String(err);
       if (msg.includes("AI 配置") || msg.includes("配置 AI 服务商")) {
@@ -1492,7 +1495,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     } finally {
       setAiGenerating(false);
     }
-  }, [recordingId, reloadRecording, rebuildCropCache]);
+  }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
 
   /* ── Lightbox helpers ────────────────────────────────────── */
 

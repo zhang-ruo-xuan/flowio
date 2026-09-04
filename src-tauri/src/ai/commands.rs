@@ -887,6 +887,8 @@ fn apply_pipeline_result(
             return;
         }
     };
+    // AI 生成会整体改写步骤标题/描述 → 先压全局撤销栈，生成结果可一键撤销
+    let _ = crate::editor::commands::push_edit_history(&conn, recording_id);
 
     // Collect step IDs in order
     let step_ids: Vec<String> = {

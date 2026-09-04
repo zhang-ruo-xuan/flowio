@@ -72,6 +72,8 @@ pub fn redact_recording_text(
     recording_id: String,
 ) -> Result<usize, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 文字脱敏会改写步骤标题/描述 → 先压全局撤销栈，脱敏结果可一键撤销
+    let _ = crate::editor::commands::push_edit_history(&conn, &recording_id);
     // Phase A: 按设置中的脱敏配置（类别开关 + 自定义正则）执行
     let config = crate::settings::commands::read_redaction_config(&conn);
     let mut stmt = conn

@@ -23,7 +23,7 @@
 //! cpal 的 `Stream` 由采集线程持有（drop 即停止），不进 Tauri State。
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -174,7 +174,13 @@ fn run_capture(
     init_tx: Sender<Result<i64, String>>,
     done_tx: Sender<()>,
 ) {
-    let setup = build_stream_for_default_device(Arc::clone(&paused), Arc::clone(&samples), pcm_tx);
+    let gain_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    let setup = build_stream_for_default_device(
+        Arc::clone(&paused),
+        Arc::clone(&samples),
+        Arc::clone(&gain_bits),
+        pcm_tx,
+    );
     let (stream, info) = match setup {
         Ok(v) => v,
         Err(e) => {
@@ -246,6 +252,11 @@ fn run_capture(
     while let Ok(chunk) = pcm_rx.try_recv() {
         append_pcm(&buffers, &recording_id, &chunk);
     }
+    let final_gain = f32::from_bits(gain_bits.load(Ordering::Relaxed));
+    crate::ai::commands::ai_dbg_log(&format!(
+        "[VOICE] mic stopped: final AGC gain=×{:.1}（远低于 ×4 说明麦克风输入电平偏低，建议戴耳机或调大系统麦克风电平）",
+        final_gain
+    ));
     drop(stream);
     let _ = done_tx.send(());
 }
@@ -262,6 +273,7 @@ struct StreamInfo {
 fn build_stream_for_default_device(
     paused: Arc<AtomicBool>,
     samples: Arc<AtomicU64>,
+    gain_bits: Arc<AtomicU32>,
     tx: Sender<Vec<i16>>,
 ) -> Result<(Stream, StreamInfo), String> {
     let host = cpal::default_host();
@@ -281,6 +293,7 @@ fn build_stream_for_default_device(
         &cfg,
         Arc::clone(&paused),
         Arc::clone(&samples),
+        Arc::clone(&gain_bits),
         tx.clone(),
     ) {
         Ok(stream) => Ok((stream, info)),
@@ -308,7 +321,7 @@ fn build_stream_for_default_device(
                 channels: fallback.channels(),
                 format: fallback.sample_format(),
             };
-            let stream = build_stream(&device, &fallback, paused, samples, tx)?;
+            let stream = build_stream(&device, &fallback, paused, samples, gain_bits, tx)?;
             Ok((stream, info))
         }
     }
@@ -343,6 +356,7 @@ fn build_stream(
     cfg: &SupportedStreamConfig,
     paused: Arc<AtomicBool>,
     samples: Arc<AtomicU64>,
+    gain_bits: Arc<AtomicU32>,
     tx: Sender<Vec<i16>>,
 ) -> Result<Stream, String> {
     let sc: StreamConfig = cfg.config();
@@ -356,19 +370,19 @@ fn build_stream(
     match fmt {
         SampleFormat::F32 => device.build_input_stream::<f32, _, _>(
             &sc,
-            make_callback::<f32>(channels, dev_rate, |s| s, Arc::clone(&paused), Arc::clone(&samples), tx),
+            make_callback::<f32>(channels, dev_rate, |s| s, Arc::clone(&paused), Arc::clone(&samples), Arc::clone(&gain_bits), tx),
             err_fn,
             None,
         ),
         SampleFormat::I16 => device.build_input_stream::<i16, _, _>(
             &sc,
-            make_callback::<i16>(channels, dev_rate, |s| s as f32 / 32768.0, Arc::clone(&paused), Arc::clone(&samples), tx),
+            make_callback::<i16>(channels, dev_rate, |s| s as f32 / 32768.0, Arc::clone(&paused), Arc::clone(&samples), Arc::clone(&gain_bits), tx),
             err_fn,
             None,
         ),
         SampleFormat::U16 => device.build_input_stream::<u16, _, _>(
             &sc,
-            make_callback::<u16>(channels, dev_rate, |s| (s as f32 - 32768.0) / 32768.0, Arc::clone(&paused), Arc::clone(&samples), tx),
+            make_callback::<u16>(channels, dev_rate, |s| (s as f32 - 32768.0) / 32768.0, Arc::clone(&paused), Arc::clone(&samples), Arc::clone(&gain_bits), tx),
             err_fn,
             None,
         ),
@@ -377,19 +391,70 @@ fn build_stream(
     .map_err(|e| format!("打开麦克风失败（可能被系统权限或其他程序占用）: {}", e))
 }
 
-/// 造一个 cpal 数据回调：降混 → 重采样 → i16 → 投进 channel。
+/// 软件自动增益（AGC）。
+///
+/// 为什么需要：浏览器 getUserMedia 默认自带 AGC / 降噪，换 cpal 裸采后
+/// 这层全没了 —— 低电平麦克风（实测整体 RMS 0.004 上下，贴着静音阈值
+/// SILENCE_RMS=0.0045）会让 VAD 判不出说话区段，ASR 收到的是「耳语级」
+/// 信号，识别质量极差。这里用慢速 EMA 跟踪语音电平，把增益朝目标缓推：
+/// 只放大不压低（gain ≥ 1），限幅防爆音，快攻慢放避免把静音段也放大。
+pub struct Agc {
+    gain: f32, // 当前增益（1.0 = 不放大）
+    level: f32, // 信号 RMS 的慢速滑动平均
+}
+
+impl Agc {
+    const TARGET_RMS: f32 = 0.06; // 目标语音电平（约 -24 dBFS，ASR 舒适区）
+    const MAX_GAIN: f32 = 16.0; // 上限 +24dB，再大主要在放大底噪
+    const MIN_LEVEL: f32 = 1e-4; // 低于此视为纯静音，不参与电平估计
+
+    pub fn new() -> Self {
+        Self { gain: 1.0, level: 0.0 }
+    }
+
+    /// 对一块 16kHz 单声道 i16 样本就地增益，并更新电平估计与增益。
+    pub fn process(&mut self, buf: &mut [i16]) {
+        if buf.is_empty() {
+            return;
+        }
+        let sum: f64 = buf.iter().map(|&s| (s as f64 / 32768.0).powi(2)).sum();
+        let rms = (sum / buf.len() as f64).sqrt() as f32;
+        if rms > Self::MIN_LEVEL {
+            // 快攻慢放：语音到来快速跟上电平，静音段缓慢回落
+            let alpha = if rms > self.level { 0.15 } else { 0.01 };
+            self.level += (rms - self.level) * alpha;
+        }
+        let want = if self.level > Self::MIN_LEVEL {
+            (Self::TARGET_RMS / self.level).clamp(1.0, Self::MAX_GAIN)
+        } else {
+            Self::MAX_GAIN
+        };
+        self.gain += (want - self.gain) * 0.02; // 增益缓变，避免呼吸声/泵感
+        for s in buf.iter_mut() {
+            *s = (*s as f32 * self.gain).clamp(-32767.0, 32767.0) as i16;
+        }
+    }
+
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+}
+
+/// 造一个 cpal 数据回调：降混 → 重采样 → AGC → i16 → 投进 channel。
 fn make_callback<T>(
     channels: usize,
     dev_rate: u32,
     to_f32: fn(T) -> f32,
     paused: Arc<AtomicBool>,
     samples: Arc<AtomicU64>,
+    gain_bits: Arc<AtomicU32>,
     tx: Sender<Vec<i16>>,
 ) -> impl FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static
 where
     T: Copy + Send + 'static,
 {
     let mut res = Resampler::new(dev_rate, audio::SAMPLE_RATE);
+    let mut agc = Agc::new();
     let mut mono: Vec<f32> = Vec::new();
     move |data: &[T], _: &cpal::InputCallbackInfo| {
         if paused.load(Ordering::Relaxed) {
@@ -402,6 +467,8 @@ where
         if out.is_empty() {
             return;
         }
+        agc.process(&mut out);
+        gain_bits.store(agc.gain().to_bits(), Ordering::Relaxed);
         samples.fetch_add(out.len() as u64, Ordering::Relaxed);
         let _ = tx.send(out);
     }
@@ -631,9 +698,14 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Vec<i16>>();
         let paused = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(AtomicU64::new(0));
-        let (stream, info) =
-            build_stream_for_default_device(Arc::clone(&paused), Arc::clone(&samples), tx)
-                .expect("打开麦克风失败");
+        let gain_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let (stream, info) = build_stream_for_default_device(
+            Arc::clone(&paused),
+            Arc::clone(&samples),
+            gain_bits,
+            tx,
+        )
+        .expect("打开麦克风失败");
         println!(
             "设备={} 原始采样率={}Hz 声道={} 格式={:?}",
             info.name, info.dev_rate, info.channels, info.format
@@ -667,5 +739,78 @@ mod tests {
             "3 秒应至少采到 1 秒的量（16000 样本），实际 {} —— 设备没送数据？",
             got
         );
+    }
+
+    // ── AGC ───────────────────────────────────────────────────
+
+    fn sine_i16(n: usize, amplitude: f32) -> Vec<i16> {
+        (0..n)
+            .map(|i| ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin() * amplitude * 32767.0) as i16)
+            .collect()
+    }
+
+    fn rms_i16(buf: &[i16]) -> f32 {
+        let sum: f64 = buf.iter().map(|&s| (s as f64 / 32768.0).powi(2)).sum();
+        (sum / buf.len().max(1) as f64).sqrt() as f32
+    }
+
+    #[test]
+    fn agc_boosts_quiet_input_toward_target() {
+        let mut agc = Agc::new();
+        let in_rms = rms_i16(&sine_i16(1600, 0.008)); // 整体 RMS ≈ 0.0057 的安静输入
+        let mut last = Vec::new();
+        // 模拟真实流式：每轮回调送来「新鲜的、未被放大过」的原始样本
+        for _ in 0..300 {
+            let mut buf = sine_i16(1600, 0.008);
+            agc.process(&mut buf);
+            last = buf;
+        }
+        assert!(agc.gain() > 4.0, "低电平输入 3 秒后增益应 >4，实际 ×{:.2}", agc.gain());
+        let out_rms = rms_i16(&last);
+        assert!(
+            out_rms > in_rms * 3.0,
+            "输出应被显著放大：in {:.5} out {:.5}",
+            in_rms,
+            out_rms
+        );
+    }
+
+    #[test]
+    fn agc_never_attenuates_loud_input() {
+        let mut agc = Agc::new();
+        let in_rms = rms_i16(&sine_i16(1600, 0.5)); // 正常响度
+        let mut last = Vec::new();
+        for _ in 0..300 {
+            let mut buf = sine_i16(1600, 0.5);
+            agc.process(&mut buf);
+            last = buf;
+        }
+        assert!(
+            agc.gain() <= 1.05,
+            "响亮输入不应再放大，实际 ×{:.2}",
+            agc.gain()
+        );
+        assert!(
+            (rms_i16(&last) - in_rms).abs() / in_rms < 0.05,
+            "响亮输入应近似直通"
+        );
+    }
+
+    #[test]
+    fn agc_output_never_wraps() {
+        let mut agc = Agc::new();
+        // 先把增益推上去，再喂一个突发的响信号（削波场景）
+        let mut quiet = sine_i16(1600, 0.005);
+        for _ in 0..300 {
+            agc.process(&mut quiet);
+        }
+        let mut loud = vec![32000i16; 1600];
+        for _ in 0..50 {
+            agc.process(&mut loud);
+            assert!(
+                loud.iter().all(|&s| s >= -32767 && s <= 32767),
+                "增益后样本必须夹在 i16 范围内"
+            );
+        }
     }
 }
