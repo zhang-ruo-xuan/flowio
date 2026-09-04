@@ -1292,22 +1292,33 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       const sceneName = SCENE_ENTRIES.find((s) => s.slug === pubSceneSelect)?.name || "";
       const tagsToSend = sceneName ? [...new Set([...pubTags, sceneName])] : pubTags;
 
-      // 压缩每张截图，显著降低上传体积（修复“保存草稿/发布失败”：完整截图会导致请求体过大/超时）
+      // 发布=所见即所得：步骤视图为「裁图」时上传裁剪结果（与编辑器显示、导出 cropStepIds 同一视图偏好），
+      // 整窗类型（scroll/nav/screenshot）cropAdaptiveBase64 内部自动原样返回；裁剪失败回退全图，不阻塞发布。
+      // 压缩每张截图，显著降低上传体积（修复"保存草稿/发布失败"：完整截图会导致请求体过大/超时）
       const steps = await Promise.all(
-        data.steps.map(async (s) => ({
-          order_index: s.order_index,
-          step_number: s.step_number,
-          action_type: s.action_type,
-          title: s.title,
-          description: s.description,
-          tip: s.tip,
-          x: s.x,
-          y: s.y,
-          window_title: s.window_title,
-          screenshot_base64: s.screenshot_base64 ? await downscaleBase64Image(s.screenshot_base64) : undefined,
-          before_screenshot_base64: s.before_screenshot_base64 ? await downscaleBase64Image(s.before_screenshot_base64) : undefined,
-          after_screenshot_base64: s.after_screenshot_base64 ? await downscaleBase64Image(s.after_screenshot_base64) : undefined,
-        }))
+        data.steps.map(async (s) => {
+          const useCrop = getViewCropped(s.id) && !isCropDeleted(s.id) && !!s.screenshot_base64;
+          let shotB64: string | undefined = s.screenshot_base64 || undefined;
+          if (useCrop && shotB64) {
+            try {
+              shotB64 = await cropAdaptiveBase64(shotB64, s.x, s.y, s.crop_w, s.crop_h, s.action_type);
+            } catch { /* 裁剪失败 → 回退全图 */ }
+          }
+          return {
+            order_index: s.order_index,
+            step_number: s.step_number,
+            action_type: s.action_type,
+            title: s.title,
+            description: s.description,
+            tip: s.tip,
+            x: s.x,
+            y: s.y,
+            window_title: s.window_title,
+            screenshot_base64: shotB64 ? await downscaleBase64Image(shotB64) : undefined,
+            before_screenshot_base64: s.before_screenshot_base64 ? await downscaleBase64Image(s.before_screenshot_base64) : undefined,
+            after_screenshot_base64: s.after_screenshot_base64 ? await downscaleBase64Image(s.after_screenshot_base64) : undefined,
+          };
+        })
       );
 
       // 构建上传数据（截图用 base64）
@@ -1325,7 +1336,22 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         // ★ T7 多语言上传：已有译文副本时随教程一起上传到网站
         translations: Object.keys(translations).length > 0 ? translations : undefined,
       };
-      if (pubCoverBase64) uploadData.cover_base64 = pubCoverBase64;
+      if (pubCoverBase64) {
+        uploadData.cover_base64 = pubCoverBase64;
+      } else {
+        // 封面=所见即所得（与步骤截图同一视图逻辑）：未手动选封面时，取首个有主图的步骤按其视图偏好解析
+        // ——该步视图为「裁图」传裁剪图，「全图」传全图；整窗类型自动保持全图；
+        // 该步无主图但有 after 图时回退 after（不裁）。任何失败回退全图，不阻塞发布。
+        const firstImg = data.steps.find((s) => s.screenshot_base64);
+        let coverSrc: string | undefined = firstImg?.screenshot_base64 || undefined;
+        if (coverSrc && firstImg && getViewCropped(firstImg.id) && !isCropDeleted(firstImg.id)) {
+          try {
+            coverSrc = await cropAdaptiveBase64(coverSrc, firstImg.x, firstImg.y, firstImg.crop_w, firstImg.crop_h, firstImg.action_type);
+          } catch { /* 裁剪失败 → 回退全图 */ }
+        }
+        if (!coverSrc && firstImg?.after_screenshot_base64) coverSrc = firstImg.after_screenshot_base64;
+        if (coverSrc) uploadData.cover_base64 = await downscaleBase64Image(coverSrc, 720, 0.85);
+      }
 
       // POST 到网站 API（上传大量截图时可能较慢，设置 90s 超时）
       const PB_URL = "https://flowio.cn";
@@ -1371,7 +1397,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     } finally {
       setPublishing(false);
     }
-  }, [siteToken, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSceneSelect, translations]);
+  }, [siteToken, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSceneSelect, translations, stepViewCropped, deletedCrop]);
 
   /* ── 隐私脱敏 ────────────────────────────────────────────── */
 
