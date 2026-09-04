@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::recorder::activity;
 use crate::recorder::capture::{self, FrameRing};
 use crate::recorder::hook;
+use crate::recorder::ime;
 use crate::recorder::keyboard::{self, KeyEvent};
 use crate::recorder::mouse::{CapturedClick, ClickPhase};
 use crate::recorder::recorder;
@@ -1516,19 +1517,38 @@ enum BufferEffect {
 }
 
 /// 将按键应用到累积输入缓冲区，返回该键的效果。
-fn apply_key_to_buffer(buffer: &mut String, key_name: &str) -> BufferEffect {
+/// `char_str` 是已经用 ToUnicodeEx 解析出的「真实输入字符」（符号/大小写/布局
+/// 都已正确）；`key_name` 仅用于退格识别。
+fn apply_key_to_buffer(buffer: &mut String, key_name: &str, char_str: &str) -> BufferEffect {
     if key_name == "Backspace" || key_name == "Back" {
         if !buffer.is_empty() {
             buffer.pop();
         }
         BufferEffect::Backspace
+    } else if !char_str.is_empty() && !char_str.starts_with('[') {
+        buffer.push_str(char_str);
+        BufferEffect::Input
     } else {
-        let ch = keyboard::key_to_char(key_name);
-        if !ch.is_empty() && !ch.starts_with('[') {
-            buffer.push_str(&ch);
-            BufferEffect::Input
-        } else {
-            BufferEffect::Ignored
+        BufferEffect::Ignored
+    }
+}
+
+/// 尚未开始输入时，初始化一次 typing step：记录前台窗口标题并截「按键前」图。
+/// 用于首键与 IME 提交中文的时刻。
+fn ensure_typing_started(
+    accumulated_keys: &mut String,
+    typing_window_title: &mut Option<String>,
+    keyboard_before_path: &mut Option<String>,
+) {
+    if accumulated_keys.is_empty() {
+        *typing_window_title = activity::get_active_window_title();
+        if let Ok(img) = screenshot::capture_fullscreen() {
+            let mut win_img = img;
+            screenshot::crop_watermark(&mut win_img);
+            let bp = screenshot::next_screenshot_path("key_before");
+            if screenshot::capture_frame_jpeg(&win_img, &bp).is_ok() {
+                *keyboard_before_path = Some(bp.to_string_lossy().to_string());
+            }
         }
     }
 }
@@ -1584,6 +1604,8 @@ fn spawn_event_thread(
         // 点击/快捷键/导航键/切窗 flush 置 false）
         let mut can_merge_type = false;
         let flush_interval = Duration::from_millis(1500);
+        // IME 组合状态跟踪：用于检测「组合结束」的瞬间，提交中文最终文本。
+        let mut prev_composing = false;
 
         loop {
             if !running_clone.load(Ordering::Relaxed) {
@@ -1593,6 +1615,37 @@ fn spawn_event_thread(
                     flush_key_step(&typed, None, &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
                 }
                 break;
+            }
+
+            // ── IME 组合结束 → 提交中文最终文本 ─────────────
+            // 在每个循环 tick 检测：一旦组合从「进行中」变为「结束」，立刻读取
+            // GCS_RESULTSTR 拿到最终中文（如「你好」），并入输入缓冲，效果等同
+            // 输入了一串真实字符。放在循环顶部（而非仅按键时）是因为中文可能
+            // 通过点击候选词提交、不再有后续按键，必须靠轮询捕捉状态翻转。
+            {
+                let composing_now = ime::is_ime_composing();
+                if prev_composing && !composing_now {
+                    if let Some(result) = ime::get_composition_result() {
+                        if !result.is_empty() {
+                            ensure_typing_started(
+                                &mut accumulated_keys,
+                                &mut typing_window_title,
+                                &mut keyboard_before_path,
+                            );
+                            accumulated_keys.push_str(&result);
+                            if let Some((text, sensitive)) =
+                                screenshot::get_focused_element_text()
+                            {
+                                if !text.is_empty() {
+                                    last_uia_text = Some((text, sensitive));
+                                }
+                            }
+                            last_key_time = Instant::now();
+                            eprintln!("[BG] IME committed: '{}'", result);
+                        }
+                    }
+                }
+                prev_composing = composing_now;
             }
 
             // ── Drain capture ring frames ──────────────────
@@ -1755,8 +1808,11 @@ fn spawn_event_thread(
             match key_rx.try_recv() {
                 Ok(KeyEvent::Press {
                     key: key_name,
+                    vk,
+                    scan,
+                    hkl,
                     ctrl,
-                    shift: _,
+                    shift,
                     alt,
                     ts: key_instant,
                     foreground_pid: fg_pid,
@@ -1940,18 +1996,19 @@ fn spawn_event_thread(
                         continue;
                     }
 
-                    if accumulated_keys.is_empty() {
-                        typing_window_title = activity::get_active_window_title();
-                        // Capture before screenshot on first keystroke
-                        if let Ok(img) = screenshot::capture_fullscreen() {
-                            let mut win_img = img;
-                            screenshot::crop_watermark(&mut win_img);
-                            let bp = screenshot::next_screenshot_path("key_before");
-                            if screenshot::capture_frame_jpeg(&win_img, &bp).is_ok() {
-                                keyboard_before_path = Some(bp.to_string_lossy().to_string());
-                            }
-                        }
+                    // IME 组合中：此刻的按键是拼音/选词，不是最终字符。
+                    // 真正的中文在「组合结束」那一刻由循环顶部的 IME 检测提交，
+                    // 这里只刷新时间避免误触发 idle flush，然后跳过。
+                    if ime::is_ime_composing() {
+                        last_key_time = Instant::now();
+                        continue;
                     }
+
+                    ensure_typing_started(
+                        &mut accumulated_keys,
+                        &mut typing_window_title,
+                        &mut keyboard_before_path,
+                    );
 
                     // Navigation keys (Enter/Tab/Escape): flush pending keystrokes
                     // immediately and do NOT enter the type buffer (an Enter would
@@ -1982,7 +2039,22 @@ fn spawn_event_thread(
                         continue;
                     }
 
-                    match apply_key_to_buffer(&mut accumulated_keys, &key_name) {
+                    // 用 ToUnicodeEx 解析「真实输入字符」：符号/大小写/布局都正确。
+                    // 若 ToUnicodeEx 无结果（某些 OEM/区域键），回退到旧的 key_to_char。
+                    let char_str: String = {
+                        let s = keyboard::to_unicode_char(vk, scan, shift, ctrl, alt, hkl);
+                        if s.is_empty() {
+                            let fb = keyboard::key_to_char(&key_name);
+                            if fb.starts_with('[') {
+                                String::new()
+                            } else {
+                                fb
+                            }
+                        } else {
+                            s
+                        }
+                    };
+                    match apply_key_to_buffer(&mut accumulated_keys, &key_name, &char_str) {
                         BufferEffect::Input => {
                             last_key_time = Instant::now();
                             // Cache UIA text while focus is still on the input
@@ -3041,60 +3113,61 @@ mod commands_tests {
     #[test]
     fn apply_key_input_char_appends() {
         let mut buf = String::new();
-        assert_eq!(apply_key_to_buffer(&mut buf, "KeyA"), BufferEffect::Input);
+        // 第三个参数是 ToUnicodeEx 解析出的「真实字符」
+        assert_eq!(apply_key_to_buffer(&mut buf, "KeyA", "a"), BufferEffect::Input);
         assert_eq!(buf, "a");
-        assert_eq!(apply_key_to_buffer(&mut buf, "KeyB"), BufferEffect::Input);
+        assert_eq!(apply_key_to_buffer(&mut buf, "KeyB", "b"), BufferEffect::Input);
         assert_eq!(buf, "ab");
     }
 
     #[test]
     fn apply_key_sentinel_and_unknown_keys_ignored() {
         let mut buf = String::new();
-        // 未知键（如 "你"）走 other 分支返回 "[你]"，以 [ 开头视为无效键
-        assert_eq!(apply_key_to_buffer(&mut buf, "你"), BufferEffect::Ignored);
+        // 已解析字符为空（未知键 / 修饰键无字符）视为无效键
+        assert_eq!(apply_key_to_buffer(&mut buf, "你", ""), BufferEffect::Ignored);
         assert_eq!(buf, "");
-        assert_eq!(apply_key_to_buffer(&mut buf, "ShiftLeft"), BufferEffect::Ignored);
+        assert_eq!(apply_key_to_buffer(&mut buf, "ShiftLeft", ""), BufferEffect::Ignored);
         assert_eq!(buf, "");
     }
 
     #[test]
     fn apply_key_space_and_special_chars_input() {
         let mut buf = String::new();
-        assert_eq!(apply_key_to_buffer(&mut buf, "KeySpace"), BufferEffect::Input);
+        assert_eq!(apply_key_to_buffer(&mut buf, "KeySpace", " "), BufferEffect::Input);
         assert_eq!(buf, " ");
-        assert_eq!(apply_key_to_buffer(&mut buf, "Comma"), BufferEffect::Input);
+        assert_eq!(apply_key_to_buffer(&mut buf, "Comma", ","), BufferEffect::Input);
         assert_eq!(buf, " ,");
     }
 
     #[test]
     fn apply_key_bracket_prefix_ignored() {
         let mut buf = String::new();
-        // 功能键（如 "[Shift]"）不以字符形式输入
-        assert_eq!(apply_key_to_buffer(&mut buf, "[Shift]"), BufferEffect::Ignored);
+        // 功能键的已解析字符以 [ 开头（如 "[Shift]"），不以字符形式输入
+        assert_eq!(apply_key_to_buffer(&mut buf, "[Shift]", "[Shift]"), BufferEffect::Ignored);
         assert_eq!(buf, "");
     }
 
     #[test]
     fn apply_key_backspace_pops() {
         let mut buf = String::from("abc");
-        assert_eq!(apply_key_to_buffer(&mut buf, "Backspace"), BufferEffect::Backspace);
+        assert_eq!(apply_key_to_buffer(&mut buf, "Backspace", ""), BufferEffect::Backspace);
         assert_eq!(buf, "ab");
-        assert_eq!(apply_key_to_buffer(&mut buf, "Back"), BufferEffect::Backspace);
+        assert_eq!(apply_key_to_buffer(&mut buf, "Back", ""), BufferEffect::Backspace);
         assert_eq!(buf, "a");
     }
 
     #[test]
     fn apply_key_backspace_on_empty_is_safe() {
         let mut buf = String::new();
-        assert_eq!(apply_key_to_buffer(&mut buf, "Backspace"), BufferEffect::Backspace);
+        assert_eq!(apply_key_to_buffer(&mut buf, "Backspace", ""), BufferEffect::Backspace);
         assert_eq!(buf, "");
     }
 
     #[test]
     fn apply_key_enter_is_ignored_as_input() {
-        // Enter 是导航键，不进入缓冲区
+        // Enter 是导航键，调用前已解析出空字符（不进入缓冲区）
         let mut buf = String::from("abc");
-        assert_eq!(apply_key_to_buffer(&mut buf, "Enter"), BufferEffect::Ignored);
+        assert_eq!(apply_key_to_buffer(&mut buf, "Enter", ""), BufferEffect::Ignored);
         assert_eq!(buf, "abc");
     }
 

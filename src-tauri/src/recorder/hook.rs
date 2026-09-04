@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 
 use crate::recorder::keyboard::KeyEvent;
 use crate::recorder::mouse::CapturedClick;
@@ -51,6 +52,20 @@ unsafe fn get_fg_pid() -> u32 {
     let mut pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     pid
+}
+
+/// Like `get_fg_pid`, but also returns the foreground window's keyboard-layout
+/// handle (HKL) so `ToUnicodeEx` can translate with the *target app's* layout
+/// rather than flowio's thread default.
+unsafe fn get_fg_pid_and_hkl() -> (u32, usize) {
+    let hwnd = GetForegroundWindow();
+    if hwnd.is_invalid() {
+        return (0, 0);
+    }
+    let mut pid: u32 = 0;
+    let tid = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let hkl = GetKeyboardLayout(tid).0 as usize;
+    (pid, hkl)
 }
 
 /// Modifier key down-state tracking (combo-key semantics for Ctrl+C/V, etc.).
@@ -140,6 +155,9 @@ unsafe extern "system" fn keyboard_hook_proc(
     if code >= 0 {
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let vk = info.vkCode;
+        // Low byte is the scan code; the high byte carries the extended-key flag
+        // (0xE0) which ToUnicodeEx does not want.
+        let scan = info.scanCode & 0xFF;
 
         let is_press = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         let is_release = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
@@ -174,11 +192,14 @@ unsafe extern "system" fn keyboard_hook_proc(
             // 真实按键时刻（钩子触发的瞬间）。处理线程消费事件时也可能是
             // 几百毫秒之后，但帧环里要找的是这一刻的屏幕，所以必须带上。
             let ts = std::time::Instant::now();
-            let fg_pid = get_fg_pid();
+            let (fg_pid, fg_hkl) = get_fg_pid_and_hkl();
             if let Ok(guard) = KEY_TX.lock() {
                 if let Some(ref tx) = *guard {
                     let _ = tx.send(KeyEvent::Press {
                         key: name,
+                        vk,
+                        scan,
+                        hkl: fg_hkl,
                         ctrl: CTRL_DOWN.load(Ordering::SeqCst),
                         shift: SHIFT_DOWN.load(Ordering::SeqCst),
                         alt: ALT_DOWN.load(Ordering::SeqCst),

@@ -12,7 +12,7 @@
 //! the IME's current composition state regardless of hook layer.
 
 use windows::Win32::UI::Input::Ime::{
-    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR,
+    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR, GCS_RESULTSTR,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -43,8 +43,53 @@ pub fn is_ime_composing() -> bool {
         // For Chinese Pinyin: non-empty when user is typing pinyin,
         // becomes empty when the candidate is selected (composition ends).
         let len = ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0);
-        ImmReleaseContext(hwnd, himc);
+        let _ = ImmReleaseContext(hwnd, himc);
         composition_active(len)
+    }
+}
+
+/// Retrieve the final committed string of an IME composition (the Chinese
+/// characters the user just finalised, e.g. "你好"), by reading
+/// `GCS_RESULTSTR` from the foreground window's IME context.
+///
+/// Call this at the moment a composition *ends* (transition from composing to
+/// not-composing) so the typed Chinese text can be appended to the type buffer
+/// exactly like a sequence of real characters — matching Scribe's behaviour of
+/// capturing the final input text rather than the intermediate pinyin.
+///
+/// Returns `None` when there is no IME context or no committed result.
+pub fn get_composition_result() -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let himc = ImmGetContext(hwnd);
+        if himc.0.is_null() {
+            return None;
+        }
+        // Byte length of the result string (UTF-16; every char is 2 bytes).
+        let byte_len = ImmGetCompositionStringW(himc, GCS_RESULTSTR, None, 0);
+        let result = if byte_len > 0 {
+            let nchars = (byte_len as usize) / 2;
+            let mut buf: Vec<u16> = vec![0u16; nchars];
+            let got = ImmGetCompositionStringW(
+                himc,
+                GCS_RESULTSTR,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                byte_len as u32,
+            );
+            let _ = ImmReleaseContext(hwnd, himc);
+            if got > 0 {
+                Some(String::from_utf16_lossy(&buf[..(got as usize) / 2]))
+            } else {
+                None
+            }
+        } else {
+            let _ = ImmReleaseContext(hwnd, himc);
+            None
+        };
+        result
     }
 }
 
