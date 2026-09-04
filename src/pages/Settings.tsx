@@ -309,6 +309,13 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
     window.dispatchEvent(new CustomEvent("flowio:voice-toggle", { detail: { enabled: value } }));
   };
 
+  // 监听标题栏语音开关切换，同步本页开关显示（双向同步，避免「设置页关 / 标题栏开」）
+  useEffect(() => {
+    const handler = (e: CustomEvent<{ enabled: boolean }>) => setVoiceEnabled(e.detail.enabled);
+    window.addEventListener("flowio:voice-toggle", handler as EventListener);
+    return () => window.removeEventListener("flowio:voice-toggle", handler as EventListener);
+  }, []);
+
   /* ---- Record Target App（录制指定软件） ---- */
   const [recordTarget, setRecordTarget] = useState(() => localStorage.getItem("flowio_record_target") === "1");
   const [targetProcess, setTargetProcess] = useState(() => localStorage.getItem("flowio_record_target_process") || "");
