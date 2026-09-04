@@ -165,6 +165,21 @@ pub fn init_db(conn: &Connection) {
             step_count   INTEGER NOT NULL DEFAULT 0,
             created_at   TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        -- 全局撤销/重做（WPS 式 ↶↷）：编辑器每个写命令执行前，
+        -- 把 {录制标题 + 全部步骤行} 捕成一份快照压入 undo 栈并清空 redo 栈；
+        -- edit_undo 把「当前状态」压入 redo 栈后还原 undo 栈顶，edit_redo 对称。
+        -- 每栈每录制最多保留 50 条（写入时清理更旧的）。栈内排序用 rowid（自增）。
+        CREATE TABLE IF NOT EXISTS edit_history (
+            id           TEXT PRIMARY KEY,
+            recording_id TEXT NOT NULL,
+            stack        TEXT NOT NULL DEFAULT 'undo',
+            payload      TEXT NOT NULL,
+            step_count   INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_edit_history_rec
+            ON edit_history(recording_id, stack);
         ",
     )
     .expect("Failed to create database tables");

@@ -2351,6 +2351,8 @@ pub fn finish_recording(
     // 用户要求「不要手动合并，录完自动就是干净的」。规则层是纯本地计算
     // （不联网、不调 AI），几十步 <1ms，失败也不影响录制已落库，因此
     // 只记日志不上抛。弹框里那一串点击要靠编辑器里的「AI 精简」按钮。
+    // 精简前压全局撤销栈：进编辑器按 Ctrl+Z 就能回到精简前的原始步骤。
+    let _ = crate::editor::commands::push_edit_history(&conn, &rec_id);
     match crate::editor::commands::auto_merge_steps_conn(&conn, &rec_id) {
         Ok(r) if r.reduced > 0 => eprintln!(
             "[finish] step3.5 OK: 自动精简 {} → {} 步（省 {} 步）",

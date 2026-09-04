@@ -345,6 +345,8 @@ fn transcribe_and_apply(recording_id: &str, buffer: VoiceBuffer) -> Result<Voice
     let mut failed = 0usize;
     let mut attempted = 0usize; // 实际送 ASR 的段数（用于区分「没送」和「送了但空」）
     let mut errors: Vec<String> = Vec::new();
+    // 首次成功转写前压全局撤销栈（懒压：一条都没转出来就不制造无意义快照）
+    let mut hist_pushed = false;
 
     for (step_idx, chunks) in &sliced {
         let (step_id, desc, _) = &steps[*step_idx];
@@ -381,6 +383,10 @@ fn transcribe_and_apply(recording_id: &str, buffer: VoiceBuffer) -> Result<Voice
         let joined = texts.join("").trim().to_string();
         if joined.is_empty() {
             continue;
+        }
+        if !hist_pushed {
+            let _ = crate::editor::commands::push_edit_history(&conn, &recording_id);
+            hist_pushed = true;
         }
         let new_desc = if desc.trim().is_empty() {
             format!("【语音】{}", joined)

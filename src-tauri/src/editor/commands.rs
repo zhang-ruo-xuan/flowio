@@ -157,6 +157,7 @@ pub fn update_step(
     tip: String,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
     conn.execute(
         "UPDATE steps SET title = ?1, description = ?2, action_type = ?3, tip = ?4 \
          WHERE id = ?5",
@@ -186,6 +187,7 @@ pub fn update_step_crop(
     crop_h: Option<i32>,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
     conn.execute(
         "UPDATE steps SET x = ?1, y = ?2, crop_w = ?3, crop_h = ?4 WHERE id = ?5",
         params![x, y, crop_w, crop_h, step_id],
@@ -198,6 +200,8 @@ pub fn update_step_crop(
 #[tauri::command]
 pub fn delete_step(db: State<DbState>, step_id: String) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 删除前先压栈（此时还能反查 recording_id）
+    push_edit_history_for_step(&conn, &step_id);
     conn.execute("DELETE FROM steps WHERE id = ?1", params![step_id])
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -211,6 +215,7 @@ pub fn reorder_steps(
     step_ids: Vec<String>,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let _ = push_edit_history(&conn, &_recording_id);
     for (i, step_id) in id_order_updates(&step_ids) {
         conn.execute(
             "UPDATE steps SET order_index = ?1 WHERE id = ?2",
@@ -238,6 +243,7 @@ pub fn merge_steps(
     step_ids: Vec<String>,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let _ = push_edit_history(&conn, &recording_id);
     merge_steps_conn(&conn, &recording_id, &step_ids)
 }
 
@@ -802,7 +808,279 @@ pub struct SimplifyResult {
 #[tauri::command]
 pub fn auto_merge_steps(db: State<DbState>, recording_id: String) -> Result<SimplifyResult, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history(&conn, &recording_id)?;
     auto_merge_steps_conn(&conn, &recording_id)
+}
+
+// ── 全局撤销/重做（WPS 式 ↶↷）────────────────────────────────
+//
+// 设计：**快照由后端在每个写命令入口自动捕获**，前端不参与快照纪律——
+// 这样无论现在还是将来加新的写命令，只要记得在入口调一次 push_edit_history，
+// 撤销就自动覆盖；且快照直接从 DB 行读出、直接写回 DB 行，
+// 不存在 Rust 结构体 ↔ TS 类型的键名转换（那正是事件载荷踩过的坑）。
+//
+// 两个栈存在 edit_history 表：stack='undo' / 'redo'，栈内按 rowid（自增）排序。
+// · push_edit_history：当前状态压入 undo 栈，并清空 redo 栈（新编辑使 redo 失效）。
+// · edit_undo：把当前状态压入 redo 栈 → 还原 undo 栈顶 → 删掉栈顶那条。
+// · edit_redo：对称。
+// 限制（v1）：图片文件本身不做版本管理——删除截图后再撤销会恢复数据库引用
+// 但文件已不在磁盘上，restore 时会把不存在的文件路径置空（图片缺失但不悬空）；
+// 裁剪/上传会覆盖同名 _cropped.jpg / 新文件，撤销无法还原旧图内容。
+
+/// 快照里的单条步骤（覆盖 steps 表除 created_at 外的全部业务列）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EditorSnapshotStep {
+    id: String,
+    order_index: i32,
+    step_number: i32,
+    action_type: String,
+    title: String,
+    description: String,
+    tip: String,
+    screenshot_path: String,
+    annotated_path: String,
+    before_screenshot_path: String,
+    after_screenshot_path: Option<String>,
+    x: Option<i32>,
+    y: Option<i32>,
+    crop_w: Option<i32>,
+    crop_h: Option<i32>,
+    timestamp: i64,
+    window_title: Option<String>,
+}
+
+/// 一次快照 = 录制标题 + 全部步骤行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EditorSnapshot {
+    title: String,
+    steps: Vec<EditorSnapshotStep>,
+}
+
+/// 撤销/重做栈深度（前端按钮显隐用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct HistSizes {
+    pub undo: i64,
+    pub redo: i64,
+}
+
+const EDIT_HISTORY_LIMIT: i64 = 50;
+
+/// 从 DB 读出当前完整编辑状态（录制标题 + 全部步骤行）。
+fn capture_editor_snapshot(
+    conn: &rusqlite::Connection,
+    recording_id: &str,
+) -> Result<EditorSnapshot, String> {
+    let title: String = conn
+        .query_row(
+            "SELECT title FROM recordings WHERE id = ?1",
+            params![recording_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("读取录制标题失败: {}", e))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, order_index, step_number, action_type, title, description, tip, \
+             screenshot_path, annotated_path, before_screenshot_path, after_screenshot_path, \
+             x, y, crop_w, crop_h, timestamp, window_title \
+             FROM steps WHERE recording_id = ?1 ORDER BY order_index ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let steps = stmt
+        .query_map(params![recording_id], |r| {
+            Ok(EditorSnapshotStep {
+                id: r.get(0)?,
+                order_index: r.get(1)?,
+                step_number: r.get(2)?,
+                action_type: r.get(3)?,
+                title: r.get(4)?,
+                description: r.get(5)?,
+                tip: r.get(6)?,
+                screenshot_path: r.get(7)?,
+                annotated_path: r.get(8)?,
+                before_screenshot_path: r.get(9)?,
+                after_screenshot_path: r.get(10)?,
+                x: r.get(11)?,
+                y: r.get(12)?,
+                crop_w: r.get(13)?,
+                crop_h: r.get(14)?,
+                timestamp: r.get(15)?,
+                window_title: r.get(16)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(EditorSnapshot { title, steps })
+}
+
+/// 把「当前状态」压入 undo 栈并清空 redo 栈（每次写操作前调用）。
+pub(crate) fn push_edit_history(
+    conn: &rusqlite::Connection,
+    recording_id: &str,
+) -> Result<(), String> {
+    let snap = capture_editor_snapshot(conn, recording_id)?;
+    let payload = serde_json::to_string(&snap).map_err(|e| e.to_string())?;
+    let n = snap.steps.len() as i64;
+    conn.execute(
+        "INSERT INTO edit_history (id, recording_id, stack, payload, step_count) \
+         VALUES (?1, ?2, 'undo', ?3, ?4)",
+        params![uuid::Uuid::new_v4().to_string(), recording_id, payload, n],
+    )
+    .map_err(|e| e.to_string())?;
+    // 新编辑使 redo 失效
+    conn.execute(
+        "DELETE FROM edit_history WHERE recording_id = ?1 AND stack = 'redo'",
+        params![recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    prune_edit_history(conn, recording_id, "undo")
+}
+
+/// 步骤级写命令用的包装：先由 step_id 反查 recording_id 再压栈。
+/// 步骤已不存在（并发删除等）时静默跳过——撤销少一条总比写命令直接报错好。
+pub(crate) fn push_edit_history_for_step(
+    conn: &rusqlite::Connection,
+    step_id: &str,
+) {
+    let rid: Option<String> = conn
+        .query_row(
+            "SELECT recording_id FROM steps WHERE id = ?1",
+            params![step_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(ref rid) = rid {
+        let _ = push_edit_history(conn, rid);
+    }
+}
+
+/// 每栈每录制只保留最近 EDIT_HISTORY_LIMIT 条。
+fn prune_edit_history(
+    conn: &rusqlite::Connection,
+    recording_id: &str,
+    stack: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM edit_history WHERE recording_id = ?1 AND stack = ?2 AND id NOT IN \
+         (SELECT id FROM edit_history WHERE recording_id = ?1 AND stack = ?2 \
+          ORDER BY rowid DESC LIMIT ?3)",
+        params![recording_id, stack, EDIT_HISTORY_LIMIT],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 用快照还原（步骤全删全插 + 重排 + 恢复录制标题/total_steps）。
+/// 文件已不在磁盘上的截图路径会被置空，避免界面挂着悬空引用。
+fn restore_editor_snapshot(
+    conn: &rusqlite::Connection,
+    recording_id: &str,
+    snap: &EditorSnapshot,
+) -> Result<usize, String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM steps WHERE recording_id = ?1",
+        params![recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    for (i, s) in snap.steps.iter().enumerate() {
+        // 快照之后图片文件可能已被物理删除（如删除截图操作），置空而不是留悬空路径
+        let exists = |p: &str| p.is_empty() || std::path::Path::new(p).exists();
+        let shot = if exists(&s.screenshot_path) { &s.screenshot_path } else { "" };
+        let ann = if exists(&s.annotated_path) { &s.annotated_path } else { "" };
+        let before = if exists(&s.before_screenshot_path) { &s.before_screenshot_path } else { "" };
+        let after = s.after_screenshot_path.as_deref().filter(|p| exists(p));
+        tx.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
+             description, tip, screenshot_path, annotated_path, before_screenshot_path, \
+             after_screenshot_path, x, y, crop_w, crop_h, timestamp, window_title) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![
+                s.id, recording_id, i as i32, i as i32 + 1, s.action_type, s.title,
+                s.description, s.tip, shot, ann, before, after,
+                s.x, s.y, s.crop_w, s.crop_h, s.timestamp, s.window_title,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "UPDATE recordings SET title = ?1, total_steps = ?2, updated_at = datetime('now') \
+         WHERE id = ?3",
+        params![snap.title, snap.steps.len() as i32, recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(snap.steps.len())
+}
+
+/// 弹出指定栈的栈顶并还原（undo/redo 共用）。
+fn pop_and_restore(
+    conn: &rusqlite::Connection,
+    recording_id: &str,
+    pop_stack: &str,
+    push_stack: &str,
+) -> Result<usize, String> {
+    let (snap_id, payload): (String, String) = conn
+        .query_row(
+            "SELECT id, payload FROM edit_history \
+             WHERE recording_id = ?1 AND stack = ?2 ORDER BY rowid DESC LIMIT 1",
+            params![recording_id, pop_stack],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| if pop_stack == "undo" {
+            "没有可撤销的操作".to_string()
+        } else {
+            "没有可恢复的操作".to_string()
+        })?;
+    let snap: EditorSnapshot =
+        serde_json::from_str(&payload).map_err(|e| format!("快照已损坏: {}", e))?;
+    // 当前状态转入对侧栈（这是「重做/再撤销」能回来的原因）
+    let cur = capture_editor_snapshot(conn, recording_id)?;
+    let cur_payload = serde_json::to_string(&cur).map_err(|e| e.to_string())?;
+    let n = cur.steps.len() as i64;
+    conn.execute(
+        "INSERT INTO edit_history (id, recording_id, stack, payload, step_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![uuid::Uuid::new_v4().to_string(), recording_id, push_stack, cur_payload, n],
+    )
+    .map_err(|e| e.to_string())?;
+    prune_edit_history(conn, recording_id, push_stack)?;
+    restore_editor_snapshot(conn, recording_id, &snap)?;
+    conn.execute("DELETE FROM edit_history WHERE id = ?1", params![snap_id])
+        .map_err(|e| e.to_string())?;
+    Ok(snap.steps.len())
+}
+
+#[tauri::command]
+pub fn push_edit_snapshot(db: State<DbState>, recording_id: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history(&conn, &recording_id)
+}
+
+#[tauri::command]
+pub fn edit_undo(db: State<DbState>, recording_id: String) -> Result<usize, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    pop_and_restore(&conn, &recording_id, "undo", "redo")
+}
+
+#[tauri::command]
+pub fn edit_redo(db: State<DbState>, recording_id: String) -> Result<usize, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    pop_and_restore(&conn, &recording_id, "redo", "undo")
+}
+
+#[tauri::command]
+pub fn edit_history_sizes(db: State<DbState>, recording_id: String) -> Result<HistSizes, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let count = |stack: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edit_history WHERE recording_id = ?1 AND stack = ?2",
+            params![recording_id, stack],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    };
+    Ok(HistSizes { undo: count("undo"), redo: count("redo") })
 }
 
 // ── 撤销 ──────────────────────────────────────────────────────
@@ -1088,6 +1366,7 @@ pub async fn simplify_steps_ai(
     //    不会点完按钮什么都没发生。
     let rules = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
+        push_edit_history(&conn, &recording_id)?;
         auto_merge_steps_conn(&conn, &recording_id)?
     };
 
@@ -1173,6 +1452,7 @@ pub fn add_step(
     step_data: StepData,
 ) -> Result<Step, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let _ = push_edit_history(&conn, &recording_id);
 
     conn.execute(
         "UPDATE steps SET order_index = order_index + 1 \
@@ -1231,6 +1511,7 @@ pub fn update_recording_title(
     title: String,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let _ = push_edit_history(&conn, &id);
     conn.execute(
         "UPDATE recordings SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
         params![title, id],
@@ -1249,6 +1530,7 @@ pub fn crop_step_screenshot(
     is_after: bool,
 ) -> Result<String, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
 
     // Decode base64 → JPEG bytes
     let jpeg_bytes = decode_jpeg_base64(&cropped_base64)?;
@@ -1293,6 +1575,7 @@ pub fn upload_step_screenshot(
     is_marked: bool,
 ) -> Result<String, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
 
     // Decode base64 → JPEG bytes
     let jpeg_bytes = decode_jpeg_base64(&base64_data)?;
@@ -1327,6 +1610,7 @@ pub fn delete_step_screenshot(
     is_after: bool,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
 
     if is_after {
         // Delete "after" screenshot (screenshot_path) only
@@ -2547,5 +2831,94 @@ mod editor_tests {
         assert_eq!(short_window("WPS 表格 - 兼容模式"), "WPS 表格");
         let long = "啊".repeat(40);
         assert_eq!(short_window(&long).chars().count(), 25); // 24 + …
+    }
+
+    // ── 全局撤销/重做（edit_history 两栈）──
+
+    fn step_count(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM steps WHERE recording_id='r1'", [], |r| r.get(0))
+            .unwrap()
+    }
+    fn hist_count(conn: &rusqlite::Connection, stack: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edit_history WHERE recording_id='r1' AND stack=?1",
+            params![stack], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn edit_undo_redo_roundtrip_restores_steps_and_title() {
+        let conn = mem_db();
+        insert_step(&conn, "s1", 0, "click", "第一步", "d1");
+        insert_step(&conn, "s2", 1, "click", "第二步", "d2");
+
+        // 编辑前压栈 → 删一步 + 改标题
+        push_edit_history(&conn, "r1").unwrap();
+        conn.execute("DELETE FROM steps WHERE id='s1'", []).unwrap();
+        conn.execute("UPDATE recordings SET title='改名了' WHERE id='r1'", []).unwrap();
+        assert_eq!(step_count(&conn), 1);
+        assert_eq!(hist_count(&conn, "undo"), 1);
+        assert_eq!(hist_count(&conn, "redo"), 0);
+
+        // 撤销：步骤恢复为 2，标题也恢复
+        let n = edit_undo_conn_test(&conn, "r1").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(step_count(&conn), 2);
+        let title: String = conn.query_row("SELECT title FROM recordings WHERE id='r1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "测试录制");
+        assert_eq!(hist_count(&conn, "undo"), 0);
+        assert_eq!(hist_count(&conn, "redo"), 1);
+
+        // 重做：回到「删一步+改名」之后的状态
+        let n = pop_and_restore(&conn, "r1", "redo", "undo").unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(step_count(&conn), 1);
+        let title: String = conn.query_row("SELECT title FROM recordings WHERE id='r1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "改名了");
+        assert_eq!(hist_count(&conn, "undo"), 1);
+        assert_eq!(hist_count(&conn, "redo"), 0);
+    }
+
+    // 测试用包装：直接吃连接（命令版本吃 Tauri State）
+    fn edit_undo_conn_test(conn: &rusqlite::Connection, rid: &str) -> Result<usize, String> {
+        super::pop_and_restore(conn, rid, "undo", "redo")
+    }
+
+    #[test]
+    fn new_edit_invalidates_redo_stack() {
+        let conn = mem_db();
+        insert_step(&conn, "s1", 0, "click", "t", "d");
+        push_edit_history(&conn, "r1").unwrap();
+        conn.execute("UPDATE steps SET title='x' WHERE id='s1'", []).unwrap();
+        pop_and_restore(&conn, "r1", "undo", "redo").unwrap();
+        assert_eq!(hist_count(&conn, "redo"), 1);
+        // 新编辑 → redo 清空
+        push_edit_history(&conn, "r1").unwrap();
+        assert_eq!(hist_count(&conn, "redo"), 0);
+    }
+
+    #[test]
+    fn edit_history_prunes_to_limit() {
+        let conn = mem_db();
+        insert_step(&conn, "s1", 0, "click", "t", "d");
+        for _ in 0..(super::EDIT_HISTORY_LIMIT + 5) {
+            push_edit_history(&conn, "r1").unwrap();
+        }
+        assert_eq!(hist_count(&conn, "undo"), super::EDIT_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn restore_blanks_missing_screenshot_file() {
+        let conn = mem_db();
+        // screenshot_path 指向一个不存在的文件
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type,              title, description, tip, screenshot_path, annotated_path, before_screenshot_path)              VALUES ('s1', 'r1', 0, 1, 'click', 't', 'd', '', 'gone.jpg', '', '')",
+            [],
+        ).unwrap();
+        push_edit_history(&conn, "r1").unwrap();
+        conn.execute("UPDATE steps SET screenshot_path='changed.jpg'", []).unwrap();
+        pop_and_restore(&conn, "r1", "undo", "redo").unwrap();
+        let p: String = conn.query_row("SELECT screenshot_path FROM steps WHERE id='s1'", [], |r| r.get(0)).unwrap();
+        // 文件不存在 → 置空，不留悬空引用
+        assert_eq!(p, "");
     }
 }

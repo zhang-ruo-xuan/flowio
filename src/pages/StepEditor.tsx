@@ -26,6 +26,7 @@ import {
   PencilLine,
   Wand2,
   Undo2,
+  Redo2,
 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -548,12 +549,25 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
   /* Preview mode */
   const [previewMode, setPreviewMode] = useState(false);
-  /* ── 步骤精简：自动合并（规则）/ AI 精简 / 撤销（下拉合并为一个菜单）── */
-  const [simplifying, setSimplifying] = useState<null | "rules" | "ai" | "undo">(null);
-  const [canUndo, setCanUndo] = useState(false);
+  /* ── 步骤精简：自动合并（规则）/ AI 精简（撤销上移为顶栏全局 ↶↷）── */
+  const [simplifying, setSimplifying] = useState<null | "rules" | "ai">(null);
   const [simplifyOpen, setSimplifyOpen] = useState(false);
-  // handleAutoMerge / handleAiSimplify / handleUndoMerge 定义在 reloadRecording
+  // handleAutoMerge / handleAiSimplify 定义在 reloadRecording
   // 之后（它们的 deps 引用 reloadRecording，放在这里会 TDZ 崩溃）
+
+  /* ── 全局撤销/重做（WPS 式 ↶↷，后端 edit_history 两栈）──
+     快照由后端在每个写命令入口自动捕获，前端只负责：
+     ① 按钮显隐（edit_history_sizes）② 触发 edit_undo/edit_redo 后刷新。
+     histBusy 防连点：undo/redo 涉及全表重写，串行执行。 */
+  const [hist, setHist] = useState<{ undo: number; redo: number }>({ undo: 0, redo: 0 });
+  const [histBusy, setHistBusy] = useState(false);
+  const refreshHist = useCallback(() => {
+    invoke<{ undo: number; redo: number }>("edit_history_sizes", { recordingId })
+      .then(setHist)
+      .catch(() => setHist({ undo: 0, redo: 0 }));
+  }, [recordingId]);
+  // 自动保存定时器（声明提前：applyHist 里要在撤销前掐掉它，deps 引用不能 TDZ）
+  const autoSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* Delete target for overlay */
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
@@ -694,7 +708,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       );
       const list = await reloadRecording();
       await rebuildCropCache(list);
-      setCanUndo(true);
+      refreshHist();
       setToast({
         type: "success",
         message:
@@ -707,7 +721,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     } finally {
       setSimplifying(null);
     }
-  }, [recordingId, reloadRecording, rebuildCropCache]);
+  }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
 
   const handleAiSimplify = useCallback(async () => {
     if (!recordingId) return;
@@ -718,7 +732,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       }>("simplify_steps_ai", { recordingId });
       const list = await reloadRecording();
       await rebuildCropCache(list);
-      setCanUndo(true);
+      refreshHist();
       setToast({
         type: "success",
         // kind 为 "rules" 表示 AI 那一层没生效（剩余步骤太少，不值得再调一次），
@@ -735,23 +749,45 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     } finally {
       setSimplifying(null);
     }
-  }, [recordingId, reloadRecording, rebuildCropCache]);
+  }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
 
-  const handleUndoMerge = useCallback(async () => {
-    if (!recordingId) return;
-    setSimplifying("undo");
+  /* ── ★ 全局撤销/重做：还原后必须 rebuildCropCache（理由同精简）── */
+  const applyHist = useCallback(async (cmd: "edit_undo" | "edit_redo") => {
+    if (histBusy) return;
+    setHistBusy(true);
+    // 撤销/重做会改库里的 title/description：先掐掉待触发的自动保存，
+    // 否则 800ms 后它会把刚撤销的内容原样写回去
+    if (autoSaveRef.current) { clearTimeout(autoSaveRef.current); autoSaveRef.current = null; }
     try {
-      const n = await invoke<number>("undo_last_merge", { recordingId });
+      const n = await invoke<number>(cmd, { recordingId });
       const list = await reloadRecording();
       await rebuildCropCache(list);
-      setCanUndo(false);
-      setToast({ type: "success", message: `已撤销，恢复到 ${n} 个步骤` });
+      setToast({
+        type: "success",
+        message: cmd === "edit_undo" ? `已撤销，恢复到 ${n} 个步骤` : `已恢复，${n} 个步骤`,
+      });
     } catch (err) {
-      setToast({ type: "error", message: "撤销失败: " + String(err) });
+      setToast({ type: "error", message: String(err) });
     } finally {
-      setSimplifying(null);
+      setHistBusy(false);
+      refreshHist();
     }
-  }, [recordingId, reloadRecording, rebuildCropCache]);
+  }, [histBusy, recordingId, reloadRecording, rebuildCropCache, refreshHist]);
+
+  /* Ctrl+Z / Ctrl+Y（Ctrl+Shift+Z = 重做）；输入框内让位给原生文本撤销 */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = e.target as HTMLElement | null;
+      const tag = t?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || t?.isContentEditable) return;
+      const k = e.key.toLowerCase();
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); void applyHist("edit_undo"); }
+      else if (k === "y" || (k === "z" && e.shiftKey)) { e.preventDefault(); void applyHist("edit_redo"); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [applyHist]);
 
   useEffect(() => {
     let cancelled = false;
@@ -798,10 +834,10 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         // 译文副本（翻译功能 T1）：并行加载，失败不阻塞编辑器
         loadTranslations();
 
-        // 是否有可撤销的精简记录（决定「撤销」按钮显隐）
-        invoke<boolean>("can_undo_merge", { recordingId })
-          .then((v) => { if (!cancelled) setCanUndo(v); })
-          .catch(() => { if (!cancelled) setCanUndo(false); });
+        // 撤销/重做栈深度（顶栏 ↶↷ 按钮显隐）
+        invoke<{ undo: number; redo: number }>("edit_history_sizes", { recordingId })
+          .then((v) => { if (!cancelled) setHist(v); })
+          .catch(() => { if (!cancelled) setHist({ undo: 0, redo: 0 }); });
       } catch (err) {
         if (!cancelled) setError(String(err));
       } finally {
@@ -931,15 +967,15 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       );
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 2000);
+      refreshHist();
     } catch (err) {
       console.error("Save step failed:", err);
     } finally {
       setSaving(false);
     }
-  }, [selectedStep, editTitle, editDescription]);
+  }, [selectedStep, editTitle, editDescription, refreshHist]);
 
   /* ── Auto-save (debounce 800ms) ─────────────────────────── */
-  const autoSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [autoSaved, setAutoSaved] = useState(false);
 
   useEffect(() => {
@@ -969,12 +1005,13 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         );
         setAutoSaved(true);
         setTimeout(() => setAutoSaved(false), 1500);
+        refreshHist();
       } catch (err) {
         console.error("Auto-save failed:", err);
       }
     }, 800);
     return () => { if (autoSaveRef.current) clearTimeout(autoSaveRef.current); };
-  }, [editTitle, editDescription, selectedStep]);
+  }, [editTitle, editDescription, selectedStep, refreshHist]);
 
   /* ── Upload screenshot ─────────────────────────────────── */
 
@@ -996,10 +1033,11 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               return { ...s, screenshot_base64: base64 };
             })
           );
+          refreshHist();
         })
         .catch((err) => console.error("Upload screenshot failed:", err));
     },
-    [selectedStep]
+    [selectedStep, refreshHist]
   );
 
   /* ── Picking a file via hidden input ──────────────────── */
@@ -1027,12 +1065,13 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
             // 上传新图后恢复裁图可用并切回全图视图，让用户看到上传的图
             setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: false }));
             setViewCropped(selectedStep.id, false);
+            refreshHist();
           });
       };
       reader.readAsDataURL(file);
     };
     input.click();
-  }, [selectedStep]);
+  }, [selectedStep, refreshHist]);
 
   /* ── Paste screenshot from clipboard ──────────────────── */
 
@@ -1062,6 +1101,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                         // 上传新图后恢复裁图可用并切回全图视图
                         setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: false }));
                         setViewCropped(selectedStep.id, false);
+                        refreshHist();
                       });
                   };
                   reader.readAsDataURL(blob);
@@ -1090,6 +1130,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         return nextSteps.map((s, i) => ({ ...s, step_number: i + 1, order_index: i }));
       });
       setDeleteTarget(null);
+      refreshHist();
       if (selectedStepId === stepId) {
         setSelectedStepId((prevId) => {
           const idx = steps.findIndex((s) => s.id === prevId);
@@ -1099,7 +1140,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         });
       }
     },
-    [selectedStepId, steps]
+    [selectedStepId, steps, refreshHist]
   );
 
   /* ── Insert step ────────────────────────────────────────── */
@@ -1506,6 +1547,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         })
       );
       setToast({ type: "success", message: "标注已保存" });
+      refreshHist();
     } catch (err) {
       console.error("保存标注失败:", err);
       setToast({ type: "error", message: "保存标注失败" });
@@ -1546,6 +1588,25 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       >
         <ArrowLeft size={14} /> 返回
       </button>
+      {/* 全局撤销/重做（WPS 式）：可撤销标题/描述编辑、删步、精简、合并、改图等一切编辑 */}
+      <div style={{ display: "flex", alignItems: "center", gap: 2 }} onMouseDown={(e) => e.stopPropagation()}>
+        <button
+          onClick={() => void applyHist("edit_undo")}
+          disabled={histBusy || hist.undo === 0}
+          data-tip={"撤销 Ctrl+Z\n返回上一步编辑（可连续多次）\n编辑标题/描述、删步、精简、合并都可撤销"}
+          style={{ background: "transparent", border: "none", color: hist.undo === 0 ? "#5b6470" : "#e6edf3", cursor: hist.undo === 0 ? "default" : "pointer", padding: "4px 6px", borderRadius: 4, display: "flex", alignItems: "center", opacity: hist.undo === 0 ? 0.55 : 1 }}
+        >
+          {histBusy ? <Loader2 size={14} className="spinner" /> : <Undo2 size={14} />}
+        </button>
+        <button
+          onClick={() => void applyHist("edit_redo")}
+          disabled={histBusy || hist.redo === 0}
+          data-tip={"恢复 Ctrl+Y\n重做刚被撤销的操作"}
+          style={{ background: "transparent", border: "none", color: hist.redo === 0 ? "#5b6470" : "#e6edf3", cursor: hist.redo === 0 ? "default" : "pointer", padding: "4px 6px", borderRadius: 4, display: "flex", alignItems: "center", opacity: hist.redo === 0 ? 0.55 : 1 }}
+        >
+          <Redo2 size={14} />
+        </button>
+      </div>
       {recTitleEditing ? (
         <input
           autoFocus
@@ -1556,6 +1617,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
             if (trimmed && trimmed !== recording?.title) {
               await invoke("update_recording_title", { id: recordingId, title: trimmed });
               setRecording((prev) => prev ? { ...prev, title: trimmed } : prev);
+              refreshHist();
             }
             setRecTitleEditing(false);
           }}
@@ -2011,21 +2073,21 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           <span style={{ marginRight: "auto" }}>{steps.length} 个步骤</span>
         </div>
 
-        {/* 步骤精简：一个下拉入口收纳「AI 精简 / 仅规则合并 / 撤销」。
-            规则合并录完已自动跑过，这里的入口用于存量录制补跑与手动重跑。 */}
+        {/* 步骤精简：一个下拉入口收纳「AI 精简 / 仅规则合并」。
+            规则合并录完已自动跑过，这里的入口用于存量录制补跑与手动重跑。
+            撤销已上移为顶栏全局 ↶↷（可撤销一切编辑，不只是精简）。 */}
         {!previewMode && steps.length > 0 && (
           <div className="step-simplify-bar">
             <div style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
               <button
                 className="step-simplify-btn primary"
-                data-tip={"把啰嗦的步骤合并掉\n录完会自动跑一遍；这里也可以手动重跑或换用 AI，随时能撤销"}
+                data-tip={"把啰嗦的步骤合并掉\n录完会自动跑一遍；这里也可以手动重跑或换用 AI"}
                 disabled={simplifying !== null}
                 onClick={() => setSimplifyOpen(!simplifyOpen)}
               >
                 {simplifying ? <Loader2 size={12} className="spinner" /> : <Sparkles size={12} />}
                 {simplifying === "ai" ? "AI 精简中…"
                   : simplifying === "rules" ? "规则合并中…"
-                  : simplifying === "undo" ? "撤销中…"
                   : "精简"}
                 <ChevronDown size={11} style={{ opacity: 0.8 }} />
               </button>
@@ -2049,17 +2111,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                     {simplifying === "rules" ? <Loader2 size={14} className="spinner" /> : <Wand2 size={14} className="export-dropdown-item-icon" />}
                     <span className="export-dropdown-item-label">仅规则合并</span>
                   </button>
-                  {canUndo && (
-                    <button
-                      className="export-dropdown-item"
-                      data-tip={"撤销精简\n回到最近一次精简之前的样子，一个步骤都不会少"}
-                      onClick={() => { setSimplifyOpen(false); void handleUndoMerge(); }}
-                      disabled={simplifying !== null}
-                    >
-                      {simplifying === "undo" ? <Loader2 size={14} className="spinner" /> : <Undo2 size={14} className="export-dropdown-item-icon" />}
-                      <span className="export-dropdown-item-label">撤销精简</span>
-                    </button>
-                  )}
                 </div>
               )}
             </div>
