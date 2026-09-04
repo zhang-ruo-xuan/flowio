@@ -27,7 +27,12 @@ pub const TARGET_LANGS: &[(&str, &str)] = &[
 ];
 
 /// `translate://done` 事件载荷。
+///
+/// 🔴 必须 camelCase：前端 `StepEditor.tsx` 用 `ev.payload.recordingId` 读。
+/// 蛇形的 `recording_id` 会让前端匹配失败 → `setTranslating(false)` 永远不执行，
+/// UI 永远卡在「翻译中...」（后端其实早已完成——2026-09-04 实测踩坑）。
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TranslateDoneEvent {
     recording_id: String,
     lang: String,
@@ -299,6 +304,21 @@ pub fn save_recording_translations(
 #[cfg(test)]
 mod translate_tests {
     use super::*;
+
+    /// 事件载荷必须 camelCase：前端按 `recordingId` 匹配，蛇形会让
+    /// 「翻译中...」永远不复位（后端实际早已完成）。
+    #[test]
+    fn translate_done_event_is_camel_case() {
+        let ev = TranslateDoneEvent {
+            recording_id: "rec-1".into(),
+            lang: "en".into(),
+            ok: true,
+            summary: "ok".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(v.get("recordingId").is_some(), "必须输出 recordingId，实际：{}", v);
+        assert!(v.get("recording_id").is_none());
+    }
 
     #[test]
     fn prompt_contains_lang_and_steps_and_voice_rule() {

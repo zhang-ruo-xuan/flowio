@@ -39,7 +39,12 @@ pub struct VoiceBuffer {
 pub struct VoiceCaptureState(pub Arc<Mutex<HashMap<String, VoiceBuffer>>>);
 
 /// `voice://done` 事件载荷。
+///
+/// 🔴 必须 camelCase：前端（App.tsx / StepEditor.tsx）用 `ev.payload.recordingId` 读。
+/// 蛇形的 `recording_id` 会让匹配失败 → 转写成功后编辑器不刷新、toast 不弹，
+/// 用户看到的表现与「语音没生效」一模一样（2026-09-04 实测踩坑）。
 #[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct VoiceDoneEvent {
     recording_id: String,
     transcribed: usize,
@@ -482,6 +487,22 @@ fn summarize_error_reasons(errors: &[String]) -> String {
 #[cfg(test)]
 mod voice_commands_tests {
     use super::*;
+
+    /// 事件载荷必须 camelCase：前端按 `recordingId` 匹配，蛇形会让
+    /// 转写完成后编辑器不刷新、toast 不弹（与「语音没生效」同表现）。
+    #[test]
+    fn voice_done_event_is_camel_case() {
+        let ev = VoiceDoneEvent {
+            recording_id: "rec-1".into(),
+            transcribed: 1,
+            failed: 0,
+            ok: true,
+            summary: "ok".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(v.get("recordingId").is_some(), "必须输出 recordingId，实际：{}", v);
+        assert!(v.get("recording_id").is_none());
+    }
 
     #[test]
     fn summarize_all_transcribed() {
