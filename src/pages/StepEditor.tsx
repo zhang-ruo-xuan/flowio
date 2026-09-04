@@ -1701,52 +1701,39 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         )}
       </div>
       {!previewMode && (
-        <button
-          onClick={async () => {
-            if (!siteToken) {
-              try {
-                await invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" });
-              } catch (err) {
-                setToast({ type: "error", message: "打开登录页失败: " + String(err) });
-              }
-              return;
-            }
-            setShowPublishDialog(true);
-            setPubStep("pick");
-            setPubTitle(recording?.title || "");
-          }}
-          data-tip={siteToken
-            ? "把这篇教程上传到 flowio.cn\n可先存草稿，也可填写标题/应用/分类后直接发布"
-            : "登录后才能上传到 flowio.cn（点击去登录）"}
-          style={{
-            background: siteToken ? "#3366CC" : "rgba(51,102,204,0.15)",
-            border: "none",
-            color: siteToken ? "#fff" : "#93b4e8",
-            cursor: "pointer",
-            padding: "3px 10px",
-            borderRadius: 4,
-            fontSize: 13,
-            display: "flex",
-            alignItems: "center",
-            gap: 4,
-          }}
-        >
-          <Upload size={14} />
-          {siteToken ? "上传网站" : "登录后上传"}
-        </button>
-      )}
-
-      {!previewMode && (
         <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
           <button
             onClick={() => setToolsOpen(!toolsOpen)}
-            data-tip={"更多工具\nAI 生成步骤说明、敏感信息脱敏、整篇翻译"}
+            data-tip={"更多工具\n上传网站、AI 生成步骤说明、敏感信息脱敏、整篇翻译"}
             style={{ background: "transparent", border: "1px solid #ff6b35", color: "#ff8a5c", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
           >
             <Wrench size={14} /> 工具 <ChevronDown size={12} />
           </button>
           {toolsOpen && (
             <div className="export-dropdown" style={{ right: 0, zIndex: 9999 }}>
+              <button
+                className="export-dropdown-item"
+                onClick={async () => {
+                  setToolsOpen(false);
+                  if (!siteToken) {
+                    try {
+                      await invoke("open_external_url", { url: "https://flowio.cn/author/login?redirect=flowio://auth" });
+                    } catch (err) {
+                      setToast({ type: "error", message: "打开登录页失败: " + String(err) });
+                    }
+                    return;
+                  }
+                  setShowPublishDialog(true);
+                  setPubStep("pick");
+                  setPubTitle(recording?.title || "");
+                }}
+                data-tip={siteToken
+                  ? "把这篇教程上传到 flowio.cn\n可先存草稿，也可填写标题/应用/分类后直接发布"
+                  : "登录后才能上传到 flowio.cn（点击去登录）"}
+              >
+                <Upload size={14} className="export-dropdown-item-icon" />
+                <span className="export-dropdown-item-label">{siteToken ? "上传网站" : "登录后上传"}</span>
+              </button>
               <label
                 className="export-dropdown-item"
                 style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
@@ -2298,19 +2285,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 // ── 有截图：图片 + 切换 + 标注 + 删除 ──
                 return (
                   <div className="step-detail-image">
-                    {/* 全图 / 裁图 切换 */}
-                    <div className="step-detail-view-segmented" data-tip="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
-                      <button
-                        className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep.id) ? ' active' : ''}`}
-                        onClick={() => setViewCropped(selectedStep.id, false)}
-                        data-tip="这一步用完整截图"
-                      >全图</button>
-                      <button
-                        className={`step-detail-view-segmented-btn${getViewCropped(selectedStep.id) ? ' active' : ''}`}
-                        onClick={() => setViewCropped(selectedStep.id, true)}
-                        data-tip="这一步只截取操作区域（只影响当前步骤）"
-                      >裁图</button>
-                    </div>
                     <img
                       ref={detailImgRef}
                       src={`data:image/jpeg;base64,${_src}`}
