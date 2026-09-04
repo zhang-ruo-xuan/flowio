@@ -1322,6 +1322,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       );
 
       // 构建上传数据（截图用 base64）
+      // 覆盖发布：同一录制曾发布过（本地映射记录 guide id）→ 带 guide_id 让网站覆盖更新而非新建
+      let prevGuideId: string | null = null;
+      try { prevGuideId = localStorage.getItem(`flowio_pub_${recordingId}`); } catch { /* ignore */ }
       const uploadData: Record<string, unknown> = {
         title,
         app_name,
@@ -1332,6 +1335,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         visibility: "public",
         status: targetStatus,
         downloadable: pubDownloadable,
+        guide_id: prevGuideId || undefined,
         steps,
         // ★ T7 多语言上传：已有译文副本时随教程一起上传到网站
         translations: Object.keys(translations).length > 0 ? translations : undefined,
@@ -1388,6 +1392,10 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       }
 
       setPublishedGuide(result.guide || null);
+      // 记录「录制 → 已发布教程」映射：下次发布同一录制时覆盖更新而非新建
+      if (result.guide?.id) {
+        try { localStorage.setItem(`flowio_pub_${recordingId}`, String(result.guide.id)); } catch { /* ignore */ }
+      }
       setShowPublishDialog(false);
       setPubStep("pick");
       setToast({ type: "success", message: isDraft ? "草稿已保存！" : "发布成功！教程已上传到网站" });
