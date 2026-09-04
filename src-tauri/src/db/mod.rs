@@ -180,6 +180,10 @@ pub fn init_db(conn: &Connection) {
         );
         CREATE INDEX IF NOT EXISTS idx_edit_history_rec
             ON edit_history(recording_id, stack);
+
+        -- 撤销/重做历史只在本次运行内有效：启动即清空（用户要求退出软件后不保留，
+        -- 避免重启后还能撤销到上一次会话的旧编辑状态）。
+        DELETE FROM edit_history;
         ",
     )
     .expect("Failed to create database tables");
