@@ -599,7 +599,13 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     () => (recordingId ? readInitialView().stepViewCropped : {})
   );
   const getViewCropped = (stepId: string) => stepViewCropped[stepId] ?? false;
-  const setViewCropped = (stepId: string, value: boolean) => setStepViewCropped(prev => ({ ...prev, [stepId]: value }));
+  const setViewCropped = (stepId: string, value: boolean) => setStepViewCropped(prev => {
+    const next = { ...prev, [stepId]: value };
+    // 同步标题栏全局开关：若改动后所有步骤已一致，则让顶部高亮跟随，避免两处控件不同步
+    const allSame = steps.every((s) => (next[s.id] ?? false) === value);
+    if (allSame) setGlobalView(value ? 'crop' : 'full');
+    return next;
+  });
   /* 裁剪图是否已被用户删除（true=该步骤裁剪图视为不存在，仅影响裁图视图，全图不受影响） */
   const [deletedCrop, setDeletedCrop] = useState<Record<string, boolean>>({});
   const isCropDeleted = (stepId: string) => !!deletedCrop[stepId];
@@ -2285,6 +2291,19 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 // ── 有截图：图片 + 切换 + 标注 + 删除 ──
                 return (
                   <div className="step-detail-image">
+                    {/* 全图 / 裁图 切换（仅当前步骤，悬浮截图时显示在右下角） */}
+                    <div className="step-detail-view-segmented" data-tip="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
+                      <button
+                        className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep?.id ?? '') ? ' active' : ''}`}
+                        onClick={() => setViewCropped(selectedStep?.id ?? '', false)}
+                        data-tip="这一步用完整截图"
+                      >全图</button>
+                      <button
+                        className={`step-detail-view-segmented-btn${getViewCropped(selectedStep?.id ?? '') ? ' active' : ''}`}
+                        onClick={() => setViewCropped(selectedStep?.id ?? '', true)}
+                        data-tip="这一步只截取操作区域（只影响当前步骤）"
+                      >裁图</button>
+                    </div>
                     <img
                       ref={detailImgRef}
                       src={`data:image/jpeg;base64,${_src}`}
