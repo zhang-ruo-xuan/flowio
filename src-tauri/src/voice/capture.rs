@@ -31,9 +31,8 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
-use tauri::{AppHandle, State};
+use tauri::State;
 
-use super::asr;
 use super::audio;
 use super::commands::{VoiceBuffer, VoiceCaptureState};
 use crate::DbState;
@@ -71,8 +70,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// 与步骤的 `timestamp`（epoch ms）同源。
 #[tauri::command]
 pub fn voice_mic_start(
-    app: AppHandle,
-    db: State<'_, DbState>,
+    _app: tauri::AppHandle,
+    _db: State<'_, DbState>,
     state: State<'_, MicCaptureState>,
     buffers: State<'_, VoiceCaptureState>,
     recording_id: String,
@@ -93,9 +92,6 @@ pub fn voice_mic_start(
     let paused = Arc::new(AtomicBool::new(false));
     let samples = Arc::new(AtomicU64::new(0));
 
-    // ★ 实时字幕：开麦时解析一次 ASR Key + 热词（失败只降级为「无实时字幕」，不影响录制）
-    let live_ctx = resolve_live_ctx(&app, &db);
-
     let t_paused = Arc::clone(&paused);
     let t_samples = Arc::clone(&samples);
     thread::spawn(move || {
@@ -110,7 +106,6 @@ pub fn voice_mic_start(
             cmd_rx,
             init_tx,
             done_tx,
-            live_ctx,
         );
     });
 
@@ -125,23 +120,6 @@ pub fn voice_mic_start(
         samples,
     });
     Ok(started_at)
-}
-
-/// 解析实时字幕所需的 ASR Key + 热词；拿不到就返回 None（降级：不出字幕，
-/// 停止录制时照常整段转写）。
-fn resolve_live_ctx(app: &AppHandle, db: &State<'_, DbState>) -> Option<LiveCtx> {
-    let conn = db.inner().0.lock().ok()?;
-    let config = crate::ai::commands::resolve_ai_config(&conn);
-    let (asr_key, _ch) = crate::voice::commands::resolve_asr_key(&config);
-    if asr_key.trim().is_empty() {
-        return None;
-    }
-    let hotwords = asr::merge_hotwords(&crate::voice::commands::read_custom_hotwords(&conn));
-    Some(LiveCtx {
-        app: app.clone(),
-        asr_key,
-        hotwords,
-    })
 }
 
 /// 暂停 / 恢复采集。暂停期间丢弃 PCM（不写入缓冲）。
@@ -188,13 +166,6 @@ pub fn voice_mic_stop(state: State<'_, MicCaptureState>) -> Result<u64, String> 
 
 /// 采集线程主体：建流 → play → 排空 PCM + 处理命令 → 退出。
 #[allow(clippy::too_many_arguments)]
-/// ★ 实时字幕上下文：开麦时解析一次（Key + 热词），采集线程复用。
-pub struct LiveCtx {
-    pub app: AppHandle,
-    pub asr_key: String,
-    pub hotwords: Vec<String>,
-}
-
 fn run_capture(
     buffers: VoiceCaptureState,
     recording_id: String,
@@ -205,7 +176,6 @@ fn run_capture(
     cmd_rx: Receiver<MicCmd>,
     init_tx: Sender<Result<i64, String>>,
     done_tx: Sender<()>,
-    live_ctx: Option<LiveCtx>,
 ) {
     let gain_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
     let setup = build_stream_for_default_device(
@@ -233,9 +203,6 @@ fn run_capture(
                     sample_rate: audio::SAMPLE_RATE,
                     pcm: Vec::new(),
                     last_heartbeat_len: 0,
-                    live_segments: Vec::new(),
-                    live_cursor: Default::default(),
-                    live_pending: Default::default(),
                 },
             );
         }
@@ -260,18 +227,6 @@ fn run_capture(
         // 1) 排空已采集的 PCM
         while let Ok(chunk) = pcm_rx.try_recv() {
             append_pcm(&buffers, &recording_id, &chunk);
-            // ★ 实时字幕：句级 VAD（说完一句就送 ASR，结果 emit 到前端）
-            if let Some(ctx) = live_ctx.as_ref() {
-                crate::voice::commands::feed_live_chunk(
-                    &buffers,
-                    &recording_id,
-                    &chunk,
-                    audio::SAMPLE_RATE,
-                    &ctx.asr_key,
-                    &ctx.hotwords,
-                    &ctx.app,
-                );
-            }
         }
         // 2) 处理命令（50ms 超时后回到 1）
         match cmd_rx.recv_timeout(DRAIN_INTERVAL) {
@@ -279,17 +234,6 @@ fn run_capture(
             Ok(MicCmd::SetPaused(true)) => {
                 if paused_since.is_none() {
                     paused_since = Some(Instant::now());
-                }
-                // ★ 实时字幕：暂停前把已说的半句吐出去
-                if let Some(ctx) = live_ctx.as_ref() {
-                    crate::voice::commands::flush_live_chunk(
-                        &buffers,
-                        &recording_id,
-                        audio::SAMPLE_RATE,
-                        &ctx.asr_key,
-                        &ctx.hotwords,
-                        &ctx.app,
-                    );
                 }
                 paused.store(true, Ordering::Relaxed);
             }
@@ -310,34 +254,6 @@ fn run_capture(
     // 收尾：排空剩余
     while let Ok(chunk) = pcm_rx.try_recv() {
         append_pcm(&buffers, &recording_id, &chunk);
-    }
-    // ★ 实时字幕：把最后没说完的半句也吐出去（否则结尾几秒的话只靠整段兜底）
-    if let Some(ctx) = live_ctx.as_ref() {
-        crate::voice::commands::flush_live_chunk(
-            &buffers,
-            &recording_id,
-            audio::SAMPLE_RATE,
-            &ctx.asr_key,
-            &ctx.hotwords,
-            &ctx.app,
-        );
-        // 🔴 等在途实时转写全部落库再发 done（不持锁等待）。否则前端收到
-        // done → voice_finish 移除缓冲 → 尾句转写完无处可写 → 最后一句必丢。
-        let pending = buffers
-            .0
-            .lock()
-            .ok()
-            .and_then(|mut m| m.get_mut(&recording_id).map(|b| b.live_pending.clone()));
-        if let Some(p) = pending {
-            use std::sync::atomic::Ordering;
-            let left = crate::voice::commands::wait_live_pending(&p, std::time::Duration::from_secs(8));
-            if left > 0 || p.load(Ordering::SeqCst) > 0 {
-                crate::ai::commands::ai_dbg_log(&format!(
-                    "[VOICE] mic stop: {} live ASR still in flight after wait",
-                    left
-                ));
-            }
-        }
     }
     let final_gain = f32::from_bits(gain_bits.load(Ordering::Relaxed));
     crate::ai::commands::ai_dbg_log(&format!(

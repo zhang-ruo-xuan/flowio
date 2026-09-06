@@ -35,15 +35,6 @@ function App() {
   const location = useLocation();
   const isEditor = location.pathname.startsWith("/editor/");
   const appWindow = getCurrentWindow();
-  /** ★ 屏幕级字幕窗（独立置顶 WebviewWindow）：主窗口录制时最小化，内置面板看不见，
-   *  字幕必须悬浮在所有应用上方。show=开麦/恢复，hide=关麦/暂停/停止。失败静默（字幕是增强体验）。
-   *  show 前先确认 ASR Key 可用，避免 Key 缺失时窗口挂着「正在聆听…」永远不出字。 */
-  const showCaptionWindow = useCallback(() => {
-    invoke<boolean>("voice_live_supported")
-      .then((ok) => { if (ok) return invoke("voice_caption_show"); })
-      .catch(() => {});
-  }, []);
-  const hideCaptionWindow = useCallback(() => { invoke("voice_caption_hide").catch(() => {}); }, []);
   const [isMaximized, setIsMaximized] = useState(false);
   const [avatarLoadFailed, setAvatarLoadFailed] = useState(false);
   // ── 语音输入（PRD F1）────────────────────────────────────────
@@ -51,8 +42,6 @@ function App() {
   const [voiceActive, setVoiceActive] = useState(false);   // 麦克风是否采集中
   const [voiceTranscribing, setVoiceTranscribing] = useState(false); // 停止后转写中
   const [voiceToast, setVoiceToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  /** ★ 实时字幕：录制中最近 3 句转写（Rust 端 voice://caption 推送） */
-  const [voiceCaptions, setVoiceCaptions] = useState<string[]>([]);
   const voiceRecorderRef = useRef<VoiceRecorder | null>(null);
   const voiceChunkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // 看门狗：采集样本数连续多秒不增长 = 音频回调停摆（最小化场景），记入 debug log
@@ -298,24 +287,6 @@ function App() {
     return () => { unlisten?.(); };
   }, [showVoiceToast]);
 
-  // voice://caption：录制中实时字幕（每识别完一句推一次）
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      unlisten = await listen<{ recordingId: string; text: string }>("voice://caption", (ev) => {
-        const t = String(ev.payload?.text || "").trim();
-        if (!t) return;
-        setVoiceCaptions((prev) => [...prev, t].slice(-3));
-      });
-    })();
-    return () => { unlisten?.(); };
-  }, []);
-
-  // 开/关麦与录制开始/结束时清空字幕（避免上一段的字残留）
-  useEffect(() => {
-    setVoiceCaptions([]);
-  }, [voiceActive, recording]);
-
   // 监听设置页语音开关切换，同步标题栏显示（避免「设置页开 / 标题栏显示关」）
   useEffect(() => {
     const handler = (e: CustomEvent<{ enabled: boolean }>) => {
@@ -338,7 +309,6 @@ function App() {
       // 录制中关麦：停止采集，已采集部分照常转写
       voiceRecorderRef.current = null;
       setVoiceActive(false);
-      hideCaptionWindow();
       if (voiceChunkTimerRef.current) { clearInterval(voiceChunkTimerRef.current); voiceChunkTimerRef.current = null; }
     } else if (next && !voiceRecorderRef.current) {
       // 录制中开麦：从现在开始采集（Rust 侧 cpal，PCM 直接进后端缓冲）
@@ -347,7 +317,6 @@ function App() {
         await rec.start(recId);
         voiceRecorderRef.current = rec;
         setVoiceActive(true);
-        showCaptionWindow();
         voiceStallRef.current = { last: 0, ticks: 0, logged: false };
         voiceChunkTimerRef.current = setInterval(async () => {
           const r = voiceRecorderRef.current;
@@ -373,7 +342,7 @@ function App() {
         showVoiceToast({ type: "error", message: `麦克风开启失败：${String(err)}，本次录制将以无语音方式继续` });
       }
     }
-  }, [voiceEnabled, showVoiceToast, showCaptionWindow, hideCaptionWindow]);
+  }, [voiceEnabled, showVoiceToast]);
 
   // 开始录制前开麦（V2/V3）；失败降级为纯录制，不阻塞
   const startVoiceIfEnabled = useCallback(async (id: string) => {
@@ -383,7 +352,6 @@ function App() {
       await rec.start(id);
       voiceRecorderRef.current = rec;
       setVoiceActive(true);
-      showCaptionWindow();
       voiceStallRef.current = { last: 0, ticks: 0, logged: false };
       // 看门狗：非暂停状态下样本数 5 秒不增长 → 采集停摆，只报一次。
       // （Rust 侧采集不受窗口最小化影响；真停了说明设备被拔掉/被独占）
@@ -407,7 +375,7 @@ function App() {
       console.warn("[voice] start failed:", err);
       showVoiceToast({ type: "error", message: `麦克风开启失败：${String(err)}，本次录制将以无语音方式继续` });
     }
-  }, [voiceEnabled, showVoiceToast, showCaptionWindow]);
+  }, [voiceEnabled, showVoiceToast]);
 
   // 停止采集并触发转写（在 finish_recording 成功后调用；V5/V9 不阻塞）
   const stopVoiceAndTranscribe = useCallback(async (id: string) => {
@@ -415,7 +383,6 @@ function App() {
     const rec = voiceRecorderRef.current;
     voiceRecorderRef.current = null;
     setVoiceActive(false);
-    hideCaptionWindow();
     if (!rec) return;
     try {
       // Rust 侧采集会把剩余 PCM 全部落进缓冲后再返回，前端无需补传
@@ -427,7 +394,7 @@ function App() {
       setVoiceTranscribing(false);
       showVoiceToast({ type: "error", message: "语音转写失败: " + String(err) });
     }
-  }, [showVoiceToast, hideCaptionWindow]);
+  }, [showVoiceToast]);
 
   // 卸载兜底清理
   useEffect(() => {
@@ -468,14 +435,13 @@ function App() {
       isPausedRef.current = true;
       setIsPaused(true);
       void voiceRecorderRef.current?.pause(); // 暂停期间的音频不进缓冲（恢复时补等长静音）
-      hideCaptionWindow(); // 暂停时字幕窗也收起（无新句子）
       await appWindow.unminimize();
       await appWindow.show();
       await appWindow.setFocus();
     } catch (err) {
       console.error("Failed to pause recording:", err);
     }
-  }, [hideCaptionWindow]);
+  }, []);
 
   const handleResumeRecording = useCallback(async () => {
     const id = recordingIdRef.current;
@@ -486,7 +452,6 @@ function App() {
       isPausedRef.current = false;
       setIsPaused(false);
       void voiceRecorderRef.current?.resume();
-      if (voiceRecorderRef.current?.isActive) showCaptionWindow(); // 恢复采集 → 字幕窗重新悬浮
       // small delay to let resume_recording settle before minimizing
       await new Promise(r => setTimeout(r, 200));
       appWindow.minimize().catch(e => console.error("minimize on resume failed:", e));
@@ -494,7 +459,7 @@ function App() {
       alert("恢复录制失败: " + (err?.message || err));
       console.error("Failed to resume recording:", err);
     }
-  }, [showCaptionWindow]);
+  }, []);
 
   const handleStopRecording = useCallback(async () => {
     let id: string | null = recordingIdRef.current;
@@ -715,17 +680,6 @@ function App() {
           <span>{voiceTranscribing ? "语音转写中…" : recording ? "录制中" : "就绪"}</span>
         </span>
       </div>
-
-      {/* ★ 实时字幕：录制中把识别出的句子显示在底部（pointer-events:none，不拦任何操作） */}
-      {recording && voiceActive && voiceCaptions.length > 0 && (
-        <div className="voice-caption-panel">
-          {voiceCaptions.map((t, i) => (
-            <div key={`${i}-${t.slice(0, 6)}`} className={i === voiceCaptions.length - 1 ? "cap-line last" : "cap-line"}>
-              {t}
-            </div>
-          ))}
-        </div>
-      )}
 
       {/* 语音输入非阻塞 toast（V3/V9） */}
       {voiceToast && (
