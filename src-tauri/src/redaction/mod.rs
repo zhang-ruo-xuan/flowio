@@ -539,7 +539,10 @@ fn long_edge_at_least(w: u32, h: u32, min: u32) -> bool {
 }
 
 /// 计算瓦片原点与尺寸列表 `(x0, y0, tw, th)`（纯逻辑，便于单测）。
-/// 步长 = 瓦片尺寸 × (1-重叠)，最后一片贴边（min 保证不越界）。
+///
+/// ★ v0.65.97 覆盖修复：旧实现 tw = ceil(w/grid) 再带重叠步长，grid 片总覆盖
+/// 只有 w×(1-重叠+1/grid)——1920 宽时右侧漏 ~115px 条带，该区域永不被复查。
+/// 新实现把瓦片本身放大 (1+重叠) 倍再切：总覆盖 = tw + (grid-1)×step ≥ w。
 fn tile_origins(
     w: u32,
     h: u32,
@@ -550,10 +553,11 @@ fn tile_origins(
     if w == 0 || h == 0 || grid == 0 {
         return out;
     }
-    let tw = (w + grid - 1) / grid;
-    let th = (h + grid - 1) / grid;
-    let step_x = ((tw as f64) * (1.0 - overlap)).round().max(1.0) as u32;
-    let step_y = ((th as f64) * (1.0 - overlap)).round().max(1.0) as u32;
+    let ov = overlap.clamp(0.0, 0.9);
+    let tw = ((((w as f64) * (1.0 + ov)) / (grid as f64)).ceil() as u32).clamp(1, w);
+    let th = ((((h as f64) * (1.0 + ov)) / (grid as f64)).ceil() as u32).clamp(1, h);
+    let step_x = ((tw as f64) * (1.0 - ov)).round().max(1.0) as u32;
+    let step_y = ((th as f64) * (1.0 - ov)).round().max(1.0) as u32;
     for row in 0..grid {
         for col in 0..grid {
             let x0 = (col * step_x).min(w - tw);
@@ -978,29 +982,40 @@ mod repro_tests {
         assert!(!long_edge_at_least(0, 0, 1)); // 无效图不切瓦片
     }
 
-    /// tile_origins：2×2 瓦片覆盖全图、带重叠、不越界（纯逻辑）
+    /// tile_origins：2×2 瓦片覆盖全图（v0.65.97 含边缘）、带重叠、不越界（纯逻辑）
     #[test]
     fn tile_origins_basic() {
         let tiles = tile_origins(1920, 1080, TILE_GRID, TILE_OVERLAP);
         assert_eq!(tiles.len(), 4);
-        let tw = (1920 + 1) / 2; // 960
-        let th = (1080 + 1) / 2; // 540
+        // ★ v0.65.97: tw = ceil(1920×1.12/2) = 1076（旧实现 960 会漏右侧 115px）
+        let tw = ((((1920_f64) * (1.0 + TILE_OVERLAP)) / 2.0).ceil()) as u32;
+        let th = ((((1080_f64) * (1.0 + TILE_OVERLAP)) / 2.0).ceil()) as u32;
         // 全部瓦片尺寸一致且不越界
         for &(x0, y0, w, h) in &tiles {
             assert_eq!((w, h), (tw, th));
             assert!(x0 + w <= 1920 && y0 + h <= 1080);
         }
-        // 第一片贴原点；第二列/行按步长偏移且带重叠（x0 < tw）
-        assert_eq!(tiles[0], (0, 0, tw, th));
-        let (x1, y1, _, _) = tiles[3];
-        assert!(x1 > 0 && x1 < tw, "右下瓦片应带重叠偏移: x0={}", x1);
-        assert!(y1 > 0 && y1 < th, "右下瓦片应带重叠偏移: y0={}", y1);
-        // 小图（未达阈值尺寸的极端小图）不除零、不越界
+        // ★ 全覆盖：x/y 两轴上 末片终点 ≥ 全图尺寸、首片贴原点、相邻片衔接无缝
+        let mut xs: Vec<u32> = tiles.iter().map(|t| t.0).collect();
+        xs.sort_unstable();
+        xs.dedup();
+        assert_eq!(xs[0], 0);
+        assert_eq!(xs[0] + tw, 0 + tw); // sanity
+        assert!(xs.last().unwrap() + tw >= 1920, "x 轴必须盖满右边缘");
+        assert!(xs.windows(2).all(|w| w[1] <= w[0] + tw), "x 轴相邻片衔接无缝");
+        let mut ys: Vec<u32> = tiles.iter().map(|t| t.1).collect();
+        ys.sort_unstable();
+        ys.dedup();
+        assert_eq!(ys[0], 0);
+        assert!(ys.last().unwrap() + th >= 1080, "y 轴必须盖满下边缘");
+        assert!(ys.windows(2).all(|w| w[1] <= w[0] + th));
+        // 小图（未达阈值尺寸的极端小图）不除零、不越界且覆盖
         let tiny = tile_origins(10, 10, TILE_GRID, TILE_OVERLAP);
         assert_eq!(tiny.len(), 4);
         for &(x0, y0, w, h) in &tiny {
             assert!(x0 + w <= 10 && y0 + h <= 10);
         }
+        assert!(tiny.iter().map(|t| t.0 + t.2).max().unwrap() >= 10);
         // 无效输入返回空
         assert!(tile_origins(0, 0, 2, 0.12).is_empty());
     }
