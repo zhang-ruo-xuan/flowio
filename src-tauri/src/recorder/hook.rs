@@ -74,6 +74,7 @@ unsafe fn get_fg_pid_and_hkl() -> (u32, usize) {
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
+static META_DOWN: AtomicBool = AtomicBool::new(false); // Win key (Meta)
 
 // ── VK → key name (matches rdev's Debug format for backwards compat) ──────
 
@@ -106,7 +107,8 @@ fn vk_to_key_name(vk_code: u32) -> String {
         0xDB => return "LeftBracket".into(),    // [{
         0xDC => return "BackSlash".into(),      // \|
         0xDD => return "RightBracket".into(),   // ]}
-        0xDE => return "Quote".into(),          // '"
+        0xDE => return "Quote".into(),          // '
+        0x2C => return "PrintScreen".into(),    // VK_SNAPSHOT（截图键）
         0xE2 => return "BackSlash".into(),      // \| (non-US)
         _ => {}
     }
@@ -171,6 +173,9 @@ unsafe extern "system" fn keyboard_hook_proc(
                 0x11 | 0xA2 | 0xA3 => CTRL_DOWN.store(true, Ordering::SeqCst),
                 0x10 | 0xA0 | 0xA1 => SHIFT_DOWN.store(true, Ordering::SeqCst),
                 0x12 | 0xA4 | 0xA5 => ALT_DOWN.store(true, Ordering::SeqCst),
+                // Win 键（VK_LWIN=0x5B / VK_RWIN=0x5C）：用于识别 Win+Combo 快捷键
+                // （Win+D 显示桌面等），否则 D 会漏进 type buffer 被记成字符 "d"。
+                0x5B | 0x5C => META_DOWN.store(true, Ordering::SeqCst),
                 _ => {}
             }
         } else if is_release {
@@ -178,15 +183,18 @@ unsafe extern "system" fn keyboard_hook_proc(
                 0x11 | 0xA2 | 0xA3 => CTRL_DOWN.store(false, Ordering::SeqCst),
                 0x10 | 0xA0 | 0xA1 => SHIFT_DOWN.store(false, Ordering::SeqCst),
                 0x12 | 0xA4 | 0xA5 => ALT_DOWN.store(false, Ordering::SeqCst),
+                0x5B | 0x5C => META_DOWN.store(false, Ordering::SeqCst),
                 _ => {}
             }
         }
 
-        // Modifier keys (Ctrl/Shift/Alt) only update the down-state; they must
+        // Modifier keys (Ctrl/Shift/Alt/Win) only update the down-state; they must
         // NOT emit standalone Press events. Otherwise a bare Ctrl press would be
         // modelled as a bogus "快捷键 Ctrl+ControlLeft" hotkey step, and combos
         // like Ctrl+C would produce two steps (hotkey + copy) instead of one.
-        let is_modifier = matches!(vk, 0x11 | 0x10 | 0x12 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5);
+        // Win (0x5B/0x5C) is included so the key itself never emits — only the
+        // *other* key of a Win+Combo arrives with `meta=true`.
+        let is_modifier = matches!(vk, 0x11 | 0x10 | 0x12 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5 | 0x5B | 0x5C);
         if is_press && !is_modifier {
             let name = vk_to_key_name(vk);
             // 真实按键时刻（钩子触发的瞬间）。处理线程消费事件时也可能是
@@ -203,6 +211,7 @@ unsafe extern "system" fn keyboard_hook_proc(
                         ctrl: CTRL_DOWN.load(Ordering::SeqCst),
                         shift: SHIFT_DOWN.load(Ordering::SeqCst),
                         alt: ALT_DOWN.load(Ordering::SeqCst),
+                        meta: META_DOWN.load(Ordering::SeqCst),
                         ts,
                         foreground_pid: fg_pid,
                     });

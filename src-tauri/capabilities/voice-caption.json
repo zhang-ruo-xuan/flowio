@@ -1,0 +1,8 @@
+{
+  "identifier": "voice-caption",
+  "description": "实时字幕悬浮窗：只Listen语音转写事件（voice://caption / voice://caption-reset）",
+  "windows": ["voice-caption"],
+  "permissions": [
+    "core:event:default"
+  ]
+}

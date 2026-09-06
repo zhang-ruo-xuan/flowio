@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback, useRef, Fragment } from "react";
+﻿import { useState, useEffect, useCallback, useRef, useMemo, Fragment, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import {
   ArrowLeft,
@@ -18,10 +18,13 @@ import {
   FileCode,
   FileText,
   File,
+  ImageIcon,
   ShieldCheck,
   ScanSearch,
+  Settings as SettingsIcon,
   Wrench,
   Upload,
+  Copy,
   Languages,
   PencilLine,
   Wand2,
@@ -35,9 +38,11 @@ import FileSaveDialog from "../components/FileSaveDialog";
 import AnnotationsOverlay from "../components/AnnotationsOverlay";
 import LoginSaveModal from "../components/LoginSaveModal";
 import type { Annotation } from "../lib/annotate";
-import { CROP_PAD } from "../lib/cropAnchor";
-import { previewBox } from "../lib/previewBox";
+import { CROP_PAD, type CropAnchor } from "../lib/cropAnchor";
+import { isUniformCropPixels } from "../lib/cropBlank";
+import { previewBox, type PreviewBox } from "../lib/previewBox";
 import type { Recording, Step } from "../types";
+import { useAppStore } from "../store/appStore";
 
 /* ── Export format options ─────────────────────────────────── */
 
@@ -45,6 +50,9 @@ const EXPORT_FORMATS = [
   { value: "html", label: "HTML", ext: "", icon: FileCode },
   { value: "docx", label: "Word", ext: "", icon: FileText },
   { value: "pdf", label: "PDF", ext: "", icon: File },
+  { value: "markdown", label: "Markdown", ext: "md", icon: FileCode },
+  { value: "txt", label: "TXT", ext: "txt", icon: FileText },
+  { value: "long", label: "长图", ext: "png", icon: ImageIcon },
 ] as const;
 
 /** 各导出格式的悬浮说明（说清「导出来能干嘛」，而不是重复格式名） */
@@ -52,6 +60,9 @@ const EXPORT_TIPS: Record<string, string> = {
   html: "导出单个 HTML 文件，带目录；双击即可打开，也能直接放到网站上",
   docx: "导出 Word 文档，方便交给同事继续编辑排版",
   pdf: "导出 PDF，适合直接发给别人看或打印",
+  markdown: "导出纯 Markdown 文本文件（不含图片），方便贴到笔记/博客或交给 AI 继续编辑",
+  txt: "导出纯文本，只保留步骤标题和说明，适合快速复制粘贴",
+  long: "把所有步骤的截图拼成一张长图，适合发长微博 / 朋友圈或直接查看",
 };
 
 /* ── Backend response types ────────────────────────────────── */
@@ -72,11 +83,15 @@ type TranslationsMap = Record<string, TranslatedGuide>;
 
 /** 语言代码 → 显示名（与 Rust 端 TARGET_LANGS 保持一致） */
 const LANG_LABELS: Record<string, string> = {
+  zh: "中文",
   en: "English",
   ja: "日本語",
   ko: "한국어",
   es: "Español",
 };
+
+/** 原文快照在 translations 里的专用键（首次翻译前由 Rust 端写入，勿上传网站） */
+const ORIG_KEY = "__orig";
 
 /* ── Publish form constants ───────────────────────────────── */
 
@@ -151,10 +166,19 @@ function cropAdaptiveBase64(
             const extra = Math.round(cropW / 3);
             rw += extra;
             left = Math.round(x - rw / 2 - extra / 2);
+            top = Math.round(y - rh / 2);
+          } else if (actionType === "drag") {
+            // DRAG 步骤高度方向多留上下文：拖拽选区多为扁长（表格行 ~25px），
+            // 仅 +16px（CROP_PAD*2）看不出在拖哪里。额外至少 100px（约 4 行）、
+            // 并按选区高 0.6× 增长，让裁图带出周围行/列，用户能辨认拖拽位置与内容。
+            const extraH = Math.max(Math.round(cropH * 0.6), 100);
+            rh += extraH;
+            top = Math.round(y - rh / 2);
+            left = Math.round(x - rw / 2);
           } else {
             left = Math.round(x - rw / 2);
+            top = Math.round(y - rh / 2);
           }
-          top = Math.round(y - rh / 2);
           cw = rw;
           ch = rh;
         } else if (x != null && y != null && x >= 0 && y >= 0) {
@@ -188,6 +212,13 @@ function cropAdaptiveBase64(
           return;
         }
         ctx.drawImage(img, left, top, cw, ch, 0, 0, cw, ch);
+        // 空白裁剪守卫：录制时 UIA 不可用会记到「Program Manager」宿主伪元素矩形，
+        // 裁出纯灰空白、毫无信息量 —— 回退整图（见 lib/cropBlank.ts 同步清单）。
+        const guard = ctx.getImageData(0, 0, cw, ch);
+        if (isUniformCropPixels(guard.data, cw, ch)) {
+          resolve(base64);
+          return;
+        }
         resolve(canvas.toDataURL("image/jpeg", 0.85).split(",")[1] || base64);
       } catch (err) {
         reject(err);
@@ -285,9 +316,56 @@ function Lightbox({
 interface StepEditorProps {
   siteToken?: string | null;
   siteUser?: { id: string; email?: string; display_name?: string; bio?: string; avatar?: string } | null;
+  voiceTranscribing?: boolean;
 }
 
 // 把 base64 截图压缩为更小的 JPEG，降低上传体积，避免“保存草稿/发布”因请求体过大而失败
+/** 评估截图"信息丰富度"（0~1）。用于智能选封面：空白/纯色加载页得分低，内容丰富的页面得分高。 */
+async function scoreScreenshotRichness(b64: string): Promise<number> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const w = 24, h = 24;
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) { resolve(0.5); return; }
+      ctx.drawImage(img, 0, 0, w, h);
+      try {
+        const d = ctx.getImageData(0, 0, w, h).data;
+        const n = w * h;
+        let sum = 0, sumSq = 0;
+        for (let i = 0; i < n; i++) {
+          const l = (d[i*4] + d[i*4+1] + d[i*4+2]) / 3;
+          sum += l; sumSq += l * l;
+        }
+        const mean = sum / n;
+        const variance = sumSq / n - mean * mean;
+        let edge = 0;
+        for (let y = 1; y < h; y++) {
+          for (let x = 1; x < w; x++) {
+            const i1 = (y*w+x)*4, i2 = (y*w+(x-1))*4, i3 = ((y-1)*w+x)*4;
+            const l1 = (d[i1]+d[i1+1]+d[i1+2])/3;
+            const l2 = (d[i2]+d[i2+1]+d[i2+2])/3;
+            const l3 = (d[i3]+d[i3+1]+d[i3+2])/3;
+            edge += Math.abs(l1-l2) + Math.abs(l1-l3);
+          }
+        }
+        resolve(Math.min(1, variance / 3000 + edge / 4000));
+      } catch {
+        resolve(0.5);
+      }
+    };
+    img.onerror = () => resolve(0.5);
+    img.src = b64;
+  });
+}
+
+/** 发布弹窗预览用：raw base64 → 可直接给 <img src> 的 dataURL（上传 API 两种格式都认，但 <img> 必须带前缀） */
+function toPreviewSrc(b64: string): string {
+  return b64.startsWith("data:") ? b64 : `data:image/jpeg;base64,${b64}`;
+}
+
 async function downscaleBase64Image(dataUrl: string, maxWidth = 1280, quality = 0.82): Promise<string> {
   return new Promise((resolve) => {
     try {
@@ -316,7 +394,7 @@ async function downscaleBase64Image(dataUrl: string, maxWidth = 1280, quality = 
   });
 }
 
-export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
+export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: StepEditorProps) {
   const { id } = useParams<{ id: string }>();
   const recordingId = id!;
   const navigate = useNavigate();
@@ -335,38 +413,33 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [translateOpen, setTranslateOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState<string | null>(null);
   const [redacting, setRedacting] = useState(false);
+  // ★ v310: 脱敏结果弹窗（带 ×，不点不消失；与插件端对齐）
+  const [redactResult, setRedactResult] = useState<{ title: string; lines: string[] } | null>(null);
   const [scanRedacting, setScanRedacting] = useState(false);
   const [scanProgress, setScanProgress] = useState<{ done: number; total: number; currentStepId: string }>({ done: 0, total: 0, currentStepId: "" });
   const [scanToast, setScanToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const scanToastTimerRef = useRef<number | null>(null);
   const [showSaveDialog, setShowSaveDialog] = useState<string | null>(null);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [voiceBanner, setVoiceBanner] = useState(voiceTranscribing ?? false); // 录制跳编辑界面时，若语音未好则顶部常驻提示
   const [aiGenerating, setAiGenerating] = useState(false);
   const [domainMode, setDomainMode] = useState<"auto" | "spreadsheet" | "browser" | "code" | "terminal">("auto");
 
-  /* Translation state（译文副本：不覆盖原文，预览/导出可切语言，PRD T1-T9） */
+  /* Translation state */
   const [translations, setTranslations] = useState<TranslationsMap>({});
   const [translating, setTranslating] = useState(false);
-  const [translateModalOpen, setTranslateModalOpen] = useState(false);
-  // ★ T8 译文可编辑：编辑弹窗状态（语言 + 草稿）
-  const [editTransOpen, setEditTransOpen] = useState(false);
-  const [editTransLang, setEditTransLang] = useState<string>("en");
-  const [editDraftTitle, setEditDraftTitle] = useState("");
-  const [editDraftSteps, setEditDraftSteps] = useState<{ i: number; title: string; description: string }[]>([]);
-  const [savingTranslation, setSavingTranslation] = useState(false);
-  const [translateLang, setTranslateLang] = useState<string>("en");
-  /* 导出语言：null = 原文 */
-  const [exportLang, setExportLang] = useState<string | null>(null);
 
-  const loadTranslations = useCallback(async () => {
+  const loadTranslations = useCallback(async (): Promise<TranslationsMap> => {
     try {
       const t = await invoke<TranslationsMap | null>("get_recording_translations", { recordingId });
       setTranslations(t ?? {});
+      return t ?? {};
     } catch {
-      /* 译文加载失败不阻塞编辑器，保持 {} 即可 */
+      return {};
     }
   }, [recordingId]);
 
@@ -413,6 +486,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const [pubDownloadable, setPubDownloadable] = useState<"yes" | "no">("yes");
   const [pubCoverBase64, setPubCoverBase64] = useState<string | null>(null);
     const [pubCoverPreview, setPubCoverPreview] = useState<string | null>(null);
+    const [smartLoading, setSmartLoading] = useState(false);
     // 适用场景（与网站编辑器一致）
     const [pubSceneSelect, setPubSceneSelect] = useState("");
     const SCENE_ENTRIES: { emoji: string; name: string; slug: string }[] = [
@@ -459,36 +533,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     return () => clearTimeout(timer);
   }, [toast]);
 
-  /* ── translate://done（翻译完成 → 刷新译文副本，PRD T4）── */
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    let cancelled = false;
-    listen<{ recordingId: string; lang: string; ok: boolean; summary: string }>(
-      "translate://done",
-      (ev) => {
-        if (ev.payload.recordingId !== recordingId) return;
-        setTranslating(false);
-        if (ev.payload.ok) {
-          loadTranslations();
-          setToast({ type: "success", message: `已生成${LANG_LABELS[ev.payload.lang] || ev.payload.lang}译文，可在预览/导出中切换语言` });
-        } else {
-          setToast({ type: "error", message: "翻译失败: " + (ev.payload.summary || "未知错误") });
-        }
-      }
-    ).then((fn) => {
-      if (cancelled) fn();
-      else unlisten = fn;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [recordingId, loadTranslations]);
-
-  /* ── 翻译（PRD T2/T3）：只翻标题+步骤描述，存译文副本不覆盖原文 ── */
+  /* ── 翻译：选择语言后直接翻译，完成后同步到编辑器步骤 ── */
   const handleTranslate = useCallback(
     async (lang: string) => {
-      setTranslateModalOpen(false);
       if (steps.length === 0) {
         setToast({ type: "error", message: "没有可翻译的步骤" });
         return;
@@ -496,7 +543,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       setTranslating(true);
       try {
         await invoke("translate_recording", { recordingId, lang });
-        // 完成后由 translate://done 事件收尾（toast + 刷新译文）
+        // 完成后由 translate://done 事件收尾（同步译文到编辑器）
       } catch (err) {
         setTranslating(false);
         setToast({ type: "error", message: "翻译失败: " + String(err) });
@@ -505,53 +552,14 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     [recordingId, steps.length]
   );
 
-  /* ── ★ T8 译文可编辑：打开编辑弹窗（按当前步骤顺序构建草稿，缺失字段回退原文） ── */
-  const transLangs = Object.keys(translations);
-  const openEditTrans = useCallback((lang: string) => {
-    const t = translations[lang];
-    setEditTransLang(lang);
-    setEditDraftTitle(t?.title ?? "");
-    setEditDraftSteps(
-      steps.map((s, idx) => {
-        const st = t?.steps?.[String(s.order_index ?? idx)];
-        return {
-          i: s.order_index ?? idx,
-          title: st?.title ?? s.title ?? "",
-          description: st?.description ?? s.description ?? "",
-        };
-      })
-    );
-    setEditTransOpen(true);
-  }, [translations, steps]);
-
-  const handleSaveTranslation = useCallback(async () => {
-    if (!recordingId || savingTranslation) return;
-    setSavingTranslation(true);
-    try {
-      const stepsMap: Record<string, { title: string; description: string }> = {};
-      for (const s of editDraftSteps) {
-        stepsMap[String(s.i)] = { title: s.title, description: s.description };
-      }
-      const next: TranslationsMap = {
-        ...translations,
-        [editTransLang]: { title: editDraftTitle, steps: stepsMap },
-      };
-      await invoke("save_recording_translations", { recordingId, translations: next });
-      setTranslations(next);
-      setEditTransOpen(false);
-      setToast({ type: "success", message: `已保存${LANG_LABELS[editTransLang] || editTransLang}译文` });
-    } catch (err) {
-      setToast({ type: "error", message: "保存译文失败: " + String(err) });
-    } finally {
-      setSavingTranslation(false);
-    }
-  }, [recordingId, translations, editTransLang, editDraftTitle, editDraftSteps, savingTranslation]);
-
   /* Preview mode */
   const [previewMode, setPreviewMode] = useState(false);
   /* ── 步骤精简：自动合并（规则）/ AI 精简（撤销上移为顶栏全局 ↶↷）── */
   const [simplifying, setSimplifying] = useState<null | "rules" | "ai">(null);
   const [simplifyOpen, setSimplifyOpen] = useState(false);
+  // 跨页面保留的「AI 精简进行中」标记：离开教程页也不丢，回来仍显示「AI 精简中…」
+  const globalAiBusy = useAppStore((s) => s.simplifyingId === recordingId);
+  const aiBusy = simplifying === "ai" || globalAiBusy;
   // handleAutoMerge / handleAiSimplify 定义在 reloadRecording
   // 之后（它们的 deps 引用 reloadRecording，放在这里会 TDZ 崩溃）
 
@@ -569,12 +577,106 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   // 自动保存定时器（声明提前：applyHist 里要在撤销前掐掉它，deps 引用不能 TDZ）
   const autoSaveRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  /* ── 把一份译文（或原文快照）同步到编辑器步骤（translate://done 与秒切共用）── */
+  const syncStepsFromGuide = useCallback(
+    async (trans: TranslatedGuide) => {
+      for (const s of steps) {
+        const st = trans.steps[String(s.order_index ?? steps.indexOf(s))];
+        if (!st) continue;
+        const newTitle = st.title ?? s.title;
+        const newDesc = st.description ?? s.description;
+        if (newTitle === s.title && newDesc === s.description) continue;
+        try {
+          await invoke("update_step", {
+            stepId: s.id,
+            title: newTitle,
+            description: newDesc,
+            actionType: s.action_type,
+            tip: s.tip || "",
+          });
+        } catch {}
+        setSteps((prev) =>
+          prev.map((p) =>
+            p.id === s.id ? { ...p, title: newTitle, description: newDesc } : p
+          )
+        );
+      }
+      if (trans.title && recording && trans.title !== recording.title) {
+        try { await invoke("update_recording_title", { id: recordingId, title: trans.title }); } catch {}
+        setRecording((prev) => prev ? { ...prev, title: trans.title } : prev);
+      }
+      refreshHist();
+    },
+    [steps, recording, recordingId, refreshHist] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  /* ── 当前生效的语言（"orig" | 语言代码 | null），用于下拉高亮 ── */
+  const [appliedLang, setAppliedLang] = useState<string | null>(null);
+
+  /* ── 翻译下拉点击：有缓存译文 → 秒切不重译；无缓存 → 走 LLM 翻译 ── */
+  const handleLangClick = useCallback(
+    async (code: string) => {
+      if (code === ORIG_KEY) {
+        const orig = translations[ORIG_KEY];
+        if (!orig) {
+          setToast({ type: "error", message: "该教程没有原文快照（旧版本翻译的），可用顶栏撤销恢复" });
+          return;
+        }
+        setTranslateOpen(false);
+        await syncStepsFromGuide(orig);
+        setAppliedLang("orig");
+        setToast({ type: "success", message: "已恢复原文" });
+        return;
+      }
+      const cached = translations[code];
+      if (cached) {
+        setTranslateOpen(false);
+        await syncStepsFromGuide(cached);
+        setAppliedLang(code);
+        setToast({ type: "success", message: `已切换到${LANG_LABELS[code] || code}译文` });
+        return;
+      }
+      // 无缓存 → 首次翻译（完成后由 translate://done 收尾）
+      void handleTranslate(code);
+    },
+    [translations, syncStepsFromGuide, handleTranslate] // eslint-disable-line react-hooks/exhaustive-deps
+  );
+
+  /* ── translate://done（翻译完成 → 同步译文到编辑器并记下生效语言）── */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen<{ recordingId: string; lang: string; ok: boolean; summary: string }>(
+      "translate://done",
+      async (ev) => {
+        if (ev.payload.recordingId !== recordingId) return;
+        setTranslating(false);
+        if (ev.payload.ok) {
+          const t = await loadTranslations();
+          const trans = t[ev.payload.lang];
+          if (!trans) return;
+          await syncStepsFromGuide(trans);
+          setAppliedLang(ev.payload.lang);
+          setToast({ type: "success", message: `已翻译为${LANG_LABELS[ev.payload.lang] || ev.payload.lang}，可通过「翻译 → 原文」随时恢复` });
+        }
+      }
+    ).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [recordingId, loadTranslations, syncStepsFromGuide]); // eslint-disable-line react-hooks/exhaustive-deps
+
   /* Delete target for overlay */
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
   /* Inline title editing */
   const [recTitleEditing, setRecTitleEditing] = useState(false);
   const [recTitleDraft, setRecTitleDraft] = useState("");
+  const recTitleInputRef = useRef<HTMLInputElement>(null);
 
   /* Lightbox */
   const [lightboxOpen, setLightboxOpen] = useState(false);
@@ -619,6 +721,31 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
   const detailImgRef = useRef<HTMLImageElement>(null);
 
+  /* 主图容器几何：state 驱动，禁止直接写 parent.style。
+     旧实现 onLoad 里直接改 parent 的 inline 比例/maxWidth —— 这些值会残留：
+     切步骤 / 全图↔裁图切换后，若新图的 load 事件没触发处理（React 对内存缓存图
+     存在丢 onLoad 的已知问题），容器比例还是上一张图的 → object-fit: contain
+     在底部/两侧留下灰色占位区（用户实测截图：容器是旧裁图的 1.66:1，全图 2.2:1）。
+     现在：src 一变立即重置（回落 CSS 默认比例），新图 onLoad 或 effect 兜底写入
+     新比例，几何永远与当前显示的图同步。memo 缓存已算过的比例，来回切换不闪灰。 */
+  const [detailImgBox, setDetailImgBox] = useState<{ src: string; box: PreviewBox | null }>({
+    src: "",
+    box: null,
+  });
+  const detailBoxMemo = useRef<Map<string, PreviewBox>>(new Map());
+
+  /* 兜底：图片已加载完成（complete）但 box 还没写入 → 直接按 naturalWidth 补一次。
+     覆盖「内存缓存图丢 onLoad」的路径，保证容器比例必然收敛到当前显示的图。 */
+  useEffect(() => {
+    if (detailImgBox.box) return;
+    const img = detailImgRef.current;
+    if (!img || !img.complete || !img.naturalWidth) return;
+    const box = previewBox(img.naturalWidth, img.naturalHeight);
+    if (!box) return;
+    detailBoxMemo.current.set(detailImgBox.src, box);
+    setDetailImgBox((prev) => (prev.box ? prev : { ...prev, box }));
+  }, [detailImgBox]);
+
   /* 裁剪图（400×400 @点击坐标）缓存：key=step.id，为所有步骤异步预生成，避免预览/缩略图重复计算 */
   const [cropCache, setCropCache] = useState<Record<string, string>>({});
   // 首屏视图恢复完成后才允许持久化，避免挂载瞬间用默认值 {} / 'full' 覆盖已保存的偏好
@@ -627,6 +754,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   /* Annotation (手动标注编辑器) */
   const [annotateOpen, setAnnotateOpen] = useState(false);
   const [annotateStepId, setAnnotateStepId] = useState<string>("");
+  /** 打开标注时的当前视图：'full'=全图，'crop'=裁图。决定裁切结果落到哪个槽位 */
+  const [annotateMode, setAnnotateMode] = useState<'full' | 'crop'>('full');
 
   // ⚠️ 这里**不要**再给主预览容器写死高度。
   // v24 之前的遗留代码曾写 `height = clamp(w*9/16, 200, 520)`，把盒子锁成 16:9，
@@ -675,7 +804,43 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     setCropCache(cache);
   }, []);
 
+  /** 将某张步骤截图设为封面（预览用原图，上传用压缩图） */
+  const selectStepCover = async (s: { id: string; screenshot_base64?: string | null }) => {
+    if (!s.screenshot_base64) return;
+    // ⚠️ downscaleBase64Image 只认 dataURL：raw base64 传入会 onerror 原样返回（压缩静默失效），必须先补前缀
+    const small = await downscaleBase64Image(toPreviewSrc(s.screenshot_base64), 720, 0.85);
+    setPubCoverBase64(small);
+    setPubCoverPreview(small);
+  };
+
+  /** 智能选封面：排除空白/纯色截图，优先中段步骤，挑信息量最丰富的一张 */
+  const handleSmartCover = async () => {
+    const cand = steps.filter((s) => s.screenshot_base64);
+    if (cand.length === 0) return;
+    setSmartLoading(true);
+    try {
+      let best: typeof cand[number] | null = null;
+      let bestScore = -1;
+      await Promise.all(
+        cand.map(async (s, i) => {
+          const richness = await scoreScreenshotRichness(s.screenshot_base64 as string);
+          const midness = 1 - Math.abs(i - (cand.length - 1) / 2) / (cand.length / 2 + 1);
+          const score = richness * 0.7 + midness * 0.3;
+          if (score > bestScore) { bestScore = score; best = s; }
+        }),
+      );
+      if (best) await selectStepCover(best);
+    } finally {
+      setSmartLoading(false);
+    }
+  };
+
   /* ── voice://done（语音转写完成 → 刷新步骤显示【语音】内容，PRD V8）── */
+  // 语音转写进行中提示条：外部状态变为 false（例如全局 voice://done 已置位）时收起
+  useEffect(() => {
+    if (!voiceTranscribing) setVoiceBanner(false);
+  }, [voiceTranscribing]);
+
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     let cancelled = false;
@@ -687,11 +852,14 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       summary: string;
     }>("voice://done", (ev) => {
       if (ev.payload.recordingId !== recordingId) return;
+      setVoiceBanner(false); // 无论成功失败都收起「生成中」提示条
       if (ev.payload.ok && ev.payload.transcribed > 0) {
-        reloadRecording().catch(() => {});
-        setToast({ type: "success", message: `语音转写完成：${ev.payload.summary}` });
+        reloadRecording().catch(() => {}); // 刷新步骤显示【语音】内容
+        setToast({ type: "success", message: `语音转写完成，已为 ${ev.payload.transcribed} 个步骤补全语音说明` });
+      } else if (ev.payload.ok) {
+        setToast({ type: "success", message: "语音转写完成（未识别到有效语音）" });
       } else {
-        setToast({ type: "error", message: `语音转写失败：${ev.payload.summary || "无可识别语音"}` });
+        setToast({ type: "error", message: "语音转写失败：" + (ev.payload.summary || "未知错误") });
       }
     }).then((fn) => {
       if (cancelled) fn();
@@ -732,29 +900,43 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   const handleAiSimplify = useCallback(async () => {
     if (!recordingId) return;
     setSimplifying("ai");
-    try {
-      const r = await invoke<{
-        before: number; after: number; reduced: number; kind: string;
-      }>("simplify_steps_ai", { recordingId });
-      const list = await reloadRecording();
-      await rebuildCropCache(list);
-      refreshHist();
-      setToast({
-        type: "success",
-        // kind 为 "rules" 表示 AI 那一层没生效（剩余步骤太少，不值得再调一次），
-        // 但规则层已经先跑过了，用户仍然拿到收益 —— 必须说清楚，别让人以为没反应。
-        message:
-          r.reduced > 0
-            ? r.kind === "ai"
-              ? `AI 精简完成：${r.before} 步 → ${r.after} 步（省 ${r.reduced} 步）`
-              : `已自动合并：${r.before} 步 → ${r.after} 步（AI 判断无需再合并）`
-            : "没有检测到可合并的冗余步骤",
+    // 跨页面保留「进行中」标记：离开教程页也不丢，回来仍显示「AI 精简中…」
+    useAppStore.getState().setSimplifyingId(recordingId);
+    // 后台执行：只发起，不阻塞。完成后由全局 flowio://job-done 事件收尾
+    //（刷新步骤 + 右上角弹窗提醒），软件不退出就一直跑到完。
+    invoke("simplify_steps_ai", { recordingId })
+      .then(() => {})
+      .catch((err) => {
+        setSimplifying(null);
+        useAppStore.getState().setSimplifyingId(null);
+        setToast({ type: "error", message: "AI 精简启动失败: " + String(err) });
       });
-    } catch (err) {
-      setToast({ type: "error", message: "AI 精简失败: " + String(err) });
-    } finally {
-      setSimplifying(null);
-    }
+  }, [recordingId, setToast]);
+
+  /* ── flowio://job-done（AI 精简完成 → 刷新步骤；离开教程页也照常收尾）── */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen<{ recording_id: string; op: string; ok: boolean; summary: string }>(
+      "flowio://job-done",
+      async (ev) => {
+        if (ev.payload.recording_id !== recordingId) return;
+        if (ev.payload.op !== "ai_simplify") return;
+        setSimplifying(null);
+        useAppStore.getState().setSimplifyingId(null);
+        if (!ev.payload.ok) {
+          // 精简失败（多在免费通道限流时）：编辑页内直接弹红条，避免只靠右上角 9s 卡片被忽略
+          setToast({ type: "error", message: "AI 精简失败：" + ev.payload.summary });
+          return;
+        }
+        if (ev.payload.ok) {
+          const list = await reloadRecording();
+          await rebuildCropCache(list);
+          refreshHist();
+        }
+      }
+    ).then((fn) => { if (cancelled) fn(); else unlisten = fn; });
+    return () => { cancelled = true; unlisten?.(); };
   }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
 
   /* ── ★ 全局撤销/重做：还原后必须 rebuildCropCache（理由同精简）── */
@@ -795,14 +977,193 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     return () => window.removeEventListener("keydown", onKey);
   }, [applyHist]);
 
+  /* ── 查找 / 替换（Ctrl+F / Ctrl+H）────────────────────────────
+   * 无按钮纯快捷键入口；浮条支持 Enter/Shift+Enter 导航、Esc 关闭。
+   * 全部替换走后端 replace_in_steps：整段只压一次撤销快照，Ctrl+Z 一次还原。 */
+  const [findOpen, setFindOpen] = useState(false);
+  const [replaceMode, setReplaceMode] = useState(false); // Ctrl+H 打开时显示替换行
+  const [findText, setFindText] = useState("");
+  const [committedQuery, setCommittedQuery] = useState(""); // 回车提交后才真正搜索（打字过程不触发）
+  const [replaceText, setReplaceText] = useState("");
+  const [matchIdx, setMatchIdx] = useState(0);
+  const [replacing, setReplacing] = useState(false);
+  const findInputRef = useRef<HTMLInputElement>(null);
+  const titleInputRef = useRef<HTMLInputElement>(null);
+  const descInputRef = useRef<HTMLTextAreaElement>(null);
+
+  /** 查找命中高亮：把 text 中所有大小写不敏感命中片段包上 <mark>（侧栏标题等纯文本处用） */
+  const renderFindHighlight = (text: string, q: string): React.ReactNode => {
+    if (!q) return text;
+    const lc = text.toLowerCase();
+    const qlc = q.toLowerCase();
+    if (!lc.includes(qlc)) return text;
+    const parts: React.ReactNode[] = [];
+    let i = 0;
+    let k = 0;
+    for (;;) {
+      const idx = lc.indexOf(qlc, i);
+      if (idx === -1) { parts.push(text.slice(i)); break; }
+      if (idx > i) parts.push(text.slice(i, idx));
+      parts.push(<mark key={k++} className="find-hit">{text.slice(idx, idx + q.length)}</mark>);
+      i = idx + q.length;
+    }
+    return parts;
+  };
+
+  /** 大小写不敏感整串替换（与 Rust replace_ci 同语义；回调进 handleReplaceAll 的本地同步） */
+  const replaceAllCI = (hay: string, search: string, rep: string): string => {
+    if (!search) return hay;
+    const hayLc = hay.toLowerCase();
+    const qLc = search.toLowerCase();
+    if (hayLc.length !== hay.length || qLc.length !== search.length) return hay.split(search).join(rep);
+    let out = "";
+    let i = 0;
+    for (;;) {
+      const idx = hayLc.indexOf(qLc, i);
+      if (idx === -1) { out += hay.slice(i); break; }
+      out += hay.slice(i, idx) + rep;
+      i = idx + search.length;
+    }
+    return out;
+  };
+
+  // 命中清单：每个（步骤 × 字段）一条；导航即选中该步骤并滚到侧栏可见
+  const findMatches = useMemo(() => {
+    const q = committedQuery.trim().toLowerCase();
+    if (!findOpen || !q) return [];
+    const out: { stepId: string; field: "title" | "description" }[] = [];
+    steps.forEach((s) => {
+      if ((s.title || "").toLowerCase().includes(q)) out.push({ stepId: s.id, field: "title" });
+      if ((s.description || "").toLowerCase().includes(q)) out.push({ stepId: s.id, field: "description" });
+    });
+    return out;
+  }, [findOpen, committedQuery, steps]);
+
+  // 提交的查询词变化 → 回到第一个命中
+  useEffect(() => { setMatchIdx(0); }, [committedQuery]);
+
+  // 命中导航 → 选中步骤 + 侧栏滚动可见 + 标题/描述输入框内选中命中片段（原生选中高亮，一眼定位）
+  useEffect(() => {
+    if (!findOpen || findMatches.length === 0) return;
+    const m = findMatches[Math.min(matchIdx, findMatches.length - 1)];
+    if (!m) return;
+    setSelectedStepId(m.stepId);
+    const t = setTimeout(() => {
+      document.getElementById(`step-item-${m.stepId}`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      const q = committedQuery.trim();
+      if (!q) return;
+      const st = steps.find((s) => s.id === m.stepId);
+      const val = (m.field === "title" ? st?.title : st?.description) || "";
+      const idx = val.toLowerCase().indexOf(q.toLowerCase());
+      const target = m.field === "title" ? titleInputRef.current : descInputRef.current;
+      if (target && idx !== -1) {
+        // 只设置选中片段、不抢焦点：焦点留在查找框，Enter/Shift+Enter 才能继续上下切换
+        target.setSelectionRange(idx, idx + q.length);
+      }
+    }, 60);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matchIdx, findOpen, findMatches]);
+
+  const openFindBar = useCallback((withReplace: boolean) => {
+    // 预填当前选中文本（若有）并立即按它搜索，像 VSCode 一样省一次输入
+    const sel = (window.getSelection()?.toString() || "").trim();
+    if (sel) {
+      const t = sel.slice(0, 80);
+      setFindText(t);
+      setCommittedQuery(t);
+    }
+    setReplaceMode(withReplace);
+    setFindOpen(true);
+    setMatchIdx(0);
+    setTimeout(() => findInputRef.current?.select(), 30);
+  }, []);
+
+  // Ctrl+F / Ctrl+H：全局接管（含焦点在输入框时；原生编辑器里这两键无语义）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "f") { e.preventDefault(); openFindBar(false); }
+      else if (k === "h") { e.preventDefault(); openFindBar(true); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openFindBar]);
+
+  const handleReplaceAll = useCallback(async () => {
+    const q = findText;
+    if (!q.trim()) { setToast({ type: "error", message: "请先输入查找内容" }); return; }
+    if (replacing) return;
+    setReplacing(true);
+    try {
+      const r = await invoke<{ changedSteps: number; replaced: number }>("replace_in_steps", {
+        recordingId,
+        search: q,
+        replace: replaceText,
+      });
+      if (r.replaced === 0) {
+        setToast({ type: "error", message: "没有找到可替换的内容" });
+      } else {
+        // 本地同步文本（不整页重载，避免截图 base64 重新拉取）
+        setSteps((prev) => prev.map((s) => ({
+          ...s,
+          title: replaceAllCI(s.title || "", q, replaceText),
+          description: replaceAllCI(s.description || "", q, replaceText),
+        })));
+        setToast({ type: "success", message: `已替换 ${r.replaced} 处（${r.changedSteps} 个步骤），Ctrl+Z 可整体撤销` });
+        refreshHist();
+      }
+    } catch (err) {
+      setToast({ type: "error", message: String(err) });
+    } finally {
+      setReplacing(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordingId, findText, replaceText, replacing, refreshHist]);
+
+  const findNavBtnStyle: CSSProperties = {
+    width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center",
+    background: "transparent", border: "1px solid transparent", borderRadius: 6,
+    color: "#57606a", fontSize: 14, cursor: "pointer", padding: 0, flexShrink: 0,
+  };
+
   useEffect(() => {
     let cancelled = false;
+    // 换教程（含 另存为 → /editor/newId 的编辑器内直跳）时先锁持久化，
+    // 防止上一份教程的视图状态被写入新 key（viewLoadedRef 跨 loading 保持 true）。
+    viewLoadedRef.current = false;
     (async () => {
       try {
-        const data = await invoke<RecordingWithSteps>("load_recording", {
-          id: recordingId,
-        });
+        // 视图偏好与录制数据并行加载：SQLite 是权威存储（editor_view_get），
+        // localStorage 只作回退（老教程首次打开时迁移入库）。
+        const [data, dbView] = await Promise.all([
+          invoke<RecordingWithSteps>("load_recording", { id: recordingId }),
+          invoke<string | null>("editor_view_get", { recordingId }).catch(() => null as string | null),
+        ]);
         if (cancelled) return;
+
+        // ── 视图偏好恢复（在 setSteps 之前，首屏即最终视图，无闪跳）──
+        let viewJson: string | null = dbView;
+        let needMigrate = false;
+        if (!viewJson) {
+          try { viewJson = localStorage.getItem(`flowio_view_${recordingId}`); } catch { /* ignore */ }
+          needMigrate = !!viewJson;
+        }
+        if (viewJson) {
+          try {
+            const parsed = JSON.parse(viewJson);
+            setStepViewCropped(parsed.stepViewCropped || {});
+            setGlobalView(parsed.globalView === "crop" ? "crop" : "full");
+            if (needMigrate) {
+              void invoke("editor_view_set", { recordingId, value: viewJson }).catch(() => { /* best-effort */ });
+            }
+          } catch { /* 坏数据忽略，用默认全图 */ }
+        } else {
+          setStepViewCropped({});
+          setGlobalView("full");
+        }
+        viewLoadedRef.current = true;
 
         // 关键：在 setSteps 之前预生成**所有步骤**的裁剪图缓存，然后单次提交。
         // 这样首次渲染就是最终状态（spinner → 裁图/全图），不存在
@@ -832,10 +1193,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           setSelectedStepId(data.steps[0].id);
         }
 
-        // 视图状态（stepViewCropped / globalView）已由 useState 惰性初始化从 localStorage 同步恢复，
-        // 此处不再重复 setState（否则新对象引用触发重渲染会破坏首屏一致性）。
-        // 只需标记恢复完成以允许后续持久化写入。
-        viewLoadedRef.current = true;
+        // 视图状态已在上方从 SQLite/localStorage 恢复并标记 viewLoadedRef，
+        // 此处无需再处理。
 
         // 译文副本（翻译功能 T1）：并行加载，失败不阻塞编辑器
         loadTranslations();
@@ -898,17 +1257,17 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
     return () => { cancelled = true; };
   }, [steps.map((s) => `${s.id}|${s.screenshot_base64}|${s.x}|${s.y}|${s.crop_w}|${s.crop_h}|${s.action_type}`).join("||")]);
 
-  /* 持久化裁图/全图视图偏好到 localStorage */
+  /* 持久化裁图/全图视图偏好：localStorage（首屏同步缓存）+ SQLite（权威存储，
+     WebView 存储曾出现丢失 → 退出重进回全图；DB 写入 fire-and-forget，失败不阻塞 UI） */
   useEffect(() => {
     if (!recordingId) return;
     // 首屏视图恢复前不写，防止挂载瞬间用默认值覆盖已保存偏好
     if (!viewLoadedRef.current) return;
+    const json = JSON.stringify({ stepViewCropped, globalView });
     try {
-      localStorage.setItem(`flowio_view_${recordingId}`, JSON.stringify({
-        stepViewCropped,
-        globalView,
-      }));
+      localStorage.setItem(`flowio_view_${recordingId}`, json);
     } catch { /* storage full / unavailable */ }
+    void invoke("editor_view_set", { recordingId, value: json }).catch(() => { /* best-effort */ });
   }, [recordingId, stepViewCropped, globalView]);
 
   const selectedIndex = steps.findIndex((s) => s.id === selectedStepId);
@@ -1060,7 +1419,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       reader.onload = (ev) => {
         const dataUrl = ev.target?.result as string;
         const base64 = dataUrl.split(",")[1];
-        invoke("upload_step_screenshot", { stepId: selectedStep.id, base64Data: base64, isAfter: true, isMarked: false })
+        // ⚠️ isAfter 必须 false：upload 语义里 true 写 after_screenshot_path（前端不做主图），
+        // false 才写主截图 screenshot_path（=主图源，退出重进不丢图）
+        invoke("upload_step_screenshot", { stepId: selectedStep.id, base64Data: base64, isAfter: false, isMarked: false })
           .then(() => {
             setSteps(prev => prev.map(s =>
               s.id !== selectedStep.id ? s : {
@@ -1096,7 +1457,9 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                   reader.onload = (ev) => {
                     const dataUrl = ev.target?.result as string;
                     const base64 = dataUrl.split(",")[1];
-                    invoke("upload_step_screenshot", { stepId: selectedStep.id, base64Data: base64, isAfter: true, isMarked: false })
+                    // ⚠️ isAfter 必须 false：upload 语义里 true 写 after_screenshot_path（前端不做主图），
+                    // false 才写主截图 screenshot_path（=主图源，退出重进不丢图）
+                    invoke("upload_step_screenshot", { stepId: selectedStep.id, base64Data: base64, isAfter: false, isMarked: false })
                       .then(() => {
                         setSteps(prev => prev.map(s =>
                           s.id !== selectedStep.id ? s : {
@@ -1217,6 +1580,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       setExportOpen(false);
       setToolsOpen(false);
       setSimplifyOpen(false);
+      setTranslateOpen(false);
     };
     window.addEventListener("mousedown", closeDropdowns);
     return () => window.removeEventListener("mousedown", closeDropdowns);
@@ -1252,24 +1616,28 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           format,
           outputPath: savedPath,
           cropStepIds: Object.keys(stepViewCropped).filter(id => stepViewCropped[id]),
-          // 导出语言（PRD T9）：null = 原文，否则用对应语言的译文副本覆盖标题/描述
-          lang: exportLang ?? undefined,
         });
-        setToast({ type: "success", message: `导出成功: ${path}` });
+        // 完成提醒统一走全局 flowio://job-done 卡片（任意页面弹窗，带教程名）
       } catch (err) {
-        setToast({ type: "error", message: "导出失败: " + String(err) });
+        // 失败提醒同样走全局卡片
       } finally {
         setExporting(false);
         setExportProgress(null);
         unlisten();
       }
     },
-    [recordingId, showSaveDialog, exportLang, stepViewCropped]
+    [recordingId, showSaveDialog, stepViewCropped]
   );
 
-  /* ── Publish to website ──────────────────────────────────── */
+/* ── Publish to website ──────────────────────────────────── */
 
-  const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "published") => {
+// SHA-256 hex（与网站后端 content_hash 同口径），用于发布前按内容兜底查已存在教程
+async function sha256Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "published") => {
     if (!siteToken) { setToast({ type: "error", message: "请先登录后再发布" }); return; }
     if (!recordingId) { setToast({ type: "error", message: "未找到当前录制，请重试" }); return; }
     setPublishing(true);
@@ -1321,10 +1689,29 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         })
       );
 
-      // 构建上传数据（截图用 base64）
       // 覆盖发布：同一录制曾发布过（本地映射记录 guide id）→ 带 guide_id 让网站覆盖更新而非新建
       let prevGuideId: string | null = null;
       try { prevGuideId = localStorage.getItem(`flowio_pub_${recordingId}`); } catch { /* ignore */ }
+
+      // 双保险：本地映射丢失（清缓存 / 换机 / 跨端先由扩展发布过）时，按 content_hash 兜底查
+      // 同主题目录已有教程，命中则覆盖更新，承接旧教程的点赞 / 评论 / 收藏，避免重复上传产生孤儿教程。
+      if (!prevGuideId) {
+        try {
+          const hash = await sha256Hex(JSON.stringify({
+            title: String(title).trim(),
+            app_name,
+            steps: steps.map((s: any) => s.title),
+          }));
+          const q = `https://flowio.cn/api/collections/guides/records?filter=${encodeURIComponent(`content_hash = "${hash}" && owner = "${siteUser?.id || ""}"`)}&fields=id,slug&perPage=1`;
+          const r = await fetch(q, { headers: { Authorization: `Bearer ${siteToken}` } });
+          if (r.ok) {
+            const d = await r.json();
+            const it = d.items?.[0];
+            if (it?.id) prevGuideId = String(it.id);
+          }
+        } catch { /* 兜底查询失败不阻塞发布 */ }
+      }
+      const isUpdateMode = !!prevGuideId;
       const uploadData: Record<string, unknown> = {
         title,
         app_name,
@@ -1338,7 +1725,11 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         guide_id: prevGuideId || undefined,
         steps,
         // ★ T7 多语言上传：已有译文副本时随教程一起上传到网站
-        translations: Object.keys(translations).length > 0 ? translations : undefined,
+        translations: (() => {
+          // __orig 是本地原文快照，不上传网站
+          const entries = Object.entries(translations).filter(([k]) => k !== ORIG_KEY);
+          return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+        })(),
       };
       if (pubCoverBase64) {
         uploadData.cover_base64 = pubCoverBase64;
@@ -1354,7 +1745,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           } catch { /* 裁剪失败 → 回退全图 */ }
         }
         if (!coverSrc && firstImg?.after_screenshot_base64) coverSrc = firstImg.after_screenshot_base64;
-        if (coverSrc) uploadData.cover_base64 = await downscaleBase64Image(coverSrc, 720, 0.85);
+        if (coverSrc) uploadData.cover_base64 = await downscaleBase64Image(toPreviewSrc(coverSrc), 720, 0.85);
       }
 
       // POST 到网站 API（上传大量截图时可能较慢，设置 90s 超时）
@@ -1412,26 +1803,69 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       } catch { /* 配额不足等忽略 */ }
       setShowPublishDialog(false);
       setPubStep("pick");
-      setToast({ type: "success", message: isDraft ? "草稿已保存！" : "发布成功！教程已上传到网站" });
+      const okMsg = isDraft
+        ? (isUpdateMode ? "草稿已更新！" : "草稿已保存！")
+        : (isUpdateMode ? "教程已更新，点赞/评论/收藏已保留" : "发布成功！教程已上传到网站");
+      setToast({ type: "success", message: okMsg });
     } catch (err) {
       const isAbort = (err as { name?: string })?.name === "AbortError";
       setToast({ type: "error", message: isAbort ? "发布超时（90秒），请检查网络后重试" : "发布失败: " + String(err) });
     } finally {
       setPublishing(false);
     }
-  }, [siteToken, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSceneSelect, translations, stepViewCropped, deletedCrop]);
+  }, [siteToken, siteUser, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSceneSelect, translations, stepViewCropped, deletedCrop]);
+
+  /* ── 另存为副本 ──────────────────────────────────────────── */
+  // 复制整篇教程为一份独立的新副本（标题加「 (副本)」后缀），
+  // 副本有全新 recording id → 发布映射/编辑历史/精简快照全部隔离，改副本不伤原教程。
+  const handleSaveAs = useCallback(async () => {
+    if (!recordingId) return;
+    try {
+      const newId = await invoke<string>("duplicate_recording", { id: recordingId });
+      setToast({ type: "success", message: "已另存为副本，正在打开副本..." });
+      navigate(`/editor/${newId}`);
+    } catch (err) {
+      setToast({ type: "error", message: "另存为失败: " + String(err) });
+    }
+  }, [recordingId, navigate]);
 
   /* ── 隐私脱敏 ────────────────────────────────────────────── */
 
   // 文本脱敏：对步骤描述中的敏感信息执行替换
   const handleRedact = useCallback(async () => {
+    // 🔴 脱敏功能总开关：关闭时提示先开启（后端同样强制拒绝，这里是友好提示）
+    try {
+      const cfg = await invoke<{ redact_before_export?: boolean }>("get_redaction_config");
+      if (!cfg.redact_before_export) {
+        setToast({ type: "error", message: "脱敏功能未开启：请到 设置 → 脱敏 打开「脱敏功能」" });
+        return;
+      }
+    } catch { /* 配置读取失败 → 交给后端守卫兜底 */ }
     setRedacting(true);
     try {
-      const changed = await invoke<number>("redact_recording_text", { recordingId });
-      setToast({ type: "success", message: changed > 0 ? "文本脱敏完成" : "未检测到敏感信息" });
+      const res = await invoke<{ changed: number; droppedTranslations: number; changedIndices?: number[] }>(
+        "redact_recording_text",
+        { recordingId },
+      );
       const list = await reloadRecording();
       await rebuildCropCache(list);
       refreshHist();
+      if (res.changed > 0) {
+        // ★ v310: 持久弹窗列出被处理的步骤（toast 几秒就没了，用户不知道改了哪些）
+        const idxs = res.changedIndices ?? [];
+        const lines = idxs.length
+          ? idxs.map((oi) => {
+              const i = list.findIndex((s) => (s as { order_index?: number }).order_index === oi);
+              return i >= 0 ? `第 ${i + 1} 步 · ${list[i]?.title ?? ""}` : `步骤 ${oi + 1}`;
+            })
+          : [`共 ${res.changed} 个步骤的文本被脱敏`];
+        if (res.droppedTranslations > 0) {
+          lines.push(`另有 ${res.droppedTranslations} 条含敏感信息的旧译文已作废（导出时回退已脱敏原文）`);
+        }
+        setRedactResult({ title: "文本脱敏完成", lines });
+      } else {
+        setToast({ type: "success", message: "未检测到敏感信息" });
+      }
     } catch (err) {
       setToast({ type: "error", message: "隐私脱敏失败: " + String(err) });
     } finally {
@@ -1451,57 +1885,79 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
   const handleScanRedact = useCallback(async () => {
     if (steps.length === 0) return;
+    // 🔴 脱敏功能总开关：关闭时提示先开启（后端同样强制拒绝，这里是友好提示）
+    try {
+      const cfg = await invoke<{ redact_before_export?: boolean }>("get_redaction_config");
+      if (!cfg.redact_before_export) {
+        showScanToast({ type: "error", message: "脱敏功能未开启：请到 设置 → 脱敏 打开「脱敏功能」" });
+        return;
+      }
+    } catch { /* 配置读取失败 → 交给后端守卫兜底 */ }
     if (scanToastTimerRef.current) clearTimeout(scanToastTimerRef.current);
     setScanRedacting(true);
     setScanProgress({ done: 0, total: 0, currentStepId: "" });
     setScanToast(null);
-    try {
-      const unlisten = await listen<{ done: number; total: number; currentStepId: string }>(
-        "scan_redact_progress",
-        (ev) => {
-          setScanProgress({ done: ev.payload.done, total: ev.payload.total, currentStepId: ev.payload.currentStepId });
-        }
-      );
-      // 兜底：后端扫描结束事件，确保按钮/进度一定复位
-      const unlistenDone = await listen(
-        "scan_redact_done",
-        () => {
-          setScanRedacting(false);
-          setScanProgress({ done: 0, total: 0, currentStepId: "" });
-        }
-      );
-      try {
-        const cfg = await invoke<{ mode?: "blur" | "block" }>("get_redaction_config");
-        const result = await invoke<{ processed: number; total: number; redactedCount: number; failedCount: number; cancelled: boolean }>(
-          "scan_redact_screenshots",
-          { recordingId, mode: cfg.mode === "block" ? "block" : "blur" }
-        );
-        if (result.cancelled) {
-          showScanToast({ type: "success", message: "扫描已取消" });
-        } else if (result.total === 0) {
-          showScanToast({ type: "success", message: "没有可扫描的截图" });
-        } else if (result.failedCount > 0 && result.redactedCount === 0) {
-          showScanToast({ type: "error", message: "扫描完成，未检测到敏感信息" });
-        } else if (result.failedCount > 0) {
-          showScanToast({ type: "success", message: "扫描脱敏完成（部分失败）" });
-        } else if (result.redactedCount === 0) {
-          showScanToast({ type: "success", message: "未检测到敏感信息" });
-        } else {
-          showScanToast({ type: "success", message: "扫描脱敏完成" });
-        }
-        const list = await reloadRecording();
-        await rebuildCropCache(list);
-      } finally {
-        unlisten();
-        unlistenDone();
+    // 进度监听（每次扫描重新注册，确保拿到完整进度）
+    const unlisten = await listen<{ done: number; total: number; currentStepId: string }>(
+      "scan_redact_progress",
+      (ev) => {
+        setScanProgress({ done: ev.payload.done, total: ev.payload.total, currentStepId: ev.payload.currentStepId });
       }
+    );
+    try {
+      const cfg = await invoke<{ mode?: "blur" | "block" }>("get_redaction_config");
+      const mode = cfg.mode === "block" ? "block" : "blur";
+      // 后台执行：只发起，不阻塞。完成后由 scan_redact_done 事件收尾（刷新 + 弹窗）。
+      await invoke("scan_redact_screenshots", { recordingId, mode });
     } catch (err) {
-      showScanToast({ type: "error", message: "扫描截图失败: " + String(err) });
-    } finally {
       setScanRedacting(false);
       setScanProgress({ done: 0, total: 0, currentStepId: "" });
+      showScanToast({ type: "error", message: "扫描截图失败: " + String(err) });
+    } finally {
+      unlisten();
     }
-  }, [recordingId, reloadRecording, rebuildCropCache, steps.length, showScanToast]);
+  }, [recordingId, steps.length, showScanToast]);
+
+  /* ── scan_redact_done（扫描脱敏完成 → 刷新+弹窗；后台执行，离开教程也照常收尾）── */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen<{ total: number; processed: number; redactedCount: number; failedCount: number; cancelled: boolean; redactedSteps?: number[] }>(
+      "scan_redact_done",
+      async (ev) => {
+        const r = ev.payload;
+        setScanRedacting(false);
+        setScanProgress({ done: 0, total: 0, currentStepId: "" });
+        const list2 = await reloadRecording().catch(() => null);
+        if (list2) await rebuildCropCache(list2).catch(() => {});
+        if (r.cancelled) {
+          showScanToast({ type: "success", message: "扫描已取消" });
+        } else if (r.total === 0) {
+          showScanToast({ type: "success", message: "没有可扫描的截图" });
+        } else if (r.failedCount > 0 && r.redactedCount === 0) {
+          showScanToast({ type: "error", message: "扫描完成，未检测到敏感信息" });
+        } else if (r.redactedCount > 0) {
+          // ★ v310: 持久弹窗列出被遮盖的步骤（不点 × 不消失）
+          const idxs = r.redactedSteps ?? [];
+          const lines = idxs.length
+            ? idxs.map((oi) => {
+                const i = list2?.findIndex((s) => (s as { order_index?: number }).order_index === oi) ?? -1;
+                return i >= 0 ? `第 ${i + 1} 步 · ${list2?.[i]?.title ?? ""}` : `步骤 ${oi + 1}`;
+              })
+            : [`共 ${r.redactedCount} 张截图中的敏感区域被遮盖`];
+          setRedactResult({ title: "截图扫描脱敏完成", lines });
+          if (r.failedCount > 0) {
+            showScanToast({ type: "error", message: `部分截图识别失败（${r.failedCount} 张已跳过）` });
+          }
+        } else if (r.failedCount > 0) {
+          showScanToast({ type: "success", message: "扫描脱敏完成（部分失败）" });
+        } else {
+          showScanToast({ type: "success", message: "未检测到敏感信息" });
+        }
+      }
+    ).then((fn) => { if (cancelled) fn(); else unlisten = fn; });
+    return () => { cancelled = true; unlisten?.(); };
+  }, [recordingId, reloadRecording, rebuildCropCache, showScanToast]);
 
   const handleCancelScanRedact = useCallback(async () => {
     try {
@@ -1575,34 +2031,67 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       setToast({ type: "error", message: "该步骤没有可标注的截图" });
       return;
     }
+    // 记录当前视图：从「裁图」视图打开 → 此后裁切顶替裁图；从「全图」打开 → 顶替全图
+    setAnnotateMode(getViewCropped(stepId) ? 'crop' : 'full');
     setAnnotateStepId(stepId);
     setAnnotateOpen(true);
   };
 
-  /** 标注完成：把烧录后的 PNG base64 通过 crop_step_screenshot 落盘并更新前端状态 */
-  const handleAnnotateSave = async (_annos: Annotation[], baked?: string) => {
-    if (!baked) {
-      setAnnotateOpen(false);
-      return;
-    }
-    const base64 = baked.split(",")[1] || "";
-    if (!base64) {
+  /**
+   * 标注完成——按打开标注时的视图（annotateMode）决定裁切结果落到哪个槽位：
+   * - 全图视图裁剪（hasCrop && mode==='full'）：
+   *     把「注释+裁切」的结果直接覆盖全图（screenshot_path），并清空裁图锚点。
+   *     原全图不保留（应用内可撤销）。
+   * - 裁图视图重裁（hasCrop && mode==='crop'）：
+   *     注释烧回全图（save_step_screenshot_full，原全图不动）+ 更新裁图锚点（顶替之前的裁图）。
+   * - 仅标注无裁切：注释烧回全图。
+   */
+  const handleAnnotateSave = async (
+    _annos: Annotation[],
+    result?: { full?: string; anchor?: CropAnchor | null; cropped?: string | undefined },
+  ) => {
+    const full = result?.full;
+    const anchor = result?.anchor ?? null;
+    const cropped = result?.cropped;
+    const hasCrop = !!anchor && !!cropped;
+    if (!full && !anchor && !cropped) {
       setAnnotateOpen(false);
       return;
     }
     const stepId = annotateStepId;
     try {
-      await invoke("crop_step_screenshot", {
-        stepId,
-        croppedBase64: base64,
-        isAfter: true,
-      });
-      setSteps((prev) =>
-        prev.map((s) => {
-          if (s.id !== stepId) return s;
-          return { ...s, screenshot_base64: base64 };
-        })
-      );
+      if (hasCrop && annotateMode === 'full') {
+        // 全图视图裁剪 → 裁切结果顶替全图，并清空裁图锚点
+        const base64 = cropped!.split(",")[1] || "";
+        if (base64) {
+          await invoke("save_step_screenshot_full", { stepId, base64Data: base64 });
+        }
+        await invoke("update_step_crop", { stepId, x: null, y: null, cropW: null, cropH: null });
+      } else if (hasCrop && annotateMode === 'crop') {
+        // 裁图视图重裁 → 注释烧回全图（原全图不动）+ 更新裁图锚点（顶替之前的裁图）
+        if (full) {
+          const base64 = full.split(",")[1] || "";
+          if (base64) {
+            await invoke("save_step_screenshot_full", { stepId, base64Data: base64 });
+          }
+        }
+        await invoke("update_step_crop", {
+          stepId,
+          x: anchor!.x,
+          y: anchor!.y,
+          cropW: anchor!.cropW,
+          cropH: anchor!.cropH,
+        });
+      } else if (full) {
+        // 仅标注（无裁切）→ 注释烧回全图
+        const base64 = full.split(",")[1] || "";
+        if (base64) {
+          await invoke("save_step_screenshot_full", { stepId, base64Data: base64 });
+        }
+      }
+      // 重新从库加载步骤 + 重建裁图缓存（screenshot_base64 与锚点可能都变了）
+      const list = await reloadRecording();
+      await rebuildCropCache(list);
       setToast({ type: "success", message: "标注已保存" });
       refreshHist();
     } catch (err) {
@@ -1637,11 +2126,11 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
   /* ── Portal toolbar into titlebar ─────────────────────── */
 
   const titlebarLeft = (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, height: "100%" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 8, height: "100%", overflow: "hidden" }}>
       <button
         onClick={() => navigate("/")}
         data-tip={"返回录制列表\n改动已自动保存"}
-        style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+        style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px 4px 2px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
       >
         <ArrowLeft size={14} /> 返回
       </button>
@@ -1666,29 +2155,36 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       </div>
       {recTitleEditing ? (
         <input
+          ref={recTitleInputRef}
           autoFocus
+          maxLength={30}
           value={recTitleDraft}
           onChange={(e) => setRecTitleDraft(e.target.value)}
           onBlur={async () => {
             const trimmed = recTitleDraft.trim();
-            if (trimmed && trimmed !== recording?.title) {
+            if (!trimmed) { setRecTitleEditing(false); return; }
+            if (trimmed === recording?.title) { setRecTitleEditing(false); return; }
+            try {
               await invoke("update_recording_title", { id: recordingId, title: trimmed });
               setRecording((prev) => prev ? { ...prev, title: trimmed } : prev);
               refreshHist();
+              setRecTitleEditing(false);
+            } catch (err) {
+              setToast({ type: "error", message: String(err) });
+              setTimeout(() => recTitleInputRef.current?.focus(), 0);
             }
-            setRecTitleEditing(false);
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter") (e.target as HTMLInputElement).blur();
             if (e.key === "Escape") { setRecTitleDraft(recording?.title || ""); setRecTitleEditing(false); }
           }}
-          style={{ color: "#111827", fontSize: 14, fontWeight: 600, padding: "2px 6px", border: "1px solid #ff6b35", borderRadius: 4, outline: "none", width: 200, background: "#fff" }}
+          style={{ color: "#111827", fontSize: 14, fontWeight: 600, padding: "2px 6px", border: "1px solid #ff6b35", borderRadius: 4, outline: "none", width: 200, background: "#fff", marginLeft: "auto" }}
         />
       ) : (
         <span
           data-tauri-drag-region
           onClick={() => { setRecTitleDraft(recording?.title || ""); setRecTitleEditing(true); }}
-          style={{ color: "#e6edf3", fontSize: 14, fontWeight: 600, userSelect: "none", cursor: "pointer", padding: "2px 6px", borderRadius: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 420 }}
+          style={{ color: "#e6edf3", fontSize: 14, fontWeight: 600, userSelect: "none", cursor: "pointer", padding: "2px 6px", borderRadius: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, flexShrink: 1, marginLeft: "auto" }}
           data-tip={recording?.title || "Untitled"}
           title={recording?.title || ""}
         >
@@ -1700,44 +2196,27 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
   const titlebarActions = (
     <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      {!previewMode && (
+        <button
+          onClick={() => void handleSaveAs()}
+          data-tip="另存为副本：复制一份完全相同的教程（含截图），改副本不会破坏原教程"
+          style={{ background: "transparent", border: "1px solid #8b5cf6", color: "#a78bfa", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+        >
+          <Copy size={14} /> 另存为
+        </button>
+      )}
       <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
         <button
-          onClick={() => setExportOpen(!exportOpen)}
+          onClick={() => { setExportOpen(!exportOpen); setToolsOpen(false); setTranslateOpen(false); setSimplifyOpen(false); }}
           disabled={exporting}
-          data-tip={"导出教程\n导出为 Word / PDF / HTML；如果有译文，可以先在上面选语言"}
+          data-tip={"导出教程\n导出为 Word / PDF / HTML / Markdown 等；要用译文导出，先在「翻译」里选好导出语言"}
           style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
         >
           <Download size={14} /> {exportProgress ? exportProgress : exporting ? "导出中..." : "导出"} <ChevronDown size={12} />
         </button>
         {exportOpen && (
           <div className="export-dropdown" style={{ right: 0 }}>
-            {/* 导出语言（PRD T9）：原文 + 已生成译文的语言 */}
-            {Object.keys(translations).length > 0 && (
-              <div style={{ padding: "6px 10px", borderBottom: "1px solid #30363d" }}>
-                <div style={{ fontSize: 11, color: "#8b949e", marginBottom: 4 }}>导出语言</div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                  <button
-                    className={`export-dropdown-item${exportLang === null ? " active" : ""}`}
-                    onClick={() => setExportLang(null)}
-                    style={{ padding: "3px 8px", fontSize: 12 }}
-                    data-tip="用录制时的原始语言导出"
-                  >
-                    原文
-                  </button>
-                  {Object.keys(translations).map((lang) => (
-                    <button
-                      key={lang}
-                      className={`export-dropdown-item${exportLang === lang ? " active" : ""}`}
-                      onClick={() => setExportLang(lang)}
-                      style={{ padding: "3px 8px", fontSize: 12 }}
-                      data-tip={`用${LANG_LABELS[lang] || lang}译文导出`}
-                    >
-                      {LANG_LABELS[lang] || lang}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            {/* 导出语言已迁到「翻译」下拉，这里只保留格式 */}
             {EXPORT_FORMATS.map((fmt) => {
               const Icon = fmt.icon;
               return (
@@ -1758,8 +2237,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       {!previewMode && (
         <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
           <button
-            onClick={() => setToolsOpen(!toolsOpen)}
-            data-tip={"更多工具\n上传网站、AI 生成步骤说明、敏感信息脱敏、整篇翻译"}
+            onClick={() => { setToolsOpen(!toolsOpen); setExportOpen(false); setTranslateOpen(false); setSimplifyOpen(false); }}
+            data-tip={"更多工具\n上传网站、AI 生成步骤说明、敏感信息脱敏"}
             style={{ background: "transparent", border: "1px solid #ff6b35", color: "#ff8a5c", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
           >
             <Wrench size={14} /> 工具 <ChevronDown size={12} />
@@ -1817,6 +2296,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 <Upload size={14} className="export-dropdown-item-icon" />
                 <span className="export-dropdown-item-label">{siteToken ? "上传网站" : "登录后上传"}</span>
               </button>
+              {/* 另存为已移至顶栏按钮，此处不重复 */}
               <button
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleAiGenerate(); }}
@@ -1849,28 +2329,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               </button>
               <button
                 className="export-dropdown-item"
-                onClick={() => { setToolsOpen(false); setTranslateModalOpen(true); }}
-                disabled={translating}
-                data-tip={"翻译教程\n把标题和每一步描述翻译成别的语言；译文存成副本，原文一直保留"}
-              >
-                {translating ? <Loader2 size={14} className="spinner" /> : <Languages size={14} className="export-dropdown-item-icon" />}
-                <span className="export-dropdown-item-label">{translating ? "翻译中..." : "翻译教程"}</span>
-              </button>
-              {/* ★ T8 译文可编辑：编辑已有译文副本 */}
-              <button
-                className="export-dropdown-item"
-                onClick={() => { setToolsOpen(false); openEditTrans(transLangs[0] || "en"); }}
-                disabled={transLangs.length === 0 || steps.length === 0}
-                style={{ opacity: transLangs.length === 0 ? 0.5 : 1 }}
-                data-tip={transLangs.length === 0
-                  ? "还没有译文，请先点「翻译教程」"
-                  : "编辑已有译文\n逐句修改翻译结果，不影响原文"}
-              >
-                <PencilLine size={14} className="export-dropdown-item-icon" />
-                <span className="export-dropdown-item-label">编辑译文</span>
-              </button>
-              <button
-                className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleScanRedact(); }}
                 disabled={scanRedacting || steps.length === 0}
                 data-tip={"扫描截图脱敏\n用 OCR 找出截图画面里的敏感信息并打码，比「文本脱敏」更彻底，也更慢"}
@@ -1879,10 +2337,79 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 {scanRedacting ? <Loader2 size={14} className="spinner" /> : <ScanSearch size={14} className="export-dropdown-item-icon" />}
                 <span className="export-dropdown-item-label">{scanRedacting ? "扫描中..." : "扫描脱敏"}</span>
               </button>
+              {/* ★ v310: 脱敏设置入口（与插件端对齐）——跳设置页脱敏 tab */}
+              <button
+                className="export-dropdown-item"
+                onClick={() => { setToolsOpen(false); navigate("/settings#redaction"); }}
+                data-tip={"脱敏设置\n选择检测哪些类别的敏感信息（身份证/手机号/邮箱…），以及自定义正则规则"}
+              >
+                <SettingsIcon size={14} className="export-dropdown-item-icon" />
+                <span className="export-dropdown-item-label">脱敏设置…</span>
+              </button>
             </div>
           )}
         </div>
       )}
+
+      {/* 翻译：选择语言直接翻译，完成后同步到编辑器步骤 */}
+      {!previewMode && (
+        <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+          <button
+            onClick={() => { setTranslateOpen(!translateOpen); setExportOpen(false); setToolsOpen(false); setSimplifyOpen(false); }}
+            disabled={translating}
+            data-tip={previewMode
+              ? "切换预览语言\n在这个下拉里选「原文」或某种译文，预览会立刻跟着换"
+              : "翻译\n点语言把标题和每步描述翻译过去；已翻译过的语言点一下立即切换，不用重新翻译\n选「原文」随时切回翻译前的文字\n译文存成副本，也决定导出语言"}
+            style={{ background: "transparent", border: "1px solid #3366CC", color: "#7aa2f7", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4, opacity: translating ? 0.6 : 1 }}
+          >
+            {translating ? <Loader2 size={14} className="spinner" /> : <Languages size={14} />} 翻译 <ChevronDown size={12} />
+          </button>
+          {translateOpen && (
+            <div className="export-dropdown" style={{ right: 0, zIndex: 9999 }}>
+              <div className="export-dropdown-section">
+                {/* 原文：恢复翻译前的快照（首次翻译时由后端自动保存） */}
+                <button
+                  className={`export-dropdown-item${appliedLang === "orig" ? " active" : ""}`}
+                  onClick={() => { void handleLangClick(ORIG_KEY); }}
+                  data-tip={translations[ORIG_KEY]
+                    ? "立即切回翻译前的原文（不重新翻译）"
+                    : "该教程还没有原文快照\n下次翻译时会自动保存一份"}
+                >
+                  <span className="export-dropdown-item-icon">📄</span>
+                  <span className="export-dropdown-item-label">原文</span>
+                </button>
+                {/* 原生即中文，zh 不作为可翻译目标出现在列表（存量 zh 译文仍可经后端切换） */}
+                {Object.entries(LANG_LABELS).filter(([code]) => code !== "zh").map(([code, label]) => (
+                  <button
+                    key={code}
+                    className={`export-dropdown-item${appliedLang === code ? " active" : ""}`}
+                    onClick={() => { void handleLangClick(code); }}
+                    data-tip={translations[code]
+                      ? `立即切换到${label}译文（已有缓存，不用重新翻译）`
+                      : `翻译成${label}（将替换编辑器中的文字，原文自动快照）`}
+                  >
+                    <span className="export-dropdown-item-icon">{translations[code] ? "✅" : "🌐"}</span>
+                    <span className="export-dropdown-item-label">{label}</span>
+                  </button>
+                ))}
+              </div>
+              {appliedLang && appliedLang !== "orig" && translations[appliedLang] && (
+                <div className="export-dropdown-section">
+                  <button
+                    className="export-dropdown-item"
+                    onClick={() => { setTranslateOpen(false); void handleTranslate(appliedLang); }}
+                    data-tip={`丢弃${LANG_LABELS[appliedLang] || appliedLang}缓存译文，按当前步骤文字重新翻译（较慢）`}
+                  >
+                    <span className="export-dropdown-item-icon">↻</span>
+                    <span className="export-dropdown-item-label">重新翻译</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       <button
         onClick={() => setPreviewMode(!previewMode)}
         data-tip={previewMode ? "退出预览，回到编辑" : "预览成品效果\n按读者看到的样子通篇预览（导出/上传前先看一眼）"}
@@ -1892,16 +2419,14 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       </button>
 
       {/* 全图 / 裁图 统一切换：作用于全部步骤（选择教程主要截图风格） */}
-      <div className="titlebar-view-segmented" data-tip="选择教程主要截图风格（作用于所有步骤）">
+      <div className="titlebar-view-segmented">
         <button
           className={`titlebar-view-segmented-btn${globalView === 'full' ? ' active' : ''}`}
           onClick={() => applyGlobalView('full')}
-          data-tip={"全部步骤都用完整截图\n画面完整，适合读者需要先看清整个界面的教程"}
         >全图</button>
         <button
           className={`titlebar-view-segmented-btn${globalView === 'crop' ? ' active' : ''}`}
           onClick={() => applyGlobalView('crop')}
-          data-tip={"全部步骤只截取操作区域\n重点突出、体积小，适合步骤密集的教程"}
         >裁图</button>
       </div>
     </div>
@@ -1909,15 +2434,8 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
   /* ── Render ──────────────────────────────────────────────── */
 
-  /* 预览模式取文案（PRD T6/T8）：exportLang 有译文时用译文，缺步骤回退原文 */
+  /* 预览模式取文案：翻译已直接同步到步骤，预览直接用步骤当前文本 */
   const previewStepText = (step: Step): { title: string; description: string } => {
-    if (exportLang && translations[exportLang]) {
-      const t = translations[exportLang].steps[String(step.order_index)];
-      return {
-        title: t?.title || step.title,
-        description: t?.description || step.description || "",
-      };
-    }
     return { title: step.title, description: step.description || "" };
   };
 
@@ -2004,133 +2522,44 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       )}
 
       {/* 翻译确认弹窗（PRD T3）：选语言 + 提示译文副本不覆盖原文 */}
-      {translateModalOpen && (
+      {/* ★ v310: 脱敏结果弹窗——带 ×，不点不消失（toast 太快，用户不知道哪些步骤被处理了） */}
+      {redactResult && (
         <div
-          style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
-          onMouseDown={() => setTranslateModalOpen(false)}
+          style={{ position: "fixed", inset: 0, zIndex: 10001, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
         >
           <div
-            style={{ background: "#fff", borderRadius: 10, padding: "20px 22px", width: 340, boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
+            style={{ position: "relative", background: "#fff", borderRadius: 10, padding: "20px 22px", width: 420, boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
             onMouseDown={(e) => e.stopPropagation()}
           >
+            <button
+              onClick={() => setRedactResult(null)}
+              data-tip="关闭"
+              aria-label="关闭"
+              style={{ position: "absolute", top: 10, right: 10, width: 26, height: 26, border: "none", borderRadius: 6, background: "transparent", color: "#57606a", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+            >✕</button>
             <div style={{ fontSize: 15, fontWeight: 600, color: "#24292e", display: "flex", alignItems: "center", gap: 6 }}>
-              <Languages size={16} /> 翻译教程
+              <ShieldCheck size={16} /> {redactResult.title}
             </div>
-            <div style={{ fontSize: 12.5, color: "#57606a", marginTop: 8, lineHeight: 1.6 }}>
-              将翻译教程标题和各步骤的文字描述（共 {steps.length} 个步骤）。截图与标注不会被修改，译文以副本保存，原文始终保留。
+            <div style={{ fontSize: 12.5, color: "#57606a", marginTop: 8 }}>
+              以下步骤已被脱敏处理（改错了可点 ↶ 撤销）：
             </div>
-            <label style={{ display: "block", margin: "14px 0 4px", fontSize: 13, color: "#57606a" }}>目标语言</label>
-            <select
-              value={translateLang}
-              onChange={(e) => setTranslateLang(e.target.value)}
-              style={{ width: "100%", boxSizing: "border-box", padding: "7px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13 }}
-            >
-              {Object.entries(LANG_LABELS).map(([code, label]) => (
-                <option key={code} value={code}>
-                  {label}{translations[code] ? "（已有译文，将覆盖）" : ""}
-                </option>
+            <ul style={{ margin: "8px 0 4px", padding: "8px 12px", maxHeight: 220, overflowY: "auto", listStyle: "none", background: "#f6f8fa", border: "1px solid #e5e7eb", borderRadius: 8, fontSize: 13, lineHeight: 1.9, color: "#24292e" }}>
+              {redactResult.lines.map((l, i) => (
+                <li key={i} style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{l}</li>
               ))}
-            </select>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+            </ul>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
               <button
-                onClick={() => setTranslateModalOpen(false)}
-                data-tip="不翻译，关闭"
-                style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", cursor: "pointer", fontSize: 13 }}
-              >
-                取消
-              </button>
-              <button
-                onClick={() => handleTranslate(translateLang)}
-                data-tip="开始翻译，会调用 AI，需要几十秒"
-                style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: "pointer", fontSize: 13 }}
-              >
-                开始翻译
-              </button>
+                onClick={() => setRedactResult(null)}
+                style={{ padding: "6px 16px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: "pointer", fontSize: 13 }}
+              >知道了</button>
             </div>
           </div>
         </div>
       )}
+
 
       {/* ★ T8 译文可编辑弹窗 */}
-      {editTransOpen && (
-        <div
-          style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
-          onMouseDown={() => setEditTransOpen(false)}
-        >
-          <div
-            style={{ background: "#fff", borderRadius: 10, padding: "20px 22px", width: 560, maxHeight: "80vh", overflowY: "auto", boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <div style={{ fontSize: 15, fontWeight: 600, color: "#24292e", display: "flex", alignItems: "center", gap: 6 }}>
-              <PencilLine size={16} /> 编辑译文（{LANG_LABELS[editTransLang] || editTransLang}）
-            </div>
-            <div style={{ fontSize: 12.5, color: "#57606a", marginTop: 8, lineHeight: 1.6 }}>
-              直接修改译文文本，保存后覆盖该语言副本。截图与原文不受影响。
-            </div>
-            <label style={{ display: "block", margin: "14px 0 4px", fontSize: 13, color: "#57606a" }}>语言</label>
-            <select
-              value={editTransLang}
-              onChange={(e) => openEditTrans(e.target.value)}
-              style={{ width: "100%", boxSizing: "border-box", padding: "7px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13 }}
-            >
-              {transLangs.map((code) => (
-                <option key={code} value={code}>
-                  {LANG_LABELS[code] || code}
-                </option>
-              ))}
-            </select>
-
-            <label style={{ display: "block", margin: "14px 0 4px", fontSize: 13, color: "#57606a" }}>教程标题</label>
-            <input
-              value={editDraftTitle}
-              onChange={(e) => setEditDraftTitle(e.target.value)}
-              style={{ width: "100%", boxSizing: "border-box", padding: "7px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13 }}
-            />
-
-            {editDraftSteps.map((s, idx) => (
-              <div key={idx} style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid #eaeef2" }}>
-                <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 4 }}>步骤 {idx + 1}</div>
-                <input
-                  value={s.title}
-                  onChange={(e) =>
-                    setEditDraftSteps((prev) => prev.map((p, i) => (i === idx ? { ...p, title: e.target.value } : p)))
-                  }
-                  placeholder="步骤标题"
-                  style={{ width: "100%", boxSizing: "border-box", padding: "6px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13, marginBottom: 6 }}
-                />
-                <textarea
-                  value={s.description}
-                  onChange={(e) =>
-                    setEditDraftSteps((prev) => prev.map((p, i) => (i === idx ? { ...p, description: e.target.value } : p)))
-                  }
-                  placeholder="步骤描述"
-                  rows={2}
-                  style={{ width: "100%", boxSizing: "border-box", padding: "6px 9px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", fontSize: 13, resize: "vertical" }}
-                />
-              </div>
-            ))}
-
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
-              <button
-                onClick={() => setEditTransOpen(false)}
-                data-tip="放弃这次修改并关闭"
-                style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", cursor: "pointer", fontSize: 13 }}
-              >
-                取消
-              </button>
-              <button
-                onClick={() => void handleSaveTranslation()}
-                disabled={savingTranslation}
-                data-tip="保存译文修改（原文不受影响）"
-                style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: savingTranslation ? "default" : "pointer", fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}
-              >
-                {savingTranslation && <Loader2 size={13} className="spinner" />}
-                {savingTranslation ? "保存中..." : "保存译文"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Left: Step List */}
       <div className="editor-sidebar">
@@ -2147,11 +2576,11 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               <button
                 className="step-simplify-btn primary"
                 data-tip={"把啰嗦的步骤合并掉\n录完会自动跑一遍；这里也可以手动重跑或换用 AI"}
-                disabled={simplifying !== null}
-                onClick={() => setSimplifyOpen(!simplifyOpen)}
+                disabled={simplifying !== null || aiBusy}
+                onClick={() => { setSimplifyOpen(!simplifyOpen); setExportOpen(false); setToolsOpen(false); setTranslateOpen(false); }}
               >
-                {simplifying ? <Loader2 size={12} className="spinner" /> : <Sparkles size={12} />}
-                {simplifying === "ai" ? "AI 精简中…"
+                {aiBusy ? <Loader2 size={12} className="spinner" /> : <Sparkles size={12} />}
+                {aiBusy ? "AI 精简中…"
                   : simplifying === "rules" ? "规则合并中…"
                   : "精简"}
                 <ChevronDown size={11} style={{ opacity: 0.8 }} />
@@ -2161,10 +2590,10 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                   <button
                     className="export-dropdown-item"
                     onClick={() => { setSimplifyOpen(false); void handleAiSimplify(); }}
-                    disabled={simplifying !== null}
+                    disabled={simplifying !== null || aiBusy}
                     data-tip={"AI 精简（推荐）\n先跑本地规则，再让 AI 按语义把重复步骤压成一步\n能处理规则看不懂的情况（比如弹框里坐标各异的一串点击），需要几秒到十几秒"}
                   >
-                    {simplifying === "ai" ? <Loader2 size={14} className="spinner" /> : <Sparkles size={14} className="export-dropdown-item-icon" />}
+                    {aiBusy ? <Loader2 size={14} className="spinner" /> : <Sparkles size={14} className="export-dropdown-item-icon" />}
                     <span className="export-dropdown-item-label">AI 精简（推荐）</span>
                   </button>
                   <button
@@ -2198,12 +2627,13 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 id={`step-item-${step.id}`}
                 className={`step-item group relative${selectedStepId === step.id ? " active" : ""}${previewMode ? " preview-active" : ""}`}
                 onClick={() => {
+                  // ★ 预览模式也要更新选中态：否则橙色高亮停在原步骤（如 23），
+                  //   点击 18 只有预览滚动、高亮纹丝不动（用户报：高亮不跟随）。
+                  setSelectedStepId(step.id);
+                  setLightboxMarked(false);
                   if (previewMode) {
                     const el = document.getElementById(`sop-step-${step.id}`);
                     if (el) el.scrollIntoView({ behavior: "smooth" });
-                  } else {
-                    setSelectedStepId(step.id);
-                    setLightboxMarked(false);
                   }
                 }}
               >
@@ -2250,7 +2680,11 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 <span className="step-item-number">{index + 1}</span>
                 <div className="step-item-body">
                   <div className="step-item-title">
-                    {step.title || "(无标题)"}
+                    {/* 预览模式跟随所选语言显示译文标题（缺步骤回退原文），与右侧预览一致；查找时命中片段高亮 */}
+                    {(() => {
+                      const t = previewMode ? (previewStepText(step).title || "(无标题)") : (step.title || "(无标题)");
+                      return findOpen ? renderFindHighlight(t, committedQuery.trim()) : t;
+                    })()}
                   </div>
                   <div className="step-item-type">{step.action_type}</div>
                 </div>
@@ -2337,6 +2771,12 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               {(() => {
                 const _src = getStepMainSrc(selectedStep) || "";
                 const _noImage = !_src || (selectedStep?.action_type === 'COPY') || (selectedStep?.action_type === 'HOTKEY');
+                /* 渲染期同步：显示的图变了就立即重置容器几何（重置为 null → 回落 CSS
+                   默认比例，新图 onLoad/effect 兜底马上写入新比例）。没有这一步，
+                   上一张图的 inline 比例会残留，contain 在新图周围留下灰色占位区。 */
+                if (detailImgBox.src !== _src) {
+                  setDetailImgBox({ src: _src, box: detailBoxMemo.current.get(_src) ?? null });
+                }
                 if (_noImage) {
                   return (
                     <div className="step-detail-image step-detail-image--empty" style={{ backgroundColor: '#f5f6f7' }}>
@@ -2359,18 +2799,27 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
 
                 // ── 有截图：图片 + 切换 + 标注 + 删除 ──
                 return (
-                  <div className="step-detail-image">
+                  <div
+                    className="step-detail-image"
+                    style={
+                      detailImgBox.box
+                        ? ({
+                            "--step-img-aspect": `${detailImgBox.box.aspect}`,
+                            maxWidth: `${detailImgBox.box.maxWidth}px`,
+                            minHeight: `${detailImgBox.box.minHeight}px`,
+                          } as React.CSSProperties)
+                        : undefined
+                    }
+                  >
                     {/* 全图 / 裁图 切换（仅当前步骤，悬浮截图时显示在右下角） */}
-                    <div className="step-detail-view-segmented" data-tip="切换当前步骤的截图：全图 / 裁图（只影响这一步）">
+                    <div className="step-detail-view-segmented">
                       <button
                         className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep?.id ?? '') ? ' active' : ''}`}
                         onClick={() => setViewCropped(selectedStep?.id ?? '', false)}
-                        data-tip="这一步用完整截图"
                       >全图</button>
                       <button
                         className={`step-detail-view-segmented-btn${getViewCropped(selectedStep?.id ?? '') ? ' active' : ''}`}
                         onClick={() => setViewCropped(selectedStep?.id ?? '', true)}
-                        data-tip="这一步只截取操作区域（只影响当前步骤）"
                       >裁图</button>
                     </div>
                     <img
@@ -2379,14 +2828,10 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                       alt={`步骤 ${selectedIndex + 1} 截图`}
                       onClick={() => openLightbox(selectedIndex)}
                       onLoad={(e) => {
-                        const img = e.currentTarget;
-                        const parent = img.parentElement;
-                        const box = previewBox(img.naturalWidth, img.naturalHeight);
-                        if (parent && box) {
-                          parent.style.setProperty("--step-img-aspect", `${box.aspect}`);
-                          parent.style.maxWidth = `${box.maxWidth}px`;
-                          parent.style.minHeight = `${box.minHeight}px`;
-                        }
+                        const box = previewBox(e.currentTarget.naturalWidth, e.currentTarget.naturalHeight);
+                        if (!box) return;
+                        detailBoxMemo.current.set(_src, box);
+                        setDetailImgBox((prev) => ({ ...prev, box }));
                       }}
                       style={{ cursor: "pointer" }}
                     />
@@ -2396,7 +2841,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                         e.stopPropagation();
                         openAnnotate(selectedStep.id);
                       }}
-                      data-tip={"标注这张截图\n裁剪、加文字、高亮、箭头、模糊；标完覆盖当前步骤的图"}
                     >
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
                         <path d="M8 2v12M2 8h12" />
@@ -2427,7 +2871,6 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                           }
                         }
                       }}
-                      data-tip={"删除当前这张图\n只在「裁图」模式下是删裁图，全图模式下删整张截图"}
                     >
                       ✕
                     </button>
@@ -2443,6 +2886,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 <label>标题</label>
                 <input
                   type="text"
+                  ref={titleInputRef}
                   value={editTitle}
                   onChange={(e) => setEditTitle(e.target.value)}
                 />
@@ -2452,6 +2896,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
               <div className="form-group">
                 <label>描述</label>
                 <textarea
+                  ref={descInputRef}
                   value={editDescription}
                   onChange={(e) => setEditDescription(e.target.value)}
                   rows={4}
@@ -2516,10 +2961,17 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
         // 标注固定使用 after 全图（screenshot_base64）
         const base64 = targetStep.screenshot_base64;
         if (!base64) return null;
+        // 若当前处于裁图视图，把现有裁图框作为初始选区传入，方便在现有裁图上继续微调
+        const hasAnchor = (targetStep.crop_w ?? 0) > 0 && (targetStep.crop_h ?? 0) > 0;
+        const initialCropRect = hasAnchor
+          ? { x: targetStep.x ?? 0, y: targetStep.y ?? 0, width: targetStep.crop_w ?? 0, height: targetStep.crop_h ?? 0 }
+          : null;
         return (
           <AnnotationsOverlay
             imageUrl={`data:image/jpeg;base64,${base64}`}
             annotations={[]}
+            actionType={targetStep.action_type}
+            initialCropRect={initialCropRect}
             onSave={handleAnnotateSave}
             onClose={() => setAnnotateOpen(false)}
           />
@@ -2529,7 +2981,7 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
       {/* Custom Save Dialog */}
       {showSaveDialog && (() => {
         const fmt = showSaveDialog;
-        const formatExt: Record<string, string> = { html: "html", markdown: "md", pdf: "pdf" };
+        const formatExt: Record<string, string> = { html: "html", markdown: "md", txt: "txt", pdf: "pdf", long: "png" };
         const defaultName = (recording?.title || "recording")
           .replace(/[\\/:*?"<>|]/g, "_")
           .substring(0, 120) + "." + (formatExt[fmt] || fmt);
@@ -2568,6 +3020,111 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
           }}
         >
           <span>{toast.message}</span>
+        </div>,
+        document.body
+      )}
+
+      {/* 语音转写生成中提示条：录制跳编辑界面时若语音尚未生成则常驻顶部，生成好自动收起 */}
+      {voiceBanner && createPortal(
+        <div
+          style={{
+            position: "fixed",
+            top: 52,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 10000,
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            padding: "8px 14px",
+            borderRadius: "8px",
+            fontSize: "13px",
+            fontWeight: 500,
+            boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
+            background: "#eef4ff",
+            color: "#1d4ed8",
+            border: "1px solid #bfdbfe",
+          }}
+        >
+          <Loader2 size={15} className="spinner" />
+          <span>语音转写生成中…步骤描述将自动补全，请稍候</span>
+          <button
+            onClick={() => setVoiceBanner(false)}
+            style={{ background: "transparent", border: "none", cursor: "pointer", color: "#1d4ed8", fontSize: 14, lineHeight: 1, padding: 0, marginLeft: 2 }}
+          >×</button>
+        </div>,
+        document.body
+      )}
+
+      {/* 查找 / 替换浮条（Ctrl+F / Ctrl+H，无按钮纯快捷键入口） */}
+      {findOpen && createPortal(
+        <div
+          style={{
+            position: "fixed", top: 52, right: 16, zIndex: 10000,
+            display: "flex", flexDirection: "column", gap: 8,
+            padding: "10px 12px", borderRadius: 10, width: 360,
+            background: "#fff", border: "1px solid #e2e6ea",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.14)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input
+              ref={findInputRef}
+              value={findText}
+              onChange={(e) => { setFindText(e.target.value); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  findInputRef.current?.focus(); // 确保焦点始终在查找框（防外部抢走后 Enter 失灵）
+                  const q = findText.trim();
+                  if (q !== committedQuery.trim()) {
+                    // 查询词有改动 → 先按回车提交搜索
+                    setCommittedQuery(findText);
+                    setMatchIdx(0);
+                    return;
+                  }
+                  if (findMatches.length) {
+                    setMatchIdx((i) => (e.shiftKey ? (i - 1 + findMatches.length) % findMatches.length : (i + 1) % findMatches.length));
+                  }
+                } else if (e.key === "Escape") {
+                  e.preventDefault(); setFindOpen(false);
+                }
+              }}
+              placeholder="查找步骤标题 / 描述…"
+              autoFocus
+              style={{ flex: 1, minWidth: 0, height: 30, padding: "0 10px", fontSize: 13, border: "1px solid #d0d5dd", borderRadius: 7, outline: "none" }}
+            />
+            <span style={{ fontSize: 12, color: findMatches.length ? "#57606a" : "#c0492c", minWidth: 44, textAlign: "center", flexShrink: 0 }}>
+              {committedQuery.trim() ? (findMatches.length ? `${Math.min(matchIdx + 1, findMatches.length)}/${findMatches.length}` : "无结果") : "回车搜索"}
+            </span>
+            <button onClick={() => setMatchIdx((i) => (findMatches.length ? (i - 1 + findMatches.length) % findMatches.length : 0))} title="上一个 (Shift+Enter)" style={findNavBtnStyle}>↑</button>
+            <button onClick={() => setMatchIdx((i) => (findMatches.length ? (i + 1) % findMatches.length : 0))} title="下一个 (Enter)" style={findNavBtnStyle}>↓</button>
+            <button onClick={() => setFindOpen(false)} title="关闭 (Esc)" style={findNavBtnStyle}>×</button>
+          </div>
+          {replaceMode && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                value={replaceText}
+                onChange={(e) => setReplaceText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") { e.preventDefault(); void handleReplaceAll(); }
+                  else if (e.key === "Escape") { e.preventDefault(); setFindOpen(false); }
+                }}
+                placeholder="替换为（留空 = 删除该内容）"
+                style={{ flex: 1, minWidth: 0, height: 30, padding: "0 10px", fontSize: 13, border: "1px solid #d0d5dd", borderRadius: 7, outline: "none" }}
+              />
+              <button
+                onClick={() => void handleReplaceAll()}
+                disabled={replacing}
+                style={{ height: 30, padding: "0 12px", fontSize: 12.5, fontWeight: 600, color: "#fff", background: "#f0521a", border: "none", borderRadius: 7, cursor: replacing ? "default" : "pointer", opacity: replacing ? 0.6 : 1, flexShrink: 0 }}
+              >
+                全部替换
+              </button>
+            </div>
+          )}
+          <div style={{ fontSize: 11, color: "#8a929c", lineHeight: 1.5 }}>
+            输入后按 Enter 搜索 · 再按 Enter/Shift+Enter 上下切换 · Esc 关闭；替换作用于所有步骤的标题与描述（不分大小写），Ctrl+Z 可整体撤销
+          </div>
         </div>,
         document.body
       )}
@@ -2650,29 +3207,79 @@ export default function StepEditor({ siteToken, siteUser }: StepEditorProps) {
                 ) : (
                   <div>
                     <label style={pubDialogStyles.label}>封面（可选）</label>
-                    {pubCoverPreview ? (
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                        <img src={pubCoverPreview} alt="封面预览" style={{ width: 120, height: 72, objectFit: "cover", borderRadius: 6, border: "1px solid #30363d" }} />
-                        <button type="button" onClick={() => { setPubCoverBase64(null); setPubCoverPreview(null); }} style={pubDialogStyles.addBtn} data-tip="移除封面，改用默认截图">移除</button>
+                    <div style={{ marginBottom: 8 }}>
+                      {pubCoverPreview ? (
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                          <img src={toPreviewSrc(pubCoverPreview)} alt="封面预览" style={{ width: 120, height: 72, objectFit: "cover", borderRadius: 6, border: "2px solid #58a6ff" }} />
+                          <span style={{ fontSize: 12, color: "#8b949e" }}>当前封面</span>
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 8 }}>未选封面，将自动使用首张步骤截图</div>
+                      )}
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <label style={pubDialogStyles.addBtn} data-tip="上传自定义图片作为封面">
+                          上传图片
+                          <input
+                            type="file"
+                            accept="image/*"
+                            style={{ display: "none" }}
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (!file) return;
+                              const reader = new FileReader();
+                              reader.onload = async () => {
+                                const b64 = String(reader.result);
+                                const small = await downscaleBase64Image(b64, 720, 0.85);
+                                setPubCoverPreview(small);
+                                setPubCoverBase64(small);
+                              };
+                              reader.readAsDataURL(file);
+                            }}
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={handleSmartCover}
+                          disabled={smartLoading || steps.filter((s) => s.screenshot_base64).length === 0}
+                          style={pubDialogStyles.addBtn}
+                          data-tip="自动从步骤截图里挑一张最有代表性的"
+                        >
+                          {smartLoading ? "分析中…" : "智能选封面"}
+                        </button>
+                        {pubCoverPreview && (
+                          <button
+                            type="button"
+                            onClick={() => { setPubCoverBase64(null); setPubCoverPreview(null); }}
+                            style={pubDialogStyles.addBtn}
+                            data-tip="移除封面，改用默认首张截图"
+                          >
+                            清除
+                          </button>
+                        )}
                       </div>
-                    ) : (
-                      <input
-                        type="file"
-                        accept="image/*"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (!file) return;
-                          const reader = new FileReader();
-                          reader.onload = async () => {
-                            const b64 = String(reader.result);
-                            const small = await downscaleBase64Image(b64, 720, 0.85);
-                            setPubCoverPreview(small);
-                            setPubCoverBase64(small);
-                          };
-                          reader.readAsDataURL(file);
-                        }}
-                        style={{ ...pubDialogStyles.input, color: "#8b949e" }}
-                      />
+                    </div>
+                    {steps.filter((s) => s.screenshot_base64).length > 0 && (
+                      <div style={{ marginTop: 8 }}>
+                        <div style={{ fontSize: 12, color: "#8b949e", marginBottom: 6 }}>从步骤截图选择</div>
+                        <select
+                          style={{ ...pubDialogStyles.input, height: 34, cursor: "pointer" }}
+                          value=""
+                          onChange={(e) => {
+                            const s = steps.find((x) => x.id === e.target.value);
+                            if (s) void selectStepCover(s);
+                          }}
+                          data-tip="选中即设为封面，上方预览可见效果"
+                        >
+                          <option value="">选择步骤截图作为封面…</option>
+                          {steps
+                            .filter((s) => s.screenshot_base64)
+                            .map((s) => (
+                              <option key={s.id} value={s.id}>
+                                第{s.step_number}步：{s.title || s.action_type}
+                              </option>
+                            ))}
+                        </select>
+                      </div>
                     )}
 
                     <label style={pubDialogStyles.label}>标题</label>

@@ -64,6 +64,10 @@ fn resolve_typed_title(window_title: Option<&str>, domain: AppDomain) -> String 
                 AppDomain::Browser => crate::ai::domain::browser_page_name(t),
                 _ => t.to_string(),
             };
+            let display = crate::recorder::activity::shorten_window_label(
+                &display,
+                crate::recorder::activity::TITLE_LABEL_MAX_CHARS,
+            );
             format!("在「{}」中输入", display)
         }
         _ => "在「」中输入".to_string(),
@@ -354,6 +358,200 @@ fn display_shortcut_key(key: &str) -> String {
             .trim_end_matches(')')
             .to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Windows 键（Meta）组合键 → 中文步骤标题 + 截图 settle。
+///
+/// 覆盖常用 Win 快捷键；`ctrl`/`shift` 透传用于区分带修饰键的变体
+/// （如 Win+Shift+S 区域截图、Win+Ctrl+D 新建虚拟桌面）。
+/// 返回 None 表示不识别，交由调用方兜底成「快捷键 Win+X」。
+fn win_shortcut(shift: bool, ctrl: bool, key: &str) -> Option<(String, ShortcutSettle)> {
+    use ShortcutSettle as S;
+    let title = match key {
+        "KeyD" => match (ctrl, shift) {
+            (true, _) => "Win+Ctrl+D 新建虚拟桌面".to_string(),
+            _ => "Win+D 显示桌面".to_string(),
+        },
+        "KeyE" => "Win+E 打开文件资源管理器".to_string(),
+        "KeyR" => "Win+R 打开运行".to_string(),
+        "KeyL" => "Win+L 锁定计算机".to_string(),
+        "KeyV" => "Win+V 打开剪贴板历史".to_string(),
+        "KeyM" => if shift {
+            "Win+Shift+M 还原最小化的窗口".to_string()
+        } else {
+            "Win+M 最小化所有窗口".to_string()
+        },
+        "KeyComma" => "Win+, 临时查看桌面".to_string(),
+        "KeyTab" => "Win+Tab 打开任务视图".to_string(),
+        "KeyS" => match (ctrl, shift) {
+            (_, true) => "Win+Shift+S 区域截图".to_string(),
+            (true, _) => "Win+Ctrl+S 保存全部".to_string(),
+            _ => "Win+S 打开搜索".to_string(),
+        },
+        "KeyI" => "Win+I 打开设置".to_string(),
+        "KeyX" => "Win+X 打开快捷菜单".to_string(),
+        "KeyA" => "Win+A 打开快速设置".to_string(),
+        "KeyN" => "Win+N 打开通知中心".to_string(),
+        "KeyB" => "Win+B 焦点移到托盘通知区".to_string(),
+        "KeyT" => "Win+T 循环切换任务栏程序".to_string(),
+        "KeyU" => "Win+U 打开轻松使用/设置".to_string(),
+        "KeyP" => "Win+P 打开投影菜单".to_string(),
+        "KeyK" => "Win+K 打开无线显示".to_string(),
+        "KeyZ" => "Win+Z 打开窗口贴靠布局".to_string(),
+        "KeySpace" => "Win+空格 切换输入法".to_string(),
+        "Period" | "SemiColon" => "Win+. 打开表情符号面板".to_string(),
+        "PrintScreen" => "Win+PrintScreen 截图并保存".to_string(),
+        "KeyF" => "Win+F 打开反馈中心".to_string(),
+        "KeyH" => "Win+H 语音输入".to_string(),
+        "KeyG" => "Win+G 打开 Xbox 游戏栏".to_string(),
+        "KeyC" => "Win+C 打开 Copilot".to_string(),
+        "KeyLeftArrow" => match (ctrl, shift) {
+            (true, _) => "Win+Ctrl+← 切换到上一个虚拟桌面".to_string(),
+            (_, true) => "Win+Shift+← 移动窗口到左侧显示器".to_string(),
+            _ => "Win+← 贴靠窗口到左侧".to_string(),
+        },
+        "KeyRightArrow" => match (ctrl, shift) {
+            (true, _) => "Win+Ctrl+→ 切换到下一个虚拟桌面".to_string(),
+            (_, true) => "Win+Shift+→ 移动窗口到右侧显示器".to_string(),
+            _ => "Win+→ 贴靠窗口到右侧".to_string(),
+        },
+        "KeyUpArrow" => if shift {
+            "Win+Shift+↑ 最大化窗口高度".to_string()
+        } else {
+            "Win+↑ 最大化窗口".to_string()
+        },
+        "KeyDownArrow" => if shift {
+            "Win+Shift+↓ 还原窗口高度".to_string()
+        } else {
+            "Win+↓ 还原/最小化窗口".to_string()
+        },
+        "Key1" | "Key2" | "Key3" | "Key4" | "Key5" | "Key6" | "Key7" | "Key8" | "Key9" => {
+            let n = key.chars().last().unwrap().to_digit(10).unwrap();
+            if shift {
+                format!("Win+Shift+{} 打开任务栏第{}个程序的新实例", n, n)
+            } else if ctrl {
+                format!("Win+Ctrl+{} 固定/取消固定任务栏程序", n)
+            } else {
+                format!("Win+{} 打开/激活任务栏第{}个程序", n, n)
+            }
+        }
+        _ => return None,
+    };
+    Some((title, S::visual(450)))
+}
+
+/// Ctrl/Alt 组合键的通用中文标签（覆盖常见办公/浏览器快捷键）。
+/// 返回 None 时调用方兜底成「快捷键 Ctrl+X」/「快捷键 Alt+X」。
+fn common_combo_label(ctrl: bool, alt: bool, shift: bool, key: &str) -> Option<String> {
+    let k = if ctrl { "Ctrl" } else { "Alt" };
+    Some(match key {
+        "KeyW" => format!("{}+W 关闭窗口/标签页", k),
+        "KeyT" => if shift {
+            format!("{}+Shift+T 恢复关闭的标签页", k)
+        } else {
+            format!("{}+T 新建标签页", k)
+        },
+        "KeyN" => if shift {
+            format!("{}+Shift+N 新建隐身窗口", k)
+        } else {
+            format!("{}+N 新建", k)
+        },
+        "KeyO" => format!("{}+O 打开", k),
+        "KeyP" => if shift {
+            format!("{}+Shift+P 命令面板", k)
+        } else {
+            format!("{}+P 打印", k)
+        },
+        "KeyS" => if shift {
+            format!("{}+Shift+S 另存为", k)
+        } else {
+            format!("{}+S 保存", k)
+        },
+        "KeyB" => format!("{}+B 加粗", k),
+        "KeyI" => format!("{}+I 斜体", k),
+        "KeyU" => format!("{}+U 下划线", k),
+        "PrintScreen" => if alt {
+            // Alt+PrintScreen = 截取当前活动窗口（录屏场景高频操作）
+            "Alt+PrintScreen 截取当前窗口".to_string()
+        } else {
+            format!("{}+PrintScreen", k)
+        },
+        "KeyF4" => if ctrl {
+            "Ctrl+F4 关闭标签页".to_string()
+        } else {
+            "Alt+F4 关闭窗口".to_string()
+        },
+        // 系统级组合键：Ctrl+Alt+Del / Ctrl+Shift+Esc 等此前被记成泛化
+        // 「快捷键 Ctrl+Delete」，这里给出正确的中文语义。
+        "Delete" => if ctrl && alt {
+            "Ctrl+Alt+Del 打开安全选项".to_string()
+        } else if shift {
+            format!("{}+Shift+Delete 永久删除", k)
+        } else {
+            format!("{}+Delete 删除", k)
+        },
+        "Escape" => if ctrl && shift {
+            "Ctrl+Shift+Esc 打开任务管理器".to_string()
+        } else {
+            format!("{}+Esc 取消/关闭", k)
+        },
+        "F10" => if shift {
+            format!("{}+Shift+F10 打开右键菜单", k)
+        } else {
+            "F10 菜单栏".to_string()
+        },
+        "KeyTab" => if ctrl && alt {
+            "Ctrl+Alt+Tab 打开窗口切换器".to_string()
+        } else if shift {
+            format!("{}+Shift+Tab 上一个标签页", k)
+        } else {
+            format!("{}+Tab 下一个标签页", k)
+        },
+        "KeyEnter" => format!("{}+Enter 提交", k),
+        "PageUp" => format!("{}+PageUp 上一个标签页", k),
+        "PageDown" => format!("{}+PageDown 下一个标签页", k),
+        s if (ctrl && s.starts_with("Key"))
+            && matches!(
+                s, "Key1" | "Key2" | "Key3" | "Key4" | "Key5" | "Key6" | "Key7" | "Key8" | "Key9"
+            ) =>
+        {
+            let n = s.chars().last().unwrap().to_digit(10).unwrap();
+            format!("Ctrl+{} 切换到第{}个标签页", n, n)
+        }
+        _ => return None,
+    })
+}
+
+/// 功能键（F1–F12）无修饰键时，此前会被当成空白字符直接丢弃。
+/// 这里补成快捷键步骤，常见键带语义标签。
+fn function_key_label(key: &str) -> Option<String> {
+    Some(
+        match key {
+            "F1" => "F1 帮助",
+            "F2" => "F2 重命名",
+            "F3" => "F3 查找下一个",
+            "F4" => "F4 地址栏/重复",
+            "F5" => "F5 刷新",
+            "F6" => "F6 切换焦点区域",
+            "F7" => "F7 拼写检查",
+            "F8" => "F8 扩展选择",
+            "F9" => "F9 发送/接收",
+            "F10" => "F10 菜单栏",
+            "F11" => "F11 全屏",
+            "F12" => "F12 开发者工具",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// 无修饰键的「动作键」中，此前会被当成空白字符静默丢弃、但明显是一步操作的
+/// 键。目前只覆盖截图键（PrintScreen）——它是录屏场景最该被记录的键之一。
+fn standalone_key_label(key: &str) -> Option<String> {
+    match key {
+        "PrintScreen" => Some("PrintScreen 截图保存".to_string()),
+        _ => None,
     }
 }
 
@@ -1284,7 +1482,13 @@ fn schedule_alt_tab_settle(idx: usize, captured: &Arc<Mutex<Vec<StepData>>>) {
         if let Ok(mut st) = cs.lock() {
             if let Some(s) = st.get_mut(idx) {
                 if let Some(t) = title {
-                    s.title = format!("快捷键 Alt+Tab · 切换到 {}", t);
+                    s.title = format!(
+                        "快捷键 Alt+Tab · 切换到 {}",
+                        crate::recorder::activity::shorten_window_label(
+                            &t,
+                            crate::recorder::activity::TITLE_LABEL_MAX_CHARS,
+                        )
+                    );
                     s.window_title = t;
                 }
                 // 切窗口：整屏展示新窗口，不做裁剪
@@ -1399,6 +1603,39 @@ fn build_click_step(
 /// This is what fixes "drag steps crop to an empty area": the old path only
 /// recorded the button-press coordinate as a plain click, so the crop landed on
 /// the drag's start point and missed the selected region entirely.
+/// drag 步骤裁图框几何（纯函数，便于单测）。
+///
+/// 输入：选区包围盒 (bx0, by0, bw, bh) 与图尺寸；输出：裁图矩形 (left, top, w, h)。
+/// 规则：
+/// - 选区各向 100% 外扩（至少 DRAG_PAD_MIN）——拖拽选区多为扁长矩形（如表格选几行/列），
+///   50% 外扩对单行选区（~25px）只加 12px（被 min 吃掉），用户看不出在拖哪里；
+///   100% 外扩保证「选区 + 等量上下文」，扁条也能带出周围行/列。
+/// - 最小视野 DRAG_MIN_CROP_W/H：确保即使点按式拖拽（bw/bh≈0）也有足够上下文辨认位置；
+/// - 饱和到图尺寸，中心尽量对齐选区中心；贴边时整体平移进图内（不缩框）。
+fn drag_crop_box(
+    bx0: i32,
+    by0: i32,
+    bw: i32,
+    bh: i32,
+    img_w: i32,
+    img_h: i32,
+) -> (i32, i32, i32, i32) {
+    const DRAG_PAD_MIN: i32 = 40;
+    const DRAG_MIN_CROP_W: i32 = 560;
+    const DRAG_MIN_CROP_H: i32 = 520;
+    let img_w = img_w.max(1);
+    let img_h = img_h.max(1);
+    let pad_x = bw.max(DRAG_PAD_MIN);
+    let pad_y = bh.max(DRAG_PAD_MIN);
+    let crop_w = (bw + pad_x * 2).max(DRAG_MIN_CROP_W).min(img_w);
+    let crop_h = (bh + pad_y * 2).max(DRAG_MIN_CROP_H).min(img_h);
+    let cx0 = bx0 + bw / 2;
+    let cy0 = by0 + bh / 2;
+    let left = (cx0 - crop_w / 2).clamp(0, img_w - crop_w);
+    let top = (cy0 - crop_h / 2).clamp(0, img_h - crop_h);
+    (left, top, crop_w, crop_h)
+}
+
 fn build_drag_step(
     dx: f64,
     dy: f64,
@@ -1438,15 +1675,8 @@ fn build_drag_step(
     let bw = (dx_i - ux_i).abs();
     let bh = (dy_i - uy_i).abs();
 
-    // Small margin so the selection edges aren't flush against the crop border.
-    const DRAG_PAD: i32 = 16;
     let (img_w, img_h) = (annotated.width() as i32, annotated.height() as i32);
-    let left = (bx0 - DRAG_PAD).clamp(0, img_w);
-    let top = (by0 - DRAG_PAD).clamp(0, img_h);
-    let right = (bx0 + bw + DRAG_PAD).clamp(0, img_w);
-    let bottom = (by0 + bh + DRAG_PAD).clamp(0, img_h);
-    let crop_w = (right - left).max(1);
-    let crop_h = (bottom - top).max(1);
+    let (left, top, crop_w, crop_h) = drag_crop_box(bx0, by0, bw, bh, img_w, img_h);
     let (win_cx, win_cy) = (left + crop_w / 2, top + crop_h / 2);
 
     // Save clean before screenshot (no annotation)
@@ -1814,6 +2044,7 @@ fn spawn_event_thread(
                     ctrl,
                     shift,
                     alt,
+                    meta,
                     ts: key_instant,
                     foreground_pid: fg_pid,
                 }) => {
@@ -1851,14 +2082,17 @@ fn spawn_event_thread(
                         continue;
                     }
 
-                    // Scribe-style combo-key semantics: Ctrl/Alt combinations are
+                    // Scribe-style combo-key semantics: Ctrl/Alt/Win combinations are
                     // never typed characters. They become copy/paste/hotkey steps,
                     // and their letter keys never pollute the type buffer.
-                    if ctrl || alt {
+                    // ⚠️ meta（Win 键）优先于 ctrl/alt 判定：这样 Win+Ctrl+Arrow
+                    // 这类带 Win 的组合能走 Win 分支拿到正确标签，而不是被当成
+                    // 普通 Ctrl+Arrow。
+                    if ctrl || alt || meta {
                         {
                             use std::io::Write;
                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(r"D:\录步\flowio_debug.log") {
-                                let _ = writeln!(f, "[COMBO] key={} ctrl={} alt={} -> combo branch", key_name, ctrl, alt);
+                                let _ = writeln!(f, "[COMBO] key={} ctrl={} alt={} meta={} -> combo branch", key_name, ctrl, alt, meta);
                             }
                         }
                         // 使用真实按键时刻（钩子触发瞬间），不是 channel 消费时刻。
@@ -1878,7 +2112,34 @@ fn spawn_event_thread(
                         last_uia_text = None;
                         can_merge_type = false; // 快捷键打断输入连续性
 
-                        let _pushed: Option<usize> = if ctrl {
+                        let _pushed: Option<usize> = if meta {
+                            // Windows 键组合键（Win+D / Win+E / …）：之前因缺少
+                            // meta 追踪，Win+D 的 "D" 会漏进 type buffer 被记成字符
+                            // "d"。现在统一识别成有意义的快捷键步骤。
+                            match win_shortcut(shift, ctrl, &key_name) {
+                                Some((title, settle)) => flush_shortcut_step(
+                                    "hotkey",
+                                    title,
+                                    String::new(),
+                                    &cs_for_thread,
+                                    settle,
+                                    &ring,
+                                    combo_ts,
+                                ),
+                                None => {
+                                    let title = format!("快捷键 Win+{}", display_shortcut_key(&key_name));
+                                    flush_shortcut_step(
+                                        "hotkey",
+                                        title,
+                                        String::new(),
+                                        &cs_for_thread,
+                                        ShortcutSettle::visual(450),
+                                        &ring,
+                                        combo_ts,
+                                    )
+                                }
+                            }
+                        } else if ctrl {
                             match key_name.as_str() {
                                 // 全选：剪贴板不变，必须读焦点控件选中文本。
                                 // 截图不等固定 450ms —— 那时用户可能已经按了
@@ -1945,7 +2206,8 @@ fn spawn_event_thread(
                                 "KeyY" => flush_shortcut_step("hotkey", "Ctrl+Y 重做".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
                                 "KeyS" => flush_shortcut_step("hotkey", "Ctrl+S 保存".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
                                 _ => {
-                                    let title = format!("快捷键 Ctrl+{}", display_shortcut_key(&key_name));
+                                    let title = common_combo_label(ctrl, alt, shift, &key_name)
+                                        .unwrap_or_else(|| format!("快捷键 Ctrl+{}", display_shortcut_key(&key_name)));
                                     flush_shortcut_step("hotkey", title, String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts)
                                 }
                             }
@@ -1986,7 +2248,8 @@ fn spawn_event_thread(
                                     }
                                 }
                             } else {
-                                let title = format!("快捷键 Alt+{}", display_shortcut_key(&key_name));
+                                let title = common_combo_label(ctrl, alt, shift, &key_name)
+                                    .unwrap_or_else(|| format!("快捷键 Alt+{}", display_shortcut_key(&key_name)));
                                 flush_shortcut_step("hotkey", title, String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts)
                             }
                         } else {
@@ -2035,6 +2298,35 @@ fn spawn_event_thread(
                         keyboard_before_path = None;
                         last_uia_text = None;
                         can_merge_type = false; // Enter/Tab/Esc 切换了输入上下文
+                        last_key_time = Instant::now();
+                        continue;
+                    }
+
+                    // 功能键（F1–F12）/ 截图键 无修饰键时，ToUnicodeEx 不产出
+                    // 字符，旧逻辑把它们当空白字符丢弃 → 录制里看不到 F5 刷新、
+                    // PrintScreen 截图这类操作。这里补成快捷键步骤（先 flush）。
+                    if let Some(label) = function_key_label(&key_name)
+                        .or_else(|| standalone_key_label(&key_name))
+                    {
+                        if !accumulated_keys.is_empty() {
+                            let typed = std::mem::take(&mut accumulated_keys);
+                            let win_title = typing_window_title.take().unwrap_or_default();
+                            flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
+                        }
+                        typing_window_title = None;
+                        keyboard_before_path = None;
+                        last_uia_text = None;
+                        can_merge_type = false;
+                        eprintln!("[BG] function-key step: {}", label);
+                        flush_shortcut_step(
+                            "hotkey",
+                            label,
+                            String::new(),
+                            &cs_for_thread,
+                            ShortcutSettle::visual(450),
+                            &ring,
+                            key_instant,
+                        );
                         last_key_time = Instant::now();
                         continue;
                     }
@@ -2249,14 +2541,16 @@ pub fn start_recording(
 ) -> Result<String, String> {
     let record_self = record_self.unwrap_or(false);
     // Normalize empty target to None (录制指定软件).
-    let mut target_window = target_window.filter(|t| !t.trim().is_empty());
-    // B 层：未手动选择目标软件时，自动识别前台窗口进程名（Scribe 式免手动选）。
-    if target_window.is_none() {
-        if let Some(auto) = recorder::auto_detect_target_process() {
-            eprintln!("[start_recording] auto-detected target process: {}", auto);
-            target_window = Some(auto);
-        }
-    }
+    //
+    // ⚠️ 不再自动识别前台进程作为 target：target_window 同时控制**截图范围**
+    // 和**事件过滤**（spawn_event_thread 会丢弃非目标进程的点击/键盘事件）。
+    // 自动把「录制开始时恰好在前台的那个进程」设为 target，会导致后续跨软件
+    // 操作（浏览器下载 → 安装程序 → 系统设置）的窗口和事件双双丢失。
+    // 真实事故：Python 安装教程的安装向导窗口全部没录到。
+    //
+    // 现在：只有用户在设置里手动选择「录制指定软件」才进 target 模式
+    // （localStorage 持久化，选一次后续录制都生效）；否则一律全屏录制。
+    let target_window = target_window.filter(|t| !t.trim().is_empty());
 
     // --- 防重入：已有活跃录制时直接返回它的 id ---
     // 不拦的话，重复调用会再装一次 native hook、再起一个截图线程和一个事件线程。
@@ -2688,6 +2982,54 @@ pub fn get_active_recording(
 #[cfg(test)]
 mod commands_tests {
     use super::*;
+
+    // ── drag_crop_box（drag 裁图上下文外扩） ────────────────────
+
+    #[test]
+    fn drag_crop_box_wide_selection_gets_vertical_context() {
+        // 用户实测场景：表格里横向拖选 ~1000×100 的列标条。
+        // 100% 外扩（pad=100/侧）→ 宽 1200 饱和到全图 1920，
+        // 高度走最小视野 520 → 能带出多行数据上下文（旧值 240 只够表头）。
+        let (l, t, w, h) = drag_crop_box(400, 100, 1000, 100, 1920, 1080);
+        assert_eq!((l, t, w, h), (0, 0, 1920, 520));
+        // 选区中心仍应在框内
+        assert!(t <= 150 && 150 <= t + h);
+    }
+
+    #[test]
+    fn drag_crop_box_small_selection_gets_min_context() {
+        // 小选区（100×50）：100% 外扩不够，最小视野 560×520 兜底
+        let (l, t, w, h) = drag_crop_box(500, 300, 100, 50, 1920, 1080);
+        assert_eq!((w, h), (560, 520));
+        // 中心对齐选区中心 (550, 325)
+        assert_eq!((l, t), (550 - 280, 325 - 260));
+    }
+
+    #[test]
+    fn drag_crop_box_zero_selection_still_crops() {
+        // 按下即松开（bw=bh=0）：pad 回落 40，最小视野兜底，不产生 0 尺寸
+        let (l, t, w, h) = drag_crop_box(960, 540, 0, 0, 1920, 1080);
+        assert_eq!((w, h), (560, 520));
+        assert_eq!((l, t), (960 - 280, 540 - 260));
+    }
+
+    #[test]
+    fn drag_crop_box_clamps_into_image_and_saturates() {
+        // 选区贴左上角：框平移进图内，不出界
+        let (l, t, w, h) = drag_crop_box(0, 0, 50, 30, 1920, 1080);
+        assert_eq!((l, t), (0, 0));
+        assert!(w > 0 && h > 0);
+        // 选区比图还大：饱和到全图
+        let (l2, t2, w2, h2) = drag_crop_box(0, 0, 5000, 3000, 1920, 1080);
+        assert_eq!((l2, t2, w2, h2), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn drag_crop_box_never_panics_on_degenerate_image() {
+        // 退化图尺寸不 panic
+        let _ = drag_crop_box(10, 10, 5, 5, 0, 0);
+        let _ = drag_crop_box(10, 10, 5, 5, 1, 1);
+    }
 
     fn make_step(order_index: i32) -> StepData {
         StepData {
@@ -3331,5 +3673,107 @@ mod commands_tests {
         // 距离超阈 → 不是
         assert!(!is_double_click(9.0, 0.0, 100, dbl));
         assert!(!is_double_click(0.0, 8.1, 100, dbl));
+    }
+}
+
+#[cfg(test)]
+mod shortcut_label_tests {
+    use super::*;
+
+    #[test]
+    fn win_combos_have_chinese_titles() {
+        // 用户原 bug：Win+D 显示桌面，不能退化成字符 "d"
+        let (t, _) = win_shortcut(false, false, "KeyD").unwrap();
+        assert_eq!(t, "Win+D 显示桌面");
+        let (t, _) = win_shortcut(false, false, "KeyE").unwrap();
+        assert_eq!(t, "Win+E 打开文件资源管理器");
+        let (t, _) = win_shortcut(false, false, "KeyR").unwrap();
+        assert_eq!(t, "Win+R 打开运行");
+        // 带修饰键变体
+        let (t, _) = win_shortcut(true, false, "KeyS").unwrap();
+        assert_eq!(t, "Win+Shift+S 区域截图");
+        let (t, _) = win_shortcut(false, true, "KeyD").unwrap();
+        assert_eq!(t, "Win+Ctrl+D 新建虚拟桌面");
+        let (t, _) = win_shortcut(false, false, "Key1").unwrap();
+        assert_eq!(t, "Win+1 打开/激活任务栏第1个程序");
+    }
+
+    #[test]
+    fn win_unknown_falls_back() {
+        // 不识别的 Win 组合键返回 None，交由调用方兜底成「快捷键 Win+X」
+        assert!(win_shortcut(false, false, "KeyQ").is_none());
+    }
+
+    #[test]
+    fn win_tray_taskbar_keys() {
+        let (t, _) = win_shortcut(false, false, "KeyB").unwrap();
+        assert_eq!(t, "Win+B 焦点移到托盘通知区");
+        let (t, _) = win_shortcut(false, false, "KeyT").unwrap();
+        assert_eq!(t, "Win+T 循环切换任务栏程序");
+        let (t, _) = win_shortcut(false, false, "KeyU").unwrap();
+        assert_eq!(t, "Win+U 打开轻松使用/设置");
+    }
+
+    #[test]
+    fn alt_printscreen_and_shift_delete() {
+        // Alt+PrintScreen 截取当前窗口；Shift+Delete 永久删除
+        let t = common_combo_label(false, true, false, "PrintScreen").unwrap();
+        assert_eq!(t, "Alt+PrintScreen 截取当前窗口");
+        let t = common_combo_label(true, false, true, "Delete").unwrap();
+        assert_eq!(t, "Ctrl+Shift+Delete 永久删除");
+        let t = common_combo_label(false, true, true, "Delete").unwrap();
+        assert_eq!(t, "Alt+Shift+Delete 永久删除");
+        // Ctrl+Shift+S 另存为
+        let t = common_combo_label(true, false, true, "KeyS").unwrap();
+        assert_eq!(t, "Ctrl+Shift+S 另存为");
+        // Shift+F10 右键菜单（运行时仅 ctrl/alt 组合会进入此函数，shift 单独按走 function_key_label）
+        let t = common_combo_label(false, true, true, "F10").unwrap();
+        assert_eq!(t, "Alt+Shift+F10 打开右键菜单");
+    }
+
+    #[test]
+    fn common_ctrl_alt_labels() {
+        let t = common_combo_label(true, false, false, "KeyW").unwrap();
+        assert_eq!(t, "Ctrl+W 关闭窗口/标签页");
+        let t = common_combo_label(false, true, false, "KeyF4").unwrap();
+        assert_eq!(t, "Alt+F4 关闭窗口");
+        let t = common_combo_label(true, false, false, "Key1").unwrap();
+        assert_eq!(t, "Ctrl+1 切换到第1个标签页");
+        let t = common_combo_label(true, false, true, "KeyT").unwrap();
+        assert_eq!(t, "Ctrl+Shift+T 恢复关闭的标签页");
+        // 没有语义标签的键返回 None → 兜底成「快捷键 Ctrl+X」
+        assert!(common_combo_label(true, false, false, "KeyQ").is_none());
+    }
+
+    #[test]
+    fn function_keys_labelled() {
+        // 此前 F5 刷新会被当成空白字符丢弃；现在应出步骤
+        assert_eq!(function_key_label("F5").unwrap(), "F5 刷新");
+        assert_eq!(function_key_label("F11").unwrap(), "F11 全屏");
+        assert_eq!(function_key_label("F12").unwrap(), "F12 开发者工具");
+        // 非功能键返回 None
+        assert!(function_key_label("KeyD").is_none());
+        assert!(function_key_label("F13").is_none());
+    }
+
+    #[test]
+    fn system_combos_labelled() {
+        // Ctrl+Alt+Del / Ctrl+Shift+Esc / Ctrl+Alt+Tab 此前被记成泛化标签
+        let t = common_combo_label(true, true, false, "Delete").unwrap();
+        assert_eq!(t, "Ctrl+Alt+Del 打开安全选项");
+        let t = common_combo_label(true, false, true, "Escape").unwrap();
+        assert_eq!(t, "Ctrl+Shift+Esc 打开任务管理器");
+        let t = common_combo_label(true, true, false, "KeyTab").unwrap();
+        assert_eq!(t, "Ctrl+Alt+Tab 打开窗口切换器");
+        // 普通 Ctrl+Delete 仍是删除
+        let t = common_combo_label(true, false, false, "Delete").unwrap();
+        assert_eq!(t, "Ctrl+Delete 删除");
+    }
+
+    #[test]
+    fn standalone_keys_labelled() {
+        // PrintScreen 单独按此前静默丢弃，现在应出步骤
+        assert_eq!(standalone_key_label("PrintScreen").unwrap(), "PrintScreen 截图保存");
+        assert!(standalone_key_label("KeyD").is_none());
     }
 }

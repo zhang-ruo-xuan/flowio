@@ -45,8 +45,9 @@ struct ChoiceMessage {
 ///
 /// # 429 限流重试
 /// 免费通道（glm-4.6v-flash）高峰期高频返回 HTTP 429「1305 该模型当前访问量
-/// 过大」（实测连续 17 步生成时 15 步被限流）。此处按 3s/6s/12s 指数退避
-/// 重试最多 3 次；网络瞬断（send Err）同样重试。其他非 2xx 立即失败。
+/// 过大」（实测连续 17 步生成时 15 步被限流）。此处按 3s/6s/12s/24s 指数退避
+/// 重试最多 4 次（总等待约 45s，足够跨过一次限流峰值）；网络瞬断（send Err）同样重试。
+/// 其他非 2xx 立即失败。
 ///
 /// # Errors
 /// Returns a `String` error that includes HTTP status code and response
@@ -76,12 +77,13 @@ pub fn call_llm_with_tokens(
         temperature: 0.3,
     };
 
-    const MAX_RETRIES: usize = 3;
+    const MAX_RETRIES: usize = 4;
     let mut last_err = String::new();
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
-            // 3s / 6s / 12s 指数退避
-            std::thread::sleep(Duration::from_secs(3 << (attempt - 1)));
+            // 3s / 6s / 12s / 24s 指数退避（封顶 24s），跨过限流峰值
+            let delay = (3u64 << (attempt - 1)).min(24);
+            std::thread::sleep(Duration::from_secs(delay));
         }
         let response = match client
             .post(normalize_chat_url(&cfg.provider.base_url))
@@ -159,6 +161,12 @@ fn classify_llm_error(status_code: u16, text: &str, model: &str) -> String {
         format!("账户或权限异常（HTTP {}）：{}", status_code, extract_error_text(text))
     } else if status_code == 404 {
         "接口地址或路径错误（HTTP 404），请检查 base_url 是否填写正确（应为基础地址，不含 /chat/completions）".to_string()
+    } else if status_code == 429 {
+        // 免费通道高峰期限流是主因；提示用户错峰或改用自有 Key
+        format!(
+            "{}（HTTP 429）。免费通道高峰期访问量过大被限流，已自动重试仍失败。建议：① 稍后几分钟再试；② 在「设置 → AI」里配置自己的 AI Key 走私有额度，更稳定。",
+            extract_error_text(text)
+        )
     } else {
         format!("LLM API 返回错误（HTTP {}）：{}", status_code, extract_error_text(text))
     }

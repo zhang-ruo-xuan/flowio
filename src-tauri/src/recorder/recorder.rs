@@ -164,27 +164,30 @@ fn process_name_of_pid(pid: u32) -> Option<String> {
     Some(path.rsplit(['\\', '/']).next().unwrap_or("").to_string())
 }
 
-/// 自动检测当前前台窗口的进程名（用于「录制指定软件」的自动识别）。
+/// 判断进程名是否为浏览器（大小写不敏感）。
 ///
-/// 当用户未在 Settings 手动选择目标软件时，录制开始时调用此函数，
-/// 取 GetForegroundWindow() 的进程名作为 target_app，实现 Scribe 式免手动选。
+/// 背景：target 模式（录制指定软件）会**同时**限制截图范围和事件过滤——
+/// 只截目标进程的窗口，且丢弃其他进程的点击/键盘事件。因此把浏览器设为
+/// target 后，从浏览器出发的跨软件流程（下载软件 → 安装程序 → 系统设置）
+/// 会双双丢失（真实事故：Python 安装教程的安装向导窗口全没录到）。
 ///
-/// ⚠️ 若前台窗口是 Flowio 自身（用户点了 UI 按钮而非用全局热键启动录制），
-/// 返回 None 避免把 flowio.exe 误当目标软件。
-pub fn auto_detect_target_process() -> Option<String> {
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd == 0 {
-        return None;
-    }
-    let mut pid: u32 = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-    let name = process_name_of_pid(pid)?;
-    // 排除 Flowio 自身：用户点 UI 按钮启动录制时前台窗口是 Flowio，
-    // 此时不应自动设 target_app（应留给用户手动选或等热键触发）。
-    if name.eq_ignore_ascii_case("flowio.exe") {
-        return None;
-    }
-    Some(name)
+/// 自动检测前台进程作为 target 的逻辑**已移除**（见 `start_recording`），
+/// 现在只有用户手动选择才进 target 模式。保留本函数用于将来在 UI 上提示
+/// 「浏览器通常不适合作为目标软件，建议全屏录制」等场景。
+///
+/// ⚠️ 与 `process_description` 的「── 浏览器 ──」分类保持一致；新增浏览器
+/// 时两边都要补。
+pub fn is_browser_process(process_name: &str) -> bool {
+    let n = process_name.to_lowercase();
+    matches!(
+        n.as_str(),
+        "chrome.exe" | "msedge.exe" | "edge.exe" | "firefox.exe"
+            | "brave.exe" | "opera.exe" | "vivaldi.exe"
+            | "chromium.exe" | "arc.exe"
+            // 国内常见浏览器
+            | "360se.exe" | "360chrome.exe"
+            | "qqbrowser.exe" | "sogouexplorer.exe"
+    )
 }
 
 /// Enumerate visible top-level windows. Results are deduplicated by process
@@ -647,6 +650,73 @@ mod recorder_tests {
     #[test]
     fn is_flowio_empty_false() {
         assert!(!is_flowio_app(""));
+    }
+
+    // ── is_browser_process：浏览器不得被自动选为 target ──
+    // 回归保护：浏览器被设为 target 时，target 模式只截浏览器窗口，
+    // 后续原生窗口（安装程序等）会全部丢失。
+
+    #[test]
+    fn is_browser_detects_common_browsers() {
+        for name in [
+            "chrome.exe",
+            "msedge.exe",
+            "edge.exe",
+            "firefox.exe",
+            "brave.exe",
+            "opera.exe",
+            "vivaldi.exe",
+            "chromium.exe",
+            "arc.exe",
+        ] {
+            assert!(is_browser_process(name), "{} 应识别为浏览器", name);
+        }
+    }
+
+    #[test]
+    fn is_browser_detects_chinese_browsers() {
+        // 国内常见浏览器，用户基数大，必须覆盖
+        for name in ["360se.exe", "360chrome.exe", "qqbrowser.exe", "sogouexplorer.exe"] {
+            assert!(is_browser_process(name), "{} 应识别为浏览器", name);
+        }
+    }
+
+    #[test]
+    fn is_browser_is_case_insensitive() {
+        for name in ["Chrome.exe", "CHROME.EXE", "MSEdge.exe", "FireFox.EXE", "360SE.exe"] {
+            assert!(is_browser_process(name), "{} 大小写不敏感", name);
+        }
+    }
+
+    #[test]
+    fn is_browser_rejects_non_browsers() {
+        // 关键反例：安装程序、办公软件、系统工具都**不是**浏览器，
+        // 仍应可被自动检测为 target（用户手动录单个软件时依赖此行为）
+        for name in [
+            "python-3.11.4-amd64.exe", // 本次事故主角：Python 安装程序
+            "setup.exe",
+            "wps.exe",
+            "winword.exe",
+            "notepad.exe",
+            "explorer.exe",
+            "flowio.exe",
+            "wechat.exe",
+        ] {
+            assert!(!is_browser_process(name), "{} 不应识别为浏览器", name);
+        }
+    }
+
+    #[test]
+    fn is_browser_empty_false() {
+        assert!(!is_browser_process(""));
+    }
+
+    #[test]
+    fn is_browser_partial_name_not_matched() {
+        // 必须完整匹配进程名，避免 "chromexxx.exe" 之类的误判
+        assert!(!is_browser_process("chrome"));
+        assert!(!is_browser_process("my_chrome_helper.exe"));
+        assert!(!is_browser_process("edge_update.exe"));
     }
 
     #[test]

@@ -4,8 +4,10 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Annotation, AnnoType, drawAnnotation, flattenAnnotations } from '../lib/annotate';
+import { rectToCropAnchor, type CropAnchor } from '../lib/cropAnchor';
 import { containScale, contentArea } from '../lib/fitBox';
 import { annoSlop, cropSlop, hitAnnotation, hitCropHandle } from '../lib/annoHit';
+import { moveRect, resizeRect } from '../lib/cropDrag';
 import {
   annoFont, annoStroke, contentScale, uiPx, uiScale,
   UI_CROSS, UI_CROP_DASH, UI_CROP_LINE, UI_DASH, UI_HANDLE_R, UI_LINE, UI_LINE_STRONG, UI_PAD,
@@ -15,10 +17,51 @@ export type ToolType = 'select' | 'text' | 'highlight' | 'arrow' | 'blur' | 'cro
 
 export interface CropRect { x: number; y: number; width: number; height: number; }
 
+/** 把一张 dataURL 按图坐标矩形裁出，返回 JPEG dataURL（用于「全图视图裁剪」顶替全图） */
+function cropDataUrl(dataUrl: string, rect: CropRect): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const w = Math.max(1, Math.round(rect.width));
+      const h = Math.max(1, Math.round(rect.height));
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext('2d');
+      if (!ctx) {
+        reject(new Error('canvas 2d context 不可用'));
+        return;
+      }
+      ctx.drawImage(img, rect.x, rect.y, rect.width, rect.height, 0, 0, w, h);
+      try {
+        resolve(c.toDataURL('image/jpeg', 0.92));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    img.onerror = () => reject(new Error('裁剪源图加载失败'));
+    img.src = dataUrl;
+  });
+}
+
 interface Props {
   imageUrl: string;
   annotations: Annotation[];
-  onSave: (annos: Annotation[], croppedImageUrl?: string) => void;
+  /** 步骤 action_type：手动框选的裁剪矩形反算回锚点时，与自动裁图同口径（type 步骤左侧多留 1/3） */
+  actionType?: string;
+  /**
+   * 进入标注时的当前视图：'full'=全图，'crop'=裁图。
+   * 决定保存时裁切结果落到「全图」还是「裁图」槽位（见 StepEditor.handleAnnotateSave）。
+   */
+  initialCropRect?: CropRect | null;
+  /**
+   * 标注完成回调。
+   * - full  ：把注释烧录进【完整图】的 base64（顶替「全图」视图，不裁切）；
+   * - anchor：若裁剪了，框反算成的裁图锚点（顶替「裁图」视图）；
+   * - cropped：若裁剪了，注释烧录后再按框裁出的【裁切图】base64（全图视图裁剪时顶替全图用）。
+   * 三者按当前视图独立落槽，互不影响。
+   */
+  onSave: (annos: Annotation[], result: { full: string | undefined; anchor: CropAnchor | null; cropped?: string | undefined }) => void;
   onClose: () => void;
 }
 
@@ -61,7 +104,7 @@ function windowFallbackArea(): { w: number; h: number } {
   return { w: c.availW, h: c.availH };
 }
 
-export default function AnnotationsOverlay({ imageUrl, annotations: initial, onSave, onClose }: Props) {
+export default function AnnotationsOverlay({ imageUrl, annotations: initial, actionType, initialCropRect, onSave, onClose }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [annotations, setAnnotations] = useState<Annotation[]>(initial);
   const [activeTool, setActiveTool] = useState<ToolType>('select');
@@ -90,8 +133,10 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
   // Drag state for select tool
   const [isDragging, setIsDragging] = useState(false);
   const dragOffset = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
-  // 裁剪框拖动/调整起点（用于整体移动的位移计算）
-  const resizeOrigin = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  // 裁剪框拖动/调整起点：按下时的鼠标位置 + 当时矩形快照。
+  // ★ 必须以「按下时的矩形」为 base、用全程位移反算，不能拿每帧被 setCropRect
+  //   更新过的当前 rect 再叠加位移（会重复累加 → 一拉就冲到边界）。对齐 CropOverlay 的 d.origin 范式。
+  const cropDragOrigin = useRef<{ startX: number; startY: number; rect: CropRect } | null>(null);
 
   const [history, setHistory] = useState<Annotation[][]>([initial]);
   const [historyIndex, setHistoryIndex] = useState(0);
@@ -360,50 +405,23 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
     return hitCropHandle(cropRect, x, y, edge, corner);
   };
 
-  /** 根据 cropResize 方向 + 鼠标位移更新 cropRect（限制在图片范围内，最小 20px） */
+  /** 根据 cropResize 方向 + 鼠标位移更新 cropRect。
+   *  ★ 几何全部委托 cropDrag.ts 纯函数（check:crop 3.8 万例覆盖）——
+   *    旧内联实现有代数 bug：`y = ny; h = y + h - ny` 里第二行的 y 已被改写，
+   *    h 恒等于旧值 → 拖上/左边变成整体平移；框平移后超出图界，move 的
+   *    `nx + w <= image.width` 守卫永远不成立 → 框中间也拖不动。 */
   const updateCropByResize = (dir: NonNullable<typeof cropResize>, pos: { x: number; y: number }) => {
-    if (!cropRect || !image) return;
-    let { x, y, width: w, height: h } = cropRect;
-    const min = 20;
-    const clampX = (v: number) => Math.max(0, Math.min(image.width, v));
-    const clampY = (v: number) => Math.max(0, Math.min(image.height, v));
-    if (dir === 'move') {
-      const dx = pos.x - resizeOrigin.current.x;
-      const dy = pos.y - resizeOrigin.current.y;
-      const nx = clampX(x + dx);
-      const ny = clampY(y + dy);
-      if (nx + w <= image.width) x = nx;
-      if (ny + h <= image.height) y = ny;
-    } else if (dir === 'n') {
-      const ny = clampY(pos.y);
-      if (y + h - ny >= min) { y = ny; h = y + h - ny; }
-    } else if (dir === 's') {
-      const nbottom = clampY(pos.y);
-      if (nbottom - y >= min) h = nbottom - y;
-    } else if (dir === 'w') {
-      const nx = clampX(pos.x);
-      if (x + w - nx >= min) { x = nx; w = x + w - nx; }
-    } else if (dir === 'e') {
-      const nright = clampX(pos.x);
-      if (nright - x >= min) w = nright - x;
-    } else if (dir === 'nw') {
-      const nx = clampX(pos.x), ny = clampY(pos.y);
-      if (x + w - nx >= min) { x = nx; w = x + w - nx; }
-      if (y + h - ny >= min) { y = ny; h = y + h - ny; }
-    } else if (dir === 'ne') {
-      const nright = clampX(pos.x), ny = clampY(pos.y);
-      if (nright - x >= min) w = nright - x;
-      if (y + h - ny >= min) { y = ny; h = y + h - ny; }
-    } else if (dir === 'sw') {
-      const nx = clampX(pos.x), nbottom = clampY(pos.y);
-      if (x + w - nx >= min) { x = nx; w = x + w - nx; }
-      if (nbottom - y >= min) h = nbottom - y;
-    } else if (dir === 'se') {
-      const nright = clampX(pos.x), nbottom = clampY(pos.y);
-      if (nright - x >= min) w = nright - x;
-      if (nbottom - y >= min) h = nbottom - y;
-    }
-    setCropRect({ x, y, width: w, height: h });
+    const o = cropDragOrigin.current;
+    if (!o || !image) return;
+    // dx/dy 是从「按下点」起的全程位移；base 用按下时的矩形快照 rect，
+    // 每帧都用同一 base 反算 → 框跟手移动，不会越拖越快冲到边界。
+    const dx = pos.x - o.startX;
+    const dy = pos.y - o.startY;
+    const next =
+      dir === 'move'
+        ? moveRect(o.rect, dx, dy, image.width, image.height)
+        : resizeRect(o.rect, dir, dx, dy, image.width, image.height);
+    setCropRect(next);
   };
 
   /** Confirm text annotation from toolbar input */
@@ -466,7 +484,8 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
       if (cropRect) {
         const dir = hitTestCrop(pos.x, pos.y);
         if (dir) {
-          resizeOrigin.current = pos;
+          // 记录按下时的鼠标位置与矩形快照，作为后续每帧位移反算的固定 base
+          cropDragOrigin.current = { startX: pos.x, startY: pos.y, rect: { ...cropRect } };
           setCropResize(dir);
           return;
         }
@@ -527,6 +546,7 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
   const onMouseUp = () => {
     if (cropResize) {
       setCropResize(null);
+      cropDragOrigin.current = null;
       return;
     }
     if (isDragging) {
@@ -574,74 +594,79 @@ export default function AnnotationsOverlay({ imageUrl, annotations: initial, onS
     setDrawCurrent(null);
   };
 
-  const applyCrop = () => {
-    if (!cropRect || !image) return null;
-    const tc = document.createElement('canvas');
-    tc.width = cropRect.width;
-    tc.height = cropRect.height;
-    const ctx = tc.getContext('2d');
-    if (!ctx) return null;
-    ctx.drawImage(image, cropRect.x, cropRect.y, cropRect.width, cropRect.height, 0, 0, cropRect.width, cropRect.height);
-    const adjusted = annotations
-      .map(a => ({
-        ...a,
-        x: a.x - cropRect.x,
-        y: a.y - cropRect.y,
-        endX: a.endX !== undefined ? a.endX - cropRect.x : undefined,
-        endY: a.endY !== undefined ? a.endY - cropRect.y : undefined,
-      }))
-      .filter(a => {
-        if (a.type === 'arrow') {
-          const x1 = a.x, y1 = a.y, x2 = a.endX ?? 0, y2 = a.endY ?? 0;
-          return (x1 >= 0 && x1 <= cropRect.width && y1 >= 0 && y1 <= cropRect.height) ||
-                 (x2 >= 0 && x2 <= cropRect.width && y2 >= 0 && y2 <= cropRect.height);
-        }
-        return a.x + (a.width || 0) > 0 && a.x < cropRect.width &&
-               a.y + (a.height || 0) > 0 && a.y < cropRect.height;
-      });
-    // ⚠️ dims 必须传【原图】尺寸：它是内容归一化的基准，传裁切尺寸会让标注粗细随裁切框突变
-    for (const a of adjusted) drawAnnotation(ctx, a, { width: image.width, height: image.height });
-    setAnnotations(adjusted);
-    setHistory([adjusted]);
-    setHistoryIndex(0);
-    return tc.toDataURL('image/png');
-  };
-
-  const bake = (img: HTMLImageElement): string | undefined => {
+  /**
+   * 烧录结果：
+   * - full  ：把注释（箭头/高亮/文字/模糊）烧录进【完整图】，用于顶替「全图」视图；
+   *           ★ 注意**不裁切**——裁图交给锚点派生，全图与裁图互不影响。
+   * - anchor：若当前有裁剪框，把框反算成裁图锚点，用于顶替「裁图」视图
+   *          （cropAdaptiveBase64 会用全图 + 锚点重新裁出裁图）。
+   * - cropped：若当前有裁剪框，把「full（含注释）」按框裁出的【裁切图】，
+   *          供「全图视图裁剪」时直接顶替全图槽位（原全图不保留，应用内可撤销）。
+   * 三者按 StepEditor 传入的当前视图独立落槽，互不影响。
+   */
+  const bake = async (
+    img: HTMLImageElement,
+  ): Promise<{ full: string | undefined; anchor: CropAnchor | null; cropped: string | undefined }> => {
     try {
-      if (cropRect) return applyCrop() || undefined;
-      return flattenAnnotations(img, annotations) || undefined;
+      const full = flattenAnnotations(img, annotations) || undefined;
+      const anchor = cropRect
+        ? rectToCropAnchor(
+            { x: cropRect.x, y: cropRect.y, width: cropRect.width, height: cropRect.height },
+            actionType,
+          )
+        : null;
+      let cropped: string | undefined;
+      if (cropRect && full) {
+        cropped = await cropDataUrl(full, {
+          x: cropRect.x,
+          y: cropRect.y,
+          width: cropRect.width,
+          height: cropRect.height,
+        });
+      }
+      return { full, anchor, cropped };
     } catch (e) {
       console.error('标注烧录失败：', e);
-      return undefined;
+      return { full: undefined, anchor: null, cropped: undefined };
     }
   };
 
   const handleSave = () => {
-    const doSave = (img: HTMLImageElement | null) => {
-      const baked = img ? bake(img) : undefined;
-      onSave(annotations, baked);
+    const doSave = async (img: HTMLImageElement | null) => {
+      const r = img
+        ? await bake(img)
+        : { full: undefined, anchor: null, cropped: undefined };
+      onSave(annotations, r);
     };
     if (image) {
-      doSave(image);
+      void doSave(image);
     } else {
       // image 未就绪时兜底从 imageUrl 重新加载，避免标注只存元数据没烧进图
       const img = new Image();
       if (imageSrc.startsWith('http://') || imageSrc.startsWith('https://')) {
         img.crossOrigin = 'anonymous';
       }
-      img.onload = () => doSave(img);
-      img.onerror = () => doSave(null);
+      img.onload = () => void doSave(img);
+      img.onerror = () => onSave(annotations, { full: undefined, anchor: null, cropped: undefined });
       img.src = imageSrc;
     }
   };
 
   const cancelCrop = () => { setCropRect(null); setCropStart(null); setDrawCurrent(null); setIsCropping(false); setCropResize(null); setCropHover(null); };
 
-  /** 生成默认裁剪框（完全贴合图片四边，向中间拉拽裁剪），进入裁剪工具时直接可用四边框拉动 */
+  /** 生成默认裁剪框：传入了 initialCropRect（当前裁图框）就沿用它，否则贴合图片四边 */
   const initDefaultCrop = () => {
     if (!image) return;
-    setCropRect({ x: 0, y: 0, width: image.width, height: image.height });
+    if (initialCropRect && initialCropRect.width > 0 && initialCropRect.height > 0) {
+      setCropRect({
+        x: initialCropRect.x,
+        y: initialCropRect.y,
+        width: initialCropRect.width,
+        height: initialCropRect.height,
+      });
+    } else {
+      setCropRect({ x: 0, y: 0, width: image.width, height: image.height });
+    }
     setIsCropping(false);
     setCropStart(null);
     setDrawCurrent(null);

@@ -20,6 +20,7 @@ use crate::DbState;
 /// 首期支持的目标语言（lang 代码 → 展示名）。原文即中文时仍允许翻译，
 /// 由用户自行决定。
 pub const TARGET_LANGS: &[(&str, &str)] = &[
+    ("zh", "中文"),
     ("en", "English"),
     ("ja", "日本語"),
     ("ko", "한국어"),
@@ -69,7 +70,7 @@ pub fn build_translate_prompt(
         "请把下面这份操作教程从原文翻译成{}。\n\
          要求：\n\
          1. 只翻译文本含义，保持操作指令清晰、口语自然，符合{}用户的使用习惯；\n\
-         2. 【语音】开头的语音备注同样需要翻译，但保留「【语音】」前缀本身不翻译；\n\
+         2. 步骤描述里的语音转写内容（与普通说明混在一起）同样需要翻译；\n\
          3. 不要增删步骤，不要合并或改写内容；\n\
          4. 严格输出 JSON 对象，不要输出任何解释、markdown 代码块或其他文字。\n\
          输出格式：{{\"title\":\"教程标题译文\",\"steps\":[{{\"i\":步骤序号,\"t\":\"步骤标题译文\",\"d\":\"步骤描述译文\"}},...]}}，i 必须与输入一致，steps 数量必须与输入一致。\n\
@@ -115,7 +116,9 @@ pub fn parse_translate_response(text: &str) -> Result<TranslatedGuide, String> {
 }
 
 /// 读取指定录制现有译文 JSON（无 → 空 json!({})）。
-fn load_translations(conn: &rusqlite::Connection, recording_id: &str) -> Result<Value, String> {
+///
+/// `pub(crate)`：脱敏命令需要读它来作废「原文被改动过」的步骤译文（隐私一致性）。
+pub(crate) fn load_translations(conn: &rusqlite::Connection, recording_id: &str) -> Result<Value, String> {
     match crate::db::get_recording_translations_raw(conn, recording_id)? {
         Some(s) => serde_json::from_str(&s)
             .map_err(|e| format!("现有译文 JSON 损坏：{}（将新建覆盖）", e)),
@@ -162,6 +165,28 @@ pub fn translate_recording(
             .filter_map(|r| r.ok())
             .collect();
         let existing = load_translations(&conn, &recording_id)?;
+
+        // 首次翻译前快照原文（key = "__orig"）：此后编辑器文字会被译文覆盖，
+        // 原文只剩这份快照，供「原文」选项一键恢复。仅在译文副本完全为空时
+        // 快照（即当前步骤文字尚未被任何译文覆盖）；已有副本的存量教程不补拍。
+        let mut existing = existing;
+        if existing.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            let mut steps_map = serde_json::Map::new();
+            for (idx, t, d) in &steps {
+                steps_map.insert(
+                    idx.to_string(),
+                    serde_json::json!({ "title": t, "description": d }),
+                );
+            }
+            existing["__orig"] = serde_json::json!({
+                "title": title,
+                "steps": Value::Object(steps_map),
+            });
+            let snap_json = serde_json::to_string(&existing)
+                .map_err(|e| format!("原文快照序列化失败：{}", e))?;
+            crate::db::set_recording_translations_raw(&conn, &recording_id, &snap_json)?;
+        }
+
         (title, steps, existing)
     };
 
@@ -182,6 +207,8 @@ pub fn translate_recording(
 
     let app_handle = app.clone();
     let rid = recording_id.clone();
+    // recording_title 会被 move 进线程，先留一份给线程外的全局完成提醒
+    let title_for_notify = recording_title.clone();
     std::thread::spawn(move || {
         let result = run_translation(rid.clone(), lang.clone(), lang_label, recording_title, steps, existing, config);
         match &result {
@@ -201,11 +228,20 @@ pub fn translate_recording(
         let _ = app_handle.emit(
             "translate://done",
             TranslateDoneEvent {
-                recording_id: rid,
-                lang,
+                recording_id: rid.clone(),
+                lang: lang.clone(),
                 ok,
-                summary,
+                summary: summary.clone(),
             },
+        );
+        // 全局完成提醒（任意页面弹窗 + Windows 系统通知，带教程名）
+        crate::job_notify::emit_job_done(
+            &app_handle,
+            &rid,
+            &title_for_notify,
+            crate::job_notify::JobOp::Translate,
+            ok,
+            &summary,
         );
     });
 

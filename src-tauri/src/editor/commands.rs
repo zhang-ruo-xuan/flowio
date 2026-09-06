@@ -1,7 +1,7 @@
 use base64::Engine;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::DbState;
 
@@ -207,6 +207,128 @@ pub fn delete_step(db: State<DbState>, step_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 查找替换结果：被修改的步骤数 + 替换总处数。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceResult {
+    pub changed_steps: usize,
+    pub replaced: usize,
+}
+
+/// 大小写不敏感替换（与前端 JS 版语义一致）：返回 (新文本, 替换处数)。
+/// 仅当 to_lowercase 不改变字节长度时走精确字节匹配（ASCII+中文恒成立）；
+/// 罕见 Unicode（如 'İ'）会改变长度 → 退化为大小写敏感 replace，保证索引安全。
+fn replace_ci(hay: &str, search: &str, rep: &str) -> (String, usize) {
+    if search.is_empty() {
+        return (hay.to_string(), 0);
+    }
+    let hay_lc = hay.to_lowercase();
+    let search_lc = search.to_lowercase();
+    if hay_lc.len() != hay.len() || search_lc.len() != search.len() {
+        let n = hay.matches(search).count();
+        return (hay.replace(search, rep), n);
+    }
+    let hay_b = hay.as_bytes();
+    let hay_lcb = hay_lc.as_bytes();
+    let search_b = search_lc.as_bytes();
+    let mut out = String::with_capacity(hay.len() + 16);
+    let mut count = 0usize;
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i + search_b.len() <= hay_b.len() {
+        if &hay_lcb[i..i + search_b.len()] == search_b {
+            out.push_str(&hay[last..i]);
+            out.push_str(rep);
+            count += 1;
+            i += search_b.len();
+            last = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&hay[last..]);
+    (out, count)
+}
+
+/// 批量查找替换：在指定教程所有步骤的 title/description 中把 search 替换为 replace。
+/// 大小写不敏感（查找与替换同口径）；整个操作只压**一次**撤销快照——
+/// 用户 Ctrl+Z 一次即可整体还原，不会像逐个 update_step 那样产生 N 层撤销。
+#[tauri::command]
+pub fn replace_in_steps(
+    db: State<DbState>,
+    recording_id: String,
+    search: String,
+    replace: String,
+) -> Result<ReplaceResult, String> {
+    if search.trim().is_empty() {
+        return Err("查找内容不能为空".into());
+    }
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM recordings WHERE id = ?1",
+            params![recording_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if exists == 0 {
+        return Err("教程不存在".into());
+    }
+
+    // 读出全部步骤文本，先在内存里算好要改哪些行
+    let mut stmt = conn
+        .prepare("SELECT id, title, description FROM steps WHERE recording_id = ?1 ORDER BY order_index")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map(params![recording_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+
+    let mut updates: Vec<(String, String, String)> = Vec::new(); // (step_id, new_title, new_desc)
+    let mut replaced_total = 0usize;
+    for (id, title, desc) in rows {
+        let (nt, c1) = replace_ci(&title, &search, &replace);
+        let (nd, c2) = replace_ci(&desc, &search, &replace);
+        if c1 + c2 > 0 {
+            replaced_total += c1 + c2;
+            updates.push((id, nt, nd));
+        }
+    }
+    if updates.is_empty() {
+        return Ok(ReplaceResult { changed_steps: 0, replaced: 0 });
+    }
+
+    // 一次性撤销快照（替换前状态）→ 单事务写回
+    push_edit_history(&conn, &recording_id)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (id, nt, nd) in &updates {
+        tx.execute(
+            "UPDATE steps SET title = ?1, description = ?2 WHERE id = ?3",
+            params![nt, nd, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "UPDATE recordings SET updated_at = datetime('now') WHERE id = ?1",
+        params![recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(ReplaceResult {
+        changed_steps: updates.len(),
+        replaced: replaced_total,
+    })
+}
+
 /// Batch-update the order_index of steps for a recording.
 #[tauri::command]
 pub fn reorder_steps(
@@ -357,11 +479,27 @@ fn load_merge_steps(
     Ok(rows)
 }
 
+/// 合并组的「视觉承载行」：组内最后一个输入类步骤（type/paste）的 id。
+///
+/// 输入步骤的截图 = 填完之后的界面状态；合并若一律取组末步，
+/// 「填完 A 框又点 B 框」的组就会把 A 填完的截图跳掉，读者无法照做。
+/// 组内没有输入步骤时返回 None（承载行退回组末步）。
+/// 纯函数：`actions` 与 `ids` 一一对应。
+pub(crate) fn last_input_step_index(ids: &[String], actions: &[&str]) -> Option<usize> {
+    ids.iter()
+        .enumerate()
+        .filter(|(i, _)| matches!(actions.get(*i).copied().unwrap_or(""), "type" | "paste"))
+        .map(|(i, _)| i)
+        .last()
+}
+
 /// 把合并方案落到数据库（事务内）。
 ///
 /// - 每组首步承载结果：主图 / 标注图 / after 图 / 裁剪框 ← 组内**末步**（最终画面），
 ///   操作前图 / 标题 / action_type / tip / timestamp / window_title 保持**首步**。
 ///   ⚠️ timestamp 取首步而非末步：语音切片按步骤起点切，取末步会丢掉整段输入的录音。
+///   ⚠️ 2026-09-05 起例外：组内含输入步骤（type/paste）时，截图/坐标改取**最后一个
+///   输入步骤**（填完后的界面状态），见 [`last_input_step_index`]。
 /// - `removed` 里的步骤直接删除（不保留任何行）。
 /// - 最后重排 order_index / step_number，并同步 `recordings.total_steps`。
 ///
@@ -414,6 +552,13 @@ pub(crate) fn apply_merge_plan(
         }
         let first = by_id[g.ids[0].as_str()];
         let last = by_id[g.ids.last().unwrap().as_str()];
+        // 视觉承载行：组内含输入类步骤（type/paste）时，截图/坐标取**最后一个输入步骤**
+        // ——它的截图是「填完之后」的界面状态。一律取组末步会把填值过程的截图跳掉
+        // （比如填完查找值又点下一格，读者就看不到查找值填完后的样子），2026-09-05 用户反馈。
+        let actions: Vec<&str> = g.ids.iter().map(|id| by_id[id.as_str()].1.as_str()).collect();
+        let carrier = last_input_step_index(&g.ids, &actions)
+            .map(|i| by_id[g.ids[i].as_str()])
+            .unwrap_or(last);
         let desc = match &g.desc {
             Some(d) => d.clone(),
             None if !last.3.trim().is_empty() => last.3.clone(),
@@ -424,8 +569,8 @@ pub(crate) fn apply_merge_plan(
              after_screenshot_path = ?4, x = ?5, y = ?6, crop_w = ?7, crop_h = ?8 \
              WHERE id = ?9",
             params![
-                desc, last.5, last.6, last.8,
-                last.9, last.10, last.11, last.12, first.0,
+                desc, carrier.5, carrier.6, carrier.8,
+                carrier.9, carrier.10, carrier.11, carrier.12, first.0,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -738,7 +883,18 @@ fn plan_to_groups(plan: &MergePlan, rows: &[MergeStepRow]) -> Vec<MergeGroup> {
                 Some(MergeGroup {
                     ids,
                     desc,
-                    title: plan.titles.get(gi).cloned().flatten(),
+                    // ★ 精简产出的标题同样防撑爆（LLM 软约束，落库前兜底截 10 字）
+                    title: plan
+                        .titles
+                        .get(gi)
+                        .cloned()
+                        .flatten()
+                        .map(|t| {
+                            crate::recorder::activity::truncate_label(
+                                &t,
+                                crate::recorder::activity::TITLE_LABEL_MAX_CHARS,
+                            )
+                        }),
                 })
             }
         })
@@ -1083,6 +1239,59 @@ pub fn edit_history_sizes(db: State<DbState>, recording_id: String) -> Result<Hi
     Ok(HistSizes { undo: count("undo"), redo: count("redo") })
 }
 
+// ── 编辑器视图偏好持久化（全图/裁图）──────────────────────────
+// 历史方案只写 localStorage（WebView2），用户实测「退出重进丢裁图视图」，
+// WebView 存储不可靠 → 升级为 SQLite settings 表权威存储，localStorage
+// 仅作首屏同步缓存。读写都落 [VIEW] 日志，再丢视图有据可查。
+
+fn view_dbg_log(msg: &str) {
+    crate::ai::commands::ai_dbg_log(&format!("[VIEW] {}", msg));
+}
+
+/// settings 表 key：`flowio_view::<recording_id>`
+fn view_setting_key(recording_id: &str) -> String {
+    format!("flowio_view::{}", recording_id)
+}
+
+/// 读取某教程的视图偏好 JSON（全图/裁图），无记录返回 null。
+///
+/// # Errors
+/// 数据库锁/查询失败时返回错误字符串。
+#[tauri::command]
+pub fn editor_view_get(db: State<'_, DbState>, recording_id: String) -> Result<Option<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![view_setting_key(&recording_id)],
+            |r| r.get(0),
+        )
+        .ok();
+    view_dbg_log(&format!(
+        "get rec={} found={} len={}",
+        recording_id,
+        v.is_some(),
+        v.as_deref().map(str::len).unwrap_or(0)
+    ));
+    Ok(v)
+}
+
+/// 保存某教程的视图偏好 JSON（编辑器每次切换全图/裁图都会调用）。
+///
+/// # Errors
+/// 数据库写入失败时返回错误字符串。
+#[tauri::command]
+pub fn editor_view_set(db: State<'_, DbState>, recording_id: String, value: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        params![view_setting_key(&recording_id), value],
+    )
+    .map_err(|e| e.to_string())?;
+    view_dbg_log(&format!("set rec={} len={}", recording_id, value.len()));
+    Ok(())
+}
+
 // ── 撤销 ──────────────────────────────────────────────────────
 
 /// 用最近一次快照还原步骤（并消费掉该快照）。
@@ -1168,6 +1377,17 @@ pub fn build_simplify_prompt(
     titles: &[String],
     descs: &[String],
 ) -> String {
+    build_simplify_prompt_ext(steps, titles, descs, "")
+}
+
+/// [`build_simplify_prompt`] 的可扩展版：`extra_rules` 追加在基础规则之后
+/// （带截图调用时传入视觉相关规则，纯文本调用传空）。
+pub fn build_simplify_prompt_ext(
+    steps: &[MergeStepLite],
+    titles: &[String],
+    descs: &[String],
+    extra_rules: &str,
+) -> String {
     let mut lines = String::new();
     for (i, s) in steps.iter().enumerate() {
         let title = titles.get(i).cloned().unwrap_or_default();
@@ -1189,22 +1409,38 @@ pub fn build_simplify_prompt(
         ));
     }
 
+    // 2026-09-05 规则收紧（用户实测 WPS XLOOKUP 教程暴露的四类问题）：
+    //   · 规则 5：一组只覆盖一个输入框 → 保住「填完后的界面」截图（配合落库侧
+    //     last_input_step_index 承载逻辑，双保险）；
+    //   · 规则 8：禁合并历史注解（「（先误输后修正）」读者看不懂）；
+    //   · 规则 9：禁编造位置词（「另一个单元格」是模型瞎猜的）。
     format!(
         "你是屏幕录制教程的「步骤精简」助手。下面是按时间顺序自动捕获的原始操作步骤，\
          里面混着大量机械性冗余：双击单元格被记成两次点击、点输入框和紧接着的输入被拆成两步、\
          同一个输入框里的多次输入被拆成好几步、以及最后点「停止录制」的那一下。\n\n\
-         请把它们合并成「读者照着做」所需的最少步骤。\n\n\
+         请只把**机械性冗余**合并掉（重复点击、点击+输入被拆成两步、同一输入框多次输入、\
+         误操作后立刻重做），其余操作一律保持独立——目标是读者能看懂每一步在干嘛，\
+         而不是步数少。\n\n\
          原始步骤（序号\\t类型\\t坐标\\t窗口\\t标题\\t描述）：\n{n}\
          \n合并规则：\n\
          1. 只能把**相邻的若干步**合成一步。禁止跨步重组、禁止改变先后顺序。\n\
          2. 每个序号必须且只能出现一次：要么在某个 group 里，要么在 removed 里。\n\
          3. 可以合并的典型情况：同一位置的连续点击；点击某输入框后立即在同一位置输入；\
-         同一输入框内的多次连续输入；误操作后立刻重做（保留最终有效的那次）。\n\
+         同一输入框内的多次连续输入；误操作后立刻重做（保留最终有效的那次）。\
+         每一组必须满足：组内所有操作针对**同一个控件/位置**且服务**同一个目的**。\n\
          4. 不要合并语义独立的操作：点了不同的按钮/单元格、切换窗口、复制/粘贴/快捷键、\
-         打开或关闭对话框。\n\
-         5. removed 只放完全没有意义的收尾动作（例如录到最后点了一下录制工具自己的窗口）。\n\
-         6. 追求步数尽量少，但宁可多留一步也不要丢动作。\n\n\
-         输出严格 JSON，不要 markdown 代码块、不要任何解释：\n\
+         打开或关闭对话框。特别注意：复制(Ctrl+C)/剪切与粘贴是两个独立步骤，\
+         永远不并入其他组；选择/拖拽文本、点击链接、点击按钮各自独立成步。\n\
+         5. 一组最多覆盖**一个输入框/控件**的「点击+输入」过程；输入完成后去点击其他\
+         输入框或控件，必须另起一组——保证每一次填完的界面状态都有对应截图。\n\
+         6. removed 只放完全没有意义的收尾动作（例如录到最后点了一下录制工具自己的窗口）。\n\
+         7. 不确定能否合并时，一律不合并。合并后如果读者会看不懂「这一步在干嘛」，\
+         说明合过头了，把该组拆回去。步数多不是问题，看不懂才是。\n\
+         8. descriptions 只写**读者要做的最终操作**：禁止解释合并历史（如「先误输后修正」\
+         「之前输错了」），禁止任何括号补充说明；误输入与修正合并后，只写最终正确的输入。\n\
+         9. 描述里的位置信息只能来自原始标题/描述或坐标：坐标相同或非常接近 = 同一个位置；\
+         严禁凭空使用「另一个」「相邻」「某个」「相关位置」等无法佐证的定位词。{extra}\
+         \n\n输出严格 JSON，不要 markdown 代码块、不要任何解释：\n\
          {{\"groups\": [[1,2,3],[4],[5,6]], \"removed\": [], \
          \"descriptions\": {{\"1\": \"合并后这一步的一句话说明\", \"4\": \"…\"}}}}\n\
          - groups 里每个数组的元素必须是**连续递增**的序号；\n\
@@ -1212,9 +1448,21 @@ pub fn build_simplify_prompt(
          30~60 字，写给要照着操作的读者看（合并了哪些动作要交代清楚）；\n\
          - **只给合并了多步的组写描述**，单步组不要出现在 descriptions 里\
          （这些步骤的描述保持原样，不要动）。",
-        n = lines
+        n = lines,
+        extra = extra_rules,
     )
 }
+
+/// 带截图调用时追加的视觉规则（2026-09-05：AI 精简接入截图）。
+///
+/// 没有图模型看不到单元格和菜单，只能写出「另一个单元格」「相关位置」这类模糊话，
+/// 更不可能写出「工具栏-公式-函数-XLOOKUP」这种具体路径。
+pub(crate) const SIMPLIFY_VISION_RULES: &str = "\n\
+         10. 每一步都附有截图（按步骤顺序，含点击位置标注）：请结合截图、坐标和原始文字\
+         综合判断操作对象（单元格、按钮、菜单项）；截图与坐标冲突时以截图为准。\n\
+         11. 打开菜单/功能区/入口的步骤，若截图中能看到菜单和按钮文字，必须写出**完整路径**，\
+         格式如：工具栏-公式-函数-XLOOKUP；截图上认不出来就沿用原始描述，\
+         禁止写成「相关位置」「相关设置」这类模糊话。";
 
 /// 窗口标题缩短（去掉文件名后缀等噪声，只给模型看关键信息）。
 fn short_window(title: &str) -> String {
@@ -1354,11 +1602,101 @@ pub fn parse_merge_plan(raw: &str, total: usize) -> Result<MergePlan, String> {
     })
 }
 
+/// 单次精简请求最多附带的截图数（防超大录制把请求体撑爆；超出部分模型按纯文本处理）。
+const SIMPLIFY_MAX_IMAGES: usize = 40;
+
+/// 读出一步的截图（优先带点击位置标注的 annotated 图）并按 action_type 裁剪，
+/// 返回 JPEG base64；无图/读取失败返回空串。
+fn simplify_step_image(r: &MergeStepRow) -> String {
+    let path = if r.6.is_empty() { r.5.as_str() } else { r.6.as_str() };
+    let raw = crate::ai::commands::read_file_base64(path);
+    if raw.is_empty() {
+        return String::new();
+    }
+    crate::ai::pipeline::crop_and_encode_typed(&raw, r.9, r.10, r.11, r.12, &r.1)
+}
+
+/// 组装精简请求的 user 消息：文本提示词 + 按步骤顺序穿插的截图。
+/// 纯函数：`step_images` 为空时退化为纯文本（旧行为）。
+fn build_simplify_user_content(prompt: &str, step_images: &[String]) -> serde_json::Value {
+    if step_images.iter().all(|s| s.is_empty()) {
+        return serde_json::Value::String(prompt.to_string());
+    }
+    let mut parts = vec![serde_json::json!({ "type": "text", "text": prompt })];
+    for (i, img) in step_images.iter().enumerate() {
+        if img.is_empty() {
+            continue;
+        }
+        parts.push(serde_json::json!({
+            "type": "text",
+            "text": format!("上面步骤表中序号 {} 的截图：", i + 1),
+        }));
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:image/jpeg;base64,{}", img) },
+        }));
+    }
+    serde_json::Value::Array(parts)
+}
+
 /// AI 精简：把步骤序列交给模型出分区方案，校验通过后落库。
+///
+/// 外壳只负责「取标题 + 派发完成通知」；实际逻辑在 `simplify_steps_ai_inner`。
+/// 这样无论成功还是失败（`?` 提前返回），用户都能在**任意页面**收到带教程名的
+/// 完成/失败提醒（退出教程页也不丢失）。
 #[tauri::command]
 pub async fn simplify_steps_ai(
     db: State<'_, DbState>,
+    app: AppHandle,
     recording_id: String,
+) -> Result<SimplifyResult, String> {
+    let title = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT title FROM recordings WHERE id = ?1",
+            rusqlite::params![recording_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default()
+    };
+    let result = simplify_steps_ai_inner(&db, &recording_id).await;
+    match &result {
+        Ok(r) => {
+            let summary = if r.kind == "ai" {
+                format!(
+                    "AI 精简完成：从 {} 步减到 {} 步（减少 {} 步）",
+                    r.before, r.after, r.reduced
+                )
+            } else {
+                format!("已自动合并重复步骤，减少 {} 步", r.reduced)
+            };
+            crate::job_notify::emit_job_done(
+                &app,
+                &recording_id,
+                &title,
+                crate::job_notify::JobOp::AiSimplify,
+                true,
+                &summary,
+            );
+        }
+        Err(e) => {
+            crate::job_notify::emit_job_done(
+                &app,
+                &recording_id,
+                &title,
+                crate::job_notify::JobOp::AiSimplify,
+                false,
+                e,
+            );
+        }
+    }
+    result
+}
+
+/// `simplify_steps_ai` 的实际实现（见上方外壳的注释）。
+async fn simplify_steps_ai_inner(
+    db: &State<'_, DbState>,
+    recording_id: &str,
 ) -> Result<SimplifyResult, String> {
     // ── 前置：先跑规则层 ──────────────────────────────────────
     // 两个好处：① 交给 AI 的序列更短（省 token、判断更容易）；
@@ -1366,15 +1704,15 @@ pub async fn simplify_steps_ai(
     //    不会点完按钮什么都没发生。
     let rules = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        push_edit_history(&conn, &recording_id)?;
-        auto_merge_steps_conn(&conn, &recording_id)?
+        push_edit_history(&conn, recording_id)?;
+        auto_merge_steps_conn(&conn, recording_id)?
     };
 
     let (config, rows) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         (
             crate::ai::commands::resolve_ai_config(&conn),
-            load_merge_steps(&conn, &recording_id)?,
+            load_merge_steps(&conn, recording_id)?,
         )
     };
     let before = rules.before;
@@ -1401,7 +1739,23 @@ pub async fn simplify_steps_ai(
         .collect();
     let titles: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
     let descs: Vec<String> = rows.iter().map(|r| r.3.clone()).collect();
-    let prompt = build_simplify_prompt(&lite, &titles, &descs);
+
+    // ── 视觉增强（2026-09-05）：附上每步截图，模型才能写出具体位置 ──
+    // 没有图它看不到单元格/菜单，只会写「另一个单元格」「相关位置」这类模糊话。
+    // 模型不支持视觉时退化为纯文本（旧行为，规则层收益不受影响）。
+    let use_vision = crate::ai::pipeline::model_supports_vision(&config.provider.model);
+    let (prompt, step_images) = if use_vision {
+        (
+            build_simplify_prompt_ext(&lite, &titles, &descs, SIMPLIFY_VISION_RULES),
+            rows.iter()
+                .take(SIMPLIFY_MAX_IMAGES)
+                .map(simplify_step_image)
+                .collect::<Vec<String>>(),
+        )
+    } else {
+        (build_simplify_prompt(&lite, &titles, &descs), Vec::new())
+    };
+    let content = build_simplify_user_content(&prompt, &step_images);
 
     // 输出是「40+ 个分组 + 每组一句话描述」的完整 JSON，4096 会被截断
     // （截断 → 解析必然失败），留足余量到 8192。
@@ -1410,7 +1764,7 @@ pub async fn simplify_steps_ai(
             &config,
             vec![crate::ai::http::Message {
                 role: "user".to_string(),
-                content: serde_json::Value::String(prompt),
+                content,
             }],
             8192,
         )
@@ -1434,7 +1788,7 @@ pub async fn simplify_steps_ai(
         .collect();
 
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let applied = apply_merge_plan(&conn, &recording_id, &groups, &removed, true)?;
+    let applied = apply_merge_plan(&conn, recording_id, &groups, &removed, true)?;
     Ok(SimplifyResult {
         before,
         after: before - rules.reduced - applied,
@@ -1504,6 +1858,7 @@ pub fn add_step(
 }
 
 /// Update the recording title.
+/// Returns error if another recording (excluding self) already has this title.
 #[tauri::command]
 pub fn update_recording_title(
     db: State<DbState>,
@@ -1511,6 +1866,19 @@ pub fn update_recording_title(
     title: String,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 标题长度封顶：超长标题会把编辑器顶栏挤变形（与另存为 find_unique_title 同一上限）
+    let title = crate::db::commands::cap_title_chars(title.trim());
+    // Check for duplicate title (exclude current recording)
+    let dup_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM recordings WHERE title = ?1 AND id != ?2",
+            params![title, id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if dup_count > 0 {
+        return Err(format!("标题已存在：{}", title));
+    }
     let _ = push_edit_history(&conn, &id);
     conn.execute(
         "UPDATE recordings SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
@@ -1561,6 +1929,47 @@ pub fn crop_step_screenshot(
     .map_err(|e| e.to_string())?;
 
     Ok(new_path_str)
+}
+
+/// Save the fully-annotated (non-cropped) screenshot as a step's main image.
+///
+/// 与 `crop_step_screenshot` 的区别（关键，对应「全图裁图互不影响」原则）：
+/// - `crop_step_screenshot` 把「裁切后的图」写进 screenshot_path → 全图被裁切图覆盖，
+///   而裁图视图又从全图二次派生，结果全图和裁图都变成裁切图（bug 来源）；
+/// - 本命令把「**完整图 + 注释**」原地覆盖回 screenshot_path（同一个文件，不另存
+///   `_cropped.jpg`），只动全图；裁图则交给 `update_step_crop` 更新锚点独立控制。
+///
+/// 这样：全图 = 完整标注图；裁图 = 完整标注图按锚点派生。两者互不覆盖，
+/// 之后还能随时改裁图框而绝不丢全图。
+#[tauri::command]
+pub fn save_step_screenshot_full(
+    db: State<DbState>,
+    step_id: String,
+    base64_data: String,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
+
+    // 解码 base64 → 图像字节（沿用 crop_step_screenshot 的 decoder，PNG/JPEG 字节都接受）
+    let bytes = decode_jpeg_base64(&base64_data)?;
+
+    let current_path: String = conn
+        .query_row(
+            "SELECT screenshot_path FROM steps WHERE id = ?1",
+            params![step_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Step not found: {}", e))?;
+
+    if current_path.is_empty() {
+        return Err("该步骤没有主截图路径，无法写入标注".into());
+    }
+
+    // 原地覆盖同一文件：路径不变、不残留 _cropped 副本，裁图缓存随锚点派生保持一致
+    std::fs::write(&current_path, &bytes)
+        .map_err(|e| format!("Failed to write screenshot: {}", e))?;
+
+    Ok(())
 }
 
 /// Upload a screenshot (base64 JPEG) for a step, save to disk and update DB.
@@ -1795,6 +2204,50 @@ fn clear_col_sql(col: &str) -> String {
 #[cfg(test)]
 mod editor_tests {
     use super::*;
+
+    #[test]
+    fn replace_ci_basic_mixed_case() {
+        // 大小写不敏感：Search 能命中 sEARCH 等混写
+        let (out, n) = replace_ci("Click the Search button, then search again", "search", "查找");
+        assert_eq!(n, 2);
+        assert_eq!(out, "Click the 查找 button, then 查找 again");
+    }
+
+    #[test]
+    fn replace_ci_chinese_exact() {
+        let (out, n) = replace_ci("在工具栏点击保存，保存后关闭", "保存", "导出");
+        assert_eq!(n, 2);
+        assert_eq!(out, "在工具栏点击导出，导出后关闭");
+    }
+
+    #[test]
+    fn replace_ci_no_match_returns_original() {
+        let (out, n) = replace_ci("纯中文步骤", "Excel", "表格");
+        assert_eq!(n, 0);
+        assert_eq!(out, "纯中文步骤");
+    }
+
+    #[test]
+    fn replace_ci_empty_search_noop() {
+        let (out, n) = replace_ci("abc", "", "x");
+        assert_eq!(n, 0);
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn replace_ci_replace_with_empty_deletes() {
+        let (out, n) = replace_ci("步骤A，步骤B", "，", "");
+        assert_eq!(n, 1);
+        assert_eq!(out, "步骤A步骤B");
+    }
+
+    #[test]
+    fn replace_ci_no_double_match_on_overlap() {
+        // 命中后跳过整段，不做重叠匹配：aaa 中搜 aa 只替换 1 处
+        let (out, n) = replace_ci("aaa", "aa", "b");
+        assert_eq!(n, 1);
+        assert_eq!(out, "ba");
+    }
 
     #[test]
     fn step_data_window_title_defaults_to_empty() {
@@ -2300,13 +2753,15 @@ mod editor_tests {
 
         merge_steps_conn(&conn, "r1", &["s1".into(), "s2".into(), "s3".into()]).unwrap();
 
-        // s1 承载合并结果：主图取末步 s3、描述拼接、标题取首步 s1
+        // s1 承载合并结果：主图/坐标取组内最后一个输入步 s2（type，填完后的状态，
+        // 2026-09-05 起不再取末步——末步 s3 已点去「确定」，填完状态会被跳掉）、
+        // 描述拼接、标题取首步 s1
         let (action, title, desc, ss, x, order) = step_row(&conn, "s1");
         assert_eq!(action, "click");
         assert_eq!(title, "第二步");
         assert_eq!(desc, "点查找值框\n输入查找值\n点确定");
-        assert_eq!(ss, "s3.jpg"); // 末步主图
-        assert_eq!(x, Some(30)); // 末步裁剪锚点
+        assert_eq!(ss, "s2.jpg"); // 组内最后一个输入步的主图
+        assert_eq!(x, Some(20)); // 输入步的裁剪锚点
         assert_eq!(order, 1);
 
         // s2/s3 已删除，剩 2 步且 order_index 重排
@@ -2659,6 +3114,113 @@ mod editor_tests {
         assert!(p.contains("concat("));
         assert!(p.contains("groups"), "必须要求输出 groups");
         assert!(p.contains("连续递增"), "必须声明连续性约束");
+        // 2026-09-05 收紧的四条规则
+        assert!(p.contains("一个输入框"), "一组只覆盖一个输入框的填写");
+        assert!(p.contains("最终操作"), "描述只写读者要做的最终操作");
+        assert!(p.contains("禁止任何括号补充说明"), "禁合并历史注解");
+        assert!(p.contains("另一个"), "禁编造位置词（纯文本版也要禁）");
+        assert!(!p.contains("附有截图"), "纯文本版不能提截图（模型没收到图）");
+    }
+
+    #[test]
+    fn build_simplify_prompt_ext_appends_vision_rules() {
+        let steps = vec![lite("click", "t", "w", 1, 2, 0)];
+        let p = build_simplify_prompt_ext(
+            &steps,
+            &["t".to_string()],
+            &["".to_string()],
+            SIMPLIFY_VISION_RULES,
+        );
+        assert!(p.contains("附有截图"), "视觉版要告知模型收到了截图");
+        assert!(p.contains("完整路径"), "要求写出菜单完整路径");
+        assert!(p.contains("同一个位置"), "坐标相同=同一位置");
+        // 基础规则仍在
+        assert!(p.contains("连续递增"));
+    }
+
+    #[test]
+    fn build_simplify_user_content_text_only_when_no_images() {
+        let c = build_simplify_user_content("PROMPT", &[]);
+        assert!(c.is_string(), "无图时退化为纯字符串");
+        let c2 = build_simplify_user_content("PROMPT", &[String::new()]);
+        assert!(c2.is_string(), "全空图也退化为纯字符串");
+    }
+
+    #[test]
+    fn build_simplify_user_content_interleaves_text_and_images() {
+        let imgs = vec!["IMG1".to_string(), String::new(), "IMG3".to_string()];
+        let c = build_simplify_user_content("PROMPT", &imgs);
+        let arr = c.as_array().unwrap();
+        // text(prompt) + (text+img)×2（空图跳过）
+        assert_eq!(arr.len(), 5);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "text");
+        assert!(arr[1]["text"].as_str().unwrap().contains("1"));
+        assert_eq!(arr[2]["image_url"]["url"], "data:image/jpeg;base64,IMG1");
+        assert_eq!(arr[4]["image_url"]["url"], "data:image/jpeg;base64,IMG3");
+        // 空图步（序号 2）不应出现对应标签
+        let labels: Vec<&str> = arr
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect();
+        assert!(!labels.iter().any(|t| t.contains("2 的截图")));
+    }
+
+    #[test]
+    fn last_input_step_index_prefers_last_type_or_paste() {
+        let ids = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let actions = ["click", "type", "click", "paste"];
+        assert_eq!(last_input_step_index(&ids, &actions), Some(3));
+        let actions2 = ["click", "type", "click", "click"];
+        assert_eq!(last_input_step_index(&ids, &actions2), Some(1));
+        let actions3 = ["click", "click", "hotkey", "click"];
+        assert_eq!(last_input_step_index(&ids, &actions3), None);
+    }
+
+    #[test]
+    fn apply_merge_plan_input_step_carries_screenshot_and_coords() {
+        let conn = mem_db();
+        // click → type → click 合并成一组：截图/坐标必须取中间的 type 步（填完后的状态），
+        // 而不是组末步（又点去了下一格，填完状态被跳掉 → 2026-09-05 用户反馈）。
+        insert_full(&conn, "s0", 0, "click", "点输入框", "", "W", 0, 0, 1000);
+        insert_full(&conn, "s1", 1, "type", "输入", "填了值", "W", 10, 10, 2000);
+        insert_full(&conn, "s2", 2, "click", "点下一格", "", "W", 20, 20, 3000);
+        let groups = vec![MergeGroup {
+            ids: vec!["s0".into(), "s1".into(), "s2".into()],
+            desc: Some("点击输入框并填写".into()),
+            title: None,
+        }];
+        let reduced = apply_merge_plan(&conn, "r1", &groups, &[], true).unwrap();
+        assert_eq!(reduced, 2);
+        let (ss, x, y): (String, Option<i32>, Option<i32>) = conn
+            .query_row(
+                "SELECT screenshot_path, x, y FROM steps WHERE id='s0'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ss, "s1.jpg", "截图取组内最后一个输入步骤");
+        assert_eq!(x, Some(10), "坐标随截图取输入步骤（热点=输入框）");
+        assert_eq!(y, Some(10));
+    }
+
+    #[test]
+    fn apply_merge_plan_click_only_group_still_uses_last_step() {
+        let conn = mem_db();
+        // 纯点击组：维持原行为（末步承载）
+        insert_full(&conn, "s0", 0, "click", "a", "", "W", 0, 0, 1000);
+        insert_full(&conn, "s1", 1, "click", "b", "", "W", 10, 10, 2000);
+        let groups = vec![MergeGroup {
+            ids: vec!["s0".into(), "s1".into()],
+            desc: None,
+            title: None,
+        }];
+        apply_merge_plan(&conn, "r1", &groups, &[], true).unwrap();
+        let ss: String = conn
+            .query_row("SELECT screenshot_path FROM steps WHERE id='s0'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ss, "s1.jpg", "无输入步骤的组仍取组末步截图");
     }
 
     /// 黄金值测试：真实录制 2026-09-03 14:44:01（WPS 表格 XLOOKUP 教程，52 步）。

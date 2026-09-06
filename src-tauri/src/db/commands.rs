@@ -1,4 +1,4 @@
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use tauri::State;
 
@@ -207,11 +207,297 @@ pub fn delete_recordings(db: State<DbState>, ids: Vec<String>) -> Result<u32, St
 #[tauri::command]
 pub fn save_recording(
     db: State<DbState>,
-    recording: RecordingSave,
+    mut recording: RecordingSave,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 自动命名（时间戳）可能与其他录制撞名（如快速连续停止两次录制），
+    // 此处统一做去重兜底，确保入库标题唯一。
+    recording.title = find_unique_title(&conn, &recording.title);
     crate::db::save_recording_to_db(&conn, &recording)
 }
+
+/// 根据基础标题生成一个在 recordings 表中不重复的标题。
+/// 策略：先查「base」是否已存在；不存在直接返回 base。
+/// 录制标题最大长度（字符数）：超长标题会把编辑器顶栏挤变形（按钮被压成竖排）。
+/// 手动重命名与另存为统一按此封顶；存量数据不回改。
+const RECORDING_TITLE_MAX_CHARS: usize = 30;
+
+pub fn cap_title_chars(s: &str) -> String {
+    let mut out: String = s.chars().take(RECORDING_TITLE_MAX_CHARS).collect();
+    // 截断可能产生残缺结尾，清理悬挂的半个括号
+    while out.ends_with('（') {
+        out.pop();
+    }
+    out
+}
+
+/// Strip trailing (copy) or (copy N) suffix from a title to get the base name.
+/// e.g. "X（副本 2）" => "X", "X（副本）" => "X", "X" => "X"
+/// 兼容历史半角变体 "X (副本)" / "X (副本 2)"；
+/// 循环剥离：历史版本 bug 会产生「X（副本）（副本）」叠罗汉标题，一次性剥干净。
+fn strip_copy_suffix(s: &str) -> &str {
+    let mut cur = s;
+    while let Some(stripped) = strip_one_copy_suffix(cur) {
+        cur = stripped;
+    }
+    cur.trim_end()
+}
+
+fn strip_one_copy_suffix(s: &str) -> Option<&str> {
+    let inner = s.strip_suffix('）').or_else(|| s.strip_suffix(')'))?;
+    // 找最后一个开括号（全角/半角兼容历史标题）
+    let pos = inner.rfind(['（', '('])?;
+    // 跳过开括号之后必须紧跟「副本」或「副本 N」
+    //（此前这里 pos+3 只跳过了 '（' 却拿「本」去比对，永远匹配不上 → 叠罗汉 bug 根因）
+    let after_paren = &inner[pos + inner[pos..].chars().next().unwrap().len_utf8()..];
+    if after_paren == "副本" {
+        return Some(&s[..pos]);
+    }
+    let num_part = after_paren.strip_prefix("副本")?;
+    let trimmed = num_part.trim();
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Some(&s[..pos]);
+    }
+    None
+}
+
+/// Generate a unique title by stripping any existing (copy) suffix first,
+/// then trying base, base(copy), base(copy 2)...base(copy N).
+/// Uses full-width parentheses （） to match UI display.
+fn find_unique_title(conn: &rusqlite::Connection, base: &str) -> String {
+    let stripped = strip_copy_suffix(base);
+    // 先剥后缀再封顶：标题超长时截断，防止顶栏变形（副本后缀在封顶后重新追加）
+    let base_owned = cap_title_chars(stripped);
+    let base = base_owned.as_str();
+
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM recordings WHERE title = ?1")
+        .expect("prepare find_unique_title");
+    let mut exists = |t: &str| -> bool {
+        stmt.query_row(params![t], |row| row.get::<_, i64>(0))
+            .unwrap_or(0) > 0
+    };
+
+    if !exists(base) {
+        return base.to_string();
+    }
+    if !exists(&format!("{}（副本）", base)) {
+        return format!("{}（副本）", base);
+    }
+    for n in 2..=999 {
+        let candidate = format!("{}（副本 {}）", base, n);
+        if !exists(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{}（副本 {}）", base, uuid::Uuid::new_v4())
+}
+
+/// 复制一份教程为新录制（另存为）。
+/// - 生成全新的 recording id 与全新的 step id；
+/// - **截图文件连带拷贝**到 temp/flowio_screenshots 下的新文件名，避免删副本误删原图；
+/// - 副本标题去重：先剥掉源标题结尾的「（副本）/（副本 N）」（含历史叠罗汉），
+///   再依次尝试 base / base（副本）/ base（副本 2）…，并在 30 字符内封顶；
+/// - 副本沿用源教程的 user_id（归属同一账号），编辑历史/精简快照按新 id 天然隔离 → 改副本不伤原教程；
+/// - 编辑器视图偏好（全图/裁图，settings 表 `flowio_view::<rec_id>`）一并复制 → 副本打开时显示状态与源一致；
+/// - 译文副本（recordings.translations，按步骤序号键控）一并复制 → 副本无需重新翻译。
+/// 返回新录制 id，前端据此 navigate 到副本继续编辑。
+#[tauri::command]
+pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+
+    // 1) 读取源录制（含 user_id 隔离标记、步骤数、译文副本与内容标记）
+    let src = conn
+        .query_row(
+            "SELECT title, app_name, target_app, user_id, total_steps, translations, \
+             ai_generated, text_redacted, scan_redacted \
+             FROM recordings WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i32>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("源教程不存在: {}", e))?;
+
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let new_title = find_unique_title(&conn, &src.0);
+
+    // 2) 读取源步骤（按 order_index 稳定排序）
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, order_index, step_number, action_type, title, description, tip, \
+             screenshot_path, annotated_path, before_screenshot_path, x, y, crop_w, crop_h, \
+             after_screenshot_path, timestamp, window_title \
+             FROM steps WHERE recording_id = ?1 ORDER BY order_index",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, i32>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<i32>>(10)?,
+                row.get::<_, Option<i32>>(11)?,
+                row.get::<_, Option<i32>>(12)?,
+                row.get::<_, Option<i32>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, String>(16)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut steps: Vec<(
+        String, i32, i32, String, String, String, String,
+        String, String, String, Option<i32>, Option<i32>, Option<i32>, Option<i32>,
+        Option<String>, i64, String,
+    )> = Vec::new();
+    for r in rows {
+        steps.push(r.map_err(|e| e.to_string())?);
+    }
+
+    conn.execute("BEGIN", []).map_err(|e| format!("BEGIN: {}", e))?;
+
+    // 3) 插入副本录制行。translations 译文副本一并复制：JSON 按步骤序号键控，
+    //    副本步骤 order_index/step_number 原样保留 → 序号对得上，无需改写。
+    //    ai_generated/text_redacted/scan_redacted 是内容事实标记（副本内容与源相同），
+    //    必须随内容走，否则副本在列表上丢失「ai/文/扫」徽标、脱敏状态失真。
+    conn.execute(
+        "INSERT INTO recordings (id, title, app_name, target_app, user_id, status, total_steps, translations, ai_generated, text_redacted, scan_redacted, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'completed', ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
+        params![new_id, new_title, src.1, src.2, src.3, steps.len() as i32, src.5, src.6, src.7, src.8],
+    )
+    .map_err(|e| {
+        let _ = conn.execute("ROLLBACK", []);
+        format!("复制录制失败: {}", e)
+    })?;
+
+    // 4) 逐条插入副本步骤（截图文件连带拷贝），同时收集「源步骤id → 副本步骤id」映射，
+    //    供下面复制视图偏好时把逐步骤的「裁图/全图」开关改键使用。
+    let mut step_remap: Vec<(String, String)> = Vec::new();
+    for st in &steps {
+        let new_step_id = uuid::Uuid::new_v4().to_string();
+        let new_ss = copy_screenshot_file(&st.7);
+        let new_ann = copy_screenshot_file(&st.8);
+        let new_before = copy_screenshot_file(&st.9);
+        let new_after = copy_screenshot_file(st.14.clone().unwrap_or_default().as_str());
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, description, tip, \
+             screenshot_path, annotated_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![
+                new_step_id, new_id, st.1, st.2, st.3, st.4, st.5, st.6,
+                new_ss, new_ann, new_before, st.10, st.11, st.12, st.13, new_after, st.15, st.16
+            ],
+        )
+        .map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            format!("复制步骤失败: {}", e)
+        })?;
+        step_remap.push((st.0.clone(), new_step_id));
+    }
+
+    // 5) 复制编辑器视图偏好（全图/裁图显示状态）：settings 表 `flowio_view::<rec_id>`，
+    //    并把逐步骤「裁图/全图」开关（stepViewCropped，按步骤 id 键控）从源 id 改键到副本 id
+    //    → 副本打开时每步的裁图/全图显示与源完全一致（不会回退成全图）。
+    //    源无记录则跳过（新教程默认全图）。best-effort：失败不影响另存为本身。
+    let _ = copy_view_preference(&conn, &id, &new_id, &step_remap);
+
+    conn.execute("COMMIT", []).map_err(|e| format!("COMMIT: {}", e))?;
+    Ok(new_id)
+}
+
+/// 复制编辑器视图偏好（settings 表 `flowio_view::<rec_id>`，另存为时随副本走）。
+/// `step_remap` 把「源步骤 id → 副本步骤 id」映射进去，用于把 `stepViewCropped`
+/// 这张「步骤id → 是否裁图」的表同步改键——副本步骤是全新 uuid，不改键的话
+/// 所有逐步骤的「裁图/全图」开关都会键不中、回退成全图（即「当前截图显示状态」丢失）。
+/// 源无记录返回 false（跳过，新教程默认全图）。
+pub fn copy_view_preference(
+    conn: &Connection,
+    src_id: &str,
+    dst_id: &str,
+    step_remap: &[(String, String)],
+) -> bool {
+    let src_key = format!("flowio_view::{}", src_id);
+    let dst_key = format!("flowio_view::{}", dst_id);
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![src_key],
+            |r| r.get(0),
+        )
+        .ok();
+    let value = match value {
+        Some(v) => v,
+        None => return false,
+    };
+    // 解析失败则原样照搬（best-effort，不丢数据）；解析成功则把逐步骤开关改键。
+    let remapped = remap_view_value(&value, step_remap).unwrap_or_else(|| value.clone());
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        params![dst_key, remapped],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// 把视图偏好 JSON 里的 `stepViewCropped`（步骤id → 是否裁图）的键从源 id 改为副本 id。
+/// 解析失败 / 非对象 → 返回 None（调用方原样照搬）。
+fn remap_view_value(value: &str, step_remap: &[(String, String)]) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_str(value).ok()?;
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(svc) = obj.get("stepViewCropped") {
+            if let Some(map) = svc.as_object() {
+                let mut new_map = serde_json::Map::new();
+                for (old_id, flag) in map {
+                    if let Some((_, new_id)) = step_remap.iter().find(|(o, _)| o == old_id) {
+                        new_map.insert(new_id.clone(), flag.clone());
+                    }
+                }
+                obj.insert("stepViewCropped".to_string(), serde_json::Value::Object(new_map));
+            }
+        }
+    }
+    serde_json::to_string(&v).ok()
+}
+
+/// 把一张截图文件拷贝到 temp/flowio_screenshots 下的新文件名，返回新路径；
+/// 源为空或不存在时返回空串（与现有 delete 逻辑一致：空路径跳过）。
+fn copy_screenshot_file(src: &str) -> String {
+    if src.is_empty() {
+        return String::new();
+    }
+    let src_path = std::path::Path::new(src);
+    if !src_path.exists() {
+        return String::new();
+    }
+    let dir = std::env::temp_dir().join("flowio_screenshots");
+    let _ = std::fs::create_dir_all(&dir);
+    let dst = dir.join(format!("{}.jpg", uuid::Uuid::new_v4()));
+    match std::fs::copy(src_path, &dst) {
+        Ok(_) => dst.to_string_lossy().to_string(),
+        Err(_) => String::new(),
+    }
+}
+
 
 /// Update the recording app name.
 #[tauri::command]
@@ -303,6 +589,45 @@ mod tests {
     #[test]
     fn collect_paths_empty_input() {
         assert!(collect_step_screenshot_paths(vec![]).is_empty());
+    }
+
+    // ---------- copy_view_preference（另存为带视图状态） ----------
+
+    #[test]
+    fn copy_view_preference_copies_and_reports_missing() {
+        let conn = mem_db();
+        // 源无记录 → false，且不产生目标 key
+        assert!(!copy_view_preference(&conn, "src", "dst", &[]));
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM settings WHERE key = 'flowio_view::dst'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn copy_view_preference_remaps_step_ids() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('flowio_view::src', '{\"stepViewCropped\":{\"old-1\":true,\"old-2\":false},\"globalView\":\"crop\"}')",
+            [],
+        )
+        .unwrap();
+        // 副本步骤 id 是全新 uuid，必须按序改键
+        let remap = vec![
+            ("old-1".to_string(), "new-1".to_string()),
+            ("old-2".to_string(), "new-2".to_string()),
+        ];
+        assert!(copy_view_preference(&conn, "src", "dst", &remap));
+        let v: String = conn
+            .query_row("SELECT value FROM settings WHERE key = 'flowio_view::dst'", [], |r| r.get(0))
+            .unwrap();
+        // 改键成功：新 id 出现、旧 id 消失、全局视图保留
+        assert!(v.contains("new-1") && v.contains("new-2"));
+        assert!(!v.contains("old-1") && !v.contains("old-2"));
+        assert!(v.contains("globalView") && v.contains("crop"));
+        // 值跟随：new-1 应为 true（裁图），new-2 应为 false
+        assert!(v.contains("\"new-1\":true"));
+        assert!(v.contains("\"new-2\":false"));
     }
 
     // ---------- list_recordings ----------
@@ -634,5 +959,108 @@ mod tests {
         seed_rec(&conn, "r2", LOCAL_USER);
         assert!(claim_recording_inner(&conn, "r2", Some("bob")).unwrap());
         assert!(!claim_recording_inner(&conn, "r2", Some("bob")).unwrap());
+    }
+
+    #[test]
+    fn find_unique_title_no_collision_returns_base() {
+        let conn = mem_db();
+        assert_eq!(find_unique_title(&conn, "hello"), "hello");
+    }
+
+    #[test]
+    fn find_unique_title_one_collision_appends_copy() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('a', 'hello')", []).unwrap();
+        assert_eq!(find_unique_title(&conn, "hello"), "hello（副本）");
+    }
+
+    #[test]
+    fn find_unique_title_two_collisions_appends_number() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('a', 'hello')", []).unwrap();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('b', 'hello（副本）')", []).unwrap();
+        assert_eq!(find_unique_title(&conn, "hello"), "hello（副本 2）");
+    }
+
+    #[test]
+    fn find_unique_title_many_collisions_increments() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('a', 'x')", []).unwrap();
+        for i in 1..=5 {
+            let t = if i == 1 { "x（副本）" } else { &format!("x（副本 {}）", i) };
+            conn.execute("INSERT INTO recordings (id, title) VALUES (?, ?)", params![format!("d{}", i), t]).unwrap();
+        }
+        // base + (copy) + (copy2..5) = 7 existing => next should be (copy 6)
+        assert_eq!(find_unique_title(&conn, "x"), "x（副本 6）");
+    }
+
+    #[test]
+    fn find_unique_title_base_already_has_copy_suffix() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('a', 'hello')", []).unwrap();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('b', 'hello（副本）')", []).unwrap();
+        // base already has (copy) suffix -> strip to "hello", then find next -> hello(copy 2)
+        assert_eq!(find_unique_title(&conn, "hello（副本）"), "hello（副本 2）");
+    }
+
+    #[test]
+    fn find_unique_title_base_already_has_copy_number_suffix() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('a', 'demo')", []).unwrap();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('b', 'demo（副本）')", []).unwrap();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('c', 'demo（副本 2）')", []).unwrap();
+        // base="demo(copy 2)" stripped to "demo", existing: demo, demo(copy), demo(copy 2)
+        assert_eq!(find_unique_title(&conn, "demo（副本 2）"), "demo（副本 3）");
+    }
+
+    #[test]
+    fn strip_copy_suffix_basic() {
+        assert_eq!(strip_copy_suffix("X"), "X");
+        assert_eq!(strip_copy_suffix("X（副本）"), "X");
+        assert_eq!(strip_copy_suffix("X（副本 2）"), "X");
+        assert_eq!(strip_copy_suffix("X（副本 99）"), "X");
+        // not a copy suffix - no change
+        assert_eq!(strip_copy_suffix("X（其他）"), "X（其他）");
+        assert_eq!(strip_copy_suffix("X（副本abc）"), "X（副本abc）");
+    }
+
+    #[test]
+    fn strip_copy_suffix_stacked_legacy_titles() {
+        // 历史 bug 产生的叠罗汉标题：循环剥离一次剥干净
+        assert_eq!(strip_copy_suffix("X（副本）（副本）"), "X");
+        assert_eq!(strip_copy_suffix("X（副本）（副本 2）"), "X");
+        assert_eq!(strip_copy_suffix("X（副本）（副本）（副本 3）"), "X");
+    }
+
+    #[test]
+    fn strip_copy_suffix_halfwidth_legacy_variants() {
+        // 历史半角变体同样剥掉（含叠罗汉与混合宽度）
+        assert_eq!(strip_copy_suffix("X (副本)"), "X");
+        assert_eq!(strip_copy_suffix("X (副本 2)"), "X");
+        assert_eq!(strip_copy_suffix("X (副本)(副本)"), "X");
+        assert_eq!(strip_copy_suffix("X (副本)（副本 2）"), "X");
+        // 半角但不是副本后缀 → 不动
+        assert_eq!(strip_copy_suffix("X (其他)"), "X (其他)");
+        assert_eq!(strip_copy_suffix("X (副本abc)"), "X (副本abc)");
+    }
+
+    #[test]
+    fn find_unique_title_stacked_source_gets_clean_numbered_title() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('a', 'demo')", []).unwrap();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('b', 'demo（副本）')", []).unwrap();
+        conn.execute("INSERT INTO recordings (id, title) VALUES ('c', 'demo（副本）（副本）')", []).unwrap();
+        // 对叠罗汉源再另存为：剥干净后落到第一个空位（副本 2），不再叠第四层
+        assert_eq!(find_unique_title(&conn, "demo（副本）（副本）"), "demo（副本 2）");
+    }
+
+    #[test]
+    fn cap_title_chars_limits_and_keeps_utf8_safe() {
+        assert_eq!(cap_title_chars("短标题"), "短标题");
+        let long = "录".repeat(50);
+        assert_eq!(cap_title_chars(&long).chars().count(), 30);
+        // 截断落在「（」上时应清理悬挂括号
+        let tricky: String = "录".repeat(29) + "（副本）";
+        assert_eq!(cap_title_chars(&tricky), "录".repeat(29));
     }
 }

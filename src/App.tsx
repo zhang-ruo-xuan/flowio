@@ -9,9 +9,20 @@ import SettingsPage from "./pages/Settings";
 import StepEditor from "./pages/StepEditor";
 import ProfilePage from "./pages/Profile";
 import { useAuthStore } from "./store/authStore";
+import { useAppStore } from "./store/appStore";
 import { getCachedAvatar, cacheAvatar, avatarFileUrl } from "./lib/avatarCache";
 import { VoiceRecorder } from "./lib/voiceRecorder";
 import Tooltip from "./components/Tooltip";
+import logoIcon from "./logo-32.png";
+
+// 长任务操作 → 中文标签（全局完成提醒卡片用）
+const JOB_OP_LABELS: Record<string, string> = {
+  ai_simplify: "AI 精简",
+  translate: "翻译",
+  voice: "语音转写",
+  scan_redact: "扫描脱敏",
+  export: "导出",
+};
 
 function App() {
   const [darkMode, setDarkMode] = useState(false);
@@ -24,6 +35,15 @@ function App() {
   const location = useLocation();
   const isEditor = location.pathname.startsWith("/editor/");
   const appWindow = getCurrentWindow();
+  /** ★ 屏幕级字幕窗（独立置顶 WebviewWindow）：主窗口录制时最小化，内置面板看不见，
+   *  字幕必须悬浮在所有应用上方。show=开麦/恢复，hide=关麦/暂停/停止。失败静默（字幕是增强体验）。
+   *  show 前先确认 ASR Key 可用，避免 Key 缺失时窗口挂着「正在聆听…」永远不出字。 */
+  const showCaptionWindow = useCallback(() => {
+    invoke<boolean>("voice_live_supported")
+      .then((ok) => { if (ok) return invoke("voice_caption_show"); })
+      .catch(() => {});
+  }, []);
+  const hideCaptionWindow = useCallback(() => { invoke("voice_caption_hide").catch(() => {}); }, []);
   const [isMaximized, setIsMaximized] = useState(false);
   const [avatarLoadFailed, setAvatarLoadFailed] = useState(false);
   // ── 语音输入（PRD F1）────────────────────────────────────────
@@ -31,6 +51,8 @@ function App() {
   const [voiceActive, setVoiceActive] = useState(false);   // 麦克风是否采集中
   const [voiceTranscribing, setVoiceTranscribing] = useState(false); // 停止后转写中
   const [voiceToast, setVoiceToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  /** ★ 实时字幕：录制中最近 3 句转写（Rust 端 voice://caption 推送） */
+  const [voiceCaptions, setVoiceCaptions] = useState<string[]>([]);
   const voiceRecorderRef = useRef<VoiceRecorder | null>(null);
   const voiceChunkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // 看门狗：采集样本数连续多秒不增长 = 音频回调停摆（最小化场景），记入 debug log
@@ -40,6 +62,12 @@ function App() {
   const recordingIdRef = useRef<string | null>(null);
   const isPausedRef = useRef(false);
   const { setAuth, clearAuth, siteUser, siteToken } = useAuthStore();
+
+  // ── 长任务完成全局提醒（AI 精简/翻译/语音/扫描脱敏/导出，任意页面弹窗）──
+  const [jobToasts, setJobToasts] = useState<{
+    id: number; recordingId: string; title: string; op: string; ok: boolean; summary: string;
+  }[]>([]);
+  const jobIdRef = useRef(0);
 
   // 网站用户换了头像 / token 刷新后，旧的 url 失效 → 重新尝试加载图片
   useEffect(() => { setAvatarLoadFailed(false); }, [siteUser?.avatar, siteUser?.id]);
@@ -85,6 +113,34 @@ function App() {
   useEffect(() => {
     const savedFontSize = localStorage.getItem("fontSize") || "14";
     document.body.style.zoom = `${parseInt(savedFontSize) / 14 * 100}%`;
+  }, []);
+
+  // 长任务完成全局提醒：监听后端 flowio://job-done，任意页面右上角堆叠卡片，
+  // 带教程名，点击跳教程；AI 精简完成时清掉全局「进行中」标记。
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen<{ recording_id: string; title: string; op: string; ok: boolean; summary: string }>(
+      "flowio://job-done",
+      (ev) => {
+        const p = ev.payload;
+        const id = ++jobIdRef.current;
+        setJobToasts((prev) => [
+          ...prev,
+          { id, recordingId: p.recording_id, title: p.title, op: p.op, ok: p.ok, summary: p.summary },
+        ]);
+        if (p.ok) {
+          // 成功卡片：9 秒后自动消失（纯信息性，无需用户操作）
+          window.setTimeout(() => {
+            setJobToasts((prev) => prev.filter((t) => t.id !== id));
+          }, 9000);
+        }
+        // 失败卡片：常驻直到用户点击右上角 × 关闭，避免 9 秒内被忽略而错过失败原因
+        if (p.op === "ai_simplify") {
+          useAppStore.getState().setSimplifyingId(null);
+        }
+      }
+    ).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
   }, []);
 
   // 网站 token 自动刷新（PocketBase auth-refresh）
@@ -242,6 +298,24 @@ function App() {
     return () => { unlisten?.(); };
   }, [showVoiceToast]);
 
+  // voice://caption：录制中实时字幕（每识别完一句推一次）
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      unlisten = await listen<{ recordingId: string; text: string }>("voice://caption", (ev) => {
+        const t = String(ev.payload?.text || "").trim();
+        if (!t) return;
+        setVoiceCaptions((prev) => [...prev, t].slice(-3));
+      });
+    })();
+    return () => { unlisten?.(); };
+  }, []);
+
+  // 开/关麦与录制开始/结束时清空字幕（避免上一段的字残留）
+  useEffect(() => {
+    setVoiceCaptions([]);
+  }, [voiceActive, recording]);
+
   // 监听设置页语音开关切换，同步标题栏显示（避免「设置页开 / 标题栏显示关」）
   useEffect(() => {
     const handler = (e: CustomEvent<{ enabled: boolean }>) => {
@@ -264,6 +338,7 @@ function App() {
       // 录制中关麦：停止采集，已采集部分照常转写
       voiceRecorderRef.current = null;
       setVoiceActive(false);
+      hideCaptionWindow();
       if (voiceChunkTimerRef.current) { clearInterval(voiceChunkTimerRef.current); voiceChunkTimerRef.current = null; }
     } else if (next && !voiceRecorderRef.current) {
       // 录制中开麦：从现在开始采集（Rust 侧 cpal，PCM 直接进后端缓冲）
@@ -272,6 +347,7 @@ function App() {
         await rec.start(recId);
         voiceRecorderRef.current = rec;
         setVoiceActive(true);
+        showCaptionWindow();
         voiceStallRef.current = { last: 0, ticks: 0, logged: false };
         voiceChunkTimerRef.current = setInterval(async () => {
           const r = voiceRecorderRef.current;
@@ -297,7 +373,7 @@ function App() {
         showVoiceToast({ type: "error", message: `麦克风开启失败：${String(err)}，本次录制将以无语音方式继续` });
       }
     }
-  }, [voiceEnabled, showVoiceToast]);
+  }, [voiceEnabled, showVoiceToast, showCaptionWindow, hideCaptionWindow]);
 
   // 开始录制前开麦（V2/V3）；失败降级为纯录制，不阻塞
   const startVoiceIfEnabled = useCallback(async (id: string) => {
@@ -307,6 +383,7 @@ function App() {
       await rec.start(id);
       voiceRecorderRef.current = rec;
       setVoiceActive(true);
+      showCaptionWindow();
       voiceStallRef.current = { last: 0, ticks: 0, logged: false };
       // 看门狗：非暂停状态下样本数 5 秒不增长 → 采集停摆，只报一次。
       // （Rust 侧采集不受窗口最小化影响；真停了说明设备被拔掉/被独占）
@@ -330,7 +407,7 @@ function App() {
       console.warn("[voice] start failed:", err);
       showVoiceToast({ type: "error", message: `麦克风开启失败：${String(err)}，本次录制将以无语音方式继续` });
     }
-  }, [voiceEnabled, showVoiceToast]);
+  }, [voiceEnabled, showVoiceToast, showCaptionWindow]);
 
   // 停止采集并触发转写（在 finish_recording 成功后调用；V5/V9 不阻塞）
   const stopVoiceAndTranscribe = useCallback(async (id: string) => {
@@ -338,6 +415,7 @@ function App() {
     const rec = voiceRecorderRef.current;
     voiceRecorderRef.current = null;
     setVoiceActive(false);
+    hideCaptionWindow();
     if (!rec) return;
     try {
       // Rust 侧采集会把剩余 PCM 全部落进缓冲后再返回，前端无需补传
@@ -349,7 +427,7 @@ function App() {
       setVoiceTranscribing(false);
       showVoiceToast({ type: "error", message: "语音转写失败: " + String(err) });
     }
-  }, [showVoiceToast]);
+  }, [showVoiceToast, hideCaptionWindow]);
 
   // 卸载兜底清理
   useEffect(() => {
@@ -390,13 +468,14 @@ function App() {
       isPausedRef.current = true;
       setIsPaused(true);
       void voiceRecorderRef.current?.pause(); // 暂停期间的音频不进缓冲（恢复时补等长静音）
+      hideCaptionWindow(); // 暂停时字幕窗也收起（无新句子）
       await appWindow.unminimize();
       await appWindow.show();
       await appWindow.setFocus();
     } catch (err) {
       console.error("Failed to pause recording:", err);
     }
-  }, []);
+  }, [hideCaptionWindow]);
 
   const handleResumeRecording = useCallback(async () => {
     const id = recordingIdRef.current;
@@ -407,6 +486,7 @@ function App() {
       isPausedRef.current = false;
       setIsPaused(false);
       void voiceRecorderRef.current?.resume();
+      if (voiceRecorderRef.current?.isActive) showCaptionWindow(); // 恢复采集 → 字幕窗重新悬浮
       // small delay to let resume_recording settle before minimizing
       await new Promise(r => setTimeout(r, 200));
       appWindow.minimize().catch(e => console.error("minimize on resume failed:", e));
@@ -414,7 +494,7 @@ function App() {
       alert("恢复录制失败: " + (err?.message || err));
       console.error("Failed to resume recording:", err);
     }
-  }, []);
+  }, [showCaptionWindow]);
 
   const handleStopRecording = useCallback(async () => {
     let id: string | null = recordingIdRef.current;
@@ -530,7 +610,12 @@ function App() {
       <div className="titlebar">
         <div className="titlebar-left">
           <div data-tauri-drag-region className="titlebar-drag">
-            <span className="titlebar-logo">录步</span>
+            {!isEditor && (
+              <span className="titlebar-logo" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <img src={logoIcon} alt="" style={{ width: 18, height: 18, borderRadius: 3 }} />
+                录步 Flowio
+              </span>
+            )}
             {recording && (
               <span className={`titlebar-rec-badge ${isPaused ? "paused" : "recording"}`}>
                 <span className="titlebar-rec-dot"></span>
@@ -618,7 +703,7 @@ function App() {
             <Route path="/" element={<Dashboard onEdit={handleEdit} onStartRecording={handleStartRecording} recording={recording} isPaused={isPaused} onPauseRecording={handlePauseRecording} onResumeRecording={handleResumeRecording} onStopRecording={handleStopRecording} locationKey={location.key} />} />
             <Route path="/settings" element={<SettingsPage darkMode={darkMode} onToggleDark={() => setDarkMode(!darkMode)} />} />
             <Route path="/profile" element={<ProfilePage />} />
-            <Route path="/editor/:id" element={<StepEditor siteToken={siteToken} siteUser={siteUser} />} />
+            <Route path="/editor/:id" element={<StepEditor siteToken={siteToken} siteUser={siteUser} voiceTranscribing={voiceTranscribing} />} />
           </Routes>
         </div>
       </div>
@@ -630,6 +715,17 @@ function App() {
           <span>{voiceTranscribing ? "语音转写中…" : recording ? "录制中" : "就绪"}</span>
         </span>
       </div>
+
+      {/* ★ 实时字幕：录制中把识别出的句子显示在底部（pointer-events:none，不拦任何操作） */}
+      {recording && voiceActive && voiceCaptions.length > 0 && (
+        <div className="voice-caption-panel">
+          {voiceCaptions.map((t, i) => (
+            <div key={`${i}-${t.slice(0, 6)}`} className={i === voiceCaptions.length - 1 ? "cap-line last" : "cap-line"}>
+              {t}
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* 语音输入非阻塞 toast（V3/V9） */}
       {voiceToast && (
@@ -644,6 +740,40 @@ function App() {
           }}
         >
           {voiceToast.message}
+        </div>
+      )}
+
+      {/* 长任务完成全局提醒：任意页面右上角堆叠卡片，带教程名，点击跳教程 */}
+      {jobToasts.length > 0 && (
+        <div style={{ position: "fixed", top: 52, right: 16, zIndex: 10000, display: "flex", flexDirection: "column", gap: 8, maxWidth: 340 }}>
+          {jobToasts.map((t) => (
+            <div
+              key={t.id}
+              onClick={() => navigate(`/editor/${t.recordingId}`)}
+              style={{
+                background: t.ok ? "#ffffff" : "#fff5f5",
+                border: `1px solid ${t.ok ? "#4caf50" : "#e57373"}`,
+                borderLeft: `4px solid ${t.ok ? "#4caf50" : "#e57373"}`,
+                borderRadius: 8, padding: "10px 12px", cursor: "pointer",
+                boxShadow: "0 4px 14px rgba(0,0,0,0.16)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                <span style={{ fontWeight: 600, fontSize: 13, color: t.ok ? "#2e7d32" : "#c62828" }}>
+                  {JOB_OP_LABELS[t.op] ?? t.op}{t.ok ? "完成" : "失败"}
+                </span>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setJobToasts((prev) => prev.filter((x) => x.id !== t.id)); }}
+                  style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 14, lineHeight: 1, color: "#888" }}
+                >×</button>
+              </div>
+              <div style={{ fontSize: 12, color: "#333", marginTop: 3, fontWeight: 500 }}>
+                《{t.title || "未命名教程"}》
+              </div>
+              <div style={{ fontSize: 12, color: "#555", marginTop: 2 }}>{t.summary}</div>
+              <div style={{ fontSize: 11, color: "#999", marginTop: 4 }}>点击查看教程</div>
+            </div>
+          ))}
         </div>
       )}
 

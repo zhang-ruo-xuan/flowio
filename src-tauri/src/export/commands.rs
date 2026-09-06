@@ -1,4 +1,5 @@
 use base64::Engine;
+use ab_glyph::Font;
 use docx_rs::*;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,35 @@ use tauri::{Emitter, State};
 
 use crate::redaction::{redact_screenshot_copy, redact_text_with_config, RedactMode};
 use crate::DbState;
+
+// ── Font cache for long-screenshot text rendering ────────────
+fn load_font() -> Option<ab_glyph::FontArc> {
+    let candidates = [
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttf",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ];
+    for path in &candidates {
+        if let Ok(data) = std::fs::read(path) {
+            if data.len() > 4 {
+                // FontArc 需要静态生命周期数据，leak 一次（进程级单例，可接受）
+                let static_data: &'static [u8] = Box::leak(data.into_boxed_slice());
+                if let Ok(font) = ab_glyph::FontArc::try_from_slice(static_data) {
+                    return Some(font);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Global font singleton (lazy, once per process)
+fn get_font() -> Option<ab_glyph::FontArc> {
+    use std::sync::OnceLock;
+    static FONT: OnceLock<Option<ab_glyph::FontArc>> = OnceLock::new();
+    FONT.get_or_init(load_font).clone()
+}
 
 // ── Export result types ───────────────────────────────────────
 
@@ -55,10 +85,23 @@ pub async fn export_recording(
     crop_step_ids: Option<Vec<String>>,
     lang: Option<String>,
 ) -> Result<String, String> {
+    // 读取教程标题，供完成提醒展示（失败不致命，降级为空串）
+    let title = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT title FROM recordings WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default()
+    };
+
     // async 命令运行在异步运行时线程，不阻塞 UI 主线程。内部 catch_unwind 防 panic 崩掉 IPC。
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // 进度回调用 app 的克隆，保留原 app 句柄供完成后发全局提醒。
+    let app_for_progress = app.clone();
+    let result: Result<String, String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let progress = move |done: usize, total: usize| {
-            let _ = app.emit(
+            let _ = app_for_progress.emit(
                 "export://progress",
                 serde_json::json!({ "done": done, "total": total }),
             );
@@ -73,7 +116,28 @@ pub async fn export_recording(
             lang.as_deref(),
         )
     }))
-    .map_err(|_| "export_recording panicked".to_string())?
+    .map_err(|_| "export_recording panicked".to_string())?;
+
+    // 全局完成提醒（任意页面弹窗 + Windows 系统通知，带教程名）
+    match &result {
+        Ok(path) => crate::job_notify::emit_job_done(
+            &app,
+            &id,
+            &title,
+            crate::job_notify::JobOp::Export,
+            true,
+            &format!("已导出为 {}", path),
+        ),
+        Err(e) => crate::job_notify::emit_job_done(
+            &app,
+            &id,
+            &title,
+            crate::job_notify::JobOp::Export,
+            false,
+            e,
+        ),
+    }
+    result
 }
 
 /// 实际导出逻辑（在独立线程内执行，避免长任务占用 IPC / 阻塞 UI）。
@@ -129,12 +193,9 @@ pub(crate) fn export_recording_inner(
             Ok(path.to_string_lossy().to_string())
         }
         "markdown" => {
-            // Create screenshots subdirectory next to the MD file
+            // Screenshots placed alongside the MD file (no subdirectory)
             let parent = path.parent().unwrap_or(std::path::Path::new("."));
-            let ss_dir = parent.join("screenshots");
-            std::fs::create_dir_all(&ss_dir)
-                .map_err(|e| format!("Failed to create screenshots dir: {}", e))?;
-            let content = export_markdown(&recording, &steps, &ss_dir, &crop_set);
+            let content = export_markdown(&recording, &steps, &parent, &crop_set);
             std::fs::write(&path, content)
                 .map_err(|e| format!("Failed to write Markdown: {}", e))?;
             Ok(path.to_string_lossy().to_string())
@@ -147,7 +208,17 @@ pub(crate) fn export_recording_inner(
             export_docx(&recording, &steps, &path, &crop_set)?;
             Ok(path.to_string_lossy().to_string())
         }
-        other => Err(format!("Unsupported format: {}. Use html, markdown, docx, or pdf.", other)),
+        "txt" => {
+            let content = export_txt(&recording, &steps);
+            std::fs::write(&path, content)
+                .map_err(|e| format!("Failed to write TXT: {}", e))?;
+            Ok(path.to_string_lossy().to_string())
+        }
+        "long" => {
+            export_long_image(&recording, &steps, &path, &crop_set)?;
+            Ok(path.to_string_lossy().to_string())
+        }
+        other => Err(format!("Unsupported format: {}. Use html, markdown, txt, docx, pdf, or long.", other)),
     }
 }
 
@@ -318,8 +389,10 @@ fn generate_export_path(
     let ext = match format.to_lowercase().as_str() {
         "html" => "html",
         "markdown" => "md",
+        "txt" => "txt",
         "pdf" => "pdf",
         "docx" | "word" => "docx",
+        "long" => "png",
         _ => "txt",
     };
     output_dir.join(format!("{}_{}.{}", sanitized_title, timestamp, ext))
@@ -501,21 +574,29 @@ pub(crate) fn export_crop_box(
 
     // ① 外扩 CROP_PAD
     let mut rw = if add_pad { rw0 + EXPORT_CROP_PAD * 2 } else { rw0 };
-    let rh = if add_pad { rh0 + EXPORT_CROP_PAD * 2 } else { rh0 };
+    let mut rh = if add_pad { rh0 + EXPORT_CROP_PAD * 2 } else { rh0 };
 
     // ② type 步骤左侧多留原始宽的 1/3，把左侧 label（如"用户名"）带进裁图。
     //    ⚠️ 左移量是 extra/2 而不是 extra：框宽 rw 已含 extra，居中项 cx - rw/2
     //    天然在左右各分到 extra/2。写成 - extra 会过冲，使右侧留白变成
     //    PAD - extra/2 —— 元素宽 > 48px 即为负值，右边缘被切（300px 输入框切 42px）。
     //    extra 用 round 而非整数截断，与前端 Math.round(cropW / 3) 对齐。
+    // ③ drag 步骤高度方向多留上下文：拖拽选区多为扁长（表格行 ~25px），
+    //    仅 +16px（EXPORT_CROP_PAD*2）看不出在拖哪里。额外至少 100px 并按选区高
+    //    0.6× 增长（与前端 cropAdaptiveBase64 一致）。
+    let mut top = cy - rh / 2;
     let left = if add_pad && action_type == "type" {
         let extra = ((rw0 as f64) / 3.0).round();
         rw += extra as i32;
         (cx as f64 - (rw as f64) / 2.0 - extra / 2.0).round() as i32
+    } else if add_pad && action_type == "drag" {
+        let extra_h = ((rh0 as f64) * 0.6).round().max(100.0);
+        rh += extra_h as i32;
+        top = (cy as f64 - (rh as f64) / 2.0).round() as i32;
+        cx - rw / 2
     } else {
         cx - rw / 2
     };
-    let top = cy - rh / 2;
 
     // 贴边平移进图内（不缩小裁剪框，避免内容被切掉一半）
     let rw = rw.min(img_w).max(1);
@@ -525,6 +606,50 @@ pub(crate) fn export_crop_box(
     Some((left, top, rw, rh))
 }
 
+/// 空白裁剪守卫阈值 —— 与前端 `src/lib/cropBlank.ts::BLANK_CROP_DELTA` 同步（黄金值 24，
+/// 锁在 `scripts/check-crop.mjs` 第 7 段）。JPEG 平坦区噪声 ±6 左右，24 有充分余量。
+pub(crate) const BLANK_CROP_DELTA: i32 = 24;
+
+/// 空白裁剪守卫：裁出的区域几乎纯色（三通道极差全部 ≤ BLANK_CROP_DELTA）时
+/// 毫无信息量，调用方应回退**整图**。
+///
+/// 背景：WPS「正在打开文档」加载中录制时 UIA 元素树不可用，录制端把
+/// 「Program Manager」桌面宿主窗口的伪元素矩形记成裁图锚点，裁出纯灰空白，
+/// 而用户实际看到的加载动画在画面中心（2026-09-05 用户实测）。锚点本身指向
+/// 空白区，退 40% 点击点兜底照样空白，唯一有意义的回退是整图。
+///
+/// ⚠️ 同步清单：前端 `src/lib/cropBlank.ts`（编辑器/发布/封面）与
+/// `ai/pipeline.rs::crop_and_encode_typed`（AI 裁图）。算法与阈值必须一致。
+pub(crate) fn is_blank_crop(img: &image::DynamicImage) -> bool {
+    let rgb = img.to_rgb8();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    if w == 0 || h == 0 {
+        return false;
+    }
+    // 步长采样（与前端同公式）：目标约 2 万样本。漏采的小特征在整图里仍在 ——
+    // 回退整图永远不丢信息，故宁松勿严。
+    let stride = (((w * h) as f64 / 20000.0).sqrt().floor() as usize).max(1);
+    let mut min = [255u8; 3];
+    let mut max = [0u8; 3];
+    for y in (0..h).step_by(stride) {
+        for x in (0..w).step_by(stride) {
+            let p = rgb.get_pixel(x as u32, y as u32).0;
+            for c in 0..3 {
+                if p[c] < min[c] {
+                    min[c] = p[c];
+                }
+                if p[c] > max[c] {
+                    max[c] = p[c];
+                }
+            }
+        }
+    }
+    max
+        .iter()
+        .zip(min.iter())
+        .all(|(mx, mn)| (*mx as i32 - *mn as i32) <= BLANK_CROP_DELTA)
+}
+
 /// 返回 `(最终写出去的字节, 这些字节对应的真实像素尺寸)`。
 ///
 /// ⚠️ 调用方必须拿**第二个返回值**去算显示尺寸，不要用原图尺寸：
@@ -532,7 +657,7 @@ pub(crate) fn export_crop_box(
 /// 于是裁剪后的图被按原图比例拉伸变形（如 1920×1080 原图裁出 800×600，
 /// 显示成 16:9 的框 → 横向拉伸 33%），且小裁剪区域会被放大到 600px 宽变模糊。
 /// 见测试 `docx_image_emu_matches_written_bytes`。
-fn maybe_crop_screenshot_bytes(
+pub(crate) fn maybe_crop_screenshot_bytes(
     raw_bytes: Vec<u8>,
     x: Option<i32>,
     y: Option<i32>,
@@ -554,6 +679,10 @@ fn maybe_crop_screenshot_bytes(
     };
 
     let cropped = img.crop(left as u32, top as u32, rw as u32, rh as u32);
+    // 空白裁剪守卫：区域几乎纯色时回退整图（与前端 lib/cropBlank.ts 同步）
+    if is_blank_crop(&cropped) {
+        return (raw_bytes, full_dims);
+    }
     let mut buf: Vec<u8> = Vec::new();
     // 输出 JPEG 质量 85（与前端 canvas.toDataURL("image/jpeg", 0.85) 一致）
     let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
@@ -645,63 +774,27 @@ fn mime_from_path(path: &str) -> &'static str {
 
 // ── Markdown export ───────────────────────────────────────────
 
-/// Generate a Scribe-style Markdown document:
-///   - Clean title + metadata row
-///   - Numbered step cards with badge-style header, description, screenshot, tip
-///   - Screenshots copied to a `screenshots/` subdirectory and referenced via relative paths
-fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], ss_dir: &std::path::Path, crop_set: &std::collections::HashSet<&str>) -> String {
+/// Generate a clean Markdown document (text only, no images):
+///   - Title + metadata row
+///   - Numbered step cards with header, description, tip
+///   - No screenshot files are created or referenced
+fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], _ss_dir: &std::path::Path, _crop_set: &std::collections::HashSet<&str>) -> String {
     let step_list: String = steps
         .iter()
         .map(|s| {
-            // ── Screenshot (copy to subdir, relative path) ─────
-            let screenshot_line = if s.screenshot_path.is_empty() {
-                String::from("> *(No screenshot)*")
-            } else {
-                let src = std::path::Path::new(&s.screenshot_path);
-                let ext = src
-                    .extension()
-                    .unwrap_or(std::ffi::OsStr::new("jpg"));
-                let filename = format!("step_{}.{}", s.step_number, ext.to_string_lossy());
-                let dest = ss_dir.join(&filename);
-                let is_crop = crop_set.contains(s.id.as_str());
-                if is_crop {
-                    // 裁剪模式：读取→裁剪→写入
-                    match std::fs::read(src).ok().filter(|b| !b.is_empty()) {
-                        Some(raw) => {
-                            let cropped = maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type).0;
-                            match std::fs::write(&dest, &cropped) {
-                                Ok(_) => format!("![Screenshot](./screenshots/{})", filename),
-                                Err(_) => format!("> *(Screenshot export failed)*"),
-                            }
-                        }
-                        None => format!("> *(Screenshot not found: {})*", s.screenshot_path.replace('\\', "/")),
-                    }
-                } else {
-                    // 全图模式：直接复制原文件
-                    match std::fs::copy(src, &dest) {
-                        Ok(_) => format!("![Screenshot](./screenshots/{})", filename),
-                        Err(_) => format!(
-                            "> *(Screenshot not found: {})*",
-                            s.screenshot_path.replace('\\', "/")
-                        ),
-                    }
-                }
-            };
-
-            // ── Step header (Scribe-style badge) ───────────────
+            // ── Step header ───────────────
             let header = build_md_step_header(s.step_number, &s.action_type, &s.title);
 
-            // ── Description ─────────────────────────────────────
+            // ── Description ───────────────
             let desc_block = build_md_desc_block(&s.description);
 
-            // ── Tip (styled blockquote) ─────────────────────────
+            // ── Tip ───────────────────────
             let tip_block = build_md_tip_block(&s.tip);
 
             format!(
-                "{header}\n\n{desc_block}{screenshot}\n\n{tip_block}",
+                "{header}\n\n{desc_block}{tip_block}",
                 header = header,
                 desc_block = desc_block,
-                screenshot = screenshot_line,
                 tip_block = tip_block,
             )
         })
@@ -715,6 +808,282 @@ fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], ss_dir: &s
         &recording.created_at,
         &step_list,
     )
+}
+
+// ── TXT export ────────────────────────────────────────────────
+
+/// 纯文本导出：标题 + 元信息 + 编号步骤（标题 / 描述 / 提示）。
+/// 文本导出不含截图，故忽略 crop_set。
+fn export_txt(recording: &ExportRecording, steps: &[ExportStep]) -> String {
+    let mut out = String::new();
+    out.push_str(&recording.title);
+    out.push('\n');
+    out.push_str(&format!(
+        "应用：{}　步骤数：{}　创建于：{}",
+        recording.app_name, recording.total_steps, recording.created_at
+    ));
+    out.push_str("\n\n");
+    for s in steps {
+        out.push_str(&format!("步骤 {}：{}\n", s.step_number, s.title));
+        if !s.description.is_empty() {
+            out.push_str(&s.description);
+            out.push('\n');
+        }
+        if !s.tip.is_empty() {
+            out.push_str(&format!("提示：{}\n", s.tip));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// ── Long image (stitched) export ──────────────────────────────
+
+/// 把所有步骤的截图（裁图模式下应用裁剪）竖向拼接成一张长图 PNG。
+///
+/// 布局（从上到下）：
+///   1. 教程标题头（深色背景 + 白色大字 + 元信息）
+///   2. 每张步骤截图前带步骤头部（编号圆圈 + 标题文字）
+///   3. 步骤间 24px 白色间隔
+///
+/// 统一宽度取各图最大宽度（上限 1440px），各图按比例缩放。
+/// 无截图的步骤跳过；整篇都无截图时报错。
+fn export_long_image(
+    recording: &ExportRecording,
+    steps: &[ExportStep],
+    output_path: &std::path::Path,
+    crop_set: &std::collections::HashSet<&str>,
+) -> Result<(), String> {
+    const GAP: u32 = 24;
+    const MAX_WIDTH: u32 = 1440;
+    // ── 教程标题头 ──
+    const TITLE_H: u32 = 100; // 标题区高度
+    const TITLE_BG: image::Rgba<u8> = image::Rgba([33, 41, 54, 255]); // slate-900
+    const TITLE_TEXT: image::Rgba<u8> = image::Rgba([255, 255, 255, 255]);
+    const SUBTEXT_COLOR: image::Rgba<u8> = image::Rgba([148, 163, 184, 255]); // slate-400
+    // ── 步骤头部 ──
+    const HEADER_H: u32 = 96; // 步骤标题头高度（需容纳 30px 编号 + 32px 标题）
+    const HEADER_BG: image::Rgba<u8> = image::Rgba([248, 250, 252, 255]); // #f8fafc
+    const BADGE_COLOR: image::Rgba<u8> = image::Rgba([99, 102, 241, 255]); // indigo-500
+    const TEXT_COLOR: image::Rgba<u8> = image::Rgba([30, 41, 59, 255]); // slate-800
+    const STEP_NUM_COLOR: image::Rgba<u8> = image::Rgba([255, 255, 255, 255]);
+
+    let font = get_font();
+
+    // 1) 准备每个步骤的最终位图（按需裁剪）+ 收集标题信息
+    let mut prepared: Vec<image::DynamicImage> = Vec::new();
+    let mut headers: Vec<(i32, String, String)> = Vec::new(); // (step_number, action_type, title)
+    for s in steps {
+        if s.screenshot_path.is_empty() {
+            continue;
+        }
+        let raw = match std::fs::read(&s.screenshot_path) {
+            Ok(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+        let bytes = if crop_set.contains(s.id.as_str()) {
+            maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type).0
+        } else {
+            raw
+        };
+        match image::load_from_memory(&bytes) {
+            Ok(img) => {
+                headers.push((s.step_number, s.action_type.clone(), s.title.clone()));
+                prepared.push(img);
+            }
+            Err(_) => continue,
+        }
+    }
+    if prepared.is_empty() {
+        return Err("该教程没有任何截图，无法导出长图".to_string());
+    }
+
+    // 2) 统一宽度
+    let target_w: u32 = prepared
+        .iter()
+        .map(|i| i.width())
+        .max()
+        .unwrap_or(1)
+        .min(MAX_WIDTH)
+        .max(1);
+
+    let scaled: Vec<image::DynamicImage> = prepared
+        .iter()
+        .map(|img| {
+            let ow = img.width() as f64;
+            let oh = img.height() as f64;
+            let nh = if ow <= 0.0 {
+                1
+            } else {
+                (oh * target_w as f64 / ow).round().max(1.0) as u32
+            };
+            img.resize_exact(target_w, nh, image::imageops::FilterType::Lanczos3)
+        })
+        .collect();
+
+    // 3) 构建教程标题头画布
+    let mut title_canvas =
+        image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_pixel(target_w, TITLE_H, TITLE_BG);
+
+    if let Some(ref f) = font {
+        // 教程标题（大字，28px）
+        let display_title = if recording.title.is_empty() {
+            "未命名教程".to_string()
+        } else {
+            recording.title.clone()
+        };
+        let scale_title = ab_glyph::PxScale { x: 28.0, y: 28.0 };
+        imageproc::drawing::draw_text_mut(
+            &mut title_canvas, TITLE_TEXT, 24, 28, scale_title, f, &display_title,
+        );
+        // 元信息行（小字，灰色）：应用名 · 步骤数 · 日期
+        let meta = format!(
+            "{} · {} 步骤 · {}",
+            recording.app_name, recording.total_steps, recording.created_at
+        );
+        let scale_meta = ab_glyph::PxScale { x: 14.0, y: 14.0 };
+        imageproc::drawing::draw_text_mut(
+            &mut title_canvas, SUBTEXT_COLOR, 24, 58, scale_meta, f, &meta,
+        );
+    } else {
+        // 无字体时用像素块写个简易标记（极端降级）
+        for y in 20u32..50 {
+            for x in 24u32..(target_w - 24).min(500) {
+                title_canvas.put_pixel(x, y, TITLE_TEXT);
+            }
+        }
+    }
+    let title_img = image::DynamicImage::ImageRgba8(title_canvas);
+
+    // 4) 为每张截图生成带步骤标题的头部图像
+    let mut final_images: Vec<image::DynamicImage> = Vec::new();
+
+    for (idx, img) in scaled.iter().enumerate() {
+        let (step_num, action_type, title) = &headers[idx];
+
+        let mut header_canvas =
+            image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_pixel(target_w, HEADER_H, HEADER_BG);
+
+        // 底部细线分隔
+        for x in 0..target_w {
+            header_canvas.put_pixel(x, HEADER_H - 1, image::Rgba([226, 232, 240, 255])); // #e2e8f0
+        }
+
+        // 编号圆圈（indigo 实心圆）
+        let badge_radius: i32 = 30;
+        let badge_cx: i32 = 48;
+        let badge_cy: i32 = HEADER_H as i32 / 2;
+        for y in (badge_cy - badge_radius)..=(badge_cy + badge_radius) {
+            for x in (badge_cx - badge_radius)..=(badge_cx + badge_radius) {
+                let dx = x - badge_cx;
+                let dy = y - badge_cy;
+                if dx * dx + dy * dy <= badge_radius * badge_radius {
+                    let ux = x as u32;
+                    let uy = y as u32;
+                    if ux < target_w && uy < HEADER_H {
+                        header_canvas.put_pixel(ux, uy, BADGE_COLOR);
+                    }
+                }
+            }
+        }
+
+        // 圆圈内编号（白色）。用 text_size 精确居中，避免固定偏移把白字
+        // 画到圆圈外的浅色背景上（白底白字 → 步骤号"看不清"）。
+        if let Some(ref f) = font {
+            let num_str = step_num.to_string();
+            let scale = ab_glyph::PxScale { x: 32.0, y: 32.0 };
+            let (num_w, num_h) = imageproc::drawing::text_size(scale, f, &num_str);
+            let num_x = badge_cx - num_w as i32 / 2;
+            let num_y = badge_cy - num_h as i32 / 2;
+            imageproc::drawing::draw_text_mut(
+                &mut header_canvas, STEP_NUM_COLOR, num_x, num_y, scale, f, &num_str,
+            );
+        }
+
+        // 标题文本（32px，垂直居中于头部条）
+        if let Some(ref f) = font {
+            let display_text = if title.is_empty() {
+                if action_type.is_empty() {
+                    "步骤".to_string()
+                } else {
+                    to_action_label(action_type)
+                }
+            } else {
+                title.clone()
+            };
+            let scale = ab_glyph::PxScale { x: 32.0, y: 32.0 };
+            let text_x: i32 = 92; // 圆圈右边距
+            let (_, text_h) = imageproc::drawing::text_size(scale, f, &display_text);
+            let text_y: i32 = badge_cy - text_h as i32 / 2;
+            imageproc::drawing::draw_text_mut(
+                &mut header_canvas, TEXT_COLOR, text_x, text_y, scale, f, &display_text,
+            );
+        }
+
+        let header_img = image::DynamicImage::ImageRgba8(header_canvas);
+
+        // 头部 + 截图 垂直拼接
+        let combined_h = HEADER_H + img.height();
+        let mut combined = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_pixel(
+            target_w,
+            combined_h,
+            image::Rgba([255, 255, 255, 255]),
+        );
+        let header_rgba = header_img.to_rgba8();
+        let img_rgba = img.to_rgba8();
+        image::imageops::overlay(&mut combined, &header_rgba, 0, 0);
+        image::imageops::overlay(&mut combined, &img_rgba, 0, HEADER_H as i64);
+
+        final_images.push(image::DynamicImage::ImageRgba8(combined));
+    }
+
+    // 5) 计算总高度（标题头 + 所有步骤头图 + 间隔）并创建最终画布
+    let total_h: u32 = TITLE_H
+        + final_images.iter().map(|i| i.height()).sum::<u32>()
+        + GAP * (final_images.len().saturating_sub(1)) as u32
+        + GAP; // 标题头下方也加间隔
+
+    let mut canvas = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_pixel(
+        target_w,
+        total_h,
+        image::Rgba([255u8, 255u8, 255u8, 255u8]),
+    );
+
+    // 先画标题头
+    let title_rgba = title_img.to_rgba8();
+    image::imageops::overlay(&mut canvas, &title_rgba, 0, 0);
+    let mut y: u32 = TITLE_H + GAP;
+
+    // 再逐张画步骤
+    for (i, img) in final_images.iter().enumerate() {
+        let rgba = img.to_rgba8();
+        image::imageops::overlay(&mut canvas, &rgba, 0, y as i64);
+        y += img.height();
+        if i + 1 < final_images.len() {
+            y += GAP;
+        }
+    }
+
+    canvas
+        .save(output_path)
+        .map_err(|e| format!("保存长图失败: {}", e))?;
+    Ok(())
+}
+
+/// 将英文 action_type 转为中文显示标签
+fn to_action_label(action_type: &str) -> String {
+    match action_type {
+        "click" => "点击".to_string(),
+        "scroll" => "滚动".to_string(),
+        "input" | "type" => "输入".to_string(),
+        "key" | "keydown" => "按键".to_string(),
+        "paste" => "粘贴".to_string(),
+        "drag" => "拖拽".to_string(),
+        "wait" => "等待".to_string(),
+        "navigate" => "导航".to_string(),
+        "voice" => "语音".to_string(),
+        other => other.to_string(),
+    }
 }
 
 // ── DOCX export ──────────────────────────────────────────────
@@ -1311,13 +1680,16 @@ mod tests {
         assert!(md.contains("**App:** App"));
         assert!(md.contains("## Step 1"));
         assert!(md.contains("## Step 2"));
-        assert!(md.contains("*(No screenshot)*"));
-        assert!(md.contains("> **Tip:** 提示"));
+        // MD 导出不含任何图片引用
         assert!(!md.contains("![Screenshot]"));
+        assert!(!md.contains("No screenshot"));
+        assert!(!md.contains("Screenshot not found"));
+        assert!(md.contains("> **Tip:** 提示"));
     }
 
     #[test]
-    fn test_export_markdown_missing_screenshot_file() {
+    fn test_export_markdown_ignores_screenshot_files() {
+        // MD 导出不再复制或引用任何截图文件，即使 screenshot_path 指向不存在的文件也不报错
         let rec = ExportRecording {
             id: "r2".into(),
             title: "标题2".into(),
@@ -1342,7 +1714,12 @@ mod tests {
         let ss_dir = std::env::temp_dir().join("flowio_test_md_ss2");
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let md = export_markdown(&rec, &steps, &ss_dir, &crop_set);
-        assert!(md.contains("Screenshot not found"));
+        // 不应包含任何图片引用或报错文字
+        assert!(md.contains("# 标题2"));
+        assert!(!md.contains("Screenshot"));
+        assert!(!md.contains("!["));
+        // 不应创建任何截图文件
+        assert!(!ss_dir.join("step_1.png").exists());
     }
 
     #[test]
@@ -1449,7 +1826,8 @@ mod tests {
     }
 
     #[test]
-    fn test_export_markdown_copies_real_screenshot() {
+    fn test_export_markdown_no_image_files_created() {
+        // MD 导出不再创建任何截图文件，即使步骤有截图路径
         let dir = std::env::temp_dir().join(format!("flowio_test_md3_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let png = write_tmp_png(&dir, "shot.png");
@@ -1474,12 +1852,16 @@ mod tests {
             crop_w: None,
             crop_h: None,
         }];
-        let ss_dir = dir.join("screenshots");
-        std::fs::create_dir_all(&ss_dir).unwrap();
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let md = export_markdown(&rec, &steps, &ss_dir, &crop_set);
-        assert!(md.contains("![Screenshot](./screenshots/step_1.png)"));
-        assert!(ss_dir.join("step_1.png").exists());
+        let md = export_markdown(&rec, &steps, &dir, &crop_set);
+        // 不应包含图片引用
+        assert!(!md.contains("![Screenshot]"));
+        assert!(!md.contains("step_1.png"));
+        // 不应创建 step_1.png 文件
+        assert!(!dir.join("step_1.png").exists());
+        // 但应有正常的文本内容
+        assert!(md.contains("# 标题"));
+        assert!(md.contains("## Step 1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1803,9 +2185,16 @@ mod tests {
         assert_eq!(compute_image_emu_dims(Some((2000, 4000)), 5_715_000), (5_715_000, 11_430_000));
     }
 
-    /// 构造一张纯色 JPEG，用于裁剪/尺寸回归。
+    /// 构造一张**非纯色** JPEG，用于裁剪/尺寸回归。
+    /// ⚠️ 必须带纹理：空白裁剪守卫（is_blank_crop）会把纯色区域的裁剪回退成整图，
+    /// 纯色测试图会让所有裁剪用例意外走整图分支（2026-09-05 加守卫时踩过）。
     fn test_jpeg(w: u32, h: u32) -> Vec<u8> {
-        let img = image::RgbImage::from_pixel(w, h, image::Rgb([120u8, 160, 200]));
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            // 逐像素交替的确定性纹理：任何步长采样都能采到不同值 → 永远判非纯色
+            let v = ((x * 7 + y * 13) % 32) as u8;
+            *p = image::Rgb([120u8.wrapping_add(v), 160, 200]);
+        }
         let mut buf = Vec::new();
         let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90);
         image::DynamicImage::ImageRgb8(img)
@@ -1933,6 +2322,65 @@ mod tests {
         assert_eq!(dims, None);
     }
 
+    /// 空白裁剪守卫：裁剪区域几乎纯色（如 WPS 加载中录到的「Program Manager」
+    /// 宿主伪元素矩形 → 纯灰空白）时，导出必须回退**整图字节**。
+    #[test]
+    fn blank_crop_falls_back_to_full_bytes() {
+        let raw = test_jpeg_flat(800, 600, [214, 214, 214]);
+        let (bytes, dims) = maybe_crop_screenshot_bytes(
+            raw.clone(),
+            Some(400),
+            Some(300),
+            Some(420),
+            Some(280),
+            "type",
+        );
+        assert_eq!(dims, Some((800, 600)), "纯色区域裁剪应回退整图尺寸");
+        assert_eq!(bytes, raw, "回退整图时应原样返回原始字节（不重编码）");
+    }
+
+    /// 同构数据但裁剪区域含可见内容（深色块）→ 正常裁剪，不触发守卫。
+    #[test]
+    fn non_blank_crop_still_crops() {
+        let mut img = image::RgbImage::from_pixel(800, 600, image::Rgb([214, 214, 214]));
+        for y in 280..320 {
+            for x in 380..420 {
+                img.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+        let mut buf = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90);
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(enc)
+            .unwrap();
+
+        let (_, dims) = maybe_crop_screenshot_bytes(buf, Some(400), Some(300), Some(420), Some(280), "click");
+        let (w, h) = dims.expect("含内容区域必须正常裁剪");
+        assert!(w < 800 && h < 600, "应裁出小于整图的区域，实际 {w}x{h}");
+    }
+
+    /// 构造纯色 JPEG（仅供空白守卫测试用；其余测试请用带纹理的 test_jpeg）
+    fn test_jpeg_flat(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
+        let mut buf = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90);
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(enc)
+            .expect("测试图编码失败");
+        buf
+    }
+
+    /// is_blank_crop 自身：纯色 → true；有深色块 → false；阈值黄金值 24。
+    #[test]
+    fn is_blank_crop_basic() {
+        assert_eq!(BLANK_CROP_DELTA, 24, "与前端 cropBlank.ts 黄金值锁死");
+        let flat = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(300, 200, image::Rgb([214, 214, 214])));
+        assert!(is_blank_crop(&flat), "纯灰应判空白");
+        let mut noisy = flat.to_rgb8();
+        noisy.put_pixel(150, 100, image::Rgb([214, 214, 250])); // 通道差 36 > 24
+        assert!(!is_blank_crop(&image::DynamicImage::ImageRgb8(noisy)), "含可见差异应判非空白");
+    }
+
     // B3 回归 A：PDF/HTML 模板必须带 CJK 字体回退，否则非中文系统中文渲染为豆腐块
     #[test]
     fn test_build_html_document_includes_cjk_font_fallback() {
@@ -2028,6 +2476,20 @@ mod tests {
             export_crop_box(1920, 1080, Some(960), Some(540), Some(900), Some(40), "type"),
             Some((202, 512, 1216, 56))
         );
+    }
+
+    #[test]
+    fn export_crop_box_drag_gets_extra_vertical_context() {
+        // DRAG 步骤高度方向多留上下文：选区 400×30（表格行拖选），
+        // 额外 extraH = max(30*0.6, 100) = 100 → 显示高 = 30+16+100=146。
+        // 宽度与 click 一致（无左扩）。
+        let (l, t, w, h) = export_crop_box(
+            1920, 1080, Some(960), Some(540), Some(400), Some(30), "drag",
+        ).unwrap();
+        assert_eq!(h, 30 + EXPORT_CROP_PAD * 2 + 100); // 146
+        assert_eq!(w, 400 + EXPORT_CROP_PAD * 2); // 416
+        // 高度方向中心对齐
+        assert_eq!(t, 540 - h / 2);
     }
 
     #[test]
@@ -2151,5 +2613,78 @@ mod tests {
                 "ProgramFiles 下有 Edge 却未被探测到"
             );
         }
+    }
+
+    #[test]
+    fn test_export_long_image_with_title_and_steps() {
+        // 端到端验证：长图生成含教程标题头 + 步骤头部 + 截图，尺寸正确
+        let dir = std::env::temp_dir().join(format!("flowio_test_long_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png1 = write_tmp_png(&dir, "step1.png");
+        let png2 = write_tmp_png(&dir, "step2.png");
+
+        // 用 200x150 的图（比默认 8x8 大，更接近真实截图）
+        let img1 = image::DynamicImage::new_rgb8(400, 300);
+        img1.save(&png1).unwrap();
+        let img2 = image::DynamicImage::new_rgb8(500, 250);
+        img2.save(&png2).unwrap();
+
+        let rec = ExportRecording {
+            id: "long-test".into(),
+            title: "Python 安装教程".into(),
+            app_name: "Python.org".into(),
+            total_steps: 2,
+            created_at: "2026-09-06".into(),
+        };
+        let steps = vec![
+            ExportStep {
+                id: "s1".into(),
+                order_index: 0,
+                step_number: 1,
+                action_type: "click".into(),
+                title: "点击在「Downloads」中下载按钮".into(),
+                description: "点击页面上的 Downloads 链接".into(),
+                tip: "".into(),
+                screenshot_path: png1.to_string_lossy().to_string(),
+                x: None,
+                y: None,
+                crop_w: None,
+                crop_h: None,
+            },
+            ExportStep {
+                id: "s2".into(),
+                order_index: 1,
+                step_number: 2,
+                action_type: "type".into(),
+                title: "输入在「搜索框」中 python".into(),
+                description: "在搜索框输入关键词".into(),
+                tip: "大小写不敏感".into(),
+                screenshot_path: png2.to_string_lossy().to_string(),
+                x: None,
+                y: None,
+                crop_w: None,
+                crop_h: None,
+            },
+        ];
+        let out = dir.join("long_test.png");
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        export_long_image(&rec, &steps, &out, &crop_set).unwrap();
+        assert!(out.exists(), "长图文件未生成");
+
+        let size = std::fs::metadata(&out).unwrap().len();
+        assert!(size > 1000, "长图太小（{} bytes），可能渲染失败", size);
+
+        // 验证图片可读取且尺寸合理
+        let loaded = image::open(&out).expect("无法读取生成的长图");
+        let (w, h) = (loaded.width(), loaded.height());
+        // 宽度应为 max(400, 500) = 500（或上限 1440）
+        assert!(w >= 400, "宽度 {} 小于最宽截图", w);
+        // 高度应 > 标题头(100) + 间隔(24) + 步骤1(56+300) + 间隔(24) + 步骤2(56+250)
+        let min_expected_h: u32 = 100 + 24 + (56 + 300) + 24 + (56 + 250);
+        assert!(h >= min_expected_h, "高度 {} 小于预期最小值 {}", h, min_expected_h);
+
+        println!("Long image test OK: {}x{}, {} bytes", w, h, size);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

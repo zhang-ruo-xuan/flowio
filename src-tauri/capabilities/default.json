@@ -21,6 +21,7 @@
     "deep-link:allow-register",
     "deep-link:allow-is-registered",
     "opener:default",
-    "global-shortcut:default"
+    "global-shortcut:default",
+    "notification:default"
   ]
 }

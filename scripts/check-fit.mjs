@@ -354,7 +354,21 @@ console.log('7. 主预览容器：遗留的 16:9 高度锁（v24 只修了宽度
       fail(`StepEditor 写死高度（命中 ${re}）—— inline height 会盖掉 aspect-ratio，重新引入 letterbox`);
     }
   }
-  console.log('   静态防线：主预览容器不得写死高度 ✓');
+  // 静态防线：容器几何禁止 onLoad 直接写 parent.style —— 直接写 DOM 的值会残留到
+  // 下一张图（切步骤/全图↔裁图），容器比例与新图不符 → contain 灰色占位区。
+  // 必须走 detailImgBox state（src 变化即重置，onLoad/effect 写入）。
+  if (/parent\.style\./.test(seCode)) {
+    fail('StepEditor 直接写 parent.style 设置主图容器几何 —— 旧图比例会残留，改用 detailImgBox state 驱动');
+  }
+  // 静态防线：上传/粘贴截图必须写主截图（isAfter: false → screenshot_path）。
+  // isAfter: true 在 upload 语义里写 after_screenshot_path，前端不做主图 →
+  // 粘贴的图只活在内存 state，退出重进就消失（2026-09-05 用户实测踩坑）。
+  const badUpload = seCode.match(/upload_step_screenshot[^)]*isAfter:\s*true/g);
+  if (badUpload) {
+    fail(`StepEditor upload_step_screenshot 传 isAfter: true（命中 ${badUpload.length} 处）—— 会写 after_screenshot_path 而非主截图 screenshot_path，粘贴/上传的图退出后丢失；应传 isAfter: false`);
+  }
+  console.log('   静态防线：主预览容器不得写死高度/不得直写 parent.style ✓');
+  console.log('   静态防线：upload_step_screenshot 必须 isAfter:false（写主截图，退出不丢图）✓');
 }
 
 /* ═══ 8. 命中容差：图像像素 vs 屏幕像素 ═════════════════════ */
@@ -471,7 +485,19 @@ console.log('9. 静态防线：组件源码不得再出现「window 尺寸直接
       bodies: [
         ['const findAt = ', /annoSlop\(|slopPx\(/, 'findAt 必须用 annoSlop 换算容差'],
         ['const hitTestCrop = ', /cropSlop\(|slopPx\(/, 'hitTestCrop 必须用 cropSlop 换算容差'],
+        ['const updateCropByResize = ', /moveRect\(|resizeRect\(/, '裁剪框拖拽几何必须委托 cropDrag 纯函数（旧内联实现有 y/h 自引用代数 bug：拖上/左边变平移、move 守卫卡死）'],
       ],
+    },
+    {
+      file: '../src/pages/StepEditor.tsx',
+      name: '步骤编辑器',
+      mustHave: [
+        // 空白裁剪守卫：cropAdaptiveBase64 裁出纯色区域时必须回退整图
+        //（WPS 加载中录到「Program Manager」宿主伪元素矩形 → 纯灰空白，2026-09-05）
+        ['isUniformCropPixels(', 'cropAdaptiveBase64 必须做空白裁剪守卫（lib/cropBlank.ts）'],
+        ['from "../lib/cropBlank"', '必须从 cropBlank 引入语义入口，不要内联阈值'],
+      ],
+      forbidden: [],
     },
     {
       file: '../src/components/CropOverlay.tsx',
@@ -703,13 +729,17 @@ console.log('11. UI 装饰（手柄/虚线/十字线）必须在屏幕上大小�
   ]) {
     if (re.test(comp)) fail(`AnnotationsOverlay.tsx 出现写死的绘制尺寸 ${re}（${why}）`);
   }
-  // 裁图时 dims 必须传【原图】尺寸：传裁切尺寸会让剩余标注的粗细随裁切框大小突变
-  const cropCall = comp.match(/for \(const a of adjusted\) drawAnnotation\([^;]*\);/);
-  if (!cropCall) fail('找不到 applyCrop 里的 drawAnnotation 调用（静态防线已失配）');
-  else if (cropCall[0].includes('cropRect.')) {
-    fail('applyCrop 的 drawAnnotation 传了 cropRect 尺寸（应传原图尺寸 image.width/height）');
+  // 改版后：标注编辑器不再「裁切烧录」。注释统一烧录进【完整图】flattenAnnotations，
+  // 裁图由锚点(rectToCropAnchor / update_step_crop)独立派生 → 全图与裁图互不影响。
+  // 旧 applyCrop（裁切后再 drawAnnotation 烧录、并覆盖全图）是 bug 来源，必须彻底移除，
+  // 否则注释归一化基准可能再次被传成 cropRect 尺寸，或全图被裁切图顶替。
+  if (/function applyCrop\s*\(/.test(comp)) {
+    fail('旧的 applyCrop 裁切烧录函数仍在（应移除，注释统一走 flattenAnnotations 烧录完整图）');
   }
-  console.log('   (c) 静态防线：无写死的图像像素绘制尺寸；裁图仍以原图尺寸为归一化基准');
+  if (!/flattenAnnotations\(img, annotations\)/.test(comp)) {
+    fail('bake 未调用 flattenAnnotations 把注释烧录进完整图（全图视图会丢失注释）');
+  }
+  console.log('   (c) 静态防线：注释恒烧录进完整图，无裁切烧录分支；全图/裁图互不影响');
 }
 
 /* ═══ 12. 跨端一致性：网站端必须与桌面端同步 ═══════════════ */

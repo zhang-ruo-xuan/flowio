@@ -119,13 +119,15 @@ impl RedactionConfig {
     pub fn from_json(v: &serde_json::Value) -> Self {
         let mut cfg = Self::default_all();
         if let Some(arr) = v.get("enabled").and_then(|x| x.as_array()) {
+            // 🔴 用户显式配置的类别列表**必须原样生效（含空数组 = 全部不勾 = 什么都不检测）**。
+            // 之前空数组被当成「未配置」静默回落 default_all：
+            // 设置里所有类别都不勾，扫描/文本脱敏仍按全量 11 类规则跑（2026-09-06 实锤：
+            // 用户 DB enabled=[] 但扫描照样打码）。键缺失（旧配置无此字段）才保留全量默认。
             let enabled: Vec<SensitiveKind> = arr
                 .iter()
                 .filter_map(|x| x.as_str().and_then(SensitiveKind::from_key))
                 .collect();
-            if !enabled.is_empty() {
-                cfg.enabled = enabled;
-            }
+            cfg.enabled = enabled;
         }
         if let Some(arr) = v.get("custom_patterns").and_then(|x| x.as_array()) {
             cfg.custom_patterns = arr
@@ -490,6 +492,78 @@ fn normalize_ocr_text(s: &str) -> String {
         .collect::<String>()
 }
 
+/// 对 OCR 文本行做命中检测并就地脱敏，返回命中行数（纯逻辑，便于单测）。
+fn redact_hits_on_lines(
+    rgba: &mut image::RgbaImage,
+    lines: &[ocr::OcrLine],
+    config: &RedactionConfig,
+    mode: RedactMode,
+) -> usize {
+    let mut hits = 0usize;
+    for line in lines {
+        let text = normalize_ocr_text(&line.text);
+        if text.is_empty() {
+            continue;
+        }
+        if find_sensitive_with_config(&text, config).is_empty() {
+            continue;
+        }
+        // 命中行：区域向外扩 4px，避免文字贴边，裁剪交给内部实现
+        let x = (line.x - 4.0).floor().max(0.0) as i32;
+        let y = (line.y - 4.0).floor().max(0.0) as i32;
+        let w = (line.w + 8.0).ceil() as i32;
+        let h = (line.h + 8.0).ceil() as i32;
+        match mode {
+            RedactMode::Blur => blur_region_rgba(rgba, x, y, w, h),
+            RedactMode::Block => fill_block_rgba(rgba, x, y, w, h),
+        }
+        hits += 1;
+    }
+    hits
+}
+
+// 🔴 瓦片复查（第三级零命中兜底，与扩展端 v0.65.94 同策略）：
+// 整图与灰度放大两级 OCR 都零命中且图够大时，把截图切成 grid×grid 带
+// 重叠的瓦片逐片 OCR——小字（手机号/学号等）在瓦片里的有效字号放大 4 倍，
+// 命中率显著提升。仅零命中图多花 4 次 OCR，不影响命中图的速度。
+const TILE_MIN_LONG_EDGE: u32 = 1200;
+const TILE_GRID: u32 = 2;
+const TILE_OVERLAP: f64 = 0.12;
+
+/// 长边是否达到阈值（纯逻辑，便于单测）。任一边为 0 视为无效图。
+fn long_edge_at_least(w: u32, h: u32, min: u32) -> bool {
+    if w == 0 || h == 0 {
+        return false;
+    }
+    w.max(h) >= min
+}
+
+/// 计算瓦片原点与尺寸列表 `(x0, y0, tw, th)`（纯逻辑，便于单测）。
+/// 步长 = 瓦片尺寸 × (1-重叠)，最后一片贴边（min 保证不越界）。
+fn tile_origins(
+    w: u32,
+    h: u32,
+    grid: u32,
+    overlap: f64,
+) -> Vec<(u32, u32, u32, u32)> {
+    let mut out = Vec::new();
+    if w == 0 || h == 0 || grid == 0 {
+        return out;
+    }
+    let tw = (w + grid - 1) / grid;
+    let th = (h + grid - 1) / grid;
+    let step_x = ((tw as f64) * (1.0 - overlap)).round().max(1.0) as u32;
+    let step_y = ((th as f64) * (1.0 - overlap)).round().max(1.0) as u32;
+    for row in 0..grid {
+        for col in 0..grid {
+            let x0 = (col * step_x).min(w - tw);
+            let y0 = (row * step_y).min(h - th);
+            out.push((x0, y0, tw, th));
+        }
+    }
+    out
+}
+
 /// 自动扫描单张截图：OCR 识别文本行 → 按配置检测敏感内容 → 对命中行区域脱敏（模糊/色块）。
 ///
 /// 返回命中的区域数；有命中时写回磁盘原路径。
@@ -505,25 +579,48 @@ pub fn redact_screenshot_auto(
 
     let img = image::open(path).map_err(|e| format!("open image failed: {}", e))?;
     let mut rgba = img.to_rgba8();
-    let mut hits = 0usize;
-    for line in &lines {
-        let text = normalize_ocr_text(&line.text);
-        if text.is_empty() {
-            continue;
+    let (iw, ih) = (rgba.width(), rgba.height());
+    let mut hits = redact_hits_on_lines(&mut rgba, &lines, config, mode);
+
+    // 🔴 零命中二次机会：Windows OCR 对同一内容的识别有波动（实测同一学号列
+    // 在相邻两张近乎相同的截图里一张命中一张漏检），漏检的直接后果是
+    // 「有的图打码了有的没打」。灰度预处理可消除 ClearType 彩色边缘，
+    // 对小字号数字/字母识别更稳。只对零命中图多花一次 OCR，不影响命中图的速度。
+    if hits == 0 {
+        if let Ok(lines2) =
+            ocr::recognize_crop_with(path, None, image::imageops::FilterType::Nearest, ocr::OCR_UPSCALE, 1)
+        {
+            hits = redact_hits_on_lines(&mut rgba, &lines2, config, mode);
         }
-        if find_sensitive_with_config(&text, config).is_empty() {
-            continue;
+    }
+
+    // 🔴 瓦片复查（第三级）：前两级（整图 / 灰度放大整图）都零命中且图够大时，
+    // 切 2×2 带 12% 重叠的瓦片逐片 OCR——小字（手机号/学号等）在瓦片里的
+    // 有效字号放大 4 倍，命中率显著提升。仅零命中图多花 4 次 OCR。
+    if hits == 0 && long_edge_at_least(iw, ih, TILE_MIN_LONG_EDGE) {
+        for (x0, y0, tw, th) in tile_origins(iw, ih, TILE_GRID, TILE_OVERLAP) {
+            let Ok(tlines) = ocr::recognize_crop_with(
+                path,
+                Some((x0, y0, tw, th)),
+                image::imageops::FilterType::Nearest,
+                ocr::OCR_UPSCALE,
+                1,
+            ) else {
+                continue; // 单瓦片失败跳过，不阻断
+            };
+            // 瓦片内坐标 → 全图坐标（recognize_crop_with 的坐标相对裁剪原点）
+            let shifted: Vec<ocr::OcrLine> = tlines
+                .into_iter()
+                .map(|l| ocr::OcrLine {
+                    text: l.text,
+                    x: l.x + x0 as f32,
+                    y: l.y + y0 as f32,
+                    w: l.w,
+                    h: l.h,
+                })
+                .collect();
+            hits += redact_hits_on_lines(&mut rgba, &shifted, config, mode);
         }
-        // 命中行：区域向外扩 4px，避免文字贴边，裁剪交给内部实现
-        let x = (line.x - 4.0).floor().max(0.0) as i32;
-        let y = (line.y - 4.0).floor().max(0.0) as i32;
-        let w = (line.w + 8.0).ceil() as i32;
-        let h = (line.h + 8.0).ceil() as i32;
-        match mode {
-            RedactMode::Blur => blur_region_rgba(&mut rgba, x, y, w, h),
-            RedactMode::Block => fill_block_rgba(&mut rgba, x, y, w, h),
-        }
-        hits += 1;
     }
 
     if hits > 0 {
@@ -828,6 +925,85 @@ mod repro_tests {
         assert_eq!(spans2.len(), 1);
         assert_eq!(spans2[0].kind, SensitiveKind::Custom);
     }
+
+    /// 🔴 回归（2026-09-06）：enabled 为**空数组**时必须原样生效（= 什么都不检测）。
+    /// 之前空数组被当成「未配置」静默回落 default_all：设置里全不勾，扫描仍按全量规则跑。
+    #[test]
+    fn from_json_empty_enabled_means_none() {
+        let cfg = RedactionConfig::from_json(&serde_json::json!({
+            "enabled": [],
+            "custom_patterns": []
+        }));
+        assert!(cfg.enabled.is_empty(), "空 enabled 必须保持为空");
+        // 空配置下任何文本都不命中（手机号也不行）
+        assert!(find_sensitive_with_config("手机13800138000", &cfg).is_empty());
+    }
+
+    /// 旧配置兼容：**键缺失**（无 enabled 字段）才回落全量默认
+    #[test]
+    fn from_json_missing_key_defaults_all() {
+        let cfg = RedactionConfig::from_json(&serde_json::json!({}));
+        assert_eq!(cfg.enabled.len(), SensitiveKind::ALL.len());
+        // 只勾一部分 → 原样生效
+        let cfg2 = RedactionConfig::from_json(&serde_json::json!({ "enabled": ["phone"] }));
+        assert_eq!(cfg2.enabled, vec![SensitiveKind::Phone]);
+    }
+
+    /// redact_hits_on_lines：命中行就地脱敏 + 零命中返回 0（纯逻辑）
+    #[test]
+    fn redact_hits_on_lines_basic() {
+        let mut img = image::RgbaImage::new(200, 40);
+        for (_, _, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgba([240, 240, 240, 255]);
+        }
+        let lines = vec![
+            ocr::OcrLine { text: "联系电话 13800138000".into(), x: 10.0, y: 10.0, w: 120.0, h: 16.0 },
+            ocr::OcrLine { text: "普通说明文字".into(), x: 10.0, y: 30.0, w: 80.0, h: 8.0 },
+        ];
+        let cfg = RedactionConfig { enabled: vec![SensitiveKind::Phone], custom_patterns: vec![] };
+        let hits = redact_hits_on_lines(&mut img, &lines, &cfg, RedactMode::Blur);
+        assert_eq!(hits, 1);
+        // 空配置 → 0 命中
+        let empty = RedactionConfig { enabled: vec![], custom_patterns: vec![] };
+        let mut img2 = image::RgbaImage::new(200, 40);
+        assert_eq!(redact_hits_on_lines(&mut img2, &lines, &empty, RedactMode::Blur), 0);
+    }
+
+    /// long_edge_at_least：阈值判断与无效图兜底（纯逻辑）
+    #[test]
+    fn long_edge_at_least_basic() {
+        assert!(long_edge_at_least(1920, 1080, TILE_MIN_LONG_EDGE));
+        assert!(long_edge_at_least(800, TILE_MIN_LONG_EDGE, TILE_MIN_LONG_EDGE));
+        assert!(!long_edge_at_least(1199, 800, TILE_MIN_LONG_EDGE));
+        assert!(!long_edge_at_least(0, 0, 1)); // 无效图不切瓦片
+    }
+
+    /// tile_origins：2×2 瓦片覆盖全图、带重叠、不越界（纯逻辑）
+    #[test]
+    fn tile_origins_basic() {
+        let tiles = tile_origins(1920, 1080, TILE_GRID, TILE_OVERLAP);
+        assert_eq!(tiles.len(), 4);
+        let tw = (1920 + 1) / 2; // 960
+        let th = (1080 + 1) / 2; // 540
+        // 全部瓦片尺寸一致且不越界
+        for &(x0, y0, w, h) in &tiles {
+            assert_eq!((w, h), (tw, th));
+            assert!(x0 + w <= 1920 && y0 + h <= 1080);
+        }
+        // 第一片贴原点；第二列/行按步长偏移且带重叠（x0 < tw）
+        assert_eq!(tiles[0], (0, 0, tw, th));
+        let (x1, y1, _, _) = tiles[3];
+        assert!(x1 > 0 && x1 < tw, "右下瓦片应带重叠偏移: x0={}", x1);
+        assert!(y1 > 0 && y1 < th, "右下瓦片应带重叠偏移: y0={}", y1);
+        // 小图（未达阈值尺寸的极端小图）不除零、不越界
+        let tiny = tile_origins(10, 10, TILE_GRID, TILE_OVERLAP);
+        assert_eq!(tiny.len(), 4);
+        for &(x0, y0, w, h) in &tiny {
+            assert!(x0 + w <= 10 && y0 + h <= 10);
+        }
+        // 无效输入返回空
+        assert!(tile_origins(0, 0, 2, 0.12).is_empty());
+    }
 }
 
 /// 脱敏功能系统化测试：文本检测/替换、图片区域脱敏、配置与策略、OCR 文本归一化。
@@ -1081,12 +1257,13 @@ mod redaction_tests {
     }
 
     #[test]
-    fn config_json_empty_enabled_falls_back_to_all() {
+    fn config_json_empty_enabled_means_none() {
         let cfg = RedactionConfig::from_json(&serde_json::json!({
             "enabled": [],
             "custom_patterns": []
         }));
-        assert_eq!(cfg.enabled.len(), SensitiveKind::ALL.len());
+        // 🔴 2026-09-06 行为变更：空 enabled = 用户全部不勾 = 什么都不检测（原为回落全量）
+        assert!(cfg.enabled.is_empty());
         assert!(cfg.custom_patterns.is_empty());
     }
 

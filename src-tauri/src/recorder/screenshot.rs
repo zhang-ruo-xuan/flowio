@@ -557,11 +557,128 @@ fn draw_rect_stroke(
     }
 }
 
-/// Draw a drag-selection annotation: a red hollow rectangle spanning the
-/// dragged region `(dx,dy)`→`(ux,uy)`, website editor style (#E74C3C, 2.5px).
+/// Draw a drag-selection annotation:
+///   1. A red hollow rectangle spanning `(dx,dy)`→`(ux,uy)` (#E74C3C, 2.5px).
+///   2. A direction arrow **from press point to release point** so the user can
+///      tell which way the drag went (arrowhead at the release end).
 pub fn draw_drag_marker(img: &mut DynamicImage, dx: i32, dy: i32, ux: i32, uy: i32) {
     const RED: [u8; 3] = [0xE7, 0x4C, 0x3C]; // #E74C3C
+    const WHITE: [u8; 3] = [255, 255, 255];
+    // 1) Selection rectangle (existing behavior).
     draw_rect_stroke(img, dx, dy, ux, uy, 2.5, RED);
+    // 2) Direction arrow: press → release (white halo + red core for visibility on any background).
+    let dist = f64::hypot((ux - dx) as f64, (uy - dy) as f64);
+    if dist < 8.0 {
+        return; // zero/near-zero drag – no meaningful direction
+    }
+    let head_len = 14.0_f64.min(dist * 0.8); // shrink arrowhead for tiny drags
+    let halo_head = head_len + 3.0; // slightly larger halo
+    // White halo (drawn first, underneath).
+    draw_line(img, dx, dy, ux, uy, 7.0, WHITE);
+    draw_arrowhead(img, dx, dy, ux, uy, halo_head, 5.0, WHITE);
+    // Red core.
+    draw_line(img, dx, dy, ux, uy, 3.0, RED);
+    draw_arrowhead(img, dx, dy, ux, uy, head_len, 3.0, RED);
+}
+
+/// Draw a straight line (no anti-aliasing) using Bresenham-like rasterisation
+/// with thickness via perpendicular dots.
+fn draw_line(img: &mut DynamicImage, x0: i32, y0: i32, x1: i32, y1: i32, stroke: f64, color: [u8; 3]) {
+    let w = img.width() as i32;
+    let h = img.height() as i32;
+    let buf = img.as_mut_rgba8().expect("RGBA8");
+    let px = image::Rgba([color[0], color[1], color[2], 255]);
+    let r = (stroke / 2.0).ceil() as i32;
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let adx = dx.abs();
+    let ady = dy.abs();
+    let steps = adx.max(ady).max(1);
+    for i in 0..=steps {
+        let t = if steps == 0 { 0.0 } else { i as f64 / steps as f64 };
+        let cx = x0 as f64 + dx as f64 * t;
+        let cy = y0 as f64 + dy as f64 * t;
+        // Fill a disk of radius `r` around each point on the line.
+        let rr = r + 1;
+        for oy in -rr..=rr {
+            for ox in -rr..=rr {
+                if ox * ox + oy * oy <= r * r {
+                    let px_i = cx.round() as i32 + ox;
+                    let py_i = cy.round() as i32 + oy;
+                    if px_i >= 0 && px_i < w && py_i >= 0 && py_i < h {
+                        buf.put_pixel(px_i as u32, py_i as u32, px);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Draw a filled arrowhead at `(ux,uy)` pointing **away from** `(dx,dy)`.
+/// `length` = tip-to-base distance, `width` = base width (perpendicular to shaft).
+fn draw_arrowhead(
+    img: &mut DynamicImage,
+    dx: i32, dy: i32,
+    ux: i32, uy: i32,
+    length: f64,
+    _width: f64,
+    color: [u8; 3],
+) {
+    let w = img.width() as i32;
+    let h = img.height() as i32;
+    let buf = img.as_mut_rgba8().expect("RGBA8");
+    let px = image::Rgba([color[0], color[1], color[2], 255]);
+
+    // Direction vector (normalised).
+    let vx = ux as f64 - dx as f64;
+    let vy = uy as f64 - dy as f64;
+    let vlen = f64::hypot(vx, vy);
+    if vlen < 0.001 {
+        return;
+    }
+    let nx = vx / vlen;
+    let ny = vy / vlen;
+
+    // Arrowhead vertices: tip at (ux,uy), base centre `length` pixels behind.
+    let tip_x = ux as f64;
+    let tip_y = uy as f64;
+    let base_cx = tip_x - nx * length;
+    let base_cy = tip_y - ny * length;
+
+    // Half-base width ≈ length * 0.45 (≈ 50° included angle).
+    let hw = length * 0.45;
+    // Perpendicular vector.
+    let perp_x = -ny * hw;
+    let perp_y = nx * hw;
+
+    let v1 = (base_cx + perp_x, base_cy + perp_y); // left base corner
+    let v2 = (base_cx - perp_x, base_cy - perp_y); // right base corner
+
+    // Rasterise filled triangle (tip, v1, v2) via bounding box + barycentric test.
+    let min_x = (tip_x.min(v1.0).min(v2.0).floor() as i32 - 1).max(0);
+    let max_x = (tip_x.max(v1.0).max(v2.0).ceil() as i32 + 1).min(w - 1);
+    let min_y = (tip_y.min(v1.1).min(v2.1).floor() as i32 - 1).max(0);
+    let max_y = (tip_y.max(v1.1).max(v2.1).ceil() as i32 + 1).min(h - 1);
+
+    // Precompute denominator for barycentric coordinates.
+    let denom = (v1.0 - tip_x) * (v2.1 - tip_y) - (v1.1 - tip_y) * (v2.0 - tip_x);
+    if denom.abs() < 0.001 {
+        return; // degenerate triangle
+    }
+
+    for py_i in min_y..=max_y {
+        for px_i in min_x..=max_x {
+            let pfx = px_i as f64 + 0.5;
+            let pfy = py_i as f64 + 0.5;
+            let d1 = (v1.0 - tip_x) * (pfy - tip_y) - (v1.1 - tip_y) * (pfx - tip_x);
+            let d2 = (v2.0 - v1.0) * (pfy - v1.1) - (v2.1 - v1.1) * (pfx - v1.0);
+            let d3 = (tip_x - v2.0) * (pfy - v2.1) - (tip_y - v2.1) * (pfx - v2.0);
+            let (w1, w2, w3) = (d1 / denom, d2 / denom, d3 / denom);
+            if w1 >= 0.0 && w2 >= 0.0 && w3 >= 0.0 {
+                buf.put_pixel(px_i as u32, py_i as u32, px);
+            }
+        }
+    }
 }
 
 /// Draw the click annotation on the image:

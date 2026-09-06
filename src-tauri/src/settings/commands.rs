@@ -161,6 +161,28 @@ pub fn read_redaction_config(conn: &rusqlite::Connection) -> crate::redaction::R
     }
 }
 
+/// 脱敏功能总开关（redaction_config.redact_before_export，默认关）。
+///
+/// 🔴 用户要求（2026-09-06）：脱敏功能完全受设置里的开关控制——关闭后，
+/// 编辑器「文本脱敏」「扫描脱敏」以及导出自动脱敏全部不可用（后端强制拒绝），
+/// 点击功能时由前端提示先去设置开启。要脱敏什么（类别/自定义规则）由用户在设置里选。
+pub fn read_redaction_master_enabled(conn: &rusqlite::Connection) -> bool {
+    let mut stmt = match conn.prepare("SELECT value FROM settings WHERE key = ?1") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let json: Option<String> = stmt
+        .query_row(params![REDACTION_CONFIG_KEY], |row| row.get(0))
+        .ok();
+    let Some(s) = json else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&s)
+        .ok()
+        .and_then(|v| v.get("redact_before_export").and_then(|x| x.as_bool()))
+        .unwrap_or(false)
+}
+
 /// 刷新全局自动脱敏策略缓存（开关 + 覆盖方式 + 类别配置）。
 /// 由本模块各配置读写命令在持有 DB 连接时调用，录制线程只读缓存。
 pub fn refresh_auto_redact_policy(conn: &rusqlite::Connection) {
@@ -325,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn read_redaction_config_empty_enabled_falls_back_all() {
+    fn read_redaction_config_empty_enabled_means_none() {
         let conn = mem_db();
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('redaction_config', ?1)",
@@ -333,7 +355,8 @@ mod tests {
         )
         .unwrap();
         let cfg = read_redaction_config(&conn);
-        assert!(!cfg.enabled.is_empty(), "empty enabled should fall back to default_all");
+        // 🔴 2026-09-06 行为变更：空 enabled = 用户全部不勾 = 什么都不检测（原为回落全量）
+        assert!(cfg.enabled.is_empty(), "empty enabled must stay empty (user chose none)");
     }
 
     #[test]
@@ -354,11 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn read_redaction_config_custom_only_keeps_all_enabled() {
+    fn read_redaction_config_custom_only_means_custom_only() {
         let conn = mem_db();
         conn.execute("INSERT INTO settings (key, value) VALUES ('redaction_config', ?1)", params![r#"{"enabled": [], "custom_patterns": ["x-\\d{3}"]}"#]).unwrap();
         let cfg = read_redaction_config(&conn);
-        assert!(!cfg.enabled.is_empty(), "empty enabled falls back to all kinds");
+        // 🔴 2026-09-06 行为变更：enabled 空 = 只走自定义规则，不再补全量类别
+        assert!(cfg.enabled.is_empty(), "empty enabled must stay empty");
         assert_eq!(cfg.custom_patterns, vec!["x-\\d{3}".to_string()]);
     }
 

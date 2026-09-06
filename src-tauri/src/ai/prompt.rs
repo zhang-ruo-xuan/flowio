@@ -91,7 +91,7 @@ pub fn build_step_prompt(step: &StepInput, step_number: usize, force_domain: Opt
 {{"title": "...", "description": "...", "action_type": "click/input/select/scroll/navigate/other", "tip": "..."}}
 
 要求：
-- title：2-20 字，动词开头，如"点击登录按钮"
+- title：2-20 字，动作动词开头（操作在前），如"点击导出按钮"；如含页面/位置信息请放在标题末尾括号内，如"点击导出按钮（设置页）"，不要写成"在设置页点击导出按钮"
 - description：10-200 字，描述操作对象、位置和预期结果
 - action_type：click（点击）/ input（输入）/ select（选择）/ scroll（滚动）/ navigate（导航）/ other（其他）
 - tip：操作提示或注意事项，如无则为空字符串

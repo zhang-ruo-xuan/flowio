@@ -22,6 +22,10 @@ pub enum KeyEvent {
         ctrl: bool,
         shift: bool,
         alt: bool,
+        /// Win key (Meta) down-state at the moment the key went down. Lets the
+        /// combo branch model Windows-key shortcuts (Win+D / Win+E / …) instead
+        /// of letting the non-Win key fall into the type buffer as a bare char.
+        meta: bool,
         ts: std::time::Instant,
         /// Foreground window PID captured inside the hook callback at key-press
         /// time (self-filter / target-filter use it to decide whether the event

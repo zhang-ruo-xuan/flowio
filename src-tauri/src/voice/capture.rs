@@ -31,10 +31,12 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
-use tauri::State;
+use tauri::{AppHandle, State};
 
+use super::asr;
 use super::audio;
 use super::commands::{VoiceBuffer, VoiceCaptureState};
+use crate::DbState;
 
 /// 采集线程收到的控制命令。
 enum MicCmd {
@@ -69,6 +71,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// 与步骤的 `timestamp`（epoch ms）同源。
 #[tauri::command]
 pub fn voice_mic_start(
+    app: AppHandle,
+    db: State<'_, DbState>,
     state: State<'_, MicCaptureState>,
     buffers: State<'_, VoiceCaptureState>,
     recording_id: String,
@@ -89,6 +93,9 @@ pub fn voice_mic_start(
     let paused = Arc::new(AtomicBool::new(false));
     let samples = Arc::new(AtomicU64::new(0));
 
+    // ★ 实时字幕：开麦时解析一次 ASR Key + 热词（失败只降级为「无实时字幕」，不影响录制）
+    let live_ctx = resolve_live_ctx(&app, &db);
+
     let t_paused = Arc::clone(&paused);
     let t_samples = Arc::clone(&samples);
     thread::spawn(move || {
@@ -103,6 +110,7 @@ pub fn voice_mic_start(
             cmd_rx,
             init_tx,
             done_tx,
+            live_ctx,
         );
     });
 
@@ -117,6 +125,23 @@ pub fn voice_mic_start(
         samples,
     });
     Ok(started_at)
+}
+
+/// 解析实时字幕所需的 ASR Key + 热词；拿不到就返回 None（降级：不出字幕，
+/// 停止录制时照常整段转写）。
+fn resolve_live_ctx(app: &AppHandle, db: &State<'_, DbState>) -> Option<LiveCtx> {
+    let conn = db.inner().0.lock().ok()?;
+    let config = crate::ai::commands::resolve_ai_config(&conn);
+    let (asr_key, _ch) = crate::voice::commands::resolve_asr_key(&config);
+    if asr_key.trim().is_empty() {
+        return None;
+    }
+    let hotwords = asr::merge_hotwords(&crate::voice::commands::read_custom_hotwords(&conn));
+    Some(LiveCtx {
+        app: app.clone(),
+        asr_key,
+        hotwords,
+    })
 }
 
 /// 暂停 / 恢复采集。暂停期间丢弃 PCM（不写入缓冲）。
@@ -163,6 +188,13 @@ pub fn voice_mic_stop(state: State<'_, MicCaptureState>) -> Result<u64, String> 
 
 /// 采集线程主体：建流 → play → 排空 PCM + 处理命令 → 退出。
 #[allow(clippy::too_many_arguments)]
+/// ★ 实时字幕上下文：开麦时解析一次（Key + 热词），采集线程复用。
+pub struct LiveCtx {
+    pub app: AppHandle,
+    pub asr_key: String,
+    pub hotwords: Vec<String>,
+}
+
 fn run_capture(
     buffers: VoiceCaptureState,
     recording_id: String,
@@ -173,6 +205,7 @@ fn run_capture(
     cmd_rx: Receiver<MicCmd>,
     init_tx: Sender<Result<i64, String>>,
     done_tx: Sender<()>,
+    live_ctx: Option<LiveCtx>,
 ) {
     let gain_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
     let setup = build_stream_for_default_device(
@@ -200,6 +233,9 @@ fn run_capture(
                     sample_rate: audio::SAMPLE_RATE,
                     pcm: Vec::new(),
                     last_heartbeat_len: 0,
+                    live_segments: Vec::new(),
+                    live_cursor: Default::default(),
+                    live_pending: Default::default(),
                 },
             );
         }
@@ -224,6 +260,18 @@ fn run_capture(
         // 1) 排空已采集的 PCM
         while let Ok(chunk) = pcm_rx.try_recv() {
             append_pcm(&buffers, &recording_id, &chunk);
+            // ★ 实时字幕：句级 VAD（说完一句就送 ASR，结果 emit 到前端）
+            if let Some(ctx) = live_ctx.as_ref() {
+                crate::voice::commands::feed_live_chunk(
+                    &buffers,
+                    &recording_id,
+                    &chunk,
+                    audio::SAMPLE_RATE,
+                    &ctx.asr_key,
+                    &ctx.hotwords,
+                    &ctx.app,
+                );
+            }
         }
         // 2) 处理命令（50ms 超时后回到 1）
         match cmd_rx.recv_timeout(DRAIN_INTERVAL) {
@@ -231,6 +279,17 @@ fn run_capture(
             Ok(MicCmd::SetPaused(true)) => {
                 if paused_since.is_none() {
                     paused_since = Some(Instant::now());
+                }
+                // ★ 实时字幕：暂停前把已说的半句吐出去
+                if let Some(ctx) = live_ctx.as_ref() {
+                    crate::voice::commands::flush_live_chunk(
+                        &buffers,
+                        &recording_id,
+                        audio::SAMPLE_RATE,
+                        &ctx.asr_key,
+                        &ctx.hotwords,
+                        &ctx.app,
+                    );
                 }
                 paused.store(true, Ordering::Relaxed);
             }
@@ -251,6 +310,34 @@ fn run_capture(
     // 收尾：排空剩余
     while let Ok(chunk) = pcm_rx.try_recv() {
         append_pcm(&buffers, &recording_id, &chunk);
+    }
+    // ★ 实时字幕：把最后没说完的半句也吐出去（否则结尾几秒的话只靠整段兜底）
+    if let Some(ctx) = live_ctx.as_ref() {
+        crate::voice::commands::flush_live_chunk(
+            &buffers,
+            &recording_id,
+            audio::SAMPLE_RATE,
+            &ctx.asr_key,
+            &ctx.hotwords,
+            &ctx.app,
+        );
+        // 🔴 等在途实时转写全部落库再发 done（不持锁等待）。否则前端收到
+        // done → voice_finish 移除缓冲 → 尾句转写完无处可写 → 最后一句必丢。
+        let pending = buffers
+            .0
+            .lock()
+            .ok()
+            .and_then(|mut m| m.get_mut(&recording_id).map(|b| b.live_pending.clone()));
+        if let Some(p) = pending {
+            use std::sync::atomic::Ordering;
+            let left = crate::voice::commands::wait_live_pending(&p, std::time::Duration::from_secs(8));
+            if left > 0 || p.load(Ordering::SeqCst) > 0 {
+                crate::ai::commands::ai_dbg_log(&format!(
+                    "[VOICE] mic stop: {} live ASR still in flight after wait",
+                    left
+                ));
+            }
+        }
     }
     let final_gain = f32::from_bits(gain_bits.load(Ordering::Relaxed));
     crate::ai::commands::ai_dbg_log(&format!(
@@ -440,6 +527,66 @@ impl Agc {
     }
 }
 
+/// 一阶高通滤波器（滤除风扇、空调等低频背景噪音）。
+///
+/// 截止频率约 80Hz（人声基频通常 > 85Hz），用最简 IIR 实现：
+///   y[n] = α * (y[n-1] + x[n] - x[n-1])
+struct HighPassFilter {
+    prev_input: f32,
+    prev_output: f32,
+    alpha: f32, // = rc / (rc + dt)，越接近 1 截止越低
+}
+
+impl HighPassFilter {
+    /// 新建：cutoff_hz 为截止频率，sample_rate 为采样率
+    fn new(cutoff_hz: f32, sample_rate: u32) -> Self {
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff_hz);
+        let dt = 1.0 / sample_rate.max(1) as f32;
+        let alpha = rc / (rc + dt);
+        Self { prev_input: 0.0, prev_output: 0.0, alpha }
+    }
+
+    /// 处理单个样本，返回滤波后值
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.alpha * (self.prev_output + input - self.prev_input);
+        self.prev_input = input;
+        self.prev_output = output;
+        output
+    }
+}
+
+/// 噪声门：当信号能量低于阈值时直接归零，只放过「有人声」的段。
+///
+/// 用滑动窗口 RMS 检测，低于 gate_threshold 时输出静音；高于时原样通过。
+/// 窗口 10ms（160 样本 @16kHz），避免切掉语音起首的弱辅音。
+pub struct NoiseGate {
+    buf: Vec<f32>,      // 滑动窗口
+    gate_threshold: f32, // RMS 阈值（低于此 → 静音）
+    window_size: usize,
+}
+
+impl NoiseGate {
+    /// threshold_rms：RMS 阈值，建议 0.002~0.005（介于 FALLBACK_MIN_RMS 和 SILENCE_RMS 之间）
+    pub fn new(threshold_rms: f32, sample_rate: u32) -> Self {
+        let ws = ((sample_rate as f64) * 0.01).max(32.0) as usize; // 10ms 窗口
+        Self { buf: Vec::with_capacity(ws), gate_threshold: threshold_rms, window_size: ws }
+    }
+
+    /// 处理一个样本：窗口内 RMS 低于阈值 → 返回 0；否则返回原值
+    pub fn process(&mut self, sample: f32) -> f32 {
+        self.buf.push(sample);
+        if self.buf.len() > self.window_size {
+            self.buf.remove(0);
+        }
+        if self.buf.len() < self.window_size {
+            return sample; // 窗口未填满，先放行
+        }
+        let sum_sq: f32 = self.buf.iter().map(|&x| x * x).sum();
+        let rms = (sum_sq / self.window_size as f32).sqrt();
+        if rms < self.gate_threshold { 0.0 } else { sample }
+    }
+}
+
 /// 造一个 cpal 数据回调：降混 → 重采样 → AGC → i16 → 投进 channel。
 fn make_callback<T>(
     channels: usize,
@@ -455,6 +602,8 @@ where
 {
     let mut res = Resampler::new(dev_rate, audio::SAMPLE_RATE);
     let mut agc = Agc::new();
+    let mut hpf = HighPassFilter::new(120.0, audio::SAMPLE_RATE); // 120Hz 高通滤除风扇/空调低频噪音
+    let mut gate = NoiseGate::new(0.003, audio::SAMPLE_RATE);   // 噪声门阈值
     let mut mono: Vec<f32> = Vec::new();
     move |data: &[T], _: &cpal::InputCallbackInfo| {
         if paused.load(Ordering::Relaxed) {
@@ -467,7 +616,15 @@ where
         if out.is_empty() {
             return;
         }
+        // 信号处理链：AGC → 高通滤波 → 噪声门 → i16
         agc.process(&mut out);
+        // 高通滤波（在 i16 上做 f32 运算）
+        for s in out.iter_mut() {
+            let sf = *s as f32 / 32768.0;
+            let filtered = hpf.process(sf);
+            let gated = gate.process(filtered);
+            *s = (gated.clamp(-1.0, 1.0) * 32767.0) as i16;
+        }
         gain_bits.store(agc.gain().to_bits(), Ordering::Relaxed);
         samples.fetch_add(out.len() as u64, Ordering::Relaxed);
         let _ = tx.send(out);
@@ -812,5 +969,100 @@ mod tests {
                 "增益后样本必须夹在 i16 范围内"
             );
         }
+    }
+
+    // ── 高通滤波器 ─────────────────────────────────────
+
+    #[test]
+    fn hpf_blocks_dc_offset() {
+        let mut f = HighPassFilter::new(80.0, 16_000);
+        // 直流偏移应被滤除
+        let mut out = 0.0f32;
+        for _ in 0..2000 {
+            out = f.process(0.5); // 恒定直流
+        }
+        assert!(out.abs() < 0.01, "直流应被高通滤除，实际 {:.4}", out);
+    }
+
+    #[test]
+    fn hpf_passes_sine_above_cutoff() {
+        let mut f = HighPassFilter::new(120.0, 16_000);
+        // 440Hz 正弦波应在通带（远高于 120Hz 截止）
+        let mut sum_sq = 0.0f64;
+        let mut n = 0u32;
+        for i in 0..4000 {
+            let x = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin()) * 0.5;
+            let y = f.process(x);
+            if i > 500 { // 跳过建立期
+                sum_sq += (y as f64).powi(2);
+                n += 1;
+            }
+        }
+        let rms = (sum_sq / n.max(1) as f64).sqrt();
+        // 440Hz 在通带，输出 RMS 应 > 0.1（输入 RMS = 0.35）
+        assert!(rms > 0.1, "440Hz 应通过高通滤波器，输出 RMS={:.5}", rms);
+    }
+
+    #[test]
+    fn hpf_attenuates_low_frequency() {
+        let mut f_low = HighPassFilter::new(120.0, 16_000);
+        let mut f_high = HighPassFilter::new(120.0, 16_000);
+        let mut rms_low = 0.0f64;
+        let mut rms_high = 0.0f64;
+        const N: usize = 4000;
+        for i in 0..N {
+            // 30Hz 低频（应在阻带）
+            let x_low = ((i as f32 * 30.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin()) * 0.5;
+            let y_low = f_low.process(x_low);
+            if i > 1000 { rms_low += (y_low as f64).powi(2); }
+
+            // 440Hz 高频（应在通带）
+            let x_high = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin()) * 0.5;
+            let y_high = f_high.process(x_high);
+            if i > 1000 { rms_high += (y_high as f64).powi(2); }
+        }
+        let n_f = (N - 1000) as f64;
+        rms_low = (rms_low / n_f).sqrt();
+        rms_high = (rms_high / n_f).sqrt();
+        // 一阶高通 -6dB/倍频程，30Hz 距 120Hz 约 2 个倍频程 → 衰减 ~12dB
+        // 440Hz 在通带几乎无损，比值应 > 2 倍
+        assert!(
+            rms_high > rms_low * 2.0,
+            "高频(440Hz) RMS 应大于低频(30Hz): {:.5} vs {:.5}",
+            rms_high, rms_low
+        );
+    }
+
+    // ── 噪声门 ─────────────────────────────────────────
+
+    #[test]
+    fn noise_gate_passes_loud_signal() {
+        let mut gate = NoiseGate::new(0.001, 16_000); // 低阈值
+        let amplitude = 0.1f32; // 响亮信号
+        let mut passed = 0usize;
+        let mut total = 0usize;
+        for i in 0..8000 {
+            let s = ((i as f32 * 440.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin()) * amplitude;
+            let out = gate.process(s);
+            total += 1;
+            if out != 0.0 { passed += 1; }
+        }
+        // 大部分样本应通过
+        assert!(passed > total * 9 / 10, "响亮信号应大部分通过: {}/{}", passed, total);
+    }
+
+    #[test]
+    fn noise_gate_silences_quiet_signal() {
+        let mut gate = NoiseGate::new(0.01, 16_000); // 较高阈值
+        let amplitude = 0.0005f32; // 极弱信号（底噪级）
+        let mut silenced = 0usize;
+        let total = 4000usize;
+        for i in 0..total {
+            let s = ((i as f32 * 60.0 * 2.0 * std::f32::consts::PI / 16_000.0).sin()) * amplitude;
+            let out = gate.process(s);
+            if out == 0.0 { silenced += 1; }
+        }
+        // 大部分样本应被静音
+        assert!(silenced > total * 8 / 10, "弱信号应大部分被静音: {}/{}", silenced, total);
     }
 }

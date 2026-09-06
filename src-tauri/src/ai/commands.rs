@@ -26,7 +26,7 @@ struct StepRow {
 }
 
 /// 读取文件并编码为 base64；空路径或读取失败返回空字符串。
-fn read_file_base64(path: &str) -> String {
+pub(crate) fn read_file_base64(path: &str) -> String {
     if path.is_empty() {
         String::new()
     } else {

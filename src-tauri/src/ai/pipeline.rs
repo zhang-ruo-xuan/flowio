@@ -236,7 +236,7 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
         };
 
         match parse::parse_step_output(raw, &preprocessed[i].action_type) {
-            Ok(output) => {
+            Ok(mut output) => {
                 // Validate required fields
                 if output.title.trim().is_empty() {
                     errors.push(format!(
@@ -252,6 +252,12 @@ pub fn run_pipeline(cfg: &AiConfig, job: AiJob) -> Result<AiResult, String> {
                     ));
                     continue;
                 }
+                // ★ 标题防撑爆：LLM 是软约束（prompt 要求短标题但可能超），
+                //   落库前程序级兜底截到 10 字 +「…」，与录制标题同口径。
+                output.title = crate::recorder::activity::truncate_label(
+                    &output.title,
+                    crate::recorder::activity::TITLE_LABEL_MAX_CHARS,
+                );
                 steps.push(output);
             }
             Err(e) => {
@@ -397,11 +403,16 @@ pub(crate) fn ai_crop_region(
             // ⚠️ 是 `- extra / 2` 而不是 `- extra`：框宽 rw 本身已含 extra，居中项
             // `x - rw/2` 天然在左右各分到 extra/2。多减一个 extra/2 会过冲，
             // 使右侧留白变成 PAD - extra/2（cw=300 时切掉 26px 右边缘）。
+            // Stage C: drag 步骤高度方向多留上下文（与前端 cropAdaptiveBase64 一致）。
             if action_type == "type" {
                 let extra = ((cw as f64) / 3.0).round();
                 rw += extra as i32;
                 let left = (x as f64 - (rw as f64) / 2.0 - extra / 2.0).round() as i32;
                 (left, y - rh / 2, rw, rh)
+            } else if action_type == "drag" {
+                let extra_h = ((ch as f64) * 0.6).round().max(100.0);
+                rh += extra_h as i32;
+                (x - rw / 2, y - rh / 2, rw, rh)
             } else {
                 (x - rw / 2, y - rh / 2, rw, rh)
             }
@@ -432,7 +443,7 @@ pub(crate) fn ai_crop_region(
 /// - scroll / nav / screenshot：整窗截图（不裁，原样返回，保留上下文）
 /// - type：输入框 + 左侧 label 区（元素矩形左扩 1/3 宽，让"用户名/密码"等 label 进图）
 /// - 其他（click/copy/paste/hotkey/key/shortcut 等）：元素矩形自适应（同 A+B）
-fn crop_and_encode_typed(
+pub(crate) fn crop_and_encode_typed(
     base64_str: &str,
     click_x: Option<i32>,
     click_y: Option<i32>,
@@ -467,7 +478,14 @@ fn crop_and_encode_typed(
     let cropped = match ai_crop_region(img_w, img_h, click_x, click_y, crop_w, crop_h, action_type)
     {
         AiCropRegion::Rect(left, top, w, h) => {
-            img.crop_imm(left as u32, top as u32, w as u32, h as u32)
+            let c = img.crop_imm(left as u32, top as u32, w as u32, h as u32);
+            // 空白裁剪守卫（与前端 lib/cropBlank.ts / export 同步）：区域几乎纯色时
+            // 回退整图 —— 纯色小图喂给视觉模型毫无信息量，整图才拿得到上下文。
+            if crate::export::commands::is_blank_crop(&c) {
+                img
+            } else {
+                c
+            }
         }
         AiCropRegion::Full => img,
         // 锚点完全在图外：历史约定是原样返回，不做任何重编码
@@ -498,7 +516,7 @@ fn crop_and_encode_typed(
 ///
 /// Vision model list is kept in sync with the extension's
 /// `modelSupportsVision()` in modelEnum.ts.
-fn model_supports_vision(model: &str) -> bool {
+pub(crate) fn model_supports_vision(model: &str) -> bool {
     let lower = model.to_lowercase();
 
     // Qwen 3.x series: qwen3.7-plus, qwen3.5-flash, qwen3.0-max etc.
@@ -549,8 +567,20 @@ mod pipeline_tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
+    /// 构造**带纹理**的 PNG。
+    /// ⚠️ 必须带纹理：空白裁剪守卫（is_blank_crop，2026-09-05 加）会把纯色区域的
+    /// 裁剪回退成整图，纯色测试图会让所有几何断言意外走整图分支。
     fn solid_png(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
-        let img = image::RgbImage::from_pixel(w, h, image::Rgb(rgb));
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            // 逐像素交替的确定性纹理：任何步长采样都能采到不同值 → 永远判非纯色
+            let v = ((x * 7 + y * 13) % 32) as i32;
+            *p = image::Rgb([
+                (rgb[0] as i32 + v).clamp(0, 255) as u8,
+                rgb[1],
+                rgb[2],
+            ]);
+        }
         let mut buf = Vec::new();
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
@@ -899,6 +929,45 @@ mod pipeline_tests {
         assert!(typed_img.width() > base_img.width());
     }
 
+    /// 空白裁剪守卫（2026-09-05）：裁剪区域几乎纯色时回退整图 ——
+    /// 导出端（maybe_crop_screenshot_bytes）与 AI 端（crop_and_encode_typed）
+    /// 两个消费端对同一份数据必须同为「回退整图」，防止编辑器看整图而
+    /// 导出/送 AI 的还是空白小图（行为分叉）。
+    /// 场景取自真实案例：WPS 加载中录到「Program Manager」宿主伪元素矩形
+    /// (237,790) 420×280，裁出纯灰空白，加载动画实际在画面中心。
+    #[test]
+    fn blank_crop_fallback_full_both_consumers() {
+        let raw = {
+            let img = image::RgbImage::from_pixel(800, 600, image::Rgb([214, 214, 214]));
+            let mut buf = Vec::new();
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90);
+            image::DynamicImage::ImageRgb8(img)
+                .write_with_encoder(enc)
+                .unwrap();
+            buf
+        };
+        let b64s = b64(&raw);
+
+        // 消费端 A：导出 → 尺寸必须是整图、字节原样（不重编码）
+        let (bytes, dims) = crate::export::commands::maybe_crop_screenshot_bytes(
+            raw,
+            Some(237),
+            Some(790),
+            Some(420),
+            Some(280),
+            "type",
+        );
+        assert_eq!(dims, Some((800, 600)), "导出端应回退整图");
+
+        // 消费端 B：AI → 输出也必须是整图尺寸
+        let out = crop_and_encode_typed(&b64s, Some(237), Some(790), Some(420), Some(280), "type");
+        let img = image::load_from_memory(&decode(&out)).unwrap();
+        assert_eq!((img.width(), img.height()), (800, 600), "AI 端应回退整图");
+
+        // 导出端回退时字节必须原样
+        assert_eq!(bytes, decode(&b64s), "回退整图时应原样返回原始字节");
+    }
+
     /* ── 裁图几何（ai_crop_region）───────────────────────────────
      * 本端常量（PAD=24 / MIN=280 / 缩到 90%）与导出端、前端**刻意不同**，
      * 但 type 步骤「左扩 1/3 宽」的几何推导是同一套 —— 左移量必须是 extra/2。
@@ -935,6 +1004,20 @@ mod pipeline_tests {
             )),
             (226, 160, 348, 280)
         );
+    }
+
+    #[test]
+    fn ai_crop_region_drag_gets_extra_vertical_context() {
+        // DRAG 步骤比等价 click 步骤在高度方向多留上下文（extraH = max(ch*0.6, 100)）。
+        // 不硬编码缩放后的精确值，只断言 drag 更高且含基础 padding。
+        let (_, _, _, h_drag) = rect(ai_crop_region(
+            800, 600, Some(400), Some(300), Some(400), Some(30), "drag"
+        ));
+        let (_, _, _, h_click) = rect(ai_crop_region(
+            800, 600, Some(400), Some(300), Some(400), Some(30), "click"
+        ));
+        assert!(h_drag > h_click, "drag 应比 click 高（多留上下文），实际 drag={} click={}", h_drag, h_click);
+        assert!(h_drag >= 30 + CROP_PAD * 2);
     }
 
     #[test]

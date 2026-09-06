@@ -67,6 +67,18 @@ export function cropBoxFromAnchor(anchor: CropAnchor, actionType?: string): Crop
       height,
     };
   }
+  if (actionType === 'drag') {
+    // DRAG 步骤高度方向多留上下文（与 cropAdaptiveBase64 一致）
+    const extraH = Math.max(Math.round(cropH * 0.6), 100);
+    const dragHeight = cropH + CROP_PAD * 2 + extraH;
+    const dragWidth = cropW + CROP_PAD * 2;
+    return {
+      x: Math.round(x - dragWidth / 2),
+      y: Math.round(y - dragHeight / 2),
+      width: dragWidth,
+      height: dragHeight,
+    };
+  }
   const width = cropW + CROP_PAD * 2;
   return {
     x: Math.round(x - width / 2),
@@ -84,12 +96,24 @@ export function cropBoxFromAnchor(anchor: CropAnchor, actionType?: string): Crop
  */
 export function rectToCropAnchor(rect: CropRectPx, actionType?: string): CropAnchor {
   const isType = actionType === 'type';
+  const isDrag = actionType === 'drag';
 
-  // 解析解：非 type 时 rect 宽高 = crop + 2*PAD；type 时还要多出 extra = crop/3
-  let cropW = isType
-    ? Math.round(((rect.width - CROP_PAD * 2) * 3) / 4)
-    : rect.width - CROP_PAD * 2;
-  let cropH = rect.height - CROP_PAD * 2;
+  // 解析解：非 type/drag 时 rect 宽高 = crop + 2*PAD；type 时还要多出 extra = crop/3
+  // drag 时要多出 extraH = cropH * 1.5
+  let cropW: number;
+  let cropH: number;
+  if (isType) {
+    cropW = Math.round(((rect.width - CROP_PAD * 2) * 3) / 4);
+    cropH = rect.height - CROP_PAD * 2;
+  } else if (isDrag) {
+    cropW = rect.width - CROP_PAD * 2;
+    // Forward: displayH = cropH + PAD*2 + max(cropH*0.6, 100)
+    // 粗略初值（迭代 8 轮会收敛到精确解）
+    cropH = Math.max(1, Math.round((rect.height - CROP_PAD * 2 - 100) / 1.8));
+  } else {
+    cropW = rect.width - CROP_PAD * 2;
+    cropH = rect.height - CROP_PAD * 2;
+  }
   // forward 的居中项已在左右各分到 extra/2，故中心点只需再右移 extra/2
   let cx = rect.x + rect.width / 2 + (isType ? Math.round(cropW / 3) / 2 : 0);
   let cy = rect.y + rect.height / 2;

@@ -27,7 +27,7 @@ const OCR_TIMEOUT: Duration = Duration::from_secs(15);
 /// P1-05：降为 2 倍——3 倍放大使像素数为 9 倍，BMP 编码/解码与引擎识别
 /// 都随像素数线性变慢，是导出"一直等"的主要瓶颈；2 倍仍可识别常见字号，
 /// 导出整体提速约 40%。
-const OCR_UPSCALE: u32 = 2;
+pub(crate) const OCR_UPSCALE: u32 = 2;
 
 /// OCR 识别出的一行文本及其像素包围盒（相对于原图像素坐标）。
 #[derive(Debug, Clone)]

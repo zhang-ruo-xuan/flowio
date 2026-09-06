@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo, useRef } from "react";
+import { useEffect, useLayoutEffect, useState, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import { Circle, Search, MoreVertical, Play, Pencil, FileText, Code, FileType, CheckCircle2, XCircle, Trash2, Pause, Square } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
@@ -94,6 +94,9 @@ export default function Dashboard({
   const [appNameDraft, setAppNameDraft] = useState("");
   const appNameInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  // ★ 行操作菜单：底部空间不足时向上弹出（记录触发按钮位置 + 定位完成前隐藏防闪烁）
+  const menuAnchorRef = useRef<DOMRect | null>(null);
+  const [menuPlaced, setMenuPlaced] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
 
   // Auto-dismiss toast after 4s
@@ -104,9 +107,14 @@ export default function Dashboard({
   }, [toast]);
 
   // 依赖登录态：登录/退出后按账号隔离刷新列表（Rust 端按 settings.current_user 过滤）
+  const [listLoaded, setListLoaded] = useState(false);
   useEffect(() => {
+    setListLoaded(false);
     invoke<Recording[]>("list_recordings")
-      .then(setRecordings)
+      .then((r) => {
+        setRecordings(r);
+        setListLoaded(true);
+      })
       .catch((err) => console.error("Failed to list recordings:", err));
   }, [locationKey, siteUser?.id]);
 
@@ -135,6 +143,22 @@ export default function Dashboard({
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, [openMenuId]);
+
+  // ★ 菜单渲染后测量实际高度：底部放不下则改为向上弹出（菜单底边贴按钮顶边）
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    const anchor = menuAnchorRef.current;
+    if (!openMenuId || !el || !anchor) return;
+    const h = el.offsetHeight;
+    // 仅在仍处于「默认向下」位置时判断翻转，避免 setState 回路
+    if (menuPos.top === anchor.bottom + 4) {
+      if (anchor.bottom + 4 + h > window.innerHeight - 8) {
+        setMenuPos({ top: Math.max(8, anchor.top - h - 4), left: anchor.right - 160 });
+        return;
+      }
+    }
+    setMenuPlaced(true);
+  }, [openMenuId, menuPos]);
 
   const handleExport = (id: string, format: string) => {
     setOpenMenuId(null);
@@ -212,7 +236,12 @@ export default function Dashboard({
         )
       );
     } catch (err) {
-      console.error("Rename failed:", err);
+      const msg = String(err);
+      console.error("Rename failed:", msg);
+      setToast({ type: "error", message: msg });
+      // 保持重命名态，不退出，让用户修改后重试
+      setTimeout(() => renameInputRef.current?.focus(), 0);
+      return;
     }
     setRenamingId(null);
     setOpenMenuId(null);
@@ -244,13 +273,24 @@ export default function Dashboard({
     );
   }, [recordings, search]);
 
+  // ★ 只在「值真正变化」时回第 1 页；mount 时（从教程返回重新挂载）不能重置，
+  //   否则 sessionStorage 恢复的页码会被这两处 effect 立刻打回第 1 页
+  const prevSearchRef = useRef(search);
+  const prevUserRef = useRef(siteUser?.id);
   useEffect(() => {
-    setPage(1);
+    if (prevSearchRef.current !== search) {
+      prevSearchRef.current = search;
+      setPage(1);
+    }
   }, [search]);
 
   // 换账号 → 重置页码，避免 A 用户的"第 2 页"被 B 用户看到
   useEffect(() => {
-    setPage(1);
+    const uid = siteUser?.id;
+    if (prevUserRef.current !== uid) {
+      prevUserRef.current = uid;
+      setPage(1);
+    }
   }, [siteUser?.id]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
@@ -267,12 +307,14 @@ export default function Dashboard({
     );
   };
 
-  // 删除录制 / 搜索后总页数可能少于当前页：自动回弹到合法页码
+  // 删除录制 / 搜索后总页数可能少于当前页：自动回弹到合法页码。
+  // ★ 必须等列表加载完成（listLoaded）再回弹：刚从教程返回时 recordings 还是空数组，
+  //   totalPages=1，若此时回弹会把 sessionStorage 恢复的页码清掉
   useEffect(() => {
-    if (page > totalPages) {
+    if (listLoaded && page > totalPages) {
       setPage(totalPages);
     }
-  }, [page, totalPages]);
+  }, [listLoaded, page, totalPages]);
 
   const recStatus = (r: Recording) => {
     const parts: string[] = [];
@@ -340,7 +382,7 @@ export default function Dashboard({
           <button
             className="btn btn-primary dashboard-action-btn"
             onClick={() => onStartRecording()}
-            data-tip={"开始录制\n之后在任何软件里正常操作即可，录步会自动截图并记录每一步"}
+            data-tip={"开始录制\n之后在任何软件里正常操作即可，录步会自动截图并记录每一步；若已开「语音」，会一并开麦"}
           >
             <Circle size={14} fill="currentColor" />
             开始录制
@@ -411,7 +453,7 @@ export default function Dashboard({
               <button
                 className="empty-state-btn"
                 onClick={() => onStartRecording()}
-                data-tip={"开始录制\n之后在任何软件里正常操作即可，录步会自动截图并记录每一步"}
+                data-tip={"开始录制\n之后在任何软件里正常操作即可，录步会自动截图并记录每一步；若已开「语音」，会一并开麦"}
               >
                 <Circle size={8} fill="currentColor" />
                 开始录制
@@ -529,6 +571,8 @@ export default function Dashboard({
                               setOpenMenuId(null);
                             } else {
                               const rect = e.currentTarget.getBoundingClientRect();
+                              menuAnchorRef.current = rect;
+                              setMenuPlaced(false);
                               setMenuPos({ top: rect.bottom + 4, left: rect.right - 160 });
                               setOpenMenuId(r.id);
                             }
@@ -589,7 +633,7 @@ export default function Dashboard({
         <div
           className="dropdown-menu dropdown-fixed"
           ref={menuRef}
-          style={{ top: menuPos.top, left: menuPos.left }}
+          style={{ top: menuPos.top, left: menuPos.left, visibility: menuPlaced ? "visible" : "hidden" }}
         >
           <button
             className="dropdown-item"

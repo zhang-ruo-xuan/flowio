@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>实时字幕</title>
+  <style>
+    /* 透明窗体：只有气泡本身可见（Rust 侧 transparent + 无装饰 + 点击穿透） */
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      overflow: hidden;
+      font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    }
+    .panel {
+      position: absolute;
+      left: 50%;
+      bottom: 10px;
+      transform: translateX(-50%);
+      max-width: 96vw;
+      padding: 10px 16px;
+      border-radius: 12px;
+      background: rgba(24, 26, 40, 0.90);
+      color: #fff;
+      font-size: 15px;
+      line-height: 1.65;
+      box-shadow: 0 10px 30px -8px rgba(0, 0, 0, 0.55);
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      pointer-events: none;
+      user-select: none;
+    }
+    .cap-line {
+      opacity: 0.62;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: center;
+    }
+    .cap-line.last {
+      opacity: 1;
+      font-weight: 600;
+      animation: cap-in 0.18s ease-out;
+    }
+    .cap-line.empty {
+      opacity: 0.55;
+      font-weight: 400;
+    }
+    @keyframes cap-in {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body>
+  <div class="panel" id="panel"><div class="cap-line empty last">正在聆听…</div></div>
+  <script>
+    (function () {
+      var panel = document.getElementById("panel");
+      var MAX_LINES = 3;
+      var lines = [];
+
+      function render() {
+        panel.innerHTML = "";
+        if (!lines.length) {
+          var empty = document.createElement("div");
+          empty.className = "cap-line empty last";
+          empty.textContent = "正在聆听…";
+          panel.appendChild(empty);
+          return;
+        }
+        lines.slice(-MAX_LINES).forEach(function (t, i, arr) {
+          var d = document.createElement("div");
+          d.className = "cap-line" + (i === arr.length - 1 ? " last" : "");
+          d.textContent = t;
+          panel.appendChild(d);
+        });
+      }
+
+      function onCaption(ev) {
+        var t = String((ev && ev.payload && ev.payload.text) || "").trim();
+        if (!t) return;
+        lines.push(t);
+        if (lines.length > MAX_LINES) lines = lines.slice(-MAX_LINES);
+        render();
+      }
+      function onReset() {
+        lines = [];
+        render();
+      }
+
+      // withGlobalTauri 注入时序可能晚于脚本执行：轮询等待就绪
+      var tries = 0;
+      (function waitApi() {
+        var api = window.__TAURI__ && window.__TAURI__.event;
+        if (api && api.listen) {
+          api.listen("voice://caption", onCaption);
+          api.listen("voice://caption-reset", onReset);
+        } else if (tries++ < 100) {
+          setTimeout(waitApi, 50);
+        }
+      })();
+    })();
+  </script>
+</body>
+</html>

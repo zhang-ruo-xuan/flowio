@@ -182,9 +182,12 @@ fn split_long_range(start_ms: i64, end_ms: i64) -> Vec<(i64, i64)> {
 /// `step_offsets_ms[i]` = 第 i 步截图时刻相对音频起点的毫秒偏移
 /// （`step.timestamp - audio_started_at_ms`，可为负，内部 clamp）。
 ///
-/// 切片规则（对应 PRD V6/V7/V10/V11）：
-/// - 先做语音区段检测（句内停顿 ≤300ms 不拆），**整段区段归属其起点
-///   所在步骤**——一句话跨越多步时整句落在前一步，不拆句（V10）；
+/// 切片规则（对应 PRD V6/V7/V10/V11；2026-09-06 归属规则改版）：
+/// - **操作前的语音归这个操作的步骤**：区段起点之后第一个步骤截图时刻
+///   即该语音所属步骤——做某步操作之前说的话 → 归那一步（V10 改）；
+/// - 话没说完就做了操作（区段跨过后续步骤边界）不拆句，整段仍留在
+///   该步骤；说完后的下一段语音再归下一个操作的步骤；
+/// - 最后一步之后说的话没有更晚的步骤 → 归最后一步；
 /// - 该步骤没有任何区段 → 丢弃（无语音，V7）；
 /// - 区段超过 `MAX_SEGMENT_MS` → 等分细分，结果按顺序拼接（V11）。
 ///
@@ -200,15 +203,15 @@ pub fn slice_for_steps(
     }
     let total_ms = pcm_duration_ms(pcm.len(), sample_rate);
 
-    // 区段 → 起点所在步骤。步骤 i 覆盖 [offset_i, offset_{i+1})，
-    // 最后一步覆盖 [offset_last, ∞)。
+    // 区段 → 起点之后第一个步骤（操作前的语音归这个操作）。
+    // 没有更晚的步骤（最后一步之后才开口）→ 归最后一步。
     let mut grouped: std::collections::BTreeMap<usize, Vec<(i64, i64)>> =
         std::collections::BTreeMap::new();
     for (rs, re) in speech_regions(pcm, sample_rate) {
         let step_idx = step_offsets_ms
             .iter()
-            .rposition(|&off| off.clamp(0, total_ms) <= rs)
-            .unwrap_or(0);
+            .position(|&off| off.clamp(0, total_ms) > rs)
+            .unwrap_or(step_offsets_ms.len() - 1);
         grouped.entry(step_idx).or_default().push((rs, re));
     }
 
@@ -239,11 +242,12 @@ pub fn slice_for_steps(
 /// 内容」。此时若整段信号非数字静音，按时间戳硬切送 ASR 是最后一道
 /// 防线——真无声时 ASR 返回空文本，代价只是几次请求。
 ///
-/// 切分规则：
-/// - 步骤 i 覆盖 `[clamp(offset_i), 下一个更大的边界)`，最后一步到音频末尾；
-/// - 边界相同的连续步骤只把语音归第一个（与 `slice_for_steps` 的归属
-///   语义一致：同一时刻的多个步骤不重复分配同一段音频）；
-/// - 负偏移 clamp 到 0，超过音频长度的步骤没有音频（丢弃）；
+/// 切分规则（2026-09-06 与 `slice_for_steps` 归属规则对齐）：
+/// - 步骤 0 覆盖 `[0, clamp(offset_0))`，步骤 i 覆盖
+///   `[clamp(offset_{i-1}), clamp(offset_i))`，最后一步覆盖
+///   `[clamp(offset_{n-2}), 音频末尾)`——操作前的语音归这个操作；
+/// - 区间为空（步骤边界相同 / 无更早音频）→ 跳过；
+/// - 负偏移 clamp 到 0，超过音频长度的步骤按 clamp 后区间取；
 /// - 单段超过 `MAX_SEGMENT_MS` 等分细分，短于 `MIN_SEGMENT_MS` 的段丢弃。
 pub fn fallback_slice_all(
     pcm: &[u8],
@@ -254,25 +258,19 @@ pub fn fallback_slice_all(
         return Vec::new();
     }
     let total_ms = pcm_duration_ms(pcm.len(), sample_rate);
+    let n = step_offsets_ms.len();
     let mut out: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
-    let mut prev_start: Option<i64> = None;
-    for (i, &off) in step_offsets_ms.iter().enumerate() {
-        let start = off.clamp(0, total_ms);
-        if let Some(p) = prev_start {
-            if start <= p {
-                continue; // 与上一步同界（或时间倒序）→ 语音归上一步
-            }
-        }
-        // 终点 = 后续步骤里第一个严格更大的边界；没有则到音频末尾
-        let mut end = total_ms;
-        for &nxt in &step_offsets_ms[i + 1..] {
-            let c = nxt.clamp(0, total_ms);
-            if c > start {
-                end = c;
-                break;
-            }
-        }
-        prev_start = Some(start);
+    for i in 0..n {
+        let start = if i == 0 {
+            0
+        } else {
+            step_offsets_ms[i - 1].clamp(0, total_ms)
+        };
+        let end = if i + 1 == n {
+            total_ms
+        } else {
+            step_offsets_ms[i].clamp(0, total_ms)
+        };
         if end <= start {
             continue;
         }
@@ -372,24 +370,26 @@ mod audio_tests {
 
     #[test]
     fn slice_v7_silent_step_is_dropped() {
-        // 3 秒音频：0-1s 静音、1-2s 440Hz 语音、2-3s 静音
+        // 3 秒音频：0-1s 静音、1-2s 440Hz 语音、2-3s 静音；
+        // 语音 1-2s 起点之后第一个步骤是下标 2（2s 处截图）→ 归第 3 步
         let mut pcm = vec![0u8; 16_000 * 2]; // 0-1s
         pcm.extend(sine_pcm(1_000, 16_000, 440.0, 0.5)); // 1-2s
         pcm.extend(vec![0u8; 16_000 * 2]); // 2-3s
         let offsets = [0, 1_000, 2_000];
         let out = slice_for_steps(&pcm, 16_000, &offsets);
         let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
-        assert_eq!(idxs, vec![1], "只有第 2 步（下标 1）有语音");
+        assert_eq!(idxs, vec![2], "操作前（2s 截图前）的语音归第 3 步");
     }
 
     #[test]
-    fn slice_v10_speech_crossing_boundary_lands_on_earlier_step() {
-        // 2 秒语音覆盖两步边界（0.5s 处第二步截图）→ 整段归属第 1 步
+    fn slice_v10_speech_crossing_boundary_stays_with_upcoming_step() {
+        // 2 秒语音覆盖两步边界（0.5s 处第二步截图）→ 话没说完就操作：
+        // 整段不拆，归起点之后的第一个步骤（第 2 步，下标 1）
         let pcm = sine_pcm(2_000, 16_000, 440.0, 0.5);
         let offsets = [0, 500];
         let out = slice_for_steps(&pcm, 16_000, &offsets);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].0, 1);
     }
 
     #[test]
@@ -442,13 +442,13 @@ mod audio_tests {
     #[test]
     fn slice_negative_offset_clamps_to_zero() {
         // 第 1 步截图早于音频启动（时间戳偏移为负）→ clamp 到 0；
-        // 连续语音 0-3s 整段归属起点所在步骤（V10，不拆句）→ 只有第 1 步
+        // 连续语音 0-3s 不拆句 → 归起点之后第一个步骤（1s 处截图的第 2 步）
         let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
         let offsets = [-5_000, 1_000];
         let out = slice_for_steps(&pcm, 16_000, &offsets);
         let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
-        assert_eq!(idxs, vec![0]);
-        // 整段 3000ms 语音都归第 1 步
+        assert_eq!(idxs, vec![1]);
+        // 整段 3000ms 语音都归第 2 步
         assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 3_000);
     }
 
@@ -465,12 +465,13 @@ mod audio_tests {
 
     #[test]
     fn slice_audio_shorter_than_offsets_clamps_to_end() {
-        // 音频中途用户关掉了开关（V13）：后面的步骤偏移超出音频长度 → 丢弃
+        // 音频中途用户关掉了开关（V13）：音频只有 1s，语音 0-1s 起点之后
+        // 第一个步骤是下标 1（2s 截图 clamp 到音频末尾 1s > 0）→ 归第 2 步
         let pcm = sine_pcm(1_000, 16_000, 440.0, 0.5);
         let offsets = [0, 2_000, 4_000];
         let out = slice_for_steps(&pcm, 16_000, &offsets);
         let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
-        assert_eq!(idxs, vec![0]);
+        assert_eq!(idxs, vec![1]);
     }
 
     #[test]
@@ -494,41 +495,45 @@ mod audio_tests {
 
     #[test]
     fn fallback_assigns_segments_by_step() {
+        // 新归属：步骤 i 的区间 = [上一步边界, 本步边界)。offsets [0,1000,2000]：
+        // 步骤 0 区间 [0,0) 为空跳过；步骤 1 [0,1000)；步骤 2（最后）[1000, 3000)
         let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
         let out = fallback_slice_all(&pcm, 16_000, &[0, 1_000, 2_000]);
         let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
-        assert_eq!(idxs, vec![0, 1, 2]);
-        assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 1_000);
-        assert_eq!(pcm_duration_ms(out[1].1[0].len(), 16_000), 1_000);
-        assert_eq!(pcm_duration_ms(out[2].1[0].len(), 16_000), 1_000);
-    }
-
-    #[test]
-    fn fallback_equal_offsets_assign_to_first_step_only() {
-        let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
-        let out = fallback_slice_all(&pcm, 16_000, &[0, 0, 0]);
-        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
-        assert_eq!(idxs, vec![0]);
-        assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 3_000);
-    }
-
-    #[test]
-    fn fallback_negative_offset_clamps_and_last_extends_to_end() {
-        let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
-        let out = fallback_slice_all(&pcm, 16_000, &[-5_000, 1_000]);
-        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
-        assert_eq!(idxs, vec![0, 1]);
+        assert_eq!(idxs, vec![1, 2]);
         assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 1_000);
         assert_eq!(pcm_duration_ms(out[1].1[0].len(), 16_000), 2_000);
     }
 
     #[test]
+    fn fallback_equal_offsets_assign_to_last_step_only() {
+        // 边界全部相同 → 前面步骤区间为空，语音整段归最后一步
+        let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
+        let out = fallback_slice_all(&pcm, 16_000, &[0, 0, 0]);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![2]);
+        assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 3_000);
+    }
+
+    #[test]
+    fn fallback_negative_offset_clamps_and_last_extends_to_end() {
+        // offsets [-5000, 1000] → clamp 后 [0, 1000]：步骤 0 区间 [0,0) 为空，
+        // 最后一步覆盖 [0, 末尾) → 整段 3s 归最后一步（下标 1）
+        let pcm = sine_pcm(3_000, 16_000, 440.0, 0.5);
+        let out = fallback_slice_all(&pcm, 16_000, &[-5_000, 1_000]);
+        let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![1]);
+        assert_eq!(pcm_duration_ms(out[0].1[0].len(), 16_000), 3_000);
+    }
+
+    #[test]
     fn fallback_offset_beyond_audio_drops_step_and_drops_tiny_audio() {
-        // 第二步偏移超出音频长度 → 只有第一步
+        // 第二步偏移(5s)超出音频长度(1s) → clamp 到末尾：步骤 0 区间空，
+        // 语音整段归最后一步（下标 1）
         let pcm = sine_pcm(1_000, 16_000, 440.0, 0.5);
         let out = fallback_slice_all(&pcm, 16_000, &[0, 5_000]);
         let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
-        assert_eq!(idxs, vec![0]);
+        assert_eq!(idxs, vec![1]);
         // 音频本身过短（<400ms）→ 全部丢弃
         let tiny = sine_pcm(300, 16_000, 440.0, 0.5);
         assert!(fallback_slice_all(&tiny, 16_000, &[0]).is_empty());

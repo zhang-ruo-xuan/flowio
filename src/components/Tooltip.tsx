@@ -56,8 +56,12 @@ export default function Tooltip() {
     if (r.width === 0 && r.height === 0) return hide();
 
     const cx = r.left + r.width / 2;
-    // 默认放上方；顶部空间不够（距顶 < 56px）就翻到下方
-    const placement: Pos["placement"] = r.top > 56 ? "top" : "bottom";
+    // 默认放上方；顶部空间不够就翻到下方。
+    // 阈值对可滚动容器内的元素加严（避免 tooltip 盖住下方步骤内容）：
+    //   普通元素距顶 > 100px 才放上方；滚动容器内 > 140px 才放上方。
+    const inScrollable = !!el.closest('[style*="overflow-y: auto"], [style*="overflow: auto"], .editor-sidebar, [class*="scroll"]');
+    const threshold = inScrollable ? 140 : 100;
+    const placement: Pos["placement"] = r.top > threshold ? "top" : "bottom";
     const y = placement === "top" ? r.top - GAP : r.bottom + GAP;
     setPos({ x: cx, y, placement });
     setTip(text);

@@ -9,6 +9,7 @@ mod file_browser;
 mod redaction;
 mod hotkey;
 mod voice;
+mod job_notify;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,6 +18,7 @@ use recorder::Recorder;
 use tauri::{Manager, Emitter, AppHandle};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_store;
+use tauri_plugin_notification;
 
 /// 用系统默认浏览器打开 URL
 #[tauri::command]
@@ -112,6 +114,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // 全局快捷键：Alt+Shift+S 录制 / Alt+Shift+P 暂停 / Alt+Shift+E 停止
             hotkey::init_hotkeys(app.handle());
@@ -167,6 +170,7 @@ pub fn run() {
             db::commands::delete_recording,
             db::commands::delete_recordings,
             db::commands::save_recording,
+            db::commands::duplicate_recording,
             db::commands::update_recording_app_name,
             recorder::commands::start_recording,
             recorder::commands::list_target_windows,
@@ -194,6 +198,7 @@ pub fn run() {
             editor::commands::update_step,
             editor::commands::update_step_crop,
             editor::commands::delete_step,
+            editor::commands::replace_in_steps,
             editor::commands::reorder_steps,
             editor::commands::merge_steps,
             editor::commands::auto_merge_steps,
@@ -204,9 +209,12 @@ pub fn run() {
             editor::commands::edit_undo,
             editor::commands::edit_redo,
             editor::commands::edit_history_sizes,
+            editor::commands::editor_view_get,
+            editor::commands::editor_view_set,
             editor::commands::add_step,
             editor::commands::update_recording_title,
             editor::commands::crop_step_screenshot,
+            editor::commands::save_step_screenshot_full,
             editor::commands::upload_step_screenshot,
             editor::commands::delete_step_screenshot,
             export::commands::export_recording,
@@ -223,8 +231,15 @@ pub fn run() {
             voice::capture::voice_mic_set_paused,
             voice::capture::voice_mic_samples,
             voice::capture::voice_mic_stop,
+            voice::caption_window::voice_caption_show,
+            voice::caption_window::voice_caption_hide,
+            voice::caption_window::voice_live_supported,
             voice::commands::voice_finish,
             voice::commands::voice_cancel,
+            voice::commands::voice_get_hotwords,
+            voice::commands::voice_set_hotwords,
+            voice::commands::voice_get_correction_enabled,
+            voice::commands::voice_set_correction_enabled,
             ai::translate::translate_recording,
             ai::translate::get_recording_translations,
             ai::translate::save_recording_translations,

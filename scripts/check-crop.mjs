@@ -16,6 +16,7 @@
 
 const A = await import(new URL('../src/lib/cropAnchor.ts', import.meta.url).href);
 const D = await import(new URL('../src/lib/cropDrag.ts', import.meta.url).href);
+const B = await import(new URL('../src/lib/cropBlank.ts', import.meta.url).href);
 
 const { cropBoxFromAnchor, rectToCropAnchor, CROP_PAD } = A;
 const { resizeRect, newRect, moveRect, MIN_CROP_SIZE } = D;
@@ -262,6 +263,70 @@ console.log('6. 跨端黄金值：编辑器与导出必须逐像素一致');
     console.log(`   ${GOLDEN.length} 组与 Rust 导出端一致`);
     console.log('   （AI 管线 PAD=24/MIN=280，常量不同，黄金值另见其 cargo test）');
   }
+}
+
+/* ═══ 7. 空白裁剪守卫（isUniformCropPixels）═════════════ */
+
+console.log('7. 空白裁剪守卫：纯色区域裁剪必须回退整图（三端同步）');
+{
+  // 黄金值：与 Rust export/commands.rs::BLANK_CROP_DELTA 锁死（is_blank_crop_basic 测试）
+  if (B.BLANK_CROP_DELTA !== 24) fail(`BLANK_CROP_DELTA 期望 24，实得 ${B.BLANK_CROP_DELTA}`);
+
+  const mk = (w, h, fill) => {
+    const a = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      a[i * 4] = fill[0]; a[i * 4 + 1] = fill[1]; a[i * 4 + 2] = fill[2]; a[i * 4 + 3] = 255;
+    }
+    return a;
+  };
+
+  // ① 纯灰（真实案例：WPS 加载中录到的空白区）→ 判空白
+  if (!B.isUniformCropPixels(mk(576, 148, [214, 214, 214]), 576, 148))
+    fail('纯灰区域应判为空白（真实案例回归）');
+  if (!B.isUniformCropPixels(mk(1920, 1080, [255, 255, 255]), 1920, 1080))
+    fail('纯白大图应判为空白');
+  if (!B.isUniformCropPixels(mk(300, 200, [10, 20, 30]), 300, 200))
+    fail('纯深色图应判为空白（与亮度无关，只看极差）');
+
+  // ② ±6 的 JPEG 式噪声（LCG 可复现）→ 仍应判空白（阈值 24 要有足够余量）
+  {
+    const rng = makeRng(20260905);
+    const w = 400, h = 300;
+    const a = mk(w, h, [214, 214, 214]);
+    for (let i = 0; i < w * h; i++) {
+      const n = Math.round((rng() - 0.5) * 12); // ±6
+      a[i * 4] += n; a[i * 4 + 1] += n; a[i * 4 + 2] += n;
+    }
+    if (!B.isUniformCropPixels(a, w, h)) fail('±6 噪声的平坦区域应判为空白（JPEG 噪声余量不足）');
+  }
+
+  // ③ 含深色块（可见内容）→ 必须判非空白；块放在各角落也要被采到
+  {
+    const w = 400, h = 300;
+    const spots = [[196, 146], [4, 4], [w - 13, h - 13], [4, h - 13], [w - 13, 4]];
+    for (const [sx, sy] of spots) {
+      const a = mk(w, h, [214, 214, 214]);
+      for (let y = sy; y < sy + 8; y++)
+        for (let x = sx; x < sx + 8; x++) {
+          const i = (y * w + x) * 4;
+          a[i] = 20; a[i + 1] = 20; a[i + 2] = 20;
+        }
+      if (B.isUniformCropPixels(a, w, h)) fail(`(${sx},${sy}) 处的深色块应判为非空白`);
+    }
+  }
+
+  // ④ 边界值：极差恰好 24 → 空白；25 → 非空白（锁阈值语义）
+  {
+    const w = 64, h = 64;
+    const a = mk(w, h, [100, 100, 100]);
+    a[0] = 124; // 极差 24
+    if (!B.isUniformCropPixels(a, w, h)) fail('通道极差 = 24 应判空白（<= 阈值）');
+    const b = mk(w, h, [100, 100, 100]);
+    b[0] = 125; // 极差 25
+    if (B.isUniformCropPixels(b, w, h)) fail('通道极差 = 25 应判非空白（> 阈值）');
+  }
+
+  if (!failures) console.log('   黄金值 Δ=24 / 噪声余量 / 角落采样 / 边界语义 全部通过');
 }
 
 /* ═══ 结论 ════════════════════════════════════════════ */

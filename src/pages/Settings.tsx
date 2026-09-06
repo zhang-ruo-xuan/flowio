@@ -58,7 +58,10 @@ const kbdStyle: React.CSSProperties = {
 
 export default function SettingsPage({ darkMode, onToggleDark }: SettingsPageProps) {
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState<"ai" | "appearance" | "redaction" | "recording" | "hotkeys" | "profile">("ai");
+  // ★ v310: 支持 #redaction 深链——编辑器「脱敏 → 脱敏设置…」直达脱敏 tab（与插件端对齐）
+  const [activeTab, setActiveTab] = useState<"ai" | "appearance" | "redaction" | "recording" | "hotkeys" | "profile">(
+    typeof location !== "undefined" && location.hash === "#redaction" ? "redaction" : "ai"
+  );
   const { siteUser, siteToken, clearAuth, setAuth } = useAuthStore();
 
   /* ---- AI Config State ---- */
@@ -315,6 +318,71 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
     window.addEventListener("flowio:voice-toggle", handler as EventListener);
     return () => window.removeEventListener("flowio:voice-toggle", handler as EventListener);
   }, []);
+
+  /* ---- 语音识别热词（自定义部分；内置热词在 Rust 侧自动合并） ---- */
+  const [hotwordsText, setHotwordsText] = useState("");
+  const [hotwordsSaving, setHotwordsSaving] = useState(false);
+  const [hotwordsSaved, setHotwordsSaved] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<string[]>("voice_get_hotwords")
+      .then((list) => setHotwordsText(list.join("，")))
+      .catch(() => setHotwordsText(""));
+  }, []);
+
+  const saveHotwords = async () => {
+    const words = hotwordsText.split(/[,，、;；\n]+/).map((w) => w.trim()).filter(Boolean);
+    if (words.length > 100) {
+      setHotwordsSaved("最多 100 个热词，请删减后再保存");
+      return;
+    }
+    setHotwordsSaving(true);
+    try {
+      await invoke("voice_set_hotwords", { words });
+      setHotwordsSaved(`已保存 ${words.length} 个热词，下次语音转写生效`);
+    } catch (e) {
+      setHotwordsSaved("保存失败：" + String(e));
+    }
+    setHotwordsSaving(false);
+  };
+
+  /* ---- 语音 AI 纠错（方案③）：转写后用视觉 LLM 结合截图修口音错字 ---- */
+  const [voiceAiCorrect, setVoiceAiCorrect] = useState(true);
+  const savedAiCorrectRef = useRef<boolean | null>(null); // 语音关闭时暂存纠错状态
+  const voiceInitRef = useRef(false);                      // 跳过首次加载
+
+  useEffect(() => {
+    invoke<boolean>("voice_get_correction_enabled")
+      .then((v) => setVoiceAiCorrect(!!v))
+      .catch(() => {});
+  }, []);
+
+  // 语音输入开关联动 AI 纠错：关语音→记住并关闭纠错；开语音→恢复纠错
+  useEffect(() => {
+    if (!voiceInitRef.current) { voiceInitRef.current = true; return; }
+    if (voiceEnabled) {
+      // 恢复上一次的纠错状态
+      if (savedAiCorrectRef.current !== null) {
+        const restored = savedAiCorrectRef.current;
+        setVoiceAiCorrect(restored);
+        invoke("voice_set_correction_enabled", { enabled: restored }).catch(() => {});
+      }
+    } else {
+      // 保存当前纠错状态，然后关闭
+      savedAiCorrectRef.current = voiceAiCorrect;
+      setVoiceAiCorrect(false);
+      invoke("voice_set_correction_enabled", { enabled: false }).catch(() => {});
+    }
+  }, [voiceEnabled]);
+
+  const handleAiCorrectToggle = async (value: boolean) => {
+    setVoiceAiCorrect(value);
+    try {
+      await invoke("voice_set_correction_enabled", { enabled: value });
+    } catch {
+      setVoiceAiCorrect(!value);
+    }
+  };
 
   /* ---- Record Target App（录制指定软件） ---- */
   const [recordTarget, setRecordTarget] = useState(() => localStorage.getItem("flowio_record_target") === "1");
@@ -743,7 +811,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
         {activeTab === "redaction" && (
           <div>
             <div className="form-group">
-              <label>导出前自动脱敏</label>
+              <label>脱敏功能</label>
               <div className="toggle-switch" onClick={() => handleRedactExportToggle(!redactCfg.redact_before_export)}>
                 <div className={`toggle-switch-track${redactCfg.redact_before_export ? " active" : ""}`}>
                   <div className="toggle-switch-thumb" />
@@ -752,7 +820,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   {redactCfg.redact_before_export ? "开启" : "关闭"}
                 </span>
               </div>
-              <p className="hint">开启后，导出 HTML / Markdown / PDF / Word / 长图时自动扫描并脱敏截图中的敏感内容（文本替换为 [已隐藏]），原图与本地数据保持不动</p>
+              <p className="hint">脱敏总开关：控制「文本脱敏」「扫描脱敏」和导出时自动脱敏。关闭后这些功能不可用（点击会提示先开启）；要脱敏什么（检测类别 / 自定义规则）在下方自己选。开启后导出 HTML / Markdown / PDF / Word / 长图时也会自动扫描并脱敏截图中的敏感内容，原图与本地数据保持不动</p>
             </div>
 
             <div className="form-group">
@@ -870,6 +938,24 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                 </div>
               </div>
             </div>
+
+            <div style={{ padding: "16px 18px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--bg-secondary)", marginTop: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                <Keyboard size={15} style={{ color: "var(--blue)" }} />
+                <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>编辑器快捷键</span>
+                <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>（教程编辑界面内使用）</span>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, fontSize: 13.5, color: "var(--text-secondary)" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <kbd style={kbdStyle}>Ctrl + F</kbd>
+                  <span>查找步骤（在标题 / 描述中搜索，Enter 切换命中）</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <kbd style={kbdStyle}>Ctrl + H</kbd>
+                  <span>查找并替换（全部替换，Ctrl+Z 可整体撤销）</span>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
@@ -931,9 +1017,15 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                       已选择：<b>{targetProcess}</b>。录制时只捕获该软件窗口画面，且需要保持该窗口在前台；该软件需处于运行状态。
                     </p>
                   )}
+                  <p className="hint" style={{ marginTop: 6, color: "#b45309" }}>
+                    ⚠️ 开启后<b>只会记录该软件内的操作</b>，切换到其他软件时（如从浏览器下载后打开安装程序）那些窗口和点击都会被丢弃。安装类、跨软件类教程请勿开启。
+                  </p>
                 </div>
               )}
-              <p className="hint">开启后，录制时只捕获所选软件（如 WPS、Chrome 等）单独的画面，用于单独录制某个软件的操作教程。</p>
+              <p className="hint">
+                关闭（默认）= <b>全屏录制</b>，捕获整个屏幕，适合大多数教程，尤其是需要跨软件操作的场景（下载 → 安装 → 配置）。
+                开启后只捕获所选软件（如 WPS、Chrome 等）单独的画面，仅用于录制单一软件内的操作。
+              </p>
             </div>
 
             <div className="form-group">
@@ -946,7 +1038,49 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   {voiceEnabled ? "开启" : "关闭"}
                 </span>
               </div>
-              <p className="hint">开启后，录制时会同步收录麦克风语音；停止录制后自动识别，并把说的话追加到对应步骤的描述里（以「【语音】」开头）。也可在录制窗口顶栏随时开/关麦克风。需要 AI 设置使用智谱通道（默认免费通道已支持）。</p>
+              <p className="hint">开启后，录制时会同步收录麦克风语音；停止录制后自动识别，并把说的话作为步骤说明写入对应步骤。也可在录制窗口顶栏随时开/关麦克风。需要 AI 设置使用智谱通道（默认免费通道已支持）。</p>
+            </div>
+
+            <div className="form-group">
+              <label>识别热词（可选）</label>
+              <textarea
+                value={hotwordsText}
+                onChange={(e) => { setHotwordsText(e.target.value); setHotwordsSaved(null); }}
+                placeholder="例如：绘图模式，XLOOKUP，截图工具"
+                rows={2}
+                style={{
+                  width: "100%", maxWidth: 460, padding: "8px 10px", borderRadius: 8,
+                  border: "1px solid var(--border)", background: "var(--bg)",
+                  color: "var(--text)", fontSize: 13, resize: "vertical",
+                }}
+              />
+              <p className="hint">
+                填你常说的专有名词或容易识别错的词（用逗号、顿号或换行分隔，最多 100 个）。识别引擎会优先按这些词匹配，专治口音导致的近音错字；软件名、常用操作词已内置。
+              </p>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
+                <button
+                  className="btn"
+                  onClick={saveHotwords}
+                  disabled={hotwordsSaving}
+                  style={{ padding: "6px 14px" }}
+                >
+                  {hotwordsSaving ? "保存中…" : "保存热词"}
+                </button>
+                {hotwordsSaved && <span className="hint" style={{ color: "var(--success, #2e7d32)" }}>{hotwordsSaved}</span>}
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>语音 AI 纠错</label>
+              <div className="toggle-switch" onClick={() => handleAiCorrectToggle(!voiceAiCorrect)}>
+                <div className={`toggle-switch-track${voiceAiCorrect ? " active" : ""}`}>
+                  <div className="toggle-switch-thumb" />
+                </div>
+                <span className="toggle-switch-label">
+                  {voiceAiCorrect ? "开启" : "关闭"}
+                </span>
+              </div>
+              <p className="hint">转写完成后，AI 会结合该步骤的屏幕截图校对识别文字，只修正明显的同音/近音错字，不会添加或改写内容（改不动就保留原文）。开着会更准确，但语音转写完成时间会略长；担心速度可关闭。</p>
             </div>
           </div>
         )}

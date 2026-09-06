@@ -99,7 +99,7 @@ pub fn get_active_client_rect() -> Option<(i32, i32, i32, i32)> {
 }
 
 /// Generate a natural-language step title from a window title.
-/// Format: "在「{title}」中点击", fallback: "点击".
+/// Format: "点击在「{title}」中" (操作在前、环境后置), fallback: "点击".
 pub fn make_click_title(window_title: Option<&str>) -> String {
     make_click_title_with_app(window_title, None)
 }
@@ -108,16 +108,18 @@ pub fn make_click_title(window_title: Option<&str>) -> String {
 /// 等无标题系统 UI）时，回退为前台应用的显示名（如「Windows 开始菜单」）。
 pub fn make_click_title_with_app(window_title: Option<&str>, app: Option<&str>) -> String {
     match window_title {
-        Some(title) if !title.is_empty() => format!("在「{}」中点击", title),
+        Some(title) if !title.is_empty() => {
+            format!("点击在「{}」中", shorten_window_label(title, TITLE_LABEL_MAX_CHARS))
+        }
         _ => match app.filter(|a| !a.is_empty()) {
-            Some(a) => format!("在「{}」中点击", a),
+            Some(a) => format!("点击在「{}」中", a),
             None => "点击".to_string(),
         },
     }
 }
 
 /// 领域感知的点击步骤标题：浏览器域自动剥离「 - 浏览器」后缀只保留网页名，
-/// 其余领域沿用窗口标题原样。
+/// 其余领域沿用窗口标题原样。格式：操作（点击）在前、环境（点击在「…」中）在后。
 pub fn make_click_title_for_domain(window_title: Option<&str>, domain: AppDomain) -> String {
     match window_title {
         Some(title) if !title.is_empty() => {
@@ -125,9 +127,84 @@ pub fn make_click_title_for_domain(window_title: Option<&str>, domain: AppDomain
                 AppDomain::Browser => browser_page_name(title),
                 _ => title.to_string(),
             };
-            format!("在「{}」中点击", display)
+            format!("点击在「{}」中", shorten_window_label(&display, TITLE_LABEL_MAX_CHARS))
         }
         _ => "点击".to_string(),
+    }
+}
+
+// ── 窗口标题缩短（步骤标题防撑爆）─────────────────────────────
+
+/// 窗口标题片段在步骤标题里的最大字符数，超过截断加「…」。
+/// 用户诉求：像「常用求和函数 SUM函数.xlsx - WPS Office」这种长串只显示 10 个字。
+pub const TITLE_LABEL_MAX_CHARS: usize = 10;
+
+/// 已知应用后缀白名单（小写比较）：窗口标题形如「文档名 - 应用名」时剥掉应用段。
+/// 注意：**不含**裸 chrome/edge/firefox —— 浏览器窗口标题是「网页名 - 浏览器名」，
+/// 剥掉浏览器名由 `browser_page_name` 在浏览器域处理，这里误剥反而丢网页名。
+const KNOWN_APP_SUFFIXES: &[&str] = &[
+    "wps office",
+    "microsoft excel",
+    "microsoft word",
+    "microsoft powerpoint",
+    "microsoft edge",
+    "google chrome",
+    "internet explorer",
+    "mozilla firefox",
+    "excel",
+    "word",
+    "powerpoint",
+    "记事本",
+];
+
+/// 文档扩展名（小写比较）：「报表.xlsx - WPS Office」先剥应用后缀再剥扩展名。
+const DOC_EXTENSIONS: &[&str] = &[
+    ".xlsx", ".xls", ".xlsm", ".docx", ".doc", ".pptx", ".ppt", ".pdf",
+    ".txt", ".csv", ".md", ".rtf", ".wps", ".et", ".dps",
+];
+
+/// 把窗口标题缩短成适合放进步骤标题的短标签：
+/// 1) 反复剥「已知应用后缀」（` - WPS Office`）和「文档扩展名」（`.xlsx`）直到稳定；
+/// 2) 仍超过 `max` 个字符 → 截断加「…」（按字符数，中文英文一视同仁）。
+///
+/// 例：`常用求和函数 SUM函数.xlsx - WPS Office` → `常用求和函数 SUM…`
+pub fn shorten_window_label(raw: &str, max: usize) -> String {
+    let mut s = raw.trim().to_string();
+    loop {
+        let before = s.clone();
+        let lower = s.to_lowercase();
+        for app in KNOWN_APP_SUFFIXES {
+            let suf = format!(" - {}", app);
+            if lower.ends_with(&suf) {
+                // 后缀必为 ASCII，UTF-8 边界必然安全
+                s = s[..s.len() - suf.len()].trim_end().to_string();
+                break;
+            }
+        }
+        if s == before {
+            for ext in DOC_EXTENSIONS {
+                if lower.ends_with(ext) && s.chars().count() > 1 {
+                    s = s[..s.len() - ext.len()].trim_end().to_string();
+                    break;
+                }
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    truncate_label(&s, max)
+}
+
+/// 纯截断：超过 `max` 个字符 → 前 `max` 字符 +「…」（按字符数，中英文一视同仁）。
+/// 不剥任何后缀——给 AI 生成 / AI 精简等非窗口标题来源的兜底用。
+pub fn truncate_label(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max).collect();
+        format!("{}\u{2026}", head.trim_end())
+    } else {
+        s.to_string()
     }
 }
 
@@ -137,9 +214,10 @@ mod activity_tests {
 
     #[test]
     fn click_title_with_title() {
+        // 「Chrome - 百度」11 字符超上限 → 截断加省略号
         assert_eq!(
             make_click_title(Some("Chrome - 百度")),
-            "在「Chrome - 百度」中点击"
+            "点击在「Chrome - 百…」中"
         );
     }
 
@@ -157,7 +235,7 @@ mod activity_tests {
     fn click_title_empty_title_falls_back_to_app() {
         assert_eq!(
             make_click_title_with_app(Some(""), Some("Windows 开始菜单")),
-            "在「Windows 开始菜单」中点击"
+            "点击在「Windows 开始菜单」中"
         );
         // 应用名也为空时仍回退「点击」
         assert_eq!(make_click_title_with_app(None, Some("")), "点击");
@@ -165,7 +243,7 @@ mod activity_tests {
         // 有窗口标题时优先用标题
         assert_eq!(
             make_click_title_with_app(Some("微信"), Some("QQ")),
-            "在「微信」中点击"
+            "点击在「微信」中"
         );
     }
 
@@ -174,28 +252,59 @@ mod activity_tests {
         use crate::ai::domain::AppDomain;
         assert_eq!(
             make_click_title_for_domain(Some("百度 - Google Chrome"), AppDomain::Browser),
-            "在「百度」中点击"
+            "点击在「百度」中"
         );
         assert_eq!(
             make_click_title_for_domain(Some("GitHub - Microsoft Edge"), AppDomain::Browser),
-            "在「GitHub」中点击"
+            "点击在「GitHub」中"
         );
     }
 
     #[test]
     fn click_title_for_domain_non_browser_keeps_title() {
         use crate::ai::domain::AppDomain;
+        // 真实 Excel 窗口标题是「工作簿1 - Excel」（文档在前、应用在后）→ 剥掉「 - Excel」
+        assert_eq!(
+            make_click_title_for_domain(Some("工作簿1 - Excel"), AppDomain::Spreadsheet),
+            "点击在「工作簿1」中"
+        );
+        // 应用在前的非真实格式剥不掉 → 走 10 字截断兜底
         assert_eq!(
             make_click_title_for_domain(Some("Excel - 工作簿1"), AppDomain::Spreadsheet),
-            "在「Excel - 工作簿1」中点击"
+            "点击在「Excel - 工作…」中"
         );
         assert_eq!(
             make_click_title_for_domain(Some("记事本"), AppDomain::Other),
-            "在「记事本」中点击"
+            "点击在「记事本」中"
         );
         assert_eq!(
             make_click_title_for_domain(None, AppDomain::Browser),
             "点击"
         );
+    }
+
+    #[test]
+    fn shorten_label_strips_office_suffix_and_extension() {
+        // 用户实测案例：WPS 长窗口标题 → 剥「 - WPS Office」+「.xlsx」→ 截 10 字
+        assert_eq!(
+            shorten_window_label("常用求和函数 SUM函数.xlsx - WPS Office", TITLE_LABEL_MAX_CHARS),
+            "常用求和函数 SUM…"
+        );
+        // 只剥扩展名（后缀不是已知应用时保留）
+        assert_eq!(shorten_window_label("总结报告.docx", 20), "总结报告");
+        // 连剥两轮：后缀剥完剩扩展名
+        assert_eq!(shorten_window_label("报表.xlsx - Excel", 20), "报表");
+    }
+
+    #[test]
+    fn shorten_label_keeps_short_and_never_truncates_twice() {
+        assert_eq!(shorten_window_label("微信", 10), "微信");
+        assert_eq!(shorten_window_label("", 10), "");
+        // 恰好 10 字不截
+        assert_eq!(shorten_window_label("一二三四五六七八九十", 10), "一二三四五六七八九十");
+        // 11 字 → 10 字 + …
+        assert_eq!(shorten_window_label("一二三四五六七八九十A", 10), "一二三四五六七八九十…");
+        // 不剥非白名单后缀（浏览器网页名交给 browser_page_name）
+        assert_eq!(shorten_window_label("百度 - 某网站", 20), "百度 - 某网站");
     }
 }
