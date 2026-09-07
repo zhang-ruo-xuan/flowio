@@ -489,7 +489,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
     { key: "qq_wechat", label: "QQ号 / 微信号" },
     { key: "password_field", label: "密码 / 口令" },
     { key: "ip_mac", label: "内网IP / MAC" },
-    { key: "url_param", label: "URL 敏感参数" },
+    // 🔴 url_param（URL 敏感参数）已移除（2026-09-07，用户要求，两端同步）
     { key: "custom", label: "自定义规则" },
   ];
 

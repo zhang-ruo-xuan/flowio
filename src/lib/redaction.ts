@@ -1,7 +1,8 @@
 // P2-05 隐私安全：分享前敏感信息检测（前端侧）
 // 正则与 Rust 侧 src-tauri/src/redaction/mod.rs 保持一致：
 // 身份证（18 位）/ 手机号（11 位）/ 银行卡（13-19 位）/ 邮箱 / API Key /
-// 统一社会信用代码 / QQ号·微信号 / 密码口令 / 内网IP·MAC / URL 敏感参数 / 自定义。
+// 统一社会信用代码 / QQ号·微信号 / 密码口令 / 内网IP·MAC / 自定义。
+// 🔴 url_param（URL 敏感参数）已于 2026-09-07 移除（用户要求，误报难控）。
 
 export type SensitiveKind =
   | "id_card"
@@ -13,7 +14,6 @@ export type SensitiveKind =
   | "qq_wechat"
   | "password_field"
   | "ip_mac"
-  | "url_param"
   | "custom";
 
 export const SENSITIVE_KIND_LABEL: Record<SensitiveKind, string> = {
@@ -26,7 +26,6 @@ export const SENSITIVE_KIND_LABEL: Record<SensitiveKind, string> = {
   qq_wechat: "QQ号 / 微信号",
   password_field: "密码 / 口令",
   ip_mac: "内网IP / MAC",
-  url_param: "URL 敏感参数",
   custom: "自定义规则",
 };
 
@@ -61,8 +60,6 @@ const RE_PASSWORD =
 const RE_INTRANET_IP =
   /((?:10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|192\.168\.)[0-9]{1,3}\.[0-9]{1,3})/g;
 const RE_MAC = /((?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2})/g;
-const RE_URL_PARAM =
-  /([?&](?:token|key|secret|password|pwd|passwd|sessionid|session_id|api_key|apikey|sign|sig|auth)=[^&\s"'<>]+)/gi;
 
 function isAsciiDigit(ch: string): boolean {
   return ch >= "0" && ch <= "9";
@@ -180,7 +177,7 @@ export function findSensitiveInTextWithConfig(
     all.push(...collectNoBoundary(text, RE_INTRANET_IP, "ip_mac"));
     all.push(...collectNoBoundary(text, RE_MAC, "ip_mac"));
   }
-  if (on("url_param")) all.push(...collectNoBoundary(text, RE_URL_PARAM, "url_param"));
+  // 🔴 url_param（URL 敏感参数）已按用户要求移除（2026-09-07，两端同步）：误报难控。
   if (on("custom")) {
     for (const pat of customPatterns) {
       const trimmed = pat.trim();

@@ -33,7 +33,7 @@ pub struct SensitiveSpan {
 }
 
 impl SensitiveKind {
-    pub const ALL: [SensitiveKind; 11] = [
+    pub const ALL: [SensitiveKind; 10] = [
         SensitiveKind::IdCard,
         SensitiveKind::Phone,
         SensitiveKind::BankCard,
@@ -43,7 +43,6 @@ impl SensitiveKind {
         SensitiveKind::QqWechat,
         SensitiveKind::PasswordField,
         SensitiveKind::IpMac,
-        SensitiveKind::UrlParam,
         SensitiveKind::Custom,
     ];
 
@@ -295,16 +294,9 @@ pub fn find_sensitive_with_config(text: &str, config: &RedactionConfig) -> Vec<S
             candidates.push(SensitiveSpan { kind: SensitiveKind::IpMac, start: m.start(), end: m.end() });
         }
     }
-    if config.is_enabled(SensitiveKind::UrlParam) {
-        // URL 查询参数中携带凭据类字段
-        let re = regex::Regex::new(
-            r#"(?i)([?&](?:token|key|secret|password|pwd|passwd|sessionid|session_id|api_key|apikey|sign|sig|auth)=[^&\s"'<>]+)"#,
-        )
-        .unwrap();
-        for m in re.find_iter(text) {
-            candidates.push(SensitiveSpan { kind: SensitiveKind::UrlParam, start: m.start(), end: m.end() });
-        }
-    }
+    // 🔴 UrlParam（URL 敏感参数）已于 2026-09-07 按用户要求整体移除（两端同步）：
+    //    误报难控（token= sig= 等命中过宽，常把正常链接遮花）。枚举变体与
+    //    from_key 保留仅用于解析存量 settings JSON（含 url_param 的旧配置不再命中任何规则）。
     for pat in &config.custom_patterns {
         let pat = pat.trim();
         if pat.is_empty() {
@@ -874,7 +866,6 @@ mod repro_tests {
             ("password=abc123xyz", SensitiveKind::PasswordField),
             ("内网IP 192.168.1.100", SensitiveKind::IpMac),
             ("MAC aa:bb:cc:dd:ee:ff", SensitiveKind::IpMac),
-            ("链接 https://x.com?a=1&token=secret7890", SensitiveKind::UrlParam),
         ];
         for (text, kind) in cases {
             let spans = find_sensitive(text);
@@ -1044,7 +1035,6 @@ mod redaction_tests {
             ("password=abc123xyz", SensitiveKind::PasswordField),
             ("内网IP 192.168.1.100", SensitiveKind::IpMac),
             ("MAC aa:bb:cc:dd:ee:ff", SensitiveKind::IpMac),
-            ("链接 https://x.com?a=1&token=secret7890", SensitiveKind::UrlParam),
         ];
         for (text, kind) in cases {
             let spans = find_sensitive(text);
