@@ -487,17 +487,8 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   const [pubCoverBase64, setPubCoverBase64] = useState<string | null>(null);
     const [pubCoverPreview, setPubCoverPreview] = useState<string | null>(null);
     const [smartLoading, setSmartLoading] = useState(false);
-    // 适用场景（与网站编辑器一致）
-    const [pubSceneSelect, setPubSceneSelect] = useState("");
-    const SCENE_ENTRIES: { emoji: string; name: string; slug: string }[] = [
-      { emoji: "👥", name: "新员工入职", slug: "new-employee" },
-      { emoji: "🎓", name: "客户培训", slug: "customer-training" },
-      { emoji: "🔧", name: "问题排查", slug: "troubleshooting" },
-      { emoji: "💰", name: "财务合规", slug: "finance-compliance" },
-      { emoji: "📝", name: "日常办公", slug: "daily-office" },
-      { emoji: "🚀", name: "软件上线", slug: "software-launch" },
-      { emoji: "🎬", name: "录步", slug: "lu-bu" },
-    ];
+    // 场景描述（与浏览器插件同步）
+    const [pubSummary, setPubSummary] = useState("");
 
   // 发布弹窗内联样式
   const pubDialogStyles = {
@@ -1656,9 +1647,8 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       if (!isDraft && applications.length === 0) { setToast({ type: "error", message: "请至少填写一个涉及应用" }); return; }
       if (!isDraft && !pubCategory) { setToast({ type: "error", message: "请选择分类" }); return; }
 
-      // 适用场景的名称并入标签（与网站编辑器保持一致）
-      const sceneName = SCENE_ENTRIES.find((s) => s.slug === pubSceneSelect)?.name || "";
-      const tagsToSend = sceneName ? [...new Set([...pubTags, sceneName])] : pubTags;
+      // 标签直接发送（不再合并场景名称——场景下拉已移除，改为自由文本「场景描述」）
+      const tagsToSend = pubTags;
 
       // 发布=所见即所得：步骤视图为「裁图」时上传裁剪结果（与编辑器显示、导出 cropStepIds 同一视图偏好），
       // 整窗类型（scroll/nav/screenshot）cropAdaptiveBase64 内部自动原样返回；裁剪失败回退全图，不阻塞发布。
@@ -1714,6 +1704,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       const isUpdateMode = !!prevGuideId;
       const uploadData: Record<string, unknown> = {
         title,
+        summary: pubSummary.trim(),
         app_name,
         category,
         tags: tagsToSend,
@@ -1796,7 +1787,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
           category: pubCategory,
           tags: pubTags,
           downloadable: pubDownloadable,
-          scene: pubSceneSelect,
+          scene: pubSummary,
           coverBase64: pubCoverBase64 && pubCoverBase64.length <= 1_500_000 ? pubCoverBase64 : null,
         };
         localStorage.setItem(`flowio_pubform_${recordingId}`, JSON.stringify(formSnap));
@@ -1813,7 +1804,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
     } finally {
       setPublishing(false);
     }
-  }, [siteToken, siteUser, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSceneSelect, translations, stepViewCropped, deletedCrop]);
+  }, [siteToken, siteUser, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSummary, translations, stepViewCropped, deletedCrop]);
 
   /* ── 另存为副本 ──────────────────────────────────────────── */
   // 复制整篇教程为一份独立的新副本（标题加「 (副本)」后缀），
@@ -2270,7 +2261,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                       setPubCategory(f.category || "");
                       setPubTags(Array.isArray(f.tags) ? f.tags : []);
                       setPubDownloadable(f.downloadable === "no" ? "no" : "yes");
-                      setPubSceneSelect(f.scene || "");
+                      setPubSummary(f.scene || "");
                       setPubCoverBase64(f.coverBase64 || null);
                       setPubCoverPreview(f.coverBase64 || null);
                       pubFormRestored = true;
@@ -2282,7 +2273,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                     setPubCategory("");
                     setPubTags([]);
                     setPubDownloadable("yes");
-                    setPubSceneSelect("");
+                    setPubSummary("");
                     setPubCoverBase64(null);
                     setPubCoverPreview(null);
                   }
@@ -3206,6 +3197,85 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                   </div>
                 ) : (
                   <div>
+                    {/* ── 封面已移至底部（与插件统一顺序） ── */}
+
+                    <label style={pubDialogStyles.label}>标题</label>
+                    <input
+                      style={pubDialogStyles.input}
+                      value={pubTitle}
+                      placeholder={recording?.title || "未命名教程"}
+                      onChange={(e) => setPubTitle(e.target.value)}
+                    />
+
+                    <label style={pubDialogStyles.label}>场景描述</label>
+                    <textarea
+                      style={{ ...pubDialogStyles.input, height: 56, resize: "vertical" }}
+                      value={pubSummary}
+                      placeholder="一句话说明这篇教程适用的业务场景"
+                      rows={2}
+                      onChange={(e) => setPubSummary(e.target.value)}
+                    />
+
+                    <label style={pubDialogStyles.label}>涉及应用</label>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+                      {pubApplications.map((a) => (
+                        <span key={a} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 8px", borderRadius: 14, background: "rgba(51,102,204,0.15)", color: "#93b4e8", fontSize: 12 }}>
+                          {a}
+                          <span onClick={() => removeApp(a)} style={{ cursor: "pointer", color: "#c9d4ea" }}>×</span>
+                        </span>
+                      ))}
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input
+                        style={pubDialogStyles.input}
+                        value={pubAppInput}
+                        placeholder="如：Excel、Chrome"
+                        onChange={(e) => setPubAppInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addApp(); } }}
+                      />
+                      <button style={pubDialogStyles.addBtn} onClick={addApp} data-tip="把输入框里的应用名加进去（也可直接回车）">添加</button>
+                    </div>
+
+                    <label style={pubDialogStyles.label}>标签（可选）</label>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+                      {pubTags.map((t) => (
+                        <span key={t} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 8px", borderRadius: 14, background: "rgba(51,102,204,0.15)", color: "#93b4e8", fontSize: 12 }}>
+                          {t}
+                          <span onClick={() => removeTag(t)} style={{ cursor: "pointer", color: "#c9d4ea" }}>×</span>
+                        </span>
+                      ))}
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input
+                        style={pubDialogStyles.input}
+                        value={pubTagInput}
+                        placeholder="可选，回车添加"
+                        onChange={(e) => setPubTagInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addTag(); } }}
+                      />
+                      <button style={pubDialogStyles.addBtn} onClick={addTag} data-tip="把输入框里的标签加进去（也可直接回车）">添加</button>
+                    </div>
+
+                    {/* 场景下拉已移除（v0.xx 与插件统一：改为自由文本「场景描述」） */}
+
+                    <label style={pubDialogStyles.label}>分类</label>
+                    <select
+                      style={pubDialogStyles.input}
+                      value={pubCategory}
+                      onChange={(e) => setPubCategory(e.target.value)}
+                    >
+                      <option value="">请选择分类</option>
+                      {categories.map((c) => (
+                        <option key={c.id} value={c.id}>{c.name}</option>
+                      ))}
+                    </select>
+
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, margin: "14px 0 4px", fontSize: 13, color: "#8b949e", cursor: "pointer" }}>
+                      <input type="checkbox" checked={pubDownloadable === "yes"} onChange={(e) => setPubDownloadable(e.target.checked ? "yes" : "no")} />
+                      允许他人下载源文件
+                    </label>
+
+                    {/* 封面（与插件统一：放在最后） */}
                     <label style={pubDialogStyles.label}>封面（可选）</label>
                     <div style={{ marginBottom: 8 }}>
                       {pubCoverPreview ? (
@@ -3281,83 +3351,6 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                         </select>
                       </div>
                     )}
-
-                    <label style={pubDialogStyles.label}>标题</label>
-                    <input
-                      style={pubDialogStyles.input}
-                      value={pubTitle}
-                      placeholder={recording?.title || "未命名教程"}
-                      onChange={(e) => setPubTitle(e.target.value)}
-                    />
-
-                    <label style={pubDialogStyles.label}>涉及应用</label>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
-                      {pubApplications.map((a) => (
-                        <span key={a} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 8px", borderRadius: 14, background: "rgba(51,102,204,0.15)", color: "#93b4e8", fontSize: 12 }}>
-                          {a}
-                          <span onClick={() => removeApp(a)} style={{ cursor: "pointer", color: "#c9d4ea" }}>×</span>
-                        </span>
-                      ))}
-                    </div>
-                    <div style={{ display: "flex", gap: 6 }}>
-                      <input
-                        style={pubDialogStyles.input}
-                        value={pubAppInput}
-                        placeholder="如：Excel、Chrome"
-                        onChange={(e) => setPubAppInput(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addApp(); } }}
-                      />
-                      <button style={pubDialogStyles.addBtn} onClick={addApp} data-tip="把输入框里的应用名加进去（也可直接回车）">添加</button>
-                    </div>
-
-                    <label style={pubDialogStyles.label}>标签（可选）</label>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
-                      {pubTags.map((t) => (
-                        <span key={t} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 8px", borderRadius: 14, background: "rgba(51,102,204,0.15)", color: "#93b4e8", fontSize: 12 }}>
-                          {t}
-                          <span onClick={() => removeTag(t)} style={{ cursor: "pointer", color: "#c9d4ea" }}>×</span>
-                        </span>
-                      ))}
-                    </div>
-                    <div style={{ display: "flex", gap: 6 }}>
-                      <input
-                        style={pubDialogStyles.input}
-                        value={pubTagInput}
-                        placeholder="可选，回车添加"
-                        onChange={(e) => setPubTagInput(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addTag(); } }}
-                      />
-                      <button style={pubDialogStyles.addBtn} onClick={addTag} data-tip="把输入框里的标签加进去（也可直接回车）">添加</button>
-                    </div>
-
-                    <label style={pubDialogStyles.label}>适用场景</label>
-                    <select
-                      style={pubDialogStyles.input}
-                      value={pubSceneSelect}
-                      onChange={(e) => setPubSceneSelect(e.target.value)}
-                    >
-                      <option value="">不指定</option>
-                      {SCENE_ENTRIES.map((s) => (
-                        <option key={s.slug} value={s.slug}>{s.emoji} {s.name}</option>
-                      ))}
-                    </select>
-
-                    <label style={pubDialogStyles.label}>分类</label>
-                    <select
-                      style={pubDialogStyles.input}
-                      value={pubCategory}
-                      onChange={(e) => setPubCategory(e.target.value)}
-                    >
-                      <option value="">请选择分类</option>
-                      {categories.map((c) => (
-                        <option key={c.id} value={c.id}>{c.name}</option>
-                      ))}
-                    </select>
-
-                    <label style={{ display: "flex", alignItems: "center", gap: 8, margin: "14px 0 4px", fontSize: 13, color: "#8b949e", cursor: "pointer" }}>
-                      <input type="checkbox" checked={pubDownloadable === "yes"} onChange={(e) => setPubDownloadable(e.target.checked ? "yes" : "no")} />
-                      允许他人下载源文件
-                    </label>
 
                     <div style={{ display: "flex", justifyContent: "space-between", marginTop: 18, gap: 10 }}>
                       <button
