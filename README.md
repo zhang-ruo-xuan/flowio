@@ -18,7 +18,7 @@ AIGC:
 
 **Flowio** 是一款 Windows 桌面操作录制工具。录制任意软件的操作过程，AI 自动标注每一步标题和描述，一键导出 PDF / HTML。
 
-[产品页](https://zhangruoxuan.gitee.io/flowio/) · [下载安装包](https://gitee.com/zhangruoxuan/flowio/releases)
+[产品页](https://flowio.cn) · [下载安装包](https://gitee.com/zhangruoxuan/flowio/releases)
 
 ---
 
