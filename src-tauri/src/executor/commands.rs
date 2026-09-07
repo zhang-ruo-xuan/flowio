@@ -270,16 +270,26 @@ pub fn execute_recording(
         }
     } else {
         let backend = WindowsBackend;
-        for action in &plan {
+        // 降频校验：长录制每 2~3 步抽验一次（末步必验），显著减少每步全屏截图次数，
+        // 缓解"卡顿"；短录制仍逐步骤验，校验门功能不变。
+        let verify_every: usize = if total > 30 { 3 } else if total > 15 { 2 } else { 1 };
+        let n = plan.len();
+        for (i, action) in plan.iter().enumerate() {
             let mut status = "ok".to_string();
             let mut note = String::new();
             let mut diff: Option<f32> = None;
+
+            let do_verify = verify_every == 1 || (i % verify_every == 0) || i + 1 == n;
 
             // 单步隔离：任何一步的 unsafe Windows 调用或截图校验若 panic，
             // 只标记该步失败并继续，绝不拖垮整个进程（直接缓解"闪退"）。
             let step_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_action(action, &backend);
-                verify_step(&action.after_screenshot)
+                if do_verify {
+                    verify_step(&action.after_screenshot)
+                } else {
+                    None
+                }
             }));
             match step_result {
                 Ok(d) => diff = d,
@@ -300,12 +310,15 @@ pub fn execute_recording(
                         status = "verify-fail".into();
                         note = format!("截图差异 {:.2} 超阈值 0.08", d);
                     }
-                } else if action
-                    .after_screenshot
-                    .as_deref()
-                    .map_or(false, |p| !p.is_empty())
+                } else if do_verify
+                    && action
+                        .after_screenshot
+                        .as_deref()
+                        .map_or(false, |p| !p.is_empty())
                 {
                     note = "verify-skip：抓屏或预期图不可用".into();
+                } else if !do_verify {
+                    note = format!("verify-sampled（每 {} 步抽验，本步跳过）", verify_every);
                 }
             }
 
