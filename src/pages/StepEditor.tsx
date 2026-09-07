@@ -432,6 +432,20 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   /* Translation state */
   const [translations, setTranslations] = useState<TranslationsMap>({});
   const [translating, setTranslating] = useState(false);
+  // 当前生效的语言（"orig" | 语言代码 | null），用于下拉高亮
+  const [appliedLang, setAppliedLang] = useState<string | null>(null);
+
+  // ★ v0.65.108: appliedLang 持久化——重启桌面端后重进教程时自动恢复上次生效的翻译语言
+  const APPLIED_LANG_KEY = (rid: string) => `flowio_applied_lang_${rid}`;
+  const saveAppliedLang = (rid: string, lang: string | null) => {
+    try {
+      if (lang) localStorage.setItem(APPLIED_LANG_KEY(rid), lang);
+      else localStorage.removeItem(APPLIED_LANG_KEY(rid));
+    } catch { /* storage full */ }
+  };
+  const loadAppliedLang = (rid: string): string | null => {
+    try { return localStorage.getItem(APPLIED_LANG_KEY(rid)); } catch { return null; }
+  };
 
   const loadTranslations = useCallback(async (): Promise<TranslationsMap> => {
     try {
@@ -601,9 +615,6 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     [steps, recording, recordingId, refreshHist] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
-  /* ── 当前生效的语言（"orig" | 语言代码 | null），用于下拉高亮 ── */
-  const [appliedLang, setAppliedLang] = useState<string | null>(null);
-
   /* ── 翻译下拉点击：有缓存译文 → 秒切不重译；无缓存 → 走 LLM 翻译 ── */
   const handleLangClick = useCallback(
     async (code: string) => {
@@ -616,6 +627,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         setTranslateOpen(false);
         await syncStepsFromGuide(orig);
         setAppliedLang("orig");
+        saveAppliedLang(recordingId, "orig");
         setToast({ type: "success", message: "已恢复原文" });
         return;
       }
@@ -624,13 +636,14 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         setTranslateOpen(false);
         await syncStepsFromGuide(cached);
         setAppliedLang(code);
+        saveAppliedLang(recordingId, code);
         setToast({ type: "success", message: `已切换到${LANG_LABELS[code] || code}译文` });
         return;
       }
       // 无缓存 → 首次翻译（完成后由 translate://done 收尾）
       void handleTranslate(code);
     },
-    [translations, syncStepsFromGuide, handleTranslate] // eslint-disable-line react-hooks/exhaustive-deps
+    [translations, syncStepsFromGuide, handleTranslate, recordingId] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   /* ── translate://done（翻译完成 → 同步译文到编辑器并记下生效语言）── */
@@ -648,6 +661,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
           if (!trans) return;
           await syncStepsFromGuide(trans);
           setAppliedLang(ev.payload.lang);
+          saveAppliedLang(recordingId, ev.payload.lang);
           setToast({ type: "success", message: `已翻译为${LANG_LABELS[ev.payload.lang] || ev.payload.lang}，可通过「翻译 → 原文」随时恢复` });
         }
       }
@@ -1188,7 +1202,21 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         // 此处无需再处理。
 
         // 译文副本（翻译功能 T1）：并行加载，失败不阻塞编辑器
-        loadTranslations();
+        // ★ v0.65.108: 加载后自动恢复上次生效的翻译语言
+        loadTranslations().then((tmap) => {
+          if (cancelled) return;
+          const savedLang = loadAppliedLang(recordingId);
+          if (!savedLang || !tmap) return;
+          if (savedLang === ORIG_KEY && tmap[ORIG_KEY]) {
+            setAppliedLang("orig");
+          } else if (tmap[savedLang]) {
+            const trans = tmap[savedLang];
+            // 异步自动应用译文（不阻塞 UI 渲染）
+            syncStepsFromGuide(trans).then(() => {
+              if (!cancelled) setAppliedLang(savedLang);
+            }).catch(() => {});
+          }
+        });
 
         // 撤销/重做栈深度（顶栏 ↶↷ 按钮显隐）
         invoke<{ undo: number; redo: number }>("edit_history_sizes", { recordingId })
