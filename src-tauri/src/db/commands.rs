@@ -552,6 +552,8 @@ mod tests {
             },
             timestamp: 1_700_000_000_000 + num as i64,
             window_title: format!("Window {}", num),
+            hotkey_combo: String::new(),
+            uia_anchor: String::new(),
         }
     }
 

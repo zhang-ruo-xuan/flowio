@@ -124,6 +124,8 @@ fn build_typed_step(
         after_screenshot_path: None,
         timestamp,
         window_title: window_title.unwrap_or_default(),
+        hotkey_combo: String::new(),
+        uia_anchor: String::new(),
         is_sensitive,
     }
 }
@@ -359,6 +361,33 @@ fn display_shortcut_key(key: &str) -> String {
             .to_string(),
         other => other.to_string(),
     }
+}
+
+/// 由修饰键状态 + 主键名构造机器可读组合键串（重放端据此下发）。
+///
+/// 例：`combo_string(true,false,false,false,"KeyC")` → `"Ctrl+C"`；
+/// `combo_string(false,true,false,false,"KeyTab")` → `"Alt+Tab"`；
+/// `combo_string(false,false,true,false,"KeyD")` → `"Win+D"`；
+/// `combo_string(false,false,false,false,"KeyF5")` → `"F5"`。
+///
+/// 顺序固定为 Ctrl / Alt / Win / Shift + 主键，便于重放端分词解析。
+fn combo_string(ctrl: bool, alt: bool, meta: bool, shift: bool, key_name: &str) -> String {
+    let key = display_shortcut_key(key_name);
+    let mut parts: Vec<&str> = Vec::with_capacity(4);
+    if ctrl {
+        parts.push("Ctrl");
+    }
+    if alt {
+        parts.push("Alt");
+    }
+    if meta {
+        parts.push("Win");
+    }
+    if shift {
+        parts.push("Shift");
+    }
+    parts.push(key.as_str());
+    parts.join("+")
 }
 
 /// Windows 键（Meta）组合键 → 中文步骤标题 + 截图 settle。
@@ -678,6 +707,9 @@ fn flush_shortcut_step(
     settle: ShortcutSettle,
     ring: &FrameRing,
     key_ts: Instant,
+    // 机器可读组合键串（"Ctrl+C" / "Alt+Tab" / "Win+D" 等）；
+    // 重放端据此下发组合键，而不是解析 title 文本（title 含原始键码、格式不统一）。
+    combo: &str,
 ) -> Option<usize> {
     // Frame at keystroke time = the "before" view. Kept around so the settle
     // pass can diff against it and locate exactly what the shortcut changed.
@@ -784,6 +816,8 @@ fn flush_shortcut_step(
         timestamp: current_time_millis(),
         window_title: window_title.unwrap_or_default(),
         is_sensitive: false,
+        hotkey_combo: combo.to_string(),
+        uia_anchor: String::new(),
     };
 
     let mut pushed: Option<usize> = None;
@@ -1562,6 +1596,12 @@ fn build_click_step(
 
     let now_ms = current_time_millis();
 
+    // Stage 2b：抓取点击处的控件锚点（控件类名 + 归一化点击比例），用于分辨率无关重放。
+    // 任何失败返回空串，重放端回退到录制坐标。
+    let uia_anchor = crate::anchor::capture_anchor(x as i32, y as i32)
+        .map(|a| serde_json::to_string(&a).unwrap_or_default())
+        .unwrap_or_default();
+
     let window_title = activity::get_active_window_title();
     let click_domain = window_title
         .as_deref()
@@ -1591,6 +1631,8 @@ fn build_click_step(
             after_screenshot_path: None,
             timestamp: now_ms,
             window_title: window_title.unwrap_or_default(),
+            hotkey_combo: String::new(),
+            uia_anchor,
             is_sensitive: false,
     })
 }
@@ -1702,6 +1744,11 @@ fn build_drag_step(
     let now_ms = current_time_millis();
     let window_title = activity::get_active_window_title();
 
+    // Stage 2b：拖拽起点（dx, dy）处抓取控件锚点，用于分辨率无关重放。
+    let uia_anchor = crate::anchor::capture_anchor(dx as i32, dy as i32)
+        .map(|a| serde_json::to_string(&a).unwrap_or_default())
+        .unwrap_or_default();
+
     Some(StepData {
         id: Uuid::new_v4().to_string(),
         order_index: 0,
@@ -1716,12 +1763,14 @@ fn build_drag_step(
         before_screenshot_path: before_str,
         x: Some(win_cx),
         y: Some(win_cy),
-        crop_w: Some(crop_w),
-        crop_h: Some(crop_h),
-        after_screenshot_path: None,
-        timestamp: now_ms,
-        window_title: window_title.unwrap_or_default(),
-        is_sensitive: false,
+            crop_w: Some(crop_w),
+            crop_h: Some(crop_h),
+            after_screenshot_path: None,
+            timestamp: now_ms,
+            window_title: window_title.unwrap_or_default(),
+            hotkey_combo: String::new(),
+            uia_anchor,
+            is_sensitive: false,
     })
 }
 
@@ -2100,6 +2149,8 @@ fn spawn_event_thread(
                         // 三者 combo_ts 几乎相同，closest_to 都拿最"新"的帧（即
                         // Ctrl+V 之后的画面），全选步骤就会拍到粘贴后的内容。
                         let combo_ts = key_instant;
+                        // 结构化组合键串：重放端据此下发，避免去解析不可靠的 title 文本。
+                        let combo = combo_string(ctrl, alt, meta, shift, &key_name);
                         // Flush any pending keystrokes first so the combo is not
                         // merged into the preceding type step.
                         if !accumulated_keys.is_empty() {
@@ -2125,6 +2176,7 @@ fn spawn_event_thread(
                                     settle,
                                     &ring,
                                     combo_ts,
+                                    &combo,
                                 ),
                                 None => {
                                     let title = format!("快捷键 Win+{}", display_shortcut_key(&key_name));
@@ -2136,6 +2188,7 @@ fn spawn_event_thread(
                                         ShortcutSettle::visual(450),
                                         &ring,
                                         combo_ts,
+                                        &combo,
                                     )
                                 }
                             }
@@ -2156,6 +2209,7 @@ fn spawn_event_thread(
                                     ),
                                     &ring,
                                     combo_ts,
+                                    &combo,
                                 ),
                                 // 复制：剪贴板更新需要时间，但屏幕不会变。
                                 // settle 阶段**不再重截**（否则 450ms 后截到的是
@@ -2169,6 +2223,7 @@ fn spawn_event_thread(
                                     ShortcutSettle::copy(),
                                     &ring,
                                     combo_ts,
+                                    &combo,
                                 ),
                                 // 粘贴：屏幕会变（粘进去的文字），需要 settle
                                 // 重截。锚点由 settle 时的焦点元素决定（焦点还
@@ -2181,6 +2236,7 @@ fn spawn_event_thread(
                                     ShortcutSettle::paste(),
                                     &ring,
                                     combo_ts,
+                                    &combo,
                                 ),
                                 // 剪切：屏幕不会变（剪贴板变了），同 Ctrl+C 逻辑。
                                 "KeyX" => flush_shortcut_step(
@@ -2191,6 +2247,7 @@ fn spawn_event_thread(
                                     ShortcutSettle::copy(),
                                     &ring,
                                     combo_ts,
+                                    &combo,
                                 ),
                                 // 查找：浏览器搜索框是滑入动画，500ms 后重拍才拍得到。
                                 "KeyF" => flush_shortcut_step(
@@ -2201,14 +2258,15 @@ fn spawn_event_thread(
                                     ShortcutSettle::visual(500),
                                     &ring,
                                     combo_ts,
+                                    &combo,
                                 ),
-                                "KeyZ" => flush_shortcut_step("hotkey", "Ctrl+Z 撤销".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
-                                "KeyY" => flush_shortcut_step("hotkey", "Ctrl+Y 重做".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
-                                "KeyS" => flush_shortcut_step("hotkey", "Ctrl+S 保存".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts),
+                                "KeyZ" => flush_shortcut_step("hotkey", "Ctrl+Z 撤销".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts, &combo),
+                                "KeyY" => flush_shortcut_step("hotkey", "Ctrl+Y 重做".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts, &combo),
+                                "KeyS" => flush_shortcut_step("hotkey", "Ctrl+S 保存".to_string(), String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts, &combo),
                                 _ => {
                                     let title = common_combo_label(ctrl, alt, shift, &key_name)
                                         .unwrap_or_else(|| format!("快捷键 Ctrl+{}", display_shortcut_key(&key_name)));
-                                    flush_shortcut_step("hotkey", title, String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts)
+                                    flush_shortcut_step("hotkey", title, String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts, &combo)
                                 }
                             }
                         } else if alt {
@@ -2239,6 +2297,7 @@ fn spawn_event_thread(
                                             ShortcutSettle::switch(),
                                             &ring,
                                             combo_ts,
+                                            &combo,
                                         );
                                         if let Some(i) = idx {
                                             last_alt_tab = Some((now, i));
@@ -2250,7 +2309,7 @@ fn spawn_event_thread(
                             } else {
                                 let title = common_combo_label(ctrl, alt, shift, &key_name)
                                     .unwrap_or_else(|| format!("快捷键 Alt+{}", display_shortcut_key(&key_name)));
-                                flush_shortcut_step("hotkey", title, String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts)
+                                flush_shortcut_step("hotkey", title, String::new(), &cs_for_thread, ShortcutSettle::visual(450), &ring, combo_ts, &combo)
                             }
                         } else {
                             None
@@ -2326,6 +2385,7 @@ fn spawn_event_thread(
                             ShortcutSettle::visual(450),
                             &ring,
                             key_instant,
+                            &display_shortcut_key(&key_name),
                         );
                         last_key_time = Instant::now();
                         continue;
@@ -2464,6 +2524,8 @@ fn build_mark_step(
         after_screenshot_path,
         timestamp,
         window_title: String::new(),
+        hotkey_combo: String::new(),
+        uia_anchor: String::new(),
         is_sensitive: false,
     }
 }
@@ -2488,6 +2550,8 @@ fn steps_to_step_saves(steps: &[StepData]) -> Vec<crate::db::StepSave> {
             after_screenshot_path: s.after_screenshot_path.clone(),
             timestamp: s.timestamp,
             window_title: s.window_title.clone(),
+            hotkey_combo: s.hotkey_combo.clone(),
+            uia_anchor: s.uia_anchor.clone(),
         })
         .collect()
 }
@@ -3052,6 +3116,8 @@ mod commands_tests {
             timestamp: 0,
             window_title: String::new(),
             is_sensitive: false,
+            hotkey_combo: String::new(),
+            uia_anchor: String::new(),
         }
     }
 

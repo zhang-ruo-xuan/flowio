@@ -139,6 +139,8 @@ mod state_tests {
             timestamp: 0,
             window_title: String::new(),
             is_sensitive: false,
+            hotkey_combo: String::new(),
+            uia_anchor: String::new(),
         }
     }
 

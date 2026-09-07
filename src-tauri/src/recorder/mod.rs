@@ -48,6 +48,15 @@ pub struct StepData {
     /// 描述会被替换为 `[密码已隐藏]`。缺省为 false 以兼容旧数据。
     #[serde(default)]
     pub is_sensitive: bool,
+    /// 机器可读的组合键串（如 "Ctrl+C" / "Alt+Tab" / "Win+D"）。
+    /// 仅 hotkey/copy/paste 步骤有值；重放端据此下发组合键，而不是解析 title 文本。
+    /// 缺省为空串以兼容旧数据（旧录制没有结构化组合键）。
+    #[serde(default)]
+    pub hotkey_combo: String,
+    /// 控件锚点 JSON（Stage 2b）：点击处控件类名 + 归一化点击比例，用于分辨率无关重放。
+    /// 空串表示未抓取 / 无需锚点（重放回退到录制坐标）。缺省空串以兼容旧数据。
+    #[serde(default)]
+    pub uia_anchor: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,6 +119,8 @@ mod tests {
             timestamp: 1_700_000_000_000 + n as i64,
             window_title: format!("Window {}", n),
             is_sensitive: false,
+            hotkey_combo: String::new(),
+            uia_anchor: String::new(),
         }
     }
 
