@@ -1,7 +1,7 @@
 //! 重放后端：真实 Win32 执行层 + 测试用 DryRun（无副作用）。
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::anchor::{locate_click, ControlAnchor};
 
@@ -164,6 +164,38 @@ fn find_window_retry(substring: &str) -> Option<HWND> {
     None
 }
 
+/// 取当前前台窗口标题（诊断用）。
+fn foreground_title() -> String {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 512];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        if n > 0 {
+            String::from_utf16_lossy(&buf[..n as usize])
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// 重放诊断日志：每步记录聚焦结果，供「重放鼠标在动但文件没生成」类问题远程定位。
+/// 仅在重放时写入，频率 = 每步一次（非录制期每按键），且只在执行真实桌面动作时触发，开销可忽略。
+fn replay_log(line: &str) {
+    use std::io::Write;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) =
+        std::fs::OpenOptions::new().create(true).append(true).open(r"D:\录步\flowio_replay.log")
+    {
+        let _ = writeln!(f, "[{}] {}", ts, line);
+    }
+}
+
 fn focus_window(title: &str) -> bool {
     let t = title.trim();
     // 解析目标句柄：有标题按子串找（带重试，等对话框就绪）；无标题/找不到则复用上一次成功聚焦的窗口。
@@ -188,6 +220,12 @@ fn focus_window(title: &str) -> bool {
             *g = Some(hwnd.0 as usize);
         }
     }
+    replay_log(&format!(
+        "[focus] title='{}' ok={} fg_after='{}'",
+        t,
+        ok,
+        foreground_title()
+    ));
     ok
 }
 
