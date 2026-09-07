@@ -266,7 +266,7 @@ function App() {
   const showVoiceToast = useCallback((t: { type: "success" | "error"; message: string }) => {
     setVoiceToast(t);
     if (voiceToastTimerRef.current) clearTimeout(voiceToastTimerRef.current);
-    voiceToastTimerRef.current = setTimeout(() => setVoiceToast(null), t.type === "error" ? 6000 : 4000);
+    voiceToastTimerRef.current = setTimeout(() => setVoiceToast(null), 10000);
   }, []);
 
   // voice://done：转写完成 → 提示（StepEditor 自己监听并刷新步骤）
@@ -686,14 +686,37 @@ function App() {
         <div
           style={{
             position: "fixed", bottom: 44, right: 20, zIndex: 9999,
-            padding: "8px 14px", borderRadius: 6, fontSize: 13, maxWidth: 360,
+            display: "flex", alignItems: "flex-start", gap: 10,
+            padding: "8px 12px", borderRadius: 6, fontSize: 13, maxWidth: 400,
             boxShadow: "0 4px 14px rgba(0,0,0,0.18)",
             background: voiceToast.type === "success" ? "#f0f9f0" : "#fdf0f0",
             border: `1px solid ${voiceToast.type === "success" ? "#4caf50" : "#e57373"}`,
             color: voiceToast.type === "success" ? "#2e7d32" : "#c62828",
           }}
         >
-          {voiceToast.message}
+          <span style={{ wordBreak: "break-word", lineHeight: 1.5 }}>{voiceToast.message}</span>
+          <button
+            onClick={() => setVoiceToast(null)}
+            title="关闭"
+            style={{
+              flexShrink: 0,
+              width: 20,
+              height: 20,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: 0,
+              border: "none",
+              borderRadius: "50%",
+              background: "rgba(0,0,0,0.08)",
+              color: "inherit",
+              fontSize: 11,
+              lineHeight: 1,
+              cursor: "pointer",
+            }}
+          >
+            ✕
+          </button>
         </div>
       )}
 

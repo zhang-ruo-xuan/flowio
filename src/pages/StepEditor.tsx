@@ -531,10 +531,10 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     return () => { cancelled = true; };
   }, []);
 
-  // Auto-dismiss toast
+  // Auto-dismiss toast（★ 10s：错误文案长，2s 看不完会误以为功能坏了）
   useEffect(() => {
     if (!toast) return;
-    const timer = setTimeout(() => setToast(null), 2000);
+    const timer = setTimeout(() => setToast(null), 10000);
     return () => clearTimeout(timer);
   }, [toast]);
 
@@ -3026,8 +3026,9 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
             transform: "translate(-50%, -50%)",
             zIndex: 10001,
             display: "flex",
-            alignItems: "center",
+            alignItems: "flex-start",
             gap: "12px",
+            maxWidth: "560px",
             padding: "12px 16px",
             borderRadius: "8px",
             fontSize: "16px",
@@ -3038,7 +3039,29 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
             border: toast.type === "success" ? "1px solid #fed7aa" : "1px solid #fecaca",
           }}
         >
-          <span>{toast.message}</span>
+          <span style={{ wordBreak: "break-word", lineHeight: 1.5 }}>{toast.message}</span>
+          <button
+            onClick={() => setToast(null)}
+            title="关闭"
+            style={{
+              flexShrink: 0,
+              width: 22,
+              height: 22,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: 0,
+              border: "none",
+              borderRadius: "50%",
+              background: "rgba(0,0,0,0.08)",
+              color: "inherit",
+              fontSize: 12,
+              lineHeight: 1,
+              cursor: "pointer",
+            }}
+          >
+            ✕
+          </button>
         </div>,
         document.body
       )}
