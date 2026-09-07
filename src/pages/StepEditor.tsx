@@ -2852,11 +2852,9 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
           <span style={{ marginRight: "auto" }}>{steps.length} 个步骤</span>
         </div>
 
-        {/* 步骤精简：一个下拉入口收纳「AI 精简 / 仅规则合并」。
-            规则合并录完已自动跑过，这里的入口用于存量录制补跑与手动重跑。
-            撤销已上移为顶栏全局 ↶↷（可撤销一切编辑，不只是精简）。 */}
+        {/* 步骤精简 + 执行 / 演练 / 执行历史（同一行） */}
         {!previewMode && steps.length > 0 && (
-          <div className="step-simplify-bar">
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <div style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
               <button
                 className="step-simplify-btn primary"
@@ -2893,41 +2891,37 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                 </div>
               )}
             </div>
+            <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+              <button
+                onClick={() => handleExecute(false)}
+                disabled={executing}
+                data-tip={"精准执行\n按录制时的屏幕坐标确定性重放（非 AI 猜点），在目标窗口自动点选；每步后截图校验"}
+                style={{ background: "transparent", border: "1px solid #3fb950", color: "#3fb950", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+              >
+                ▶ 执行{executing ? "中…" : ""}
+              </button>
+            </div>
+            <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+              <button
+                onClick={() => handleExecute(true)}
+                disabled={executing}
+                data-tip={"演练（dry-run）\n只生成动作序列、不操作桌面，用于验证重放逻辑"}
+                style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+              >
+                演练
+              </button>
+            </div>
+            <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+              <button
+                onClick={() => { setShowAudit(true); loadAudit(); }}
+                data-tip={"执行历史\n查看本教程历次重放的审计记录（时间 / 结果 / 步数）"}
+                style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+              >
+                执行历史
+              </button>
+            </div>
           </div>
         )}
-
-        {/* 执行 / 演练 / 执行历史（放在精简后面，避免顶栏左侧过挤） */}
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 8 }}>
-          <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-            <button
-              onClick={() => handleExecute(false)}
-              disabled={executing}
-              data-tip={"精准执行\n按录制时的屏幕坐标确定性重放（非 AI 猜点），在目标窗口自动点选；每步后截图校验"}
-              style={{ background: "transparent", border: "1px solid #3fb950", color: "#3fb950", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-            >
-              ▶ 执行{executing ? "中…" : ""}
-            </button>
-          </div>
-          <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-            <button
-              onClick={() => handleExecute(true)}
-              disabled={executing}
-              data-tip={"演练（dry-run）\n只生成动作序列、不操作桌面，用于验证重放逻辑"}
-              style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-            >
-              演练
-            </button>
-          </div>
-          <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-            <button
-              onClick={() => { setShowAudit(true); loadAudit(); }}
-              data-tip={"执行历史\n查看本教程历次重放的审计记录（时间 / 结果 / 步数）"}
-              style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-            >
-              执行历史
-            </button>
-          </div>
-        </div>
 
         {/* Step list */}
         <div className="step-list">
