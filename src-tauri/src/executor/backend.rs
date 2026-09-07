@@ -73,8 +73,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowTextW, IsWindowVisible, SetCursorPos,
-    SetForegroundWindow, ShowWindow, SW_RESTORE,
+    EnumWindows, GetForegroundWindow, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
+    SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
 };
 
 struct EnumCtx<'a> {
@@ -114,22 +114,66 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: windows::Win32::
     BOOL(1)
 }
 
-fn focus_window(title: &str) -> bool {
-    let t = title.trim();
-    // 全屏录制无目标窗口标题：不做焦点操作，避免空串误匹配到 Flowio 自身窗口。
-    // 执行前前端已把 Flowio 最小化让出屏幕，目标应用自然处于前台，点击坐标可直接命中。
-    if t.is_empty() {
-        return false;
+/// 重放期间记住「上一次成功聚焦的目标窗口」。全屏录制每步标题虽大多有值，
+/// 但个别步（桌面/无标题窗口/保存对话框标题模糊）标题为空或匹配不到，
+/// 此时复用上一次成功聚焦的窗口，避免键盘输入落到桌面导致「文件没建出来」。
+static LAST_FOCUS: Mutex<Option<usize>> = Mutex::new(None);
+
+/// 新一次重放开始时清空缓存，避免上一轮残留的窗口句柄干扰本轮首步。
+pub fn reset_replay_focus_cache() {
+    if let Ok(mut g) = LAST_FOCUS.lock() {
+        *g = None;
     }
-    let Some(hwnd) = find_window(t) else {
-        return false;
-    };
+}
+
+/// 强制把目标窗口提到前台。
+/// `SetForegroundWindow` 在重放进行数秒后（用户「近期输入」宽限期过期）会**静默失败**，
+/// 此后键盘输入就会打到桌面而非目标软件——这正是「鼠标在动、但文件没生成」的根因。
+/// 这里用「瞬置顶→取消置顶」技巧绕过前台锁把窗口强抢到最前，失败再退路 `ShowWindow+SetForegroundWindow`。
+fn force_foreground(hwnd: HWND) -> bool {
     unsafe {
-        // 目标若被最小化则先恢复，否则 SetForegroundWindow 无权置顶；
-        // 用户刚点过「执行」(近期有输入)，前台锁超时内 SetForegroundWindow 一般可成功。
+        if GetForegroundWindow() == hwnd {
+            return true;
+        }
+        // 技巧：先置顶再取消置顶，可绕过前台锁把窗口带到最前
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         ShowWindow(hwnd, SW_RESTORE);
+        if SetForegroundWindow(hwnd).as_bool() {
+            return true;
+        }
+        // 仍失败：再试一次瞬置顶 + 前台
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
         SetForegroundWindow(hwnd).as_bool()
     }
+}
+
+fn focus_window(title: &str) -> bool {
+    let t = title.trim();
+    // 解析目标句柄：有标题按子串找；无标题/找不到则复用上一次成功聚焦的窗口。
+    let candidate = if t.is_empty() {
+        None
+    } else {
+        find_window(t)
+    };
+    let cached = LAST_FOCUS
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|raw| HWND(raw as *mut std::ffi::c_void))
+        .filter(|h| unsafe { IsWindowVisible(*h).as_bool() });
+    let hwnd = candidate.or(cached);
+    let Some(hwnd) = hwnd else {
+        return false;
+    };
+    let ok = force_foreground(hwnd);
+    if ok {
+        if let Ok(mut g) = LAST_FOCUS.lock() {
+            *g = Some(hwnd.0 as usize);
+        }
+    }
+    ok
 }
 
 fn click(x: i32, y: i32) {

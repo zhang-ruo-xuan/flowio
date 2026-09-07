@@ -269,6 +269,8 @@ pub fn execute_recording(
             });
         }
     } else {
+        // 重放前清空焦点缓存，避免上一轮残留窗口句柄误导本轮首步聚焦。
+        crate::executor::backend::reset_replay_focus_cache();
         let backend = WindowsBackend;
         // 降频校验：长录制每 2~3 步抽验一次（末步必验），显著减少每步全屏截图次数，
         // 缓解"卡顿"；短录制仍逐步骤验，校验门功能不变。
