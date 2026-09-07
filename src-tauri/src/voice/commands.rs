@@ -265,8 +265,10 @@ pub fn resolve_asr_key(cfg: &crate::ai::types::AiConfig) -> (String, &'static st
     {
         return (cfg.api_key.clone(), "用户配置");
     }
-    let builtin = crate::ai::commands::get_builtin_free_config();
-    (builtin.api_key, "内置免费通道")
+    // 内置免费通道：2026-09-07 起主 Key 用新注册智谱账号（独立配额，避开
+    // 旧账号 LLM 扫描+ASR 互相挤兑的高峰 429）；旧 Key 降级进 asr.rs 的
+    // ASR_FALLBACK_KEYS，主 Key 429 时自动兜底（见 transcribe_wav）。
+    (asr::ASR_BUILTIN_PRIMARY_KEY.to_string(), "内置免费通道")
 }
 
 /// 用户自定义 ASR 热词的 settings 键（JSON 字符串数组）。
@@ -740,6 +742,8 @@ mod voice_commands_tests {
         // 绝不能拿第三方的 key 去打智谱端点（必然 401）
         assert_ne!(key, "sk-third-party-key");
         assert!(!key.trim().is_empty());
+        // 2026-09-07 起内置通道主 Key = 新账号 Key（独立配额），旧 Key 只做兜底
+        assert_eq!(key, asr::ASR_BUILTIN_PRIMARY_KEY);
     }
 
     /// 用户自配智谱时应当优先用他自己的 Key（省内置额度、也更可控）。

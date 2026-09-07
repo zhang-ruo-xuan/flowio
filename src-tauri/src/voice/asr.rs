@@ -11,6 +11,18 @@ use std::time::Duration;
 /// ASR 端点（固定智谱；自定义服务商暂不支持 ASR）
 pub const ASR_URL: &str = "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions";
 
+/// 内置免费通道 ASR **主 Key**（2026-09-07 新注册智谱账号，独立配额）。
+///
+/// 智谱限流是**账号级**的：旧免费账号 Key 同时承担桌面 LLM 扫描（glm-4.6v-flash）
+/// 与 ASR，高峰期互相挤兑频繁 429。新账号 Key 与服务端 `/api/ai/asr` 主 Key
+/// 同账号同源，专供 ASR 后配额充裕。旧 Key 降级进 [`ASR_FALLBACK_KEYS`] 兜底。
+pub const ASR_BUILTIN_PRIMARY_KEY: &str = "054d0f9ec2f947a887b05e6ac45d7012.q3KSxvGcWLJAOMuD";
+
+/// ASR 兜底 Key 池：主 Key 返回 429（限流或配额不可用）时依次尝试。
+/// 当前仅旧免费账号 Key（与 `ai::commands::get_builtin_free_config` 同一把，
+/// LLM 扫描通道继续用它，互不影响）。
+pub const ASR_FALLBACK_KEYS: &[&str] = &["874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U"];
+
 /// ASR 模型名。
 ///
 /// 🔴 **必须是 `glm-asr-2512`，不能改成 `glm-asr`**（2026-09-03 实测踩坑，
@@ -152,6 +164,11 @@ struct AsrResponse {
 /// 转写一段 WAV 音频（≤ [`crate::voice::audio::MAX_SEGMENT_MS`]，当前 28s；
 /// 智谱服务端硬限 30s / 25MB），返回识别文本。
 ///
+/// **双 Key 主备轮换**（2026-09-07，与服务端 `/api/ai/asr` 同策略）：先按
+/// `api_key` 转写；若失败原因是 429（限流或配额不可用），依次用
+/// [`ASR_FALLBACK_KEYS`] 兜底重试。其它错误（网络/HTTP 4xx/5xx）换 Key 也是
+/// 同一端点，无意义，直接返回原错误。
+///
 /// `hotwords`：热词表（见 [`merge_hotwords`]）；`prompt`：上一段转写结果
 /// 作为上下文（见 [`segment_prompt`]）。二者为空时不上传对应字段，请求
 /// 与旧版完全一致。
@@ -164,6 +181,45 @@ struct AsrResponse {
 /// HTTP 非 2xx 或重试耗尽时返回带原因的 String；响应体缺 `text` 字段时
 /// 返回解析错误。
 pub fn transcribe_wav(
+    api_key: &str,
+    wav_bytes: Vec<u8>,
+    hotwords: &[String],
+    prompt: Option<&str>,
+) -> Result<String, String> {
+    match transcribe_wav_single(api_key, wav_bytes.clone(), hotwords, prompt) {
+        Ok(t) => Ok(t),
+        Err(e) if is_rate_limit_or_quota_error(&e) => {
+            let mut last_err = e;
+            for fallback in ASR_FALLBACK_KEYS {
+                if *fallback == api_key {
+                    continue; // 兜底 Key 与主 Key 相同则跳过
+                }
+                crate::ai::commands::ai_dbg_log(&format!(
+                    "[VOICE] ASR 主 Key 429/配额不可用，切换兜底 Key（尾 {}）重试",
+                    &fallback[fallback.len().saturating_sub(6)..]
+                ));
+                match transcribe_wav_single(fallback, wav_bytes.clone(), hotwords, prompt) {
+                    Ok(t) => return Ok(t),
+                    Err(e2) => last_err = e2,
+                }
+            }
+            Err(last_err)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 错误信息是否属于「换 Key 重试有意义」的 429 类（限流 1305 / 配额 1113）。
+/// 纯函数，有测试锁死。其它错误（网络断、HTTP 401/403/422/5xx）返回 false。
+fn is_rate_limit_or_quota_error(err: &str) -> bool {
+    // 两类 429 的错误文案都带「HTTP 429」：
+    //   · 限流耗尽："HTTP 429 xxx（已重试 3 次仍失败）"
+    //   · 配额不可用："语音转写配额不可用（HTTP 429）：..."
+    err.contains("HTTP 429")
+}
+
+/// 单 Key 版转写实现（无兜底逻辑，见 [`transcribe_wav`]）。
+fn transcribe_wav_single(
     api_key: &str,
     wav_bytes: Vec<u8>,
     hotwords: &[String],
@@ -335,6 +391,39 @@ mod asr_tests {
     fn asr_model_is_the_free_tier_one() {
         assert_eq!(ASR_MODEL, "glm-asr-2512");
         assert_ne!(ASR_MODEL, "glm-asr", "glm-asr 需付费资源包，免费 Key 会返回 429/1113");
+    }
+
+    /// 双 Key 池：主 Key（新账号）与兜底 Key（旧免费账号）必须不同且非空，
+    /// 兜底池必须含旧内置免费 Key（LLM 扫描同源 Key，账号级限流隔离）。
+    #[test]
+    fn builtin_key_pool_primary_and_fallback_are_distinct() {
+        assert!(!ASR_BUILTIN_PRIMARY_KEY.trim().is_empty());
+        assert!(!ASR_FALLBACK_KEYS.is_empty());
+        for fb in ASR_FALLBACK_KEYS {
+            assert_ne!(*fb, ASR_BUILTIN_PRIMARY_KEY, "兜底 Key 不得与主 Key 相同");
+            assert!(!fb.trim().is_empty());
+        }
+        // 旧内置免费 Key 必须在兜底池里（降级不丢弃）
+        assert!(ASR_FALLBACK_KEYS
+            .contains(&"874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U"));
+    }
+
+    /// 仅 429 类错误（限流/配额）值得换兜底 Key；网络/4xx/5xx 换 Key 无意义。
+    #[test]
+    fn only_429_class_errors_trigger_fallback() {
+        assert!(is_rate_limit_or_quota_error(
+            "HTTP 429 该模型当前访问量过大（已重试 3 次仍失败）"
+        ));
+        assert!(is_rate_limit_or_quota_error(
+            "语音转写配额不可用（HTTP 429）：余额不足或无可用资源包。..."
+        ));
+        assert!(!is_rate_limit_or_quota_error(
+            "GLM-ASR 返回错误（HTTP 401）：invalid api key"
+        ));
+        assert!(!is_rate_limit_or_quota_error("HTTP request failed: timeout"));
+        assert!(!is_rate_limit_or_quota_error(
+            "GLM-ASR 返回错误（HTTP 500）：internal"
+        ));
     }
 
     /// 1113（余额/资源包）必须立即失败；1305（限流）才值得退避重试。
