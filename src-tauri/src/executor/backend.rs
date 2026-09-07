@@ -149,13 +149,28 @@ fn force_foreground(hwnd: HWND) -> bool {
     }
 }
 
+/// 解析目标窗口句柄，带有限重试。
+/// 重放中某些步（如 Ctrl+S 后弹出的「另存为」对话框）目标窗口可能尚未被枚举到，
+/// 立即查找会失败；重试几次可等到对话框真正出现在窗口列表中，避免键盘落到错误窗口。
+fn find_window_retry(substring: &str) -> Option<HWND> {
+    for attempt in 0..3 {
+        if let Some(h) = find_window(substring) {
+            return Some(h);
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(120));
+        }
+    }
+    None
+}
+
 fn focus_window(title: &str) -> bool {
     let t = title.trim();
-    // 解析目标句柄：有标题按子串找；无标题/找不到则复用上一次成功聚焦的窗口。
+    // 解析目标句柄：有标题按子串找（带重试，等对话框就绪）；无标题/找不到则复用上一次成功聚焦的窗口。
     let candidate = if t.is_empty() {
         None
     } else {
-        find_window(t)
+        find_window_retry(t)
     };
     let cached = LAST_FOCUS
         .lock()
