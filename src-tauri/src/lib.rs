@@ -11,6 +11,7 @@ mod hotkey;
 mod voice;
 mod job_notify;
 mod executor;
+mod anchor;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -247,6 +248,8 @@ pub fn run() {
             open_external_url,
             get_pending_deep_link,
             executor::commands::execute_recording,
+            executor::commands::preview_replay,
+            executor::commands::get_replay_audit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

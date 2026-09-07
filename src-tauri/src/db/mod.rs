@@ -25,6 +25,11 @@ pub struct StepSave {
     pub after_screenshot_path: Option<String>,
     pub timestamp: i64,
     pub window_title: String,
+    /// 机器可读组合键串（"Ctrl+C" / "Alt+Tab" / "Win+D"）；hotkey/copy/paste 步骤有值。
+    pub hotkey_combo: String,
+    /// 控件锚点 JSON（Stage 2b）：点击处控件类名 + 归一化点击比例，分辨率无关重放用。
+    /// 空串表示未抓取 / 无需锚点（回退到录制坐标）。
+    pub uia_anchor: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,8 +58,8 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
         let step_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = conn.execute(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, \
-             title, description, tip, screenshot_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             title, description, tip, screenshot_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, hotkey_combo, uia_anchor) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 step_id,
                 recording.id,
@@ -73,6 +78,8 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
                 step.after_screenshot_path,
                 step.timestamp,
                 step.window_title,
+                step.hotkey_combo,
+                step.uia_anchor,
             ],
         ) {
             let _ = conn.execute("ROLLBACK", []);
@@ -181,6 +188,22 @@ pub fn init_db(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_edit_history_rec
             ON edit_history(recording_id, stack);
 
+        -- 重放审计表（Stage 3 精准可审计）：每次执行（含 dry-run / needs-approval）都留痕，
+        -- 供「审计历史」查询与信任层展示。run_id 为 uuid v4，report_json 为完整 ExecReport。
+        CREATE TABLE IF NOT EXISTS replay_audit (
+            run_id         TEXT PRIMARY KEY,
+            recording_id   TEXT NOT NULL,
+            started_at     TEXT NOT NULL,
+            finished_at    TEXT NOT NULL,
+            dry_run        INTEGER NOT NULL DEFAULT 0,
+            total_steps    INTEGER NOT NULL DEFAULT 0,
+            ok_steps       INTEGER NOT NULL DEFAULT 0,
+            failed_steps   INTEGER NOT NULL DEFAULT 0,
+            overall_status TEXT NOT NULL DEFAULT '',
+            target_app     TEXT NOT NULL DEFAULT '',
+            report_json    TEXT NOT NULL DEFAULT ''
+        );
+
         -- 撤销/重做历史只在本次运行内有效：启动即清空（用户要求退出软件后不保留，
         -- 避免重启后还能撤销到上一次会话的旧编辑状态）。
         DELETE FROM edit_history;
@@ -245,6 +268,18 @@ pub fn init_db(conn: &Connection) {
     );
     let _ = conn.execute_batch(
         "ALTER TABLE steps ADD COLUMN param_name TEXT NOT NULL DEFAULT ''",
+    );
+
+    // ── Migrations: 结构化组合键串（重放端按此下发，不解析 title）──
+    // 旧库/存量步骤该列为 ''，天然兼容；新录制会在保存时写入机器可读组合键。
+    let _ = conn.execute_batch(
+        "ALTER TABLE steps ADD COLUMN hotkey_combo TEXT NOT NULL DEFAULT ''",
+    );
+
+    // ── Migrations: 控件锚点（Stage 2b 分辨率无关重放）──
+    // 旧库/存量步骤该列为 ''，重放时回退到录制坐标；新录制在点击/拖拽时写入。
+    let _ = conn.execute_batch(
+        "ALTER TABLE steps ADD COLUMN uia_anchor TEXT NOT NULL DEFAULT ''",
     );
 }
 
@@ -340,6 +375,8 @@ mod db_tests {
             },
             timestamp: 1_700_000_000_000 + num as i64,
             window_title: format!("Window {}", num),
+            hotkey_combo: String::new(),
+            uia_anchor: String::new(),
         }
     }
 

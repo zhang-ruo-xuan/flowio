@@ -425,6 +425,26 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   const [redacting, setRedacting] = useState(false);
   // ★ v310: 脱敏结果弹窗（带 ×，不点不消失；与插件端对齐）
   const [redactResult, setRedactResult] = useState<{ title: string; lines: string[] } | null>(null);
+  // Stage 3：执行审批闸门——计划含敏感步骤（快捷键/复制/粘贴/拖拽）时弹出计划确认
+  const [approvalPlan, setApprovalPlan] = useState<{
+    recordingId: string;
+    total: number;
+    requiresApproval: boolean;
+    steps: { stepNumber: number; actionType: string; target: string; sensitive: boolean }[];
+  } | null>(null);
+  const ACTION_LABELS: Record<string, string> = {
+    click: "点击", type: "输入", input: "输入", hotkey: "快捷键", copy: "复制", paste: "粘贴",
+    drag: "拖拽", key: "按键", scroll: "滚动", select: "选择", nav: "导航",
+    screenshot: "截图", other: "其它",
+  };
+  // Stage 3：执行审计历史面板（get_replay_audit）
+  const [showAudit, setShowAudit] = useState(false);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditRecords, setAuditRecords] = useState<{
+    runId: string; startedAt: string; finishedAt: string; dryRun: boolean;
+    totalSteps: number; okSteps: number; failedSteps: number;
+    overallStatus: string; targetApp: string;
+  }[]>([]);
   const [scanRedacting, setScanRedacting] = useState(false);
   const [scanProgress, setScanProgress] = useState<{ done: number; total: number; currentStepId: string }>({ done: 0, total: 0, currentStepId: "" });
   const [scanToast, setScanToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
@@ -1710,30 +1730,87 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   const handleExecute = useCallback(
     async (dryRun: boolean) => {
       if (!recordingId) { setToast({ type: "error", message: "未找到当前录制" }); return; }
+      // 演练（dry-run）只生成动作序列、不操作桌面，无需审批
+      if (dryRun) {
+        setExecuting(true);
+        setToast({ type: "success", message: "开始演练（dry-run，不操作桌面）…" });
+        try {
+          const report = await invoke<any>("execute_recording", { recordingId, dryRun: true, stepDelayMs: 300 });
+          const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
+          setToast({
+            type: fails > 0 ? "error" : "success",
+            message: `执行完成：${report.total} 步，校验异常 ${fails} 步（演练）`,
+          });
+        } catch (err) {
+          setToast({ type: "error", message: `演练失败：${String(err)}` });
+        } finally {
+          setExecuting(false);
+        }
+        return;
+      }
+      // 真实执行：先预览计划；含敏感步骤（快捷键/复制/粘贴/拖拽）则弹审批闸门，
+      // 此时**不下发任何桌面动作**，等用户点「批准并执行」后再用 approved=true 重放
       setExecuting(true);
-      setToast({
-        type: "success",
-        message: dryRun ? "开始演练（dry-run，不操作桌面）…" : "开始精准执行，请勿操作鼠标键盘…",
-      });
       try {
-        const report = await invoke<any>("execute_recording", {
-          recordingId,
-          dryRun,
-          stepDelayMs: 300,
-        });
-        const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
-        setToast({
-          type: fails > 0 ? "error" : "success",
-          message: `执行完成：${report.total} 步，校验异常 ${fails} 步${dryRun ? "（演练）" : ""}`,
-        });
+        const preview = await invoke<any>("preview_replay", { recordingId });
+        if (!preview.requiresApproval) {
+          const report = await invoke<any>("execute_recording", {
+            recordingId, dryRun: false, stepDelayMs: 300, approvalMode: "off",
+          });
+          const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
+          setToast({
+            type: fails > 0 ? "error" : "success",
+            message: `执行完成：${report.total} 步，校验异常 ${fails} 步`,
+          });
+        } else {
+          setExecuting(false); // 闸门未过，不放行；弹窗等待用户确认
+          setApprovalPlan(preview);
+          return;
+        }
       } catch (err) {
-        setToast({ type: "error", message: `执行失败：${String(err)}` });
-      } finally {
+        setToast({ type: "error", message: `预览执行计划失败：${String(err)}` });
         setExecuting(false);
       }
     },
     [recordingId]
   );
+
+  // Stage 3：用户在审批闸门里点「批准并执行」后，才真实下发桌面动作
+  const confirmApproval = useCallback(async () => {
+    if (!recordingId || !approvalPlan) return;
+    setApprovalPlan(null);
+    setExecuting(true);
+    setToast({ type: "success", message: "已批准，开始精准执行，请勿操作鼠标键盘…" });
+    try {
+      const report = await invoke<any>("execute_recording", {
+        recordingId, dryRun: false, stepDelayMs: 300, approvalMode: "check", approved: true,
+      });
+      const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
+      setToast({
+        type: fails > 0 ? "error" : "success",
+        message: `执行完成：${report.total} 步，校验异常 ${fails} 步`,
+      });
+    } catch (err) {
+      setToast({ type: "error", message: `执行失败：${String(err)}` });
+    } finally {
+      setExecuting(false);
+    }
+  }, [recordingId, approvalPlan]);
+
+  // Stage 3：打开执行历史面板时拉取审计记录
+  const loadAudit = useCallback(async () => {
+    if (!recordingId) { setAuditRecords([]); return; }
+    setAuditLoading(true);
+    try {
+      const rows = await invoke<any[]>("get_replay_audit", { recordingId });
+      setAuditRecords(Array.isArray(rows) ? rows : []);
+    } catch (err) {
+      setToast({ type: "error", message: `读取执行历史失败：${String(err)}` });
+      setAuditRecords([]);
+    } finally {
+      setAuditLoading(false);
+    }
+  }, [recordingId]);
 
 /* ── Publish to website ──────────────────────────────────── */
 
@@ -2360,6 +2437,15 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
           演练
         </button>
       </div>
+      <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+        <button
+          onClick={() => { setShowAudit(true); loadAudit(); }}
+          data-tip={"执行历史\n查看本教程历次重放的审计记录（时间 / 结果 / 步数）"}
+          style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+        >
+          执行历史
+        </button>
+      </div>
       {!previewMode && (
         <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
           <button
@@ -2684,6 +2770,107 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
         </div>
       )}
 
+
+      {/* Stage 3：执行审批闸门——计划含敏感步骤（快捷键/复制/粘贴/拖拽）时弹出计划确认 */}
+      {approvalPlan && (
+        <div
+          style={{ position: "fixed", inset: 0, zIndex: 10002, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div
+            style={{ position: "relative", background: "#fff", borderRadius: 10, padding: "20px 22px", width: 460, boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              onClick={() => setApprovalPlan(null)}
+              data-tip="关闭"
+              aria-label="关闭"
+              style={{ position: "absolute", top: 10, right: 10, width: 26, height: 26, border: "none", borderRadius: 6, background: "transparent", color: "#57606a", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+            >✕</button>
+            <div style={{ fontSize: 15, fontWeight: 600, color: "#24292e", display: "flex", alignItems: "center", gap: 6 }}>
+              <ShieldCheck size={16} /> 执行前确认
+            </div>
+            <div style={{ fontSize: 12.5, color: "#57606a", marginTop: 8 }}>
+              本教程包含 <b style={{ color: "#d97706" }}>敏感操作</b>（快捷键 / 复制 / 粘贴 / 拖拽），重放将真实操作你的桌面。请确认下列步骤无误后再放行：
+            </div>
+            <ul style={{ margin: "8px 0 4px", padding: "8px 12px", maxHeight: 240, overflowY: "auto", listStyle: "none", background: "#f6f8fa", border: "1px solid #e5e7eb", borderRadius: 8, fontSize: 13, lineHeight: 1.9, color: "#24292e" }}>
+              {approvalPlan.steps.map((s) => (
+                <li key={s.stepNumber} style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ color: "#8c959f", minWidth: 24 }}>#{s.stepNumber}</span>
+                  <span style={{ color: s.sensitive ? "#d97706" : "#24292e", fontWeight: s.sensitive ? 600 : 400 }}>{s.sensitive ? "⚠ " : ""}{ACTION_LABELS[s.actionType] || s.actionType}</span>
+                  <span style={{ color: "#57606a", overflow: "hidden", textOverflow: "ellipsis" }}>{s.target}</span>
+                </li>
+              ))}
+            </ul>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 14 }}>
+              <button
+                onClick={() => setApprovalPlan(null)}
+                style={{ padding: "6px 16px", borderRadius: 6, border: "1px solid #d0d7de", background: "#fff", color: "#24292e", cursor: "pointer", fontSize: 13 }}
+              >取消</button>
+              <button
+                onClick={confirmApproval}
+                disabled={executing}
+                style={{ padding: "6px 16px", borderRadius: 6, border: "none", background: "#3fb950", color: "#fff", cursor: executing ? "default" : "pointer", fontSize: 13 }}
+              >批准并执行</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Stage 3：执行审计历史面板 */}
+      {showAudit && (
+        <div
+          style={{ position: "fixed", inset: 0, zIndex: 10003, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div
+            style={{ position: "relative", background: "#fff", borderRadius: 10, padding: "20px 22px", width: 520, maxHeight: "80vh", display: "flex", flexDirection: "column", boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              onClick={() => setShowAudit(false)}
+              data-tip="关闭"
+              aria-label="关闭"
+              style={{ position: "absolute", top: 10, right: 10, width: 26, height: 26, border: "none", borderRadius: 6, background: "transparent", color: "#57606a", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+            >✕</button>
+            <div style={{ fontSize: 15, fontWeight: 600, color: "#24292e" }}>执行历史</div>
+            <div style={{ fontSize: 12.5, color: "#57606a", marginTop: 4 }}>
+              本教程历次重放的审计记录（每次执行都会留痕，含被审批拦截而未下发的记录）。
+            </div>
+            <div style={{ marginTop: 10, overflowY: "auto", flex: 1 }}>
+              {auditLoading ? (
+                <div style={{ fontSize: 13, color: "#57606a", padding: "12px 0" }}>加载中…</div>
+              ) : auditRecords.length === 0 ? (
+                <div style={{ fontSize: 13, color: "#57606a", padding: "12px 0" }}>暂无执行记录</div>
+              ) : (
+                <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 8 }}>
+                  {auditRecords.map((r) => {
+                    const st = r.overallStatus || "no-steps";
+                    const color = st === "success" ? "#3fb950" : st === "failed" ? "#e5484d" : st === "no-steps" ? "#8c959f" : "#d97706";
+                    const label = st === "success" ? "成功" : st === "failed" ? "失败" : st === "no-steps" ? "无步骤" : st === "needs-approval" ? "待批准(未执行)" : "部分成功";
+                    return (
+                      <li key={r.runId} style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: "8px 10px", background: "#f6f8fa", fontSize: 13, color: "#24292e" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ fontWeight: 600, color }}>{label}</span>
+                          <span style={{ color: "#8c959f" }}>{r.dryRun ? "演练" : "执行"}</span>
+                          <span style={{ marginLeft: "auto", color: "#57606a" }}>{r.startedAt}</span>
+                        </div>
+                        <div style={{ color: "#57606a", marginTop: 4 }}>
+                          共 {r.totalSteps} 步 · 成功 {r.okSteps} · 失败 {r.failedSteps}{r.targetApp ? ` · 目标：${r.targetApp}` : ""}
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
+              <button
+                onClick={() => setShowAudit(false)}
+                style={{ padding: "6px 16px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: "pointer", fontSize: 13 }}
+              >关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ★ T8 译文可编辑弹窗 */}
 

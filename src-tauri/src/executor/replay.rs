@@ -20,6 +20,12 @@ pub struct ReplayAction {
     pub text: Option<String>,
     /// 该步执行后截图（用于校验门）
     pub after_screenshot: Option<String>,
+    /// 机器可读组合键串（hotkey/copy/paste 步有值；如 "Ctrl+C" / "Alt+Tab" / "Win+D"）。
+    /// 重放端据此下发组合键；为空表示非组合键步骤。
+    pub hotkey_combo: Option<String>,
+    /// 控件锚点 JSON（Stage 2b）：点击处控件类名 + 归一化点击比例，分辨率无关重放用。
+    /// 为空表示无锚点，回退到录制坐标。
+    pub uia_anchor: Option<String>,
 }
 
 /// 从源 DB 读取某录制的重放计划。
@@ -31,7 +37,7 @@ pub fn load_replay_plan(
 ) -> Result<Vec<ReplayAction>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path \
+            "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -48,6 +54,14 @@ pub fn load_replay_plan(
                     _ => None,
                 },
                 after_screenshot: row.get::<_, Option<String>>(6)?,
+                hotkey_combo: match row.get::<_, Option<String>>(7)? {
+                    Some(c) if !c.trim().is_empty() => Some(c),
+                    _ => None,
+                },
+                uia_anchor: match row.get::<_, Option<String>>(8)? {
+                    Some(a) if !a.trim().is_empty() => Some(a),
+                    _ => None,
+                },
             })
         })
         .map_err(|e| e.to_string())?;
@@ -58,27 +72,49 @@ pub fn load_replay_plan(
     Ok(plan)
 }
 
-/// 执行单步到指定后端（focus / click / drag / type）。
+/// 执行单步到指定后端（focus / click / drag / type / press_combo）。
 ///
 /// - 有坐标 → 先聚焦窗口再按动作类型派发；
 /// - 无坐标（x/y 为 None）→ 仅聚焦窗口（通常是"首点激活窗口"语义）；
-/// - drag 当前降级为 click：源 DB 只存了单点坐标，drag 终点缺失，
-///   精确拖拽需 Stage 2b 在录制端补齐（见 brief）。
+/// - click/drag → 鼠标点击（drag 当前降级为 click，终点缺失，Stage 2b 补）；
+/// - type/input → 文本注入；
+/// - copy/paste → 按结构化组合键下发（如 Ctrl+C / Ctrl+V，不依赖 title 解析）；
+/// - hotkey → 按结构化组合键下发（如 Alt+Tab / Win+D）；
+/// - 未知 action_type 不再静默丢弃，记录日志便于排查。
 pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
-    match (action.x, action.y) {
-        (Some(x), Some(y)) => {
+    // 无坐标：仅聚焦窗口，让后续有坐标的步能落在正确窗口
+    let (x, y) = match (action.x, action.y) {
+        (Some(x), Some(y)) => (x, y),
+        _ => {
             backend.focus(&action.window_title);
-            match action.action_type.as_str() {
-                "click" => backend.click(x, y),
-                // 降级：drag 端点缺失，先以单击兜底，后续 Stage 2b 补终点
-                "drag" => backend.click(x, y),
-                "type" | "paste" => backend.type_text(action.text.as_deref().unwrap_or("")),
-                _ => {}
+            return;
+        }
+    };
+    backend.focus(&action.window_title);
+    match action.action_type.as_str() {
+        // click/drag：优先按控件锚点（Stage 2b 分辨率无关）；无锚点回退录制坐标。
+        "click" | "drag" => {
+            if let Some(anchor) = action.uia_anchor.as_deref() {
+                if !anchor.trim().is_empty() {
+                    backend.click_anchored(anchor, x, y);
+                    return;
+                }
+            }
+            backend.click(x, y);
+        }
+        "type" | "input" => backend.type_text(action.text.as_deref().unwrap_or("")),
+        // copy/paste 是语义化的组合键步骤：直接下发对应组合键
+        "copy" => backend.press_combo(action.hotkey_combo.as_deref().unwrap_or("Ctrl+C")),
+        "paste" => backend.press_combo(action.hotkey_combo.as_deref().unwrap_or("Ctrl+V")),
+        "hotkey" => {
+            if let Some(combo) = action.hotkey_combo.as_deref() {
+                if !combo.is_empty() {
+                    backend.press_combo(combo);
+                }
             }
         }
-        _ => {
-            // 无坐标：仅聚焦窗口，让后续有坐标的步能落在正确窗口
-            backend.focus(&action.window_title);
+        other => {
+            eprintln!("[replay] 未处理的 action_type: {}", other);
         }
     }
 }
@@ -93,6 +129,28 @@ pub fn run_replay(plan: &[ReplayAction], backend: &dyn ReplayBackend, step_delay
     }
 }
 
+/// ── Stage 3 审批闸门（纯函数，可单测）──
+
+/// 敏感性分类：
+/// - 敏感（需审批）：hotkey（任意组合键，可能触发系统级动作）、
+///   copy/paste（读写剪贴板，数据面）、drag（可能移动文件/触发破坏性操作）。
+/// - 非敏感：click/type/input 等确定性 UI 操作。
+pub fn classify_sensitivity(action_type: &str) -> bool {
+    matches!(action_type, "hotkey" | "copy" | "paste" | "drag")
+}
+
+/// 计划是否含敏感步骤（任一敏感即需审批）。
+pub fn plan_requires_approval(plan: &[ReplayAction]) -> bool {
+    plan.iter().any(|a| classify_sensitivity(&a.action_type))
+}
+
+/// 审批闸门是否生效。
+/// - mode="off"（默认）：永不上闸，保持向后兼容（MVP 原行为）。
+/// - mode="check" 且 计划需审批 且 未批准 → 上闸（不下发任何动作，仅返回 needs-approval）。
+pub fn approval_engaged(requires_approval: bool, mode: &str, approved: bool) -> bool {
+    mode == "check" && requires_approval && !approved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,22 +162,23 @@ mod tests {
             "CREATE TABLE steps (
                 id TEXT, recording_id TEXT, order_index INTEGER,
                 step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER,
-                window_title TEXT, description TEXT, after_screenshot_path TEXT
+                window_title TEXT, description TEXT, after_screenshot_path TEXT,
+                hotkey_combo TEXT, uia_anchor TEXT
             )",
             [],
         )
         .unwrap();
         let rows = [
-            (1i32, "click", 100i32, 200i32, "WPS x.xlsx", "", ""),
-            (2, "type", 0, 0, "WPS x.xlsx", "hello 世界", ""),
-            (3, "click", 0, 0, "WPS x.xlsx", "", "after.png"),
-            (4, "drag", 300, 400, "WPS x.xlsx", "", ""),
+            (1i32, "click", 100i32, 200i32, "WPS x.xlsx", "", "", ""),
+            (2, "type", 0, 0, "WPS x.xlsx", "hello 世界", "", ""),
+            (3, "click", 0, 0, "WPS x.xlsx", "", "after.png", ""),
+            (4, "drag", 300, 400, "WPS x.xlsx", "", "", ""),
         ];
-        for (i, (si, at, x, y, wt, d, a)) in rows.iter().enumerate() {
+        for (i, (si, at, x, y, wt, d, a, hk)) in rows.iter().enumerate() {
             conn.execute(
-                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params!["s{i}", "rec1", i as i32, *si, at, *x, *y, wt, d, a],
+                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params!["s{i}", "rec1", i as i32, *si, at, *x, *y, wt, d, a, hk, ""],
             )
             .unwrap();
         }
@@ -161,12 +220,12 @@ mod tests {
     fn test_no_coord_step_only_focuses() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL)",
+            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','')",
             [],
         )
         .unwrap();
@@ -177,5 +236,140 @@ mod tests {
         let acts = backend.actions.lock().unwrap().clone();
         assert_eq!(acts.len(), 1);
         assert!(acts[0].starts_with("focus(记事本)") && !acts[0].contains("click"));
+    }
+
+    #[test]
+    fn test_hotkey_press_combo_dispatched() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) \
+             VALUES ('s5','rec1',4,5,'hotkey',10,20,'记事本','',NULL,'Ctrl+S','')",
+            [],
+        )
+        .unwrap();
+        let plan = load_replay_plan(&conn, "rec1").unwrap();
+        assert_eq!(plan.len(), 5);
+        let hk = &plan[4];
+        assert_eq!(hk.action_type, "hotkey");
+        assert_eq!(hk.hotkey_combo.as_deref(), Some("Ctrl+S"));
+        let backend = crate::executor::backend::DryRunBackend::new();
+        run_action(hk, &backend);
+        let acts = backend.actions.lock().unwrap().clone();
+        assert_eq!(acts.len(), 2);
+        assert!(acts[0].starts_with("focus(记事本)"));
+        assert!(acts[1].contains("hotkey(Ctrl+S)"), "got: {}", acts[1]);
+    }
+
+    #[test]
+    fn test_copy_paste_press_combo() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) VALUES ('s6','rec1',5,6,'copy',0,0,'WPS','',NULL,'Ctrl+C','')", []).unwrap();
+        conn.execute("INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) VALUES ('s7','rec1',6,7,'paste',0,0,'WPS','',NULL,'Ctrl+V','')", []).unwrap();
+        let plan = load_replay_plan(&conn, "rec1").unwrap();
+        let backend = crate::executor::backend::DryRunBackend::new();
+        run_replay(&plan, &backend, 0);
+        let acts = backend.actions.lock().unwrap().clone();
+        assert!(acts.iter().any(|a| a.contains("hotkey(Ctrl+C)")), "acts: {:?}", acts);
+        assert!(acts.iter().any(|a| a.contains("hotkey(Ctrl+V)")), "acts: {:?}", acts);
+    }
+
+    #[test]
+    fn test_click_uses_anchor_when_present() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) \
+             VALUES ('s9','rec1',7,9,'click',100,200,'WPS','',NULL,'','{\"cls\":\"Button\",\"fx\":0.5,\"fy\":0.5,\"wx\":0.3,\"wy\":0.2}')",
+            [],
+        )
+        .unwrap();
+        let plan = load_replay_plan(&conn, "rec1").unwrap();
+        let step = plan.iter().find(|s| s.step_number == 9).unwrap();
+        assert!(step.uia_anchor.is_some());
+        let backend = crate::executor::backend::DryRunBackend::new();
+        run_action(step, &backend);
+        let acts = backend.actions.lock().unwrap().clone();
+        assert!(acts.iter().any(|a| a.starts_with("focus(WPS)")));
+        // 有锚点 → 走 click_anchored（带回退坐标），而非裸 click(100,200)
+        assert!(
+            acts.iter().any(|a| a.contains("click_anchored(100,200,")),
+            "acts: {:?}",
+            acts
+        );
+        assert!(
+            !acts.iter().any(|a| a.starts_with("click(100")),
+            "不应走裸 click，got: {:?}",
+            acts
+        );
+    }
+
+    #[test]
+    fn test_click_without_anchor_falls_back_to_coords() {
+        let conn = mem_db();
+        // mem_db 的 click 行 uia_anchor 为空
+        let plan = load_replay_plan(&conn, "rec1").unwrap();
+        let step = plan.iter().find(|s| s.action_type == "click").unwrap();
+        assert!(step.uia_anchor.is_none());
+        let backend = crate::executor::backend::DryRunBackend::new();
+        run_action(step, &backend);
+        let acts = backend.actions.lock().unwrap().clone();
+        assert!(
+            acts.iter().any(|a| a.starts_with("click(100")),
+            "无锚点应回退到裸 click，got: {:?}",
+            acts
+        );
+    }
+
+    #[test]
+    fn test_classify_sensitivity() {
+        assert!(!classify_sensitivity("click"));
+        assert!(!classify_sensitivity("type"));
+        assert!(!classify_sensitivity("input"));
+        assert!(classify_sensitivity("hotkey"));
+        assert!(classify_sensitivity("copy"));
+        assert!(classify_sensitivity("paste"));
+        assert!(classify_sensitivity("drag"));
+    }
+
+    #[test]
+    fn test_plan_requires_approval() {
+        let click = ReplayAction {
+            step_number: 1,
+            action_type: "click".into(),
+            x: Some(1),
+            y: Some(1),
+            window_title: "W".into(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: None,
+            uia_anchor: None,
+        };
+        let plan_only_click = vec![click.clone()];
+        assert!(!plan_requires_approval(&plan_only_click));
+
+        let mut mixed = plan_only_click;
+        mixed.push(ReplayAction {
+            step_number: 2,
+            action_type: "copy".into(),
+            x: None,
+            y: None,
+            window_title: "W".into(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: Some("Ctrl+C".into()),
+            uia_anchor: None,
+        });
+        assert!(plan_requires_approval(&mixed));
+    }
+
+    #[test]
+    fn test_approval_engaged() {
+        // 无可敏感步骤 → 不上闸
+        assert!(!approval_engaged(false, "check", false));
+        // 模式 off → 永不上闸（向后兼容默认行为）
+        assert!(!approval_engaged(true, "off", false));
+        // 已批准 → 上闸解除
+        assert!(!approval_engaged(true, "check", true));
+        // 含敏感 + check + 未批准 → 上闸
+        assert!(approval_engaged(true, "check", false));
     }
 }
