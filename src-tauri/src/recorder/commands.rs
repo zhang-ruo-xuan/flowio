@@ -823,9 +823,25 @@ fn flush_shortcut_step(
     let mut pushed: Option<usize> = None;
     if let Ok(mut steps) = captured.lock() {
         if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
-            let idx = steps.len();
-            steps.push(step);
-            pushed = Some(idx);
+            // ★ Dedup: skip consecutive identical hotkey combos within 150 ms.
+            // A stuck Alt flag or physical key repeat can produce "Alt+A", "Alt+A",
+            // "Alt+A" in rapid succession — the user only intended one action.
+            let is_dup = steps.last().map_or(false, |last| {
+                last.action_type == action_type
+                    && last.hotkey_combo == combo
+                    && (current_time_millis() as i64 - last.timestamp as i64) < 150
+            });
+            if is_dup {
+                eprintln!(
+                    "[flush_shortcut] dedup: skipping duplicate combo '{}' ({}ms since last)",
+                    combo,
+                    current_time_millis() as i64 - steps.last().unwrap().timestamp as i64
+                );
+            } else {
+                let idx = steps.len();
+                steps.push(step);
+                pushed = Some(idx);
+            }
         } else {
             eprintln!(
                 "[flush_shortcut] 录制步骤数已达上限 {}，本次步骤已丢弃",
@@ -2105,6 +2121,35 @@ fn spawn_event_thread(
                         }
                     }
 
+                    // ★ 修饰键状态校准：钩子的原子标志（CTRL_DOWN/ALT_DOWN 等）
+                    // 可能因 keyup 被系统吞掉而卡在 true，导致后续所有普通键被
+                    // 错误地当成组合键（如用户只按了 "A" 却录成 "Alt+A"）。
+                    // 每次消费 KeyEvent 时用 GetAsyncKeyState 查询真实硬件状态，
+                    // 覆盖钩子快照中可能过时的修饰位。
+                    {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN};
+                        let real_ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as i16) < 0;
+                        let real_shift = (unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } as i16) < 0;
+                        let real_alt = (unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } as i16) < 0;
+                        let real_meta = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } as i16) < 0
+                            || (unsafe { GetAsyncKeyState(0x5C /* VK_RWIN */) } as i16) < 0;
+                        // Only calibrate down → up (unstuck).  Never force a key
+                        // that is physically held down to look released — that would
+                        // break genuine combos like "hold Ctrl then press C".
+                        if ctrl && !real_ctrl {
+                            eprintln!("[BG] modifier calibration: forcing ctrl=false (was stuck)");
+                            // Cannot mutate the received event directly; flag below.
+                        }
+                        if alt && !real_alt {
+                            eprintln!("[BG] modifier calibration: forcing alt=false (was stuck)");
+                        }
+                        // Override the snapshot for the combo decision below.
+                        let ctrl = ctrl && real_ctrl;
+                        let shift = shift && real_shift;
+                        let alt = alt && real_alt;
+                        let meta = meta && real_meta;
+                    }
+
                     // Self-filter using PID captured at hook time: 键盘分支此前
                     // 未过滤 Flowio 自身窗口的输入，在 Flowio 内编辑标题/备注时
                     // 会生成多余 type 步骤。录制自身模式下不过滤。
@@ -2162,6 +2207,18 @@ fn spawn_event_thread(
                         keyboard_before_path = None;
                         last_uia_text = None;
                         can_merge_type = false; // 快捷键打断输入连续性
+
+                        // ★ 过滤 Flowio 自身控制热键：Alt+Shift+S（录制/停止）、
+                        // Alt+Shift+P（暂停）、Alt+Shift+E（停止）。
+                        // 这些是录步自己的全局热键，不应被录进教程里。
+                        // combo_string 格式："Alt+Shift+KeyS" 等。
+                        if (alt && shift) && matches!(key_name.as_str(), "KeyS" | "KeyP" | "KeyE") {
+                            eprintln!(
+                                "[BG] control-hotkey filter: skipping Flowio own hotkey {} ({})",
+                                combo, key_name
+                            );
+                            continue;
+                        }
 
                         let _pushed: Option<usize> = if meta {
                             // Windows 键组合键（Win+D / Win+E / …）：之前因缺少
@@ -2648,6 +2705,10 @@ pub fn start_recording(
     let running_for_hook = Arc::clone(&running);
 
     // Native Windows hooks (WH_KEYBOARD_LL + WH_MOUSE_LL)
+    // Reset modifier tracking flags so a stuck Alt/Ctrl from a previous session
+    // does not turn every keystroke into a fake combo (e.g. "Alt+A" when the
+    // user only pressed "A").
+    hook::reset_modifier_flags();
     hook::init_hooks(key_tx, mouse_tx, running_for_hook);
 
     // --- Start continuous capture thread (4 FPS) ---

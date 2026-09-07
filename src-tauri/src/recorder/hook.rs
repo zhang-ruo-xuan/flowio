@@ -76,6 +76,18 @@ static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 static META_DOWN: AtomicBool = AtomicBool::new(false); // Win key (Meta)
 
+/// Force-reset all modifier down-state flags.
+///
+/// Called at the start of every recording session so that a stuck flag from a
+/// previous session (e.g. Alt keyup swallowed by RegisterHotKey) does not
+/// poison every subsequent keystroke into an artificial "Alt+X" combo.
+pub fn reset_modifier_flags() {
+    CTRL_DOWN.store(false, Ordering::SeqCst);
+    SHIFT_DOWN.store(false, Ordering::SeqCst);
+    ALT_DOWN.store(false, Ordering::SeqCst);
+    META_DOWN.store(false, Ordering::SeqCst);
+}
+
 // ── VK → key name (matches rdev's Debug format for backwards compat) ──────
 
 fn vk_to_key_name(vk_code: u32) -> String {
@@ -401,7 +413,8 @@ pub fn init_hooks(
 
 #[cfg(test)]
 mod hook_tests {
-    use super::vk_to_key_name;
+    use super::{vk_to_key_name, reset_modifier_flags, CTRL_DOWN, SHIFT_DOWN, ALT_DOWN, META_DOWN};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn letters_map_to_key_prefix() {
@@ -475,5 +488,21 @@ mod hook_tests {
     fn unknown_vk_returns_unknown_format() {
         assert_eq!(vk_to_key_name(0xFF), "Unknown(255)");
         assert_eq!(vk_to_key_name(0x01), "Unknown(1)");
+    }
+
+    #[test]
+    fn reset_modifier_flags_clears_all() {
+        // Simulate stuck flags
+        CTRL_DOWN.store(true, Ordering::SeqCst);
+        SHIFT_DOWN.store(true, Ordering::SeqCst);
+        ALT_DOWN.store(true, Ordering::SeqCst);
+        META_DOWN.store(true, Ordering::SeqCst);
+
+        reset_modifier_flags();
+
+        assert!(!CTRL_DOWN.load(Ordering::SeqCst));
+        assert!(!SHIFT_DOWN.load(Ordering::SeqCst));
+        assert!(!ALT_DOWN.load(Ordering::SeqCst));
+        assert!(!META_DOWN.load(Ordering::SeqCst));
     }
 }
