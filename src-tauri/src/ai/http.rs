@@ -78,6 +78,18 @@ pub fn call_llm_with_tokens(
     };
 
     const MAX_RETRIES: usize = 4;
+    // 🔴 内置免费通道 Key 池轮换（2026-09-07）：智谱限流按账号计，单账号退避
+    //    重试只会继续撞 429（实测整轮扫描 5/5 步全 429）。仅当当前 Key 属于
+    //    内置池时轮换；用户自配 Key 绝不覆盖。
+    let key_pool: Vec<String> =
+        if cfg.provider.id == "flowio-free"
+            && crate::ai::commands::builtin_free_key_pool().iter().any(|k| *k == cfg.api_key)
+        {
+            crate::ai::commands::builtin_free_key_pool()
+        } else {
+            vec![cfg.api_key.clone()]
+        };
+    let mut key_idx = 0;
     let mut last_err = String::new();
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -85,9 +97,10 @@ pub fn call_llm_with_tokens(
             let delay = (3u64 << (attempt - 1)).min(24);
             std::thread::sleep(Duration::from_secs(delay));
         }
+        let active_key = &key_pool[key_idx];
         let response = match client
             .post(normalize_chat_url(&cfg.provider.base_url))
-            .header("Authorization", format!("Bearer {}", cfg.api_key))
+            .header("Authorization", format!("Bearer {}", active_key))
             .header("Content-Type", "application/json")
             .json(&request_body)
             .send()
@@ -105,6 +118,13 @@ pub fn call_llm_with_tokens(
             let body = response
                 .text()
                 .unwrap_or_else(|_| "<unable to read body>".to_string());
+            if key_pool.len() > 1 {
+                key_idx = (key_idx + 1) % key_pool.len();
+                crate::ai::commands::ai_dbg_log(&format!(
+                    "[AI] LLM 429，切换内置 Key 池（尾 {}）后重试",
+                    &key_pool[key_idx][key_pool[key_idx].len().saturating_sub(6)..]
+                ));
+            }
             last_err = classify_llm_error(429, &body, &cfg.provider.model);
             continue;
         }

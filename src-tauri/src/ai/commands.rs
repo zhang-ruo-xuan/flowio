@@ -183,6 +183,20 @@ pub fn get_default_provider(db: State<DbState>) -> Result<String, String> {
     Ok(result.unwrap_or_else(|| "flowio-free".to_string()))
 }
 
+/// 内置免费通道 Key 池（主备轮换，2026-09-07）。
+/// 智谱限流按账号计（1302 账户限流 / 1305 模型并发限流），单账号高峰期必撞 429。
+/// 主 Key = 新注册智谱账号；兜底 = 旧免费账号。与插件端 modelEnum.ts
+/// FLOWIO_FREE_KEY_POOL、服务端 /api/ai/asr ASR_KEYS、voice/asr.rs 同源同账号。
+pub(crate) const AI_BUILTIN_PRIMARY_KEY: &str = "054d0f9ec2f947a887b05e6ac45d7012.q3KSxvGcWLJAOMuD";
+pub(crate) const AI_BUILTIN_FALLBACK_KEY: &str = "874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U";
+
+pub(crate) fn builtin_free_key_pool() -> Vec<String> {
+    vec![
+        AI_BUILTIN_PRIMARY_KEY.to_string(),
+        AI_BUILTIN_FALLBACK_KEY.to_string(),
+    ]
+}
+
 /// Built-in free-tier AI configuration (Flowio free trial).
 ///
 /// Uses Zhipu GLM-4.6V-Flash (vision-capable) with a built-in API key.
@@ -196,7 +210,7 @@ pub(crate) fn get_builtin_free_config() -> AiConfig {
             base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions".into(),
             model: "glm-4.6v-flash".into(),
         },
-        api_key: "874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U".into(),
+        api_key: AI_BUILTIN_PRIMARY_KEY.into(),
     }
 }
 
