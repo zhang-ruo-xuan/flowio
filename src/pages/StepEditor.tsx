@@ -34,6 +34,7 @@ import {
 import { useNavigate, useParams } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import FileSaveDialog from "../components/FileSaveDialog";
 import AnnotationsOverlay from "../components/AnnotationsOverlay";
 import LoginSaveModal from "../components/LoginSaveModal";
@@ -1727,10 +1728,41 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   );
 
 /* ── Stage 2a：精准执行器（坐标确定性重放，非 LLM/视觉）── */
+  // 真实执行：执行前先把本应用窗口最小化让出屏幕（录制时本就这么做），
+  // 否则全屏盖在最上层，重放的坐标点击会全部落在 Flowio 自己窗口上、目标应用收不到。
+  const realExecute = useCallback(
+    async (approvalMode: string) => {
+      if (!recordingId) return;
+      const win = getCurrentWindow();
+      setExecuting(true);
+      setToast({ type: "success", message: "开始精准执行，请勿操作鼠标键盘…" });
+      try {
+        try { await win.minimize(); } catch { /* 忽略未能最小化 */ }
+        // 给 OS 一点时间把目标应用顶到前台，再下发动作
+        await new Promise((r) => setTimeout(r, 300));
+        const report = await invoke<any>("execute_recording", {
+          recordingId, dryRun: false, stepDelayMs: 300, approvalMode, approved: true,
+        });
+        const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
+        setToast({
+          type: fails > 0 ? "error" : "success",
+          message: `执行完成：${report.total} 步，校验异常 ${fails} 步`,
+        });
+      } catch (err) {
+        setToast({ type: "error", message: `执行失败：${String(err)}` });
+      } finally {
+        setExecuting(false);
+        try { await win.unminimize(); } catch { /* 忽略 */ }
+        try { await win.setFocus(); } catch { /* 忽略 */ }
+      }
+    },
+    [recordingId]
+  );
+
   const handleExecute = useCallback(
     async (dryRun: boolean) => {
       if (!recordingId) { setToast({ type: "error", message: "未找到当前录制" }); return; }
-      // 演练（dry-run）只生成动作序列、不操作桌面，无需审批
+      // 演练（dry-run）只生成动作序列、不操作桌面，无需最小化、无需审批
       if (dryRun) {
         setExecuting(true);
         setToast({ type: "success", message: "开始演练（dry-run，不操作桌面）…" });
@@ -1754,48 +1786,25 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       try {
         const preview = await invoke<any>("preview_replay", { recordingId });
         if (!preview.requiresApproval) {
-          const report = await invoke<any>("execute_recording", {
-            recordingId, dryRun: false, stepDelayMs: 300, approvalMode: "off",
-          });
-          const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
-          setToast({
-            type: fails > 0 ? "error" : "success",
-            message: `执行完成：${report.total} 步，校验异常 ${fails} 步`,
-          });
+          await realExecute("off");
         } else {
           setExecuting(false); // 闸门未过，不放行；弹窗等待用户确认
           setApprovalPlan(preview);
-          return;
         }
       } catch (err) {
         setToast({ type: "error", message: `预览执行计划失败：${String(err)}` });
         setExecuting(false);
       }
     },
-    [recordingId]
+    [recordingId, realExecute]
   );
 
   // Stage 3：用户在审批闸门里点「批准并执行」后，才真实下发桌面动作
   const confirmApproval = useCallback(async () => {
     if (!recordingId || !approvalPlan) return;
     setApprovalPlan(null);
-    setExecuting(true);
-    setToast({ type: "success", message: "已批准，开始精准执行，请勿操作鼠标键盘…" });
-    try {
-      const report = await invoke<any>("execute_recording", {
-        recordingId, dryRun: false, stepDelayMs: 300, approvalMode: "check", approved: true,
-      });
-      const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
-      setToast({
-        type: fails > 0 ? "error" : "success",
-        message: `执行完成：${report.total} 步，校验异常 ${fails} 步`,
-      });
-    } catch (err) {
-      setToast({ type: "error", message: `执行失败：${String(err)}` });
-    } finally {
-      setExecuting(false);
-    }
-  }, [recordingId, approvalPlan]);
+    await realExecute("check");
+  }, [recordingId, approvalPlan, realExecute]);
 
   // Stage 3：打开执行历史面板时拉取审计记录
   const loadAudit = useCallback(async () => {

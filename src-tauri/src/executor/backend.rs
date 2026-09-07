@@ -74,7 +74,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowTextW, IsWindowVisible, SetCursorPos,
-    SetForegroundWindow,
+    SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
 struct EnumCtx<'a> {
@@ -115,10 +115,20 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: windows::Win32::
 }
 
 fn focus_window(title: &str) -> bool {
-    if let Some(hwnd) = find_window(title) {
-        unsafe { SetForegroundWindow(hwnd).as_bool() }
-    } else {
-        false
+    let t = title.trim();
+    // 全屏录制无目标窗口标题：不做焦点操作，避免空串误匹配到 Flowio 自身窗口。
+    // 执行前前端已把 Flowio 最小化让出屏幕，目标应用自然处于前台，点击坐标可直接命中。
+    if t.is_empty() {
+        return false;
+    }
+    let Some(hwnd) = find_window(t) else {
+        return false;
+    };
+    unsafe {
+        // 目标若被最小化则先恢复，否则 SetForegroundWindow 无权置顶；
+        // 用户刚点过「执行」(近期有输入)，前台锁超时内 SetForegroundWindow 一般可成功。
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd).as_bool()
     }
 }
 
