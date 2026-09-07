@@ -183,7 +183,7 @@ fn foreground_title() -> String {
 
 /// 重放诊断日志：每步记录聚焦结果，供「重放鼠标在动但文件没生成」类问题远程定位。
 /// 仅在重放时写入，频率 = 每步一次（非录制期每按键），且只在执行真实桌面动作时触发，开销可忽略。
-fn replay_log(line: &str) {
+pub(crate) fn replay_log(line: &str) {
     use std::io::Write;
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -198,6 +198,7 @@ fn replay_log(line: &str) {
 
 fn focus_window(title: &str) -> bool {
     let t = title.trim();
+    replay_log(&format!("[focus] >>> enter title='{}'", t));
     // 解析目标句柄：有标题按子串找（带重试，等对话框就绪）；无标题/找不到则复用上一次成功聚焦的窗口。
     let candidate = if t.is_empty() {
         None
@@ -212,6 +213,10 @@ fn focus_window(title: &str) -> bool {
         .filter(|h| unsafe { IsWindowVisible(*h).as_bool() });
     let hwnd = candidate.or(cached);
     let Some(hwnd) = hwnd else {
+        replay_log(&format!(
+            "[focus] <<< NO WINDOW for title='{}' (no candidate & no cached) -> focus SKIPPED",
+            t
+        ));
         return false;
     };
     let ok = force_foreground(hwnd);

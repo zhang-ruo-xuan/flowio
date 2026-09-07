@@ -82,6 +82,15 @@ pub fn load_replay_plan(
 /// - hotkey → 按结构化组合键下发（如 Alt+Tab / Win+D）；
 /// - 未知 action_type 不再静默丢弃，记录日志便于排查。
 pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
+    crate::executor::backend::replay_log(&format!(
+        "[run_action] type={} title='{}' text={:?} combo={:?} xy=({:?},{:?})",
+        action.action_type,
+        action.window_title,
+        action.text,
+        action.hotkey_combo,
+        action.x,
+        action.y
+    ));
     // 无坐标：仅聚焦窗口，让后续有坐标的步能落在正确窗口
     let (x, y) = match (action.x, action.y) {
         (Some(x), Some(y)) => (x, y),
