@@ -1728,22 +1728,25 @@ mod tests {
         .expect("open real db copy");
         crate::db::init_db(&conn); // 幂等迁移：补出 is_variable / param_name 列
 
-        let rid: String = conn
-            .query_row(
-                "SELECT id FROM recordings WHERE total_steps > 0 AND id IN \
-                 (SELECT DISTINCT recording_id FROM steps WHERE action_type = 'type') \
-                 ORDER BY created_at DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .or_else(|_| {
-                conn.query_row(
-                    "SELECT id FROM recordings WHERE total_steps > 0 ORDER BY created_at DESC LIMIT 1",
+        let rid: String = match std::env::var("FLOWIO_REAL_REC_ID") {
+            Ok(id) if !id.trim().is_empty() => id.trim().to_string(),
+            _ => conn
+                .query_row(
+                    "SELECT id FROM recordings WHERE total_steps > 0 AND id IN \
+                     (SELECT DISTINCT recording_id FROM steps WHERE action_type = 'type') \
+                     ORDER BY created_at DESC LIMIT 1",
                     [],
                     |r| r.get(0),
                 )
-            })
-            .expect("pick recording");
+                .or_else(|_| {
+                    conn.query_row(
+                        "SELECT id FROM recordings WHERE total_steps > 0 ORDER BY created_at DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                })
+                .expect("pick recording"),
+        };
         let (title, app_name, total_steps, created_at): (String, String, i32, String) = conn
             .query_row(
                 "SELECT title, app_name, total_steps, created_at FROM recordings WHERE id = ?1",

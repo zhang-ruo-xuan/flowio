@@ -420,6 +420,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   const [toolsOpen, setToolsOpen] = useState(false);
   const [translateOpen, setTranslateOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [executing, setExecuting] = useState(false);
   const [exportProgress, setExportProgress] = useState<string | null>(null);
   const [redacting, setRedacting] = useState(false);
   // ★ v310: 脱敏结果弹窗（带 ×，不点不消失；与插件端对齐）
@@ -1705,6 +1706,35 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     [recordingId, showSaveDialog, stepViewCropped]
   );
 
+/* ── Stage 2a：精准执行器（坐标确定性重放，非 LLM/视觉）── */
+  const handleExecute = useCallback(
+    async (dryRun: boolean) => {
+      if (!recordingId) { setToast({ type: "error", message: "未找到当前录制" }); return; }
+      setExecuting(true);
+      setToast({
+        type: "info",
+        message: dryRun ? "开始演练（dry-run，不操作桌面）…" : "开始精准执行，请勿操作鼠标键盘…",
+      });
+      try {
+        const report = await invoke<any>("execute_recording", {
+          recordingId,
+          dryRun,
+          stepDelayMs: 300,
+        });
+        const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
+        setToast({
+          type: fails > 0 ? "error" : "success",
+          message: `执行完成：${report.total} 步，校验异常 ${fails} 步${dryRun ? "（演练）" : ""}`,
+        });
+      } catch (err) {
+        setToast({ type: "error", message: `执行失败：${String(err)}` });
+      } finally {
+        setExecuting(false);
+      }
+    },
+    [recordingId]
+  );
+
 /* ── Publish to website ──────────────────────────────────── */
 
 // SHA-256 hex（与网站后端 content_hash 同口径），用于发布前按内容兜底查已存在教程
@@ -2309,6 +2339,26 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
             })}
           </div>
         )}
+      </div>
+      <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+        <button
+          onClick={() => handleExecute(false)}
+          disabled={executing}
+          data-tip={"精准执行\n按录制时的屏幕坐标确定性重放（非 AI 猜点），在目标窗口自动点选；每步后截图校验"}
+          style={{ background: "transparent", border: "1px solid #3fb950", color: "#3fb950", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+        >
+          ▶ 执行{executing ? "中…" : ""}
+        </button>
+      </div>
+      <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+        <button
+          onClick={() => handleExecute(true)}
+          disabled={executing}
+          data-tip={"演练（dry-run）\n只生成动作序列、不操作桌面，用于验证重放逻辑"}
+          style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+        >
+          演练
+        </button>
       </div>
       {!previewMode && (
         <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
