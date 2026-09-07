@@ -1728,7 +1728,8 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   );
 
 /* ── Stage 2a：精准执行器（坐标确定性重放，非 LLM/视觉）── */
-  // 真实执行：执行前先把本应用窗口最小化让出屏幕（录制时本就这么做），
+  // 真实执行：执行前先把本应用窗口彻底隐藏让出屏幕（hide 比 minimize 更彻底，
+  // 避免某些系统上最小化失效导致窗口仍挡在前面、点击落到 Flowio 自身），
   // 否则全屏盖在最上层，重放的坐标点击会全部落在 Flowio 自己窗口上、目标应用收不到。
   const realExecute = useCallback(
     async (approvalMode: string) => {
@@ -1737,22 +1738,23 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       setExecuting(true);
       setToast({ type: "success", message: "开始精准执行，请勿操作鼠标键盘…" });
       try {
-        try { await win.minimize(); } catch { /* 忽略未能最小化 */ }
+        try { await win.hide(); } catch { /* 忽略未能隐藏 */ }
         // 给 OS 一点时间把目标应用顶到前台，再下发动作
         await new Promise((r) => setTimeout(r, 300));
         const report = await invoke<any>("execute_recording", {
           recordingId, dryRun: false, stepDelayMs: 300, approvalMode, approved: true,
         });
         const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
+        const panics = (report.outcomes || []).filter((o: any) => o.status === "step-panic").length;
         setToast({
-          type: fails > 0 ? "error" : "success",
-          message: `执行完成：${report.total} 步，校验异常 ${fails} 步`,
+          type: fails > 0 || panics > 0 ? "error" : "success",
+          message: `执行完成：${report.total} 步，校验异常 ${fails} 步${panics > 0 ? `，异常步 ${panics} 步` : ""}`,
         });
       } catch (err) {
         setToast({ type: "error", message: `执行失败：${String(err)}` });
       } finally {
         setExecuting(false);
-        try { await win.unminimize(); } catch { /* 忽略 */ }
+        try { await win.show(); } catch { /* 忽略 */ }
         try { await win.setFocus(); } catch { /* 忽略 */ }
       }
     },
