@@ -56,3 +56,4 @@ web-viewer/
 _trash_flowio/
 verify_screen*.png
 verify_win.png
+vite.config.js

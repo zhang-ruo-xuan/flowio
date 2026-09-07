@@ -77,7 +77,8 @@ struct ExportStep {
 /// Export a recording to the specified format.
 ///
 /// Supported formats: `"html"`, `"markdown"`, `"pdf"`, `"docx"` (or `"word"`), `"txt"`, `"long"`, `"skill"`.
-/// `"skill"` = Agent Skills 1.0（SKILL.md）：有变量标记步骤时自动出变量版，否则固定版。
+/// `"skill"` = Agent Skills 1.0（SKILL.md）：有变量标记步骤时自动出变量版，否则固定版；
+/// 截图捆绑到同目录 screenshots/ 并在步骤下引用。
 /// If `output_path` is provided, write to that exact path; otherwise auto-generate
 /// a path under the `output/` directory.
 /// Returns the absolute path to the generated file.
@@ -222,11 +223,9 @@ pub(crate) fn export_recording_inner(
         }
         "skill" => {
             // Agent Skills 1.0（SKILL.md）：有任何变量标记步骤 → 变量版（##Inputs + {{param}}），
-            // 否则固定版（sample 写死）。机看以步骤指令为主，不含截图。
-            let content = export_skill_md(&recording, &steps);
-            std::fs::write(&path, content)
-                .map_err(|e| format!("Failed to write SKILL.md: {}", e))?;
-            Ok(path.to_string_lossy().to_string())
+            // 否则固定版（sample 写死）。固定/变量都是正经 skill（总纲 §4.1）。
+            // 截图捆绑到 SKILL.md 同目录 screenshots/ 并在步骤下引用——机看版核心差异。
+            export_skill_bundle(&path, &recording, &steps, &crop_set)
         }
         "long" => {
             export_long_image(&recording, &steps, &path, &crop_set)?;
@@ -859,9 +858,12 @@ fn yaml_oneline(s: &str) -> String {
 ///   frontmatter `description` 声明所需参数，`## Inputs` 列出参数与示例值，
 ///   步骤体把 sample（type 步骤的 description 即输入值）替换为 `{{param_name}}` 占位符。
 /// - **固定版**：无变量标记时输出——sample 原样写死，纯人读/机看皆可的固定流程。
+///   固定 skill 与变量 skill 是同等产物（总纲 §4.1），都走本导出器。
 ///
-/// 机看以步骤指令为主，不含截图（与 markdown 导出同策略）。
-fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep]) -> String {
+/// `images`：(步骤号, 相对路径)。非空时在对应步骤下插入截图引用——
+/// 截图由 `export_skill_bundle` 预先复制到 SKILL.md 同目录（Agent Skills 规范
+/// 支持 bundled resources），多模态执行层看图定位，这是机看版区别于 MD 导出的核心。
+fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep], images: &[(i32, String)]) -> String {
     // 收集变量步骤：(step, param_name, sample)
     let variables: Vec<(&ExportStep, String, String)> = steps
         .iter()
@@ -893,6 +895,8 @@ fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep]) -> String 
     // ── 步骤体 ──
     let var_by_step: std::collections::HashMap<&str, &str> =
         variables.iter().map(|(s, p, _)| (s.id.as_str(), p.as_str())).collect();
+    let img_by_step: std::collections::HashMap<i32, &str> =
+        images.iter().map(|(n, p)| (*n, p.as_str())).collect();
     let mut body = String::new();
     for s in steps {
         let param = var_by_step.get(s.id.as_str()).copied();
@@ -932,6 +936,9 @@ fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep]) -> String 
         if !s.tip.trim().is_empty() {
             body.push_str(&format!("   > 提示：{}\n", s.tip.trim()));
         }
+        if let Some(rel) = img_by_step.get(&s.step_number) {
+            body.push_str(&format!("   ![步骤 {} 截图]({})\n", s.step_number, rel));
+        }
     }
 
     // ── 组装 ──
@@ -959,6 +966,53 @@ fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep]) -> String 
     out.push_str("## Steps\n\n");
     out.push_str(&body);
     out
+}
+
+/// SKILL 导出落盘：把每步截图（按需裁剪）复制到 SKILL.md 同目录 `screenshots/`，
+/// 再生成带截图引用的 SKILL.md。截图缺失的步骤跳过、整体不因个别图片失败而失败。
+/// 这是「机看」版与 MD 导出的核心差异：执行层拿到的是 可读指令 + 可视定位 的捆绑包。
+fn export_skill_bundle(
+    output_path: &std::path::Path,
+    recording: &ExportRecording,
+    steps: &[ExportStep],
+    crop_set: &std::collections::HashSet<&str>,
+) -> Result<String, String> {
+    let parent = output_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let ss_dir = parent.join("screenshots");
+    let mut images: Vec<(i32, String)> = Vec::new();
+    for s in steps {
+        if s.screenshot_path.is_empty() {
+            continue;
+        }
+        let raw = match std::fs::read(&s.screenshot_path) {
+            Ok(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+        let bytes = if crop_set.contains(s.id.as_str()) {
+            maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type).0
+        } else {
+            raw
+        };
+        std::fs::create_dir_all(&ss_dir)
+            .map_err(|e| format!("Failed to create screenshots directory: {}", e))?;
+        // 扩展名跟随源文件（录制截图实为 jpg），缺省回退 png
+        let ext = std::path::Path::new(&s.screenshot_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .filter(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp"))
+            .unwrap_or_else(|| "png".to_string());
+        let fname = format!("step-{:02}.{}", s.step_number, ext);
+        if std::fs::write(ss_dir.join(&fname), &bytes).is_ok() {
+            images.push((s.step_number, format!("screenshots/{}", fname)));
+        }
+    }
+    let content = export_skill_md(recording, steps, &images);
+    std::fs::write(output_path, content)
+        .map_err(|e| format!("Failed to write SKILL.md: {}", e))?;
+    Ok(output_path.to_string_lossy().to_string())
 }
 
 // ── TXT export ────────────────────────────────────────────────
@@ -1659,7 +1713,8 @@ mod tests {
     /// 真实库 smoke（#[ignore]，手动跑）：把 `%APPDATA%/com.flowio.app/flowio.db`
     /// 复制到 `D:/tmp/flowio_real.db` 后执行
     /// `cargo test --lib skill_md_real_db_smoke -- --ignored --nocapture`，
-    /// 会导出固定版/变量版两份 SKILL.md 到 `D:/tmp/skill_*.md`。
+    /// 会导出固定版/变量版两个捆绑包到 `D:/tmp/skill_fixed/`、`D:/tmp/skill_variable/`
+    /// （SKILL.md + screenshots/ 截图目录）。
     /// 顺带验证迁移幂等：对真实库副本跑 init_db 后再读新列。
     #[test]
     #[ignore]
@@ -1713,7 +1768,7 @@ mod tests {
                 title: row.get(4)?,
                 description: row.get(5)?,
                 tip: row.get(6)?,
-                screenshot_path: String::new(),
+                screenshot_path: row.get(7)?,
                 x: row.get(8)?,
                 y: row.get(9)?,
                 crop_w: row.get(10)?,
@@ -1727,19 +1782,29 @@ mod tests {
         }
         let recording = ExportRecording { id: rid.clone(), title: title.clone(), app_name, total_steps, created_at };
 
-        // 固定版
-        let fixed = export_skill_md(&recording, &steps);
-        std::fs::write(r"D:\tmp\skill_fixed.md", &fixed).unwrap();
-        println!("== fixed ==\n{}", &fixed[..fixed.len().min(600)]);
+        // 固定版（走 bundle：截图复制到 skill_fixed/screenshots/ 并在步骤下引用）
+        let fixed = export_skill_bundle(
+            std::path::Path::new(r"D:\tmp\skill_fixed\SKILL.md"),
+            &recording,
+            &steps,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        println!("== fixed ==\n{}", &fixed);
 
         // 变量版：把第一个输入步骤标为变量（模拟作者在编辑器里点「变量」）
         if let Some(s) = steps.iter_mut().find(|s| s.action_type == "type") {
             s.is_variable = true;
             s.param_name = "order_id".into();
         }
-        let variable = export_skill_md(&recording, &steps);
-        std::fs::write(r"D:\tmp\skill_variable.md", &variable).unwrap();
-        println!("== variable ==\n{}", &variable[..variable.len().min(900)]);
+        let variable = export_skill_bundle(
+            std::path::Path::new(r"D:\tmp\skill_variable\SKILL.md"),
+            &recording,
+            &steps,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        println!("== variable ==\n{}", &variable);
     }
 
     /// 本文件源码，供静态防线扫描（编译期嵌入，改完文件 cargo test 立即生效）。
@@ -2256,7 +2321,7 @@ mod tests {
             skill_step(2, "type", "在「订单号」中输入", "SO20260906-001", false, ""),
             skill_step(3, "click", "点击导出按钮", "", false, ""),
         ];
-        let md = export_skill_md(&skill_recording(), &steps);
+        let md = export_skill_md(&skill_recording(), &steps, &[]);
         assert!(md.starts_with("---\n"));
         assert!(md.contains("name: flowio-skill")); // 中文标题压不出 ASCII → 回退
         assert!(!md.contains("## Inputs")); // 无变量 → 固定版
@@ -2272,7 +2337,7 @@ mod tests {
             skill_step(2, "type", "在「订单号」中输入", "SO20260906-001", true, "order_id"),
             skill_step(3, "type", "在「月份」中输入", "3", true, "month"),
         ];
-        let md = export_skill_md(&skill_recording(), &steps);
+        let md = export_skill_md(&skill_recording(), &steps, &[]);
         assert!(md.contains("## Inputs"));
         assert!(md.contains("- `order_id` — 示例值：`SO20260906-001`（来自步骤 2）"));
         assert!(md.contains("- `month` — 示例值：`3`（来自步骤 3）"));
@@ -2287,10 +2352,31 @@ mod tests {
             skill_step(1, "type", "输入", "abc", true, "  order_id  "),
             skill_step(2, "type", "输入", "xyz", true, ""),
         ];
-        let md = export_skill_md(&skill_recording(), &steps);
+        let md = export_skill_md(&skill_recording(), &steps, &[]);
         assert!(md.contains("`order_id`"));
         assert!(!md.contains("{{}}"));
         assert!(md.contains("输入 `xyz`")); // 空参数名的步骤按固定值渲染
+    }
+
+    #[test]
+    fn test_skill_md_image_references() {
+        // 捆绑截图：images 非空 → 对应步骤下插入相对路径引用；未提供的步骤不插
+        let steps = vec![
+            skill_step(1, "click", "打开订单表", "", false, ""),
+            skill_step(2, "type", "在「订单号」中输入", "SO20260906-001", false, ""),
+            skill_step(3, "click", "点击导出按钮", "", false, ""),
+        ];
+        let images = vec![
+            (1, "screenshots/step-01.png".to_string()),
+            (3, "screenshots/step-03.png".to_string()),
+        ];
+        let md = export_skill_md(&skill_recording(), &steps, &images);
+        assert!(md.contains("![步骤 1 截图](screenshots/step-01.png)"));
+        assert!(md.contains("![步骤 3 截图](screenshots/step-03.png)"));
+        assert!(!md.contains("step-02"));
+        // 空列表 → 纯文本（旧行为），不出任何图片引用
+        let md_plain = export_skill_md(&skill_recording(), &steps, &[]);
+        assert!(!md_plain.contains("!["));
     }
 
     #[test]

@@ -62,7 +62,7 @@ const EXPORT_TIPS: Record<string, string> = {
   docx: "导出 Word 文档，方便交给同事继续编辑排版",
   pdf: "导出 PDF，适合直接发给别人看或打印",
   markdown: "导出纯 Markdown 文本文件（不含图片），方便贴到笔记/博客或交给 AI 继续编辑",
-  skill: "导出 Agent Skills 标准的 SKILL.md，交给 CodeBuddy / Claude 等 AI 助手按步骤自动执行；标记了变量的步骤会变成可填参数",
+  skill: "导出 Agent Skills 标准的 SKILL.md（截图一并打包到 screenshots/ 目录），交给 CodeBuddy / Claude 等 AI 助手看图执行；标记了变量的步骤会变成可填参数",
   txt: "导出纯文本，只保留步骤标题和说明，适合快速复制粘贴",
   long: "把所有步骤的截图拼成一张长图，适合发长微博 / 朋友圈或直接查看",
 };
