@@ -584,6 +584,29 @@ fn standalone_key_label(key: &str) -> Option<String> {
     }
 }
 
+/// 无修饰键的「编辑/导航键」中，此前会被当成空白字符静默丢弃、但明显是一步
+/// 操作的键。覆盖保存对话框里常用的方向键（在文件列表上下选择）、Backspace/
+/// Delete（改文件名）、Home/End/PageUp/PageDown（跳转）——这些键在重放时若丢失，
+/// 会导致「在对话框里选错文件 / 文件名删错字符」等，间接造成目标文件没生成。
+/// 统一补成快捷键步骤，replay 端 press_combo 已能映射出对应虚拟键。
+fn action_key_label(key: &str) -> Option<String> {
+    let label = match key {
+        "ArrowUp" => "↑ 上移",
+        "ArrowDown" => "↓ 下移",
+        "ArrowLeft" => "← 左移",
+        "ArrowRight" => "→ 右移",
+        "Backspace" => "Backspace 删除",
+        "Delete" => "Delete 删除",
+        "Home" => "Home 行首",
+        "End" => "End 行尾",
+        "PageUp" => "PageUp 上翻页",
+        "PageDown" => "PageDown 下翻页",
+        "Insert" => "Insert 切换插入",
+        _ => return None,
+    };
+    Some(label.to_string())
+}
+
 /// 裁剪框最小尺寸（px）。比这更小的元素矩形会被撑大，否则裁出来是一条
 /// 看不清内容的窄带。
 const CROP_MIN_W: i32 = 420;
@@ -2429,6 +2452,7 @@ fn spawn_event_thread(
                     // PrintScreen 截图这类操作。这里补成快捷键步骤（先 flush）。
                     if let Some(label) = function_key_label(&key_name)
                         .or_else(|| standalone_key_label(&key_name))
+                        .or_else(|| action_key_label(&key_name))
                     {
                         if !accumulated_keys.is_empty() {
                             let typed = std::mem::take(&mut accumulated_keys);
