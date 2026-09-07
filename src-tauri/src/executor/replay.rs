@@ -154,6 +154,7 @@ pub fn approval_engaged(requires_approval: bool, mode: &str, approved: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::backend::DryRunBackend;
     use rusqlite::Connection;
 
     fn mem_db() -> Connection {
@@ -371,5 +372,61 @@ mod tests {
         assert!(!approval_engaged(true, "check", true));
         // 含敏感 + check + 未批准 → 上闸
         assert!(approval_engaged(true, "check", false));
+    }
+
+    /// 锁定「创建文件」重放编排：Ctrl+S（hotkey，聚焦主窗口）→ 输文件名（type，聚焦"另存为"）
+    /// → 回车（hotkey）。这是「重放没建出目标文件」的核心复现路径；若导航键/输入步的聚焦或
+    /// 组合键下发被回退，该测试立即失败，防止静默回归。
+    #[test]
+    fn test_save_as_replay_sequence_locks_create_file_flow() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT)",
+            [],
+        )
+        .unwrap();
+        let rows = [
+            (1i32, "hotkey", 0i32, 0i32, "无标题 - 记事本", "Ctrl+S 保存", "Ctrl+S"),
+            (2i32, "type", 0i32, 0i32, "另存为", "test.txt", ""),
+            (3i32, "hotkey", 0i32, 0i32, "另存为", "Enter 确认", "Enter"),
+        ];
+        for (i, (si, at, x, y, wt, d, hk)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                rusqlite::params!["s{i}", "rec1", i as i32, *si, at, *x, *y, wt, d, "", hk, ""],
+            )
+            .unwrap();
+        }
+        let plan = load_replay_plan(&conn, "rec1").unwrap();
+        let backend = DryRunBackend::new();
+        for action in &plan {
+            run_action(action, &backend);
+        }
+        let acts = backend.actions.lock().unwrap().clone();
+        assert!(
+            acts.iter().any(|a| a == "focus(无标题 - 记事本)"),
+            "Ctrl+S 步应先聚焦记事本主窗口，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().any(|a| a == "hotkey(Ctrl+S)"),
+            "Ctrl+S 应以组合键下发，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().any(|a| a == "focus(另存为)"),
+            "输文件名步应聚焦另存为对话框，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().any(|a| a.starts_with("type(")),
+            "应注入文件名文本，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().any(|a| a == "hotkey(Enter)"),
+            "回车确认应以组合键下发（导航键已落步），acts={:?}",
+            acts
+        );
     }
 }
