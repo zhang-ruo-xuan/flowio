@@ -1,99 +1,55 @@
 # 录步 Flowio · 桌面端
 
-> 录一遍操作，AI 自动生成带截图的操作指南。
+> 软件操作教程，录一遍就好。
 
 [![Platform](https://img.shields.io/badge/platform-Windows_10+-blue?logo=windows)](https://gitee.com/zhangruoxuan/flowio)
 [![Release](https://img.shields.io/badge/release-v0.2.0-orange)](https://gitee.com/zhangruoxuan/flowio/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**录步 Flowio** 是一款 Windows 桌面操作录制工具。录制任意软件的操作过程，边录边说话自动转成文字讲解，AI 自动标注每一步标题和描述，一键导出多格式文档或发布为在线教程。
+给同事讲一遍怎么操作，第二天又有人问同样的问题？把操作流程写成文档，截图、编号、打字要花一下午？
+
+**录步 Flowio** 把这件事变成「录一遍」：打开录制，正常操作软件，需要讲解的地方直接说话——录完后每一步的截图、文字说明自动就位，一份带图带文的操作指南直接生成。
 
 [产品页](https://flowio.cn) · [下载安装](https://flowio.cn/download) · [浏览器扩展](https://gitee.com/zhangruoxuan/flowio-extension)
 
 ---
 
-## 为什么用 Flowio
+## 适合谁用
 
-| 传统方式 | Flowio |
-|---------|--------|
-| 手动截图 → 粘贴到 Word → 逐张标注 | 录一遍 → AI 自动标注 → 导出 |
-| 每一步都要打字写说明 | 边操作边说，语音自动转文字 |
-| 英文软件教程标注中文困难 | 原生中文视觉 AI，界面术语识别精准 |
-| 截图里的手机号、密码不敢直接发 | 自动扫描脱敏，模糊或打码 |
-| 更新教程需要全部重做 | 修改单步即可，其他不变 |
-| 数据存云端，担心泄露 | 完全本地，数据在本地 SQLite |
-
----
-
-## 功能
-
-| 功能 | 说明 |
+| 场景 | 用 Flowio 怎么做 |
 |------|------|
-| **全屏 / 指定软件录制** | 录制整个屏幕或只录某个软件窗口，点击与输入自动截图 |
-| **语音转文字** | 录制时对着麦克风讲解，按步骤自动转写并 AI 纠错（支持自定义热词） |
-| **AI 智能标注** | 智谱 GLM 视觉模型理解每步截图，自动生成标题和描述 |
-| **可视化编辑器** | 全图 / 裁图双视图、区域裁剪、批注、拖拽排序、AI 精简冗余步骤 |
-| **隐私脱敏** | 扫描截图中身份证号、手机号、密钥等敏感信息，一键模糊或实心打码 |
-| **AI 翻译** | 教程一键翻译为多语言，面向不同受众分发 |
-| **多格式导出** | PDF / HTML / Markdown / Word，排版完整可直接分享 |
-| **一键发布** | 上传到 [flowio.cn](https://flowio.cn) 生成在线教程链接 |
+| **新员工培训** | 入职要学的系统操作，录一遍就是培训手册，新人照着做即可 |
+| **内部流程 SOP** | 报销、审批、下单这些固定流程，做成图文指南挂在知识库里 |
+| **客服与售后** | 常见问题操作指引，回复客户时直接甩一个教程链接 |
+| **教程创作者** | 写软件教程不用再一张张截图配文字，录完即成稿 |
+| **给客户演示** | 产品操作说明随录随出，PDF / Word / 在线链接随心分享 |
 
 ---
 
-## 快速开始
+## 它能做什么
 
-前往 [Releases](https://gitee.com/zhangruoxuan/flowio/releases) 或[官网下载页](https://flowio.cn/download)获取安装包。
-
-- 支持 Windows 10+ (x64)
-- 双击安装即可
-
-### 三步上手
-
-1. **录制** — 点击录制按钮，正常操作你的软件，需要讲解时直接说话
-2. **AI 生成** — 录制结束，AI 自动标注每一步，语音已转为文字
-3. **导出 / 发布** — 导出 PDF / Word / Markdown，或一键发布到 flowio.cn
+- **边操作边讲解** —— 鼠标点到哪截到哪，说话自动转成文字说明，不用打字
+- **AI 帮你写文档** —— 每一步的标题和描述自动生成，口语化的讲解自动润色成书面表达
+- **敏感信息放心发** —— 截图里的手机号、身份证号、账号密码自动识别，一键模糊或打码
+- **做完即可分享** —— 一键导出 PDF / Word / Markdown，或发布成网页链接发给任何人
+- **更新不用返工** —— 流程变了？只需重录改动的那一步，其他步骤原样保留
+- **数据留在本机** —— 截图和内容都存在自己电脑上，不经过任何服务器
 
 ---
 
-## 本地开发
+## 三步上手
 
-```bash
-# 前置要求：Node 20+、Rust 1.77+（MSVC 工具链）
-pnpm install
+1. **录制** —— 点击录制按钮，正常操作你的软件，需要讲解时直接说话
+2. **自动成稿** —— 录制结束，AI 整理出每一步的截图和说明，可随意修改
+3. **导出分享** —— 导出 PDF / Word，或发布成在线教程链接
 
-npm run tauri dev      # 开发模式运行
-npm run tauri build    # 构建安装包
-npm run check:geo      # 裁图几何一致性检查
-```
+> 支持 Windows 10+，前往 [Releases](https://gitee.com/zhangruoxuan/flowio/releases) 或[官网下载页](https://flowio.cn/download)安装。
 
 ---
 
-## 技术栈
+## 反馈
 
-| 层 | 技术 |
-|---|------|
-| 桌面框架 | Tauri 2 |
-| 前端 | React 19 + TypeScript + Tailwind CSS |
-| 后端 | Rust |
-| 截屏引擎 | xcap |
-| 语音采集 | cpal（WASAPI） |
-| AI 引擎 | 智谱 GLM 系列（视觉理解 + ASR 语音识别），支持用户自定义 API Key 与模型 |
-| 数据存储 | SQLite（本地） |
-
----
-
-## 相关仓库
-
-- [flowio-extension](https://gitee.com/zhangruoxuan/flowio-extension) — 浏览器扩展版（Chrome / Edge），录制网页操作
-- [flowio-site](https://gitee.com/zhangruoxuan/flowio-site) — 教程社区网站（Next.js 14，私有仓库）
-
----
-
-## 反馈与贡献
-
-MVP 阶段，欢迎试用和反馈。
-
-- Bug / 建议 → [提交 Issue](https://gitee.com/zhangruoxuan/flowio/issues)
+产品还在快速迭代，使用中的任何问题和建议都欢迎[提交 Issue](https://gitee.com/zhangruoxuan/flowio/issues)，或通过官网页脚的邮箱联系我们。
 
 ---
 
