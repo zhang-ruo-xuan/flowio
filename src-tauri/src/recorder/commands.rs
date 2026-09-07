@@ -2396,6 +2396,26 @@ fn spawn_event_thread(
                             let win_title = typing_window_title.take().unwrap_or_default();
                             flush_key_step(&typed, Some(win_title), &cs_for_thread, final_uia, keyboard_before_path.take(), &ring, last_key_time, false);
                         }
+                        // ★ 修复：导航键本身必须有可重放步骤，否则「回车确认保存 /
+                        // Tab 切字段 / Esc 取消」这类动作在重放时整段丢失——典型表现
+                        // 就是输完文件名却不回车 → 文件永远建不出来（用户报的「文件未生成」）。
+                        let nav_label = match key_name.as_str() {
+                            "Enter" | "Return" | "KeyEnter" => "Enter 确认".to_string(),
+                            "Tab" => "Tab 切换焦点".to_string(),
+                            "Escape" => "Esc 取消".to_string(),
+                            other => display_shortcut_key(other),
+                        };
+                        let nav_combo = display_shortcut_key(&key_name); // "Enter"/"Tab"/"Esc"，供 replay 端 press_combo
+                        flush_shortcut_step(
+                            "hotkey",
+                            nav_label,
+                            String::new(),
+                            &cs_for_thread,
+                            ShortcutSettle::visual(300),
+                            &ring,
+                            key_instant,
+                            &nav_combo,
+                        );
                         typing_window_title = None;
                         keyboard_before_path = None;
                         last_uia_text = None;
