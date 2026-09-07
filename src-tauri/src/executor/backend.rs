@@ -423,3 +423,39 @@ impl ReplayBackend for WindowsBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 锁定「录制端 display_shortcut_key 产出的 combo 串 == 重放端 token_to_vk 能解析」
+    /// 的契约。nav/edit 键（Enter/Tab/Esc/方向/Backspace/Delete/Home/End/翻页）此前被整段
+    /// 丢弃导致「文件没生成」，修复后它们以这些 combo 串落步；若任一侧映射被改，此测试会
+    /// 立即失败，防止静默回归。
+    #[test]
+    fn replay_combo_tokens_resolve_to_expected_vk() {
+        let cases: &[(&str, VIRTUAL_KEY)] = &[
+            ("Enter", VK_RETURN),
+            ("Tab", VK_TAB),
+            ("Esc", VK_ESCAPE),
+            ("ArrowUp", VK_UP),
+            ("ArrowDown", VK_DOWN),
+            ("ArrowLeft", VK_LEFT),
+            ("ArrowRight", VK_RIGHT),
+            ("Backspace", VK_BACK),
+            ("Delete", VK_DELETE),
+            ("Home", VK_HOME),
+            ("End", VK_END),
+            ("PageUp", VK_PRIOR),
+            ("PageDown", VK_NEXT),
+        ];
+        for (token, expected) in cases {
+            assert_eq!(
+                token_to_vk(token),
+                Some(*expected),
+                "combo 串 '{}' 应能被 token_to_vk 解析为对应虚拟键",
+                token
+            );
+        }
+    }
+}
