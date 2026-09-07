@@ -590,7 +590,7 @@ fn transcribe_and_apply(recording_id: &str, buffer: VoiceBuffer) -> Result<Voice
             "未识别到清晰人声，已跳过语音补全".to_string()
         }
     } else {
-        summarize_voice_result(transcribed, failed, &errors)
+        summarize_voice_result(transcribed, failed, steps.len(), &errors)
     };
     let summary = if ai_fixed > 0 {
         format!("{}，AI 已结合截图修正 {} 处疑似口音错字", summary, ai_fixed)
@@ -612,7 +612,14 @@ fn transcribe_and_apply(recording_id: &str, buffer: VoiceBuffer) -> Result<Voice
 }
 
 /// 聚合转写结果为面向用户的提示语（与 AI 生成的 summarize 风格一致）。
-fn summarize_voice_result(transcribed: usize, failed: usize, errors: &[String]) -> String {
+/// `total_steps`：本次教程总步骤数——转写覆盖不足时明确告知缺了哪些，
+/// 避免「明明说了话却没写进去」无从判断（2026-09-07 可见化）。
+fn summarize_voice_result(
+    transcribed: usize,
+    failed: usize,
+    total_steps: usize,
+    errors: &[String],
+) -> String {
     let reason_part = if errors.is_empty() {
         String::new()
     } else {
@@ -624,8 +631,13 @@ fn summarize_voice_result(transcribed: usize, failed: usize, errors: &[String]) 
         format!("语音转写失败（{} 段）{}", failed, reason_part)
     } else if failed > 0 {
         format!(
-            "语音转写完成：{} 个步骤已补充语音说明（{} 个失败）{}",
-            transcribed, failed, reason_part
+            "语音转写完成：{}/{} 个步骤已补充语音说明（{} 个失败）{}",
+            transcribed, total_steps, failed, reason_part
+        )
+    } else if transcribed < total_steps {
+        format!(
+            "语音转写完成：{}/{} 个步骤已补充语音说明（其余步骤未识别到语音，可能语句过短或音量低，可手动补充）",
+            transcribed, total_steps
         )
     } else {
         format!("语音转写完成：{} 个步骤已补充语音说明", transcribed)
@@ -690,14 +702,14 @@ mod voice_commands_tests {
     #[test]
     fn summarize_all_transcribed() {
         assert_eq!(
-            summarize_voice_result(5, 0, &[]),
+            summarize_voice_result(5, 0, 5, &[]),
             "语音转写完成：5 个步骤已补充语音说明"
         );
     }
 
     #[test]
     fn summarize_no_speech() {
-        assert_eq!(summarize_voice_result(0, 0, &[]), "未检测到语音内容");
+        assert_eq!(summarize_voice_result(0, 0, 5, &[]), "未检测到语音内容");
     }
 
     #[test]
@@ -705,6 +717,7 @@ mod voice_commands_tests {
         let s = summarize_voice_result(
             0,
             3,
+            6,
             &vec!["HTTP 429 该模型当前访问量过大".to_string(); 3],
         );
         assert_eq!(
@@ -715,10 +728,21 @@ mod voice_commands_tests {
 
     #[test]
     fn summarize_partial_failure() {
-        let s = summarize_voice_result(4, 1, &["网络超时".into()]);
+        let s = summarize_voice_result(4, 1, 6, &["网络超时".into()]);
         assert_eq!(
             s,
-            "语音转写完成：4 个步骤已补充语音说明（1 个失败）。原因：网络超时"
+            "语音转写完成：4/6 个步骤已补充语音说明（1 个失败）。原因：网络超时"
+        );
+    }
+
+    /// 🔴 2026-09-07 可见化：部分步骤没识别到语音时必须明示「X/Y」，
+    /// 避免「明明说了话却没写进去」无从判断。
+    #[test]
+    fn summarize_partial_coverage_lists_gap() {
+        let s = summarize_voice_result(3, 0, 6, &[]);
+        assert_eq!(
+            s,
+            "语音转写完成：3/6 个步骤已补充语音说明（其余步骤未识别到语音，可能语句过短或音量低，可手动补充）"
         );
     }
 
@@ -787,10 +811,10 @@ mod voice_commands_tests {
     #[test]
     fn summarize_reasons_cap_at_three_and_160_chars() {
         let errs: Vec<String> = (0..5).map(|i| format!("原因{}", i)).collect();
-        let s = summarize_voice_result(0, 5, &errs);
+        let s = summarize_voice_result(0, 5, 5, &errs);
         assert!(s.contains("原因0") && s.contains("原因2") && !s.contains("原因3"));
         let long: Vec<String> = vec!["长".repeat(100); 2];
-        let s2 = summarize_voice_result(0, 2, &long);
+        let s2 = summarize_voice_result(0, 2, 5, &long);
         assert!(s2.chars().count() <= 200);
     }
 }

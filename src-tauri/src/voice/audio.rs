@@ -16,10 +16,11 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// 体积校验：16kHz/16bit 单声道 = 32KB/s，28s ≈ 896KB，远低于 25MB。
 /// 改大这个值前先看 `max_segment_ms_respects_asr_limit` 那条测试。
 pub const MAX_SEGMENT_MS: i64 = 28_000;
-/// 短于该时长的切片直接丢弃（≈0.4s，无法成句）
-pub const MIN_SEGMENT_MS: i64 = 400;
-/// RMS 静音阈值（≈ -47 dBFS）：低于该值视为该步骤无有效语音
-pub const SILENCE_RMS: f32 = 0.0045;
+/// 短于该时长的切片直接丢弃（≈0.3s；2026-09-07 400→300：快速讲解的短句不再被吞）
+pub const MIN_SEGMENT_MS: i64 = 300;
+/// RMS 静音阈值（≈ -49 dBFS）：低于该值视为该步骤无有效语音
+/// （2026-09-07 0.0045→0.0035：弱音量开口段不再漏检）
+pub const SILENCE_RMS: f32 = 0.0035;
 /// 全局信号判定阈值（≈ -66 dBFS）：整段 RMS 低于该值视为「麦克风根本
 /// 没拾到声音」（数字静音/底噪水平），此时不做 ASR 兜底（送了也白送）。
 /// 高于它但 VAD 检不出区段（音量过低/短句被最小段过滤）→ 兜底整段送 ASR。
@@ -237,8 +238,8 @@ pub fn slice_for_steps(
 /// 兜底切片（VAD 兜底）：不做静音检测，直接按步骤时间戳把整段音频
 /// 切成「步骤 → 若干 PCM 段」。
 ///
-/// 背景：VAD 阈值按正常人声标定（-47 dBFS），麦克风音量过低、或说话
-/// 全是 <400ms 的短句时，`slice_for_steps` 会返回空 → 「未检测到语音
+/// 背景：VAD 阈值按正常人声标定（-49 dBFS），麦克风音量过低、或说话
+/// 全是 <300ms 的极短句时，`slice_for_steps` 会返回空 → 「未检测到语音
 /// 内容」。此时若整段信号非数字静音，按时间戳硬切送 ASR 是最后一道
 /// 防线——真无声时 ASR 返回空文本，代价只是几次请求。
 ///
@@ -534,8 +535,8 @@ mod audio_tests {
         let out = fallback_slice_all(&pcm, 16_000, &[0, 5_000]);
         let idxs: Vec<usize> = out.iter().map(|(i, _)| *i).collect();
         assert_eq!(idxs, vec![1]);
-        // 音频本身过短（<400ms）→ 全部丢弃
-        let tiny = sine_pcm(300, 16_000, 440.0, 0.5);
+        // 音频本身过短（<MIN_SEGMENT_MS=300ms）→ 全部丢弃
+        let tiny = sine_pcm(250, 16_000, 440.0, 0.5);
         assert!(fallback_slice_all(&tiny, 16_000, &[0]).is_empty());
     }
 
