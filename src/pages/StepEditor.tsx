@@ -1712,7 +1712,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       if (!recordingId) { setToast({ type: "error", message: "未找到当前录制" }); return; }
       setExecuting(true);
       setToast({
-        type: "info",
+        type: "success",
         message: dryRun ? "开始演练（dry-run，不操作桌面）…" : "开始精准执行，请勿操作鼠标键盘…",
       });
       try {
