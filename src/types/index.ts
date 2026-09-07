@@ -60,6 +60,10 @@ export interface Step {
   window_title?: string;
   /** Unix epoch ms when the step was recorded */
   timestamp: number;
+  /** 该步骤输入值是否为变量（SKILL.md 自动化导出用，每次运行可变） */
+  is_variable: boolean;
+  /** 变量参数名（如 order_id），导出 SKILL.md 时渲染为 {{param_name}} 占位符 */
+  param_name: string;
 }
 
 export interface StepSave {

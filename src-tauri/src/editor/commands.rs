@@ -44,6 +44,12 @@ pub struct Step {
     pub after_screenshot_base64: Option<String>,
     pub before_screenshot_base64: Option<String>,
     pub window_title: String,
+    /// 该步骤输入值是否为变量（每次运行都会变，SKILL.md 导出用）
+    #[serde(default)]
+    pub is_variable: bool,
+    /// 变量参数名（如 order_id），is_variable 为 true 时有意义
+    #[serde(default)]
+    pub param_name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,7 +105,8 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
             "SELECT id, recording_id, order_index, step_number, action_type, \
              title, description, tip, screenshot_path, annotated_path, \
              before_screenshot_path, created_at, \
-             x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title \
+             x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, \
+             is_variable, param_name \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -129,6 +136,8 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
                 after_screenshot_base64: None,
                 before_screenshot_base64: None,
                 window_title: row.get(18)?,
+                is_variable: row.get::<_, i64>(19)? != 0,
+                param_name: row.get(20)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -147,6 +156,9 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
 }
 
 /// Update a single step's editable fields.
+///
+/// `is_variable` / `param_name` 为可选：不传（None）时保留数据库现值（COALESCE），
+/// 老调用方（翻译同步、标题/描述自动保存）无需感知变量字段。
 #[tauri::command]
 pub fn update_step(
     db: State<DbState>,
@@ -155,13 +167,16 @@ pub fn update_step(
     description: String,
     action_type: String,
     tip: String,
+    is_variable: Option<bool>,
+    param_name: Option<String>,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     push_edit_history_for_step(&conn, &step_id);
     conn.execute(
-        "UPDATE steps SET title = ?1, description = ?2, action_type = ?3, tip = ?4 \
-         WHERE id = ?5",
-        params![title, description, action_type, tip, step_id],
+        "UPDATE steps SET title = ?1, description = ?2, action_type = ?3, tip = ?4, \
+         is_variable = COALESCE(?5, is_variable), param_name = COALESCE(?6, param_name) \
+         WHERE id = ?7",
+        params![title, description, action_type, tip, is_variable, param_name, step_id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1003,6 +1018,8 @@ struct EditorSnapshotStep {
     crop_h: Option<i32>,
     timestamp: i64,
     window_title: Option<String>,
+    is_variable: bool,
+    param_name: String,
 }
 
 /// 一次快照 = 录制标题 + 全部步骤行。
@@ -1037,7 +1054,7 @@ fn capture_editor_snapshot(
         .prepare(
             "SELECT id, order_index, step_number, action_type, title, description, tip, \
              screenshot_path, annotated_path, before_screenshot_path, after_screenshot_path, \
-             x, y, crop_w, crop_h, timestamp, window_title \
+             x, y, crop_w, crop_h, timestamp, window_title, is_variable, param_name \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -1061,6 +1078,8 @@ fn capture_editor_snapshot(
                 crop_h: r.get(14)?,
                 timestamp: r.get(15)?,
                 window_title: r.get(16)?,
+                is_variable: r.get::<_, i64>(17)? != 0,
+                param_name: r.get(18)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -1149,12 +1168,14 @@ fn restore_editor_snapshot(
         tx.execute(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
              description, tip, screenshot_path, annotated_path, before_screenshot_path, \
-             after_screenshot_path, x, y, crop_w, crop_h, timestamp, window_title) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+             after_screenshot_path, x, y, crop_w, crop_h, timestamp, window_title, \
+             is_variable, param_name) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 s.id, recording_id, i as i32, i as i32 + 1, s.action_type, s.title,
                 s.description, s.tip, shot, ann, before, after,
                 s.x, s.y, s.crop_w, s.crop_h, s.timestamp, s.window_title,
+                s.is_variable, s.param_name,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -2163,6 +2184,8 @@ fn build_new_step(
         after_screenshot_base64: None,
         before_screenshot_base64: None,
         window_title: step_data.window_title,
+        is_variable: false,
+        param_name: String::new(),
     }
 }
 
@@ -2348,6 +2371,8 @@ mod editor_tests {
             after_screenshot_base64: None,
             before_screenshot_base64: None,
             window_title: "记事本".into(),
+            is_variable: false,
+            param_name: String::new(),
         };
         let json = serde_json::to_string(&s).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2573,6 +2598,8 @@ mod editor_tests {
             after_screenshot_base64: None,
             before_screenshot_base64: None,
             window_title: "".into(),
+            is_variable: false,
+            param_name: String::new(),
         };
         populate_step_screenshot_base64(&mut step);
         assert!(step.screenshot_base64.is_some());
@@ -2611,6 +2638,8 @@ mod editor_tests {
             after_screenshot_base64: None,
             before_screenshot_base64: None,
             window_title: "".into(),
+            is_variable: false,
+            param_name: String::new(),
         };
         populate_step_screenshot_base64(&mut step);
         assert!(step.screenshot_base64.is_none());

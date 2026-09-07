@@ -337,7 +337,7 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
         .prepare(
             "SELECT id, order_index, step_number, action_type, title, description, tip, \
              screenshot_path, annotated_path, before_screenshot_path, x, y, crop_w, crop_h, \
-             after_screenshot_path, timestamp, window_title \
+             after_screenshot_path, timestamp, window_title, is_variable, param_name \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -361,6 +361,8 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
                 row.get::<_, Option<String>>(14)?,
                 row.get::<_, i64>(15)?,
                 row.get::<_, String>(16)?,
+                row.get::<_, i64>(17)?,
+                row.get::<_, String>(18)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -368,7 +370,7 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
     let mut steps: Vec<(
         String, i32, i32, String, String, String, String,
         String, String, String, Option<i32>, Option<i32>, Option<i32>, Option<i32>,
-        Option<String>, i64, String,
+        Option<String>, i64, String, i64, String,
     )> = Vec::new();
     for r in rows {
         steps.push(r.map_err(|e| e.to_string())?);
@@ -401,11 +403,13 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
         let new_after = copy_screenshot_file(st.14.clone().unwrap_or_default().as_str());
         conn.execute(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, description, tip, \
-             screenshot_path, annotated_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+             screenshot_path, annotated_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, \
+             is_variable, param_name) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 new_step_id, new_id, st.1, st.2, st.3, st.4, st.5, st.6,
-                new_ss, new_ann, new_before, st.10, st.11, st.12, st.13, new_after, st.15, st.16
+                new_ss, new_ann, new_before, st.10, st.11, st.12, st.13, new_after, st.15, st.16,
+                st.17, st.18
             ],
         )
         .map_err(|e| {

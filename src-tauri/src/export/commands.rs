@@ -65,13 +65,19 @@ struct ExportStep {
     y: Option<i32>,
     crop_w: Option<i32>,
     crop_h: Option<i32>,
+    // 变量标记（SKILL.md 自动化导出用）
+    #[serde(default)]
+    is_variable: bool,
+    #[serde(default)]
+    param_name: String,
 }
 
 // ── Tauri Command ─────────────────────────────────────────────
 
 /// Export a recording to the specified format.
 ///
-/// Supported formats: `"html"`, `"markdown"`, `"pdf"`, `"docx"` (or `"word"`).
+/// Supported formats: `"html"`, `"markdown"`, `"pdf"`, `"docx"` (or `"word"`), `"txt"`, `"long"`, `"skill"`.
+/// `"skill"` = Agent Skills 1.0（SKILL.md）：有变量标记步骤时自动出变量版，否则固定版。
 /// If `output_path` is provided, write to that exact path; otherwise auto-generate
 /// a path under the `output/` directory.
 /// Returns the absolute path to the generated file.
@@ -214,6 +220,14 @@ pub(crate) fn export_recording_inner(
                 .map_err(|e| format!("Failed to write TXT: {}", e))?;
             Ok(path.to_string_lossy().to_string())
         }
+        "skill" => {
+            // Agent Skills 1.0（SKILL.md）：有任何变量标记步骤 → 变量版（##Inputs + {{param}}），
+            // 否则固定版（sample 写死）。机看以步骤指令为主，不含截图。
+            let content = export_skill_md(&recording, &steps);
+            std::fs::write(&path, content)
+                .map_err(|e| format!("Failed to write SKILL.md: {}", e))?;
+            Ok(path.to_string_lossy().to_string())
+        }
         "long" => {
             export_long_image(&recording, &steps, &path, &crop_set)?;
             Ok(path.to_string_lossy().to_string())
@@ -271,7 +285,7 @@ fn load_export_data(
     let mut stmt = conn
         .prepare(
             "SELECT id, order_index, step_number, action_type, title, description, \
-             tip, screenshot_path, x, y, crop_w, crop_h \
+             tip, screenshot_path, x, y, crop_w, crop_h, is_variable, param_name \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -291,6 +305,8 @@ fn load_export_data(
                 y: row.get(9)?,
                 crop_w: row.get(10)?,
                 crop_h: row.get(11)?,
+                is_variable: row.get::<_, i64>(12)? != 0,
+                param_name: row.get(13)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -393,6 +409,7 @@ fn generate_export_path(
         "pdf" => "pdf",
         "docx" | "word" => "docx",
         "long" => "png",
+        "skill" => "md",
         _ => "txt",
     };
     output_dir.join(format!("{}_{}.{}", sanitized_title, timestamp, ext))
@@ -808,6 +825,140 @@ fn export_markdown(recording: &ExportRecording, steps: &[ExportStep], _ss_dir: &
         &recording.created_at,
         &step_list,
     )
+}
+
+// ── Agent Skills 1.0 (SKILL.md) export ────────────────────────
+
+/// 把标题压成 Agent Skills 合法的 name（小写字母/数字/连字符，≤48 字符）。
+/// 中文标题压不出 ASCII 词干时回退 `flowio-skill`。
+fn skill_slug_name(title: &str) -> String {
+    let mut slug = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if (c == ' ' || c == '-' || c == '_') && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "flowio-skill".to_string()
+    } else {
+        slug.chars().take(48).collect()
+    }
+}
+
+/// YAML 单行字符串转义：换行压成空格、双引号转义。
+fn yaml_oneline(s: &str) -> String {
+    s.replace(['\r', '\n'], " ").replace('"', "\\\"")
+}
+
+/// 导出 Agent Skills 1.0（SKILL.md）。
+///
+/// - **变量版**：任一步骤被标记为变量（`is_variable` 且 `param_name` 非空）时输出——
+///   frontmatter `description` 声明所需参数，`## Inputs` 列出参数与示例值，
+///   步骤体把 sample（type 步骤的 description 即输入值）替换为 `{{param_name}}` 占位符。
+/// - **固定版**：无变量标记时输出——sample 原样写死，纯人读/机看皆可的固定流程。
+///
+/// 机看以步骤指令为主，不含截图（与 markdown 导出同策略）。
+fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep]) -> String {
+    // 收集变量步骤：(step, param_name, sample)
+    let variables: Vec<(&ExportStep, String, String)> = steps
+        .iter()
+        .filter(|s| s.is_variable && !s.param_name.trim().is_empty())
+        .map(|s| {
+            (
+                s,
+                s.param_name.trim().to_string(),
+                s.description.trim().to_string(),
+            )
+        })
+        .collect();
+    let variable_mode = !variables.is_empty();
+
+    // ── frontmatter ──
+    let name = skill_slug_name(&recording.title);
+    let mut desc = format!(
+        "在 {} 中「{}」的分步操作流程，共 {} 步。",
+        if recording.app_name.is_empty() { "目标应用" } else { &recording.app_name },
+        recording.title,
+        steps.len()
+    );
+    if variable_mode {
+        let names: Vec<String> = variables.iter().map(|(_, p, _)| format!("`{}`", p)).collect();
+        desc.push_str(&format!(" 运行前需提供参数：{}。", names.join("、")));
+    }
+    let desc = yaml_oneline(&desc);
+
+    // ── 步骤体 ──
+    let var_by_step: std::collections::HashMap<&str, &str> =
+        variables.iter().map(|(s, p, _)| (s.id.as_str(), p.as_str())).collect();
+    let mut body = String::new();
+    for s in steps {
+        let param = var_by_step.get(s.id.as_str()).copied();
+        let title_line = if s.title.trim().is_empty() {
+            format!("步骤 {}", s.step_number)
+        } else {
+            s.title.trim().to_string()
+        };
+        body.push_str(&format!("{}. **{}**", s.step_number, title_line));
+        if s.action_type == "type" || s.action_type == "paste" {
+            // 输入步骤：description 就是输入值（UIA 读到的输入框内容或按键累积）
+            match param {
+                Some(p) => {
+                    let sample = s.description.trim();
+                    body.push_str("：输入 `{{");
+                    body.push_str(p);
+                    body.push_str("}}`");
+                    if sample.is_empty() {
+                        body.push_str("（实际运行时由调用方提供）");
+                    } else {
+                        body.push_str(&format!(
+                            "（示例值：`{}`，实际运行时由调用方提供）",
+                            sample
+                        ));
+                    }
+                }
+                None => {
+                    if !s.description.trim().is_empty() {
+                        body.push_str(&format!("：输入 `{}`", s.description.trim()));
+                    }
+                }
+            }
+        } else if !s.description.trim().is_empty() {
+            body.push_str(&format!("：{}", s.description.trim()));
+        }
+        body.push('\n');
+        if !s.tip.trim().is_empty() {
+            body.push_str(&format!("   > 提示：{}\n", s.tip.trim()));
+        }
+    }
+
+    // ── 组装 ──
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str(&format!("name: {}\n", name));
+    out.push_str(&format!("description: \"{}\"\n", desc));
+    out.push_str("---\n\n");
+    out.push_str(&format!("# {}\n\n", recording.title));
+    if variable_mode {
+        out.push_str("## Inputs\n\n");
+        out.push_str("运行本技能前，由调用方（Agent / 用户 / 外部系统）提供以下参数：\n\n");
+        for (s, p, sample) in &variables {
+            if sample.is_empty() {
+                out.push_str(&format!("- `{}` — 步骤 {} 的输入值\n", p, s.step_number));
+            } else {
+                out.push_str(&format!(
+                    "- `{}` — 示例值：`{}`（来自步骤 {}）\n",
+                    p, sample, s.step_number
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    out.push_str("## Steps\n\n");
+    out.push_str(&body);
+    out
 }
 
 // ── TXT export ────────────────────────────────────────────────
@@ -1505,6 +1656,92 @@ fn compute_image_emu_dims(dim: Option<(usize, usize)>, max_width_emu: usize) -> 
 mod tests {
     use super::*;
 
+    /// 真实库 smoke（#[ignore]，手动跑）：把 `%APPDATA%/com.flowio.app/flowio.db`
+    /// 复制到 `D:/tmp/flowio_real.db` 后执行
+    /// `cargo test --lib skill_md_real_db_smoke -- --ignored --nocapture`，
+    /// 会导出固定版/变量版两份 SKILL.md 到 `D:/tmp/skill_*.md`。
+    /// 顺带验证迁移幂等：对真实库副本跑 init_db 后再读新列。
+    #[test]
+    #[ignore]
+    fn skill_md_real_db_smoke() {
+        let path = std::env::var("FLOWIO_REAL_DB")
+            .unwrap_or_else(|_| r"D:\tmp\flowio_real.db".to_string());
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .expect("open real db copy");
+        crate::db::init_db(&conn); // 幂等迁移：补出 is_variable / param_name 列
+
+        let rid: String = conn
+            .query_row(
+                "SELECT id FROM recordings WHERE total_steps > 0 AND id IN \
+                 (SELECT DISTINCT recording_id FROM steps WHERE action_type = 'type') \
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .or_else(|_| {
+                conn.query_row(
+                    "SELECT id FROM recordings WHERE total_steps > 0 ORDER BY created_at DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .expect("pick recording");
+        let (title, app_name, total_steps, created_at): (String, String, i32, String) = conn
+            .query_row(
+                "SELECT title, app_name, total_steps, created_at FROM recordings WHERE id = ?1",
+                params![rid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        let mut steps: Vec<ExportStep> = Vec::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, order_index, step_number, action_type, title, description, \
+                 tip, screenshot_path, x, y, crop_w, crop_h, is_variable, param_name \
+                 FROM steps WHERE recording_id = ?1 ORDER BY order_index",
+            )
+            .unwrap();
+        let rows = stmt.query_map(params![rid], |row| {
+            Ok(ExportStep {
+                id: row.get(0)?,
+                order_index: row.get(1)?,
+                step_number: row.get(2)?,
+                action_type: row.get(3)?,
+                title: row.get(4)?,
+                description: row.get(5)?,
+                tip: row.get(6)?,
+                screenshot_path: String::new(),
+                x: row.get(8)?,
+                y: row.get(9)?,
+                crop_w: row.get(10)?,
+                crop_h: row.get(11)?,
+                is_variable: row.get::<_, i64>(12)? != 0,
+                param_name: row.get(13)?,
+            })
+        }).unwrap();
+        for r in rows {
+            steps.push(r.unwrap());
+        }
+        let recording = ExportRecording { id: rid.clone(), title: title.clone(), app_name, total_steps, created_at };
+
+        // 固定版
+        let fixed = export_skill_md(&recording, &steps);
+        std::fs::write(r"D:\tmp\skill_fixed.md", &fixed).unwrap();
+        println!("== fixed ==\n{}", &fixed[..fixed.len().min(600)]);
+
+        // 变量版：把第一个输入步骤标为变量（模拟作者在编辑器里点「变量」）
+        if let Some(s) = steps.iter_mut().find(|s| s.action_type == "type") {
+            s.is_variable = true;
+            s.param_name = "order_id".into();
+        }
+        let variable = export_skill_md(&recording, &steps);
+        std::fs::write(r"D:\tmp\skill_variable.md", &variable).unwrap();
+        println!("== variable ==\n{}", &variable[..variable.len().min(900)]);
+    }
+
     /// 本文件源码，供静态防线扫描（编译期嵌入，改完文件 cargo test 立即生效）。
     const COMMANDS_SRC: &str = include_str!("commands.rs");
 
@@ -1531,6 +1768,8 @@ mod tests {
                 y: None,
                 crop_w: None,
                 crop_h: None,
+                        is_variable: false,
+                param_name: String::new(),
             },
             ExportStep {
                 id: "test-step".into(),
@@ -1545,6 +1784,8 @@ mod tests {
                 y: None,
                 crop_w: None,
                 crop_h: None,
+                        is_variable: false,
+                param_name: String::new(),
             },
         ];
         let out = std::env::temp_dir().join("flowio_test_no_ss.pdf");
@@ -1622,6 +1863,8 @@ mod tests {
             y: None,
             crop_w: None,
             crop_h: None,
+                    is_variable: false,
+            param_name: String::new(),
         }];
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let html = gen_html_body(&rec, &steps, &crop_set);
@@ -1657,6 +1900,8 @@ mod tests {
                 y: None,
                 crop_w: None,
                 crop_h: None,
+                        is_variable: false,
+                param_name: String::new(),
             },
             ExportStep {
                 id: "test-step".into(),
@@ -1671,6 +1916,8 @@ mod tests {
                 y: None,
                 crop_w: None,
                 crop_h: None,
+                        is_variable: false,
+                param_name: String::new(),
             },
         ];
         let ss_dir = std::env::temp_dir().join("flowio_test_md_ss");
@@ -1710,6 +1957,8 @@ mod tests {
             y: None,
             crop_w: None,
             crop_h: None,
+                    is_variable: false,
+            param_name: String::new(),
         }];
         let ss_dir = std::env::temp_dir().join("flowio_test_md_ss2");
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1744,6 +1993,8 @@ mod tests {
             y: None,
             crop_w: None,
             crop_h: None,
+                    is_variable: false,
+            param_name: String::new(),
         }];
         let out = std::env::temp_dir().join("flowio_test_export.docx");
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1817,6 +2068,8 @@ mod tests {
             y: None,
             crop_w: None,
             crop_h: None,
+                    is_variable: false,
+            param_name: String::new(),
         }];
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let html = gen_html_body(&rec, &steps, &crop_set);
@@ -1851,6 +2104,8 @@ mod tests {
             y: None,
             crop_w: None,
             crop_h: None,
+                    is_variable: false,
+            param_name: String::new(),
         }];
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let md = export_markdown(&rec, &steps, &dir, &crop_set);
@@ -1890,6 +2145,8 @@ mod tests {
             y: None,
             crop_w: None,
             crop_h: None,
+                    is_variable: false,
+            param_name: String::new(),
         }];
         let out = dir.join("out.docx");
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1922,6 +2179,8 @@ mod tests {
             y: None,
             crop_w: None,
             crop_h: None,
+                    is_variable: false,
+            param_name: String::new(),
         }];
         let ss_dir = std::env::temp_dir().join("flowio_test_md4");
         let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1959,6 +2218,86 @@ mod tests {
         // GFM 段内硬换行：行尾两空格
         let md = build_md_desc_block("line1\nline2");
         assert!(md.contains("line1  \nline2"));
+    }
+
+    fn skill_step(num: i32, action: &str, title: &str, desc: &str, is_var: bool, param: &str) -> ExportStep {
+        ExportStep {
+            id: format!("s{}", num),
+            order_index: num - 1,
+            step_number: num,
+            action_type: action.into(),
+            title: title.into(),
+            description: desc.into(),
+            tip: String::new(),
+            screenshot_path: String::new(),
+            x: None,
+            y: None,
+            crop_w: None,
+            crop_h: None,
+            is_variable: is_var,
+            param_name: param.into(),
+        }
+    }
+
+    fn skill_recording() -> ExportRecording {
+        ExportRecording {
+            id: "r1".into(),
+            title: "月度对账流程".into(),
+            app_name: "WPS 表格".into(),
+            total_steps: 3,
+            created_at: "2026-09-07".into(),
+        }
+    }
+
+    #[test]
+    fn test_skill_md_fixed_version() {
+        let steps = vec![
+            skill_step(1, "click", "打开订单表", "", false, ""),
+            skill_step(2, "type", "在「订单号」中输入", "SO20260906-001", false, ""),
+            skill_step(3, "click", "点击导出按钮", "", false, ""),
+        ];
+        let md = export_skill_md(&skill_recording(), &steps);
+        assert!(md.starts_with("---\n"));
+        assert!(md.contains("name: flowio-skill")); // 中文标题压不出 ASCII → 回退
+        assert!(!md.contains("## Inputs")); // 无变量 → 固定版
+        assert!(md.contains("输入 `SO20260906-001`")); // sample 原样写死
+        assert!(!md.contains("{{"));
+        assert!(md.contains("## Steps"));
+    }
+
+    #[test]
+    fn test_skill_md_variable_version() {
+        let steps = vec![
+            skill_step(1, "click", "打开订单表", "", false, ""),
+            skill_step(2, "type", "在「订单号」中输入", "SO20260906-001", true, "order_id"),
+            skill_step(3, "type", "在「月份」中输入", "3", true, "month"),
+        ];
+        let md = export_skill_md(&skill_recording(), &steps);
+        assert!(md.contains("## Inputs"));
+        assert!(md.contains("- `order_id` — 示例值：`SO20260906-001`（来自步骤 2）"));
+        assert!(md.contains("- `month` — 示例值：`3`（来自步骤 3）"));
+        assert!(md.contains("输入 `{{order_id}}`（示例值：`SO20260906-001`"));
+        assert!(md.contains("运行前需提供参数：`order_id`、`month`"));
+    }
+
+    #[test]
+    fn test_skill_md_param_name_stripped_and_empty_ignored() {
+        // param_name 带空白 → trim；is_variable 但 param_name 空 → 不算变量
+        let steps = vec![
+            skill_step(1, "type", "输入", "abc", true, "  order_id  "),
+            skill_step(2, "type", "输入", "xyz", true, ""),
+        ];
+        let md = export_skill_md(&skill_recording(), &steps);
+        assert!(md.contains("`order_id`"));
+        assert!(!md.contains("{{}}"));
+        assert!(md.contains("输入 `xyz`")); // 空参数名的步骤按固定值渲染
+    }
+
+    #[test]
+    fn test_skill_slug_name_ascii() {
+        assert_eq!(skill_slug_name("Monthly Report 2026!"), "monthly-report-2026");
+        assert_eq!(skill_slug_name("纯中文标题"), "flowio-skill");
+        assert_eq!(skill_slug_name(""), "flowio-skill");
     }
 
     #[test]
@@ -2650,6 +2989,8 @@ mod tests {
                 y: None,
                 crop_w: None,
                 crop_h: None,
+                        is_variable: false,
+                param_name: String::new(),
             },
             ExportStep {
                 id: "s2".into(),
@@ -2664,6 +3005,8 @@ mod tests {
                 y: None,
                 crop_w: None,
                 crop_h: None,
+                        is_variable: false,
+                param_name: String::new(),
             },
         ];
         let out = dir.join("long_test.png");

@@ -51,6 +51,7 @@ const EXPORT_FORMATS = [
   { value: "docx", label: "Word", ext: "", icon: FileText },
   { value: "pdf", label: "PDF", ext: "", icon: File },
   { value: "markdown", label: "Markdown", ext: "md", icon: FileCode },
+  { value: "skill", label: "SKILL.md", ext: "md", icon: Wand2 },
   { value: "txt", label: "TXT", ext: "txt", icon: FileText },
   { value: "long", label: "长图", ext: "png", icon: ImageIcon },
 ] as const;
@@ -61,6 +62,7 @@ const EXPORT_TIPS: Record<string, string> = {
   docx: "导出 Word 文档，方便交给同事继续编辑排版",
   pdf: "导出 PDF，适合直接发给别人看或打印",
   markdown: "导出纯 Markdown 文本文件（不含图片），方便贴到笔记/博客或交给 AI 继续编辑",
+  skill: "导出 Agent Skills 标准的 SKILL.md，交给 CodeBuddy / Claude 等 AI 助手按步骤自动执行；标记了变量的步骤会变成可填参数",
   txt: "导出纯文本，只保留步骤标题和说明，适合快速复制粘贴",
   long: "把所有步骤的截图拼成一张长图，适合发长微博 / 朋友圈或直接查看",
 };
@@ -409,6 +411,9 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   const [selectedStepId, setSelectedStepId] = useState<string>("");
   const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
+  // 变量标记（SKILL.md 自动化导出用）：仅输入类步骤（type/paste）可标
+  const [editIsVar, setEditIsVar] = useState(false);
+  const [editParamName, setEditParamName] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
@@ -1324,6 +1329,8 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     if (selectedStep) {
       setEditTitle(selectedStep.title);
       setEditDescription(selectedStep.description);
+      setEditIsVar(!!selectedStep.is_variable);
+      setEditParamName(selectedStep.param_name || "");
       setTipExpanded(false);
     }
   }, [selectedStepId, steps]);
@@ -1358,6 +1365,56 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       setSaving(false);
     }
   }, [selectedStep, editTitle, editDescription, refreshHist]);
+
+  /* ── 变量标记（SKILL.md 自动化导出用）──────────────────────
+     独立于标题/描述自动保存：切换立即落库，参数名失焦时落库，
+     避免与 800ms 自动保存互相覆盖。老调用方不传变量字段，
+     Rust 端 COALESCE 保留现值。 */
+
+  const persistVariable = useCallback(
+    async (isVar: boolean, paramName: string) => {
+      if (!selectedStep) return;
+      try {
+        await invoke("update_step", {
+          stepId: selectedStep.id,
+          title: editTitle,
+          description: editDescription,
+          actionType: selectedStep.action_type,
+          tip: selectedStep.tip || "",
+          isVariable: isVar,
+          paramName,
+        });
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === selectedStep.id
+              ? { ...s, is_variable: isVar, param_name: paramName }
+              : s
+          )
+        );
+      } catch (err) {
+        console.error("Save variable mark failed:", err);
+      }
+    },
+    [selectedStep, editTitle, editDescription]
+  );
+
+  const toggleVariable = useCallback(() => {
+    if (!selectedStep) return;
+    const next = !editIsVar;
+    setEditIsVar(next);
+    let name = editParamName.trim();
+    if (next && !name) {
+      // 默认参数名：param_1 / param_2 …（避开本教程已有的变量名）
+      const used = new Set(
+        steps.filter((s) => s.is_variable && s.param_name).map((s) => s.param_name)
+      );
+      let i = 1;
+      while (used.has(`param_${i}`)) i += 1;
+      name = `param_${i}`;
+      setEditParamName(name);
+    }
+    void persistVariable(next, name);
+  }, [selectedStep, editIsVar, editParamName, steps, persistVariable]);
 
   /* ── Auto-save (debounce 800ms) ─────────────────────────── */
   const [autoSaved, setAutoSaved] = useState(false);
@@ -2922,6 +2979,53 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                 />
               </div>
 
+              {/* 变量标记（仅输入类步骤）：SKILL.md 自动化导出用 */}
+              {(selectedStep.action_type === "type" || selectedStep.action_type === "paste") && (
+                <div className="form-group">
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <button
+                      type="button"
+                      onClick={toggleVariable}
+                      data-tip="标记为变量后，导出的 SKILL.md 会把该输入变成可填参数，AI 助手执行时按需填入"
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 4,
+                        padding: "3px 10px",
+                        fontSize: 12,
+                        borderRadius: 999,
+                        border: "1px solid " + (editIsVar ? "#f59e0b" : "var(--border, #d4d4d8)"),
+                        background: editIsVar ? "#fef3c7" : "transparent",
+                        color: editIsVar ? "#92400e" : "inherit",
+                        cursor: "pointer",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {editIsVar ? <Check size={12} /> : null} 变量
+                    </button>
+                    <span style={{ fontSize: 12, color: "var(--text-secondary, #71717a)" }}>
+                      {editIsVar ? "此输入在每次运行时会变化" : "把输入值标记为可变参数"}
+                    </span>
+                  </div>
+                  {editIsVar && (
+                    <input
+                      type="text"
+                      value={editParamName}
+                      onChange={(e) => setEditParamName(e.target.value)}
+                      onBlur={() => {
+                        const name = editParamName.trim();
+                        if (name !== editParamName || name !== selectedStep.param_name) {
+                          setEditParamName(name);
+                          void persistVariable(true, name);
+                        }
+                      }}
+                      placeholder="参数名，如 order_id"
+                      style={{ marginTop: 6 }}
+                    />
+                  )}
+                </div>
+              )}
+
               {/* Tip (expandable) */}
               {selectedStep.tip && (
                 <div className="form-group">
@@ -3000,7 +3104,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       {/* Custom Save Dialog */}
       {showSaveDialog && (() => {
         const fmt = showSaveDialog;
-        const formatExt: Record<string, string> = { html: "html", markdown: "md", txt: "txt", pdf: "pdf", long: "png" };
+        const formatExt: Record<string, string> = { html: "html", markdown: "md", txt: "txt", pdf: "pdf", long: "png", skill: "md" };
         const defaultName = (recording?.title || "recording")
           .replace(/[\\/:*?"<>|]/g, "_")
           .substring(0, 120) + "." + (formatExt[fmt] || fmt);

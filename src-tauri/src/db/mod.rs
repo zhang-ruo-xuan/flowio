@@ -235,6 +235,17 @@ pub fn init_db(conn: &Connection) {
     let _ = conn.execute_batch(
         "ALTER TABLE recordings ADD COLUMN translations TEXT",
     );
+
+    // ── Migrations: 步骤变量标记（SKILL.md 自动化导出用，总纲 §3）──
+    // is_variable：该步骤的输入值是「每次运行都会变的参数」；
+    // param_name：参数名（如 order_id），导出时渲染成 {{param_name}} 占位符。
+    // 旧库/未标记步骤默认 0/''，天然兼容存量数据。
+    let _ = conn.execute_batch(
+        "ALTER TABLE steps ADD COLUMN is_variable INTEGER NOT NULL DEFAULT 0",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE steps ADD COLUMN param_name TEXT NOT NULL DEFAULT ''",
+    );
 }
 
 /// 读取译文本来的 JSON 字符串（旧库/未翻译 → None；必须 Option 读，NULL 安全）。
