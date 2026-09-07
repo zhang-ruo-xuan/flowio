@@ -14,8 +14,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: resolve(__dirname, "index.html"),
-        // 实时字幕悬浮窗（Tauri 独立 WebviewWindow 加载，纯 vanilla 无 React）
-        caption: resolve(__dirname, "caption.html"),
       },
     },
   },
