@@ -273,26 +273,40 @@ pub fn execute_recording(
         for action in &plan {
             let mut status = "ok".to_string();
             let mut note = String::new();
+            let mut diff: Option<f32> = None;
 
-            run_action(action, &backend);
-
-            if action.action_type == "drag" {
-                note = "drag 降级为 click：源 DB 未存拖拽终点，Stage 2b 补齐".into();
+            // 单步隔离：任何一步的 unsafe Windows 调用或截图校验若 panic，
+            // 只标记该步失败并继续，绝不拖垮整个进程（直接缓解"闪退"）。
+            let step_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_action(action, &backend);
+                verify_step(&action.after_screenshot)
+            }));
+            match step_result {
+                Ok(d) => diff = d,
+                Err(_) => {
+                    status = "step-panic".into();
+                    note = "该步执行时发生异常，已隔离，不影响后续步骤".into();
+                }
             }
 
-            // 校验门：执行后截图 vs 预期
-            let diff = verify_step(&action.after_screenshot);
-            if let Some(d) = diff {
-                if d > 0.08 {
-                    status = "verify-fail".into();
-                    note = format!("截图差异 {:.2} 超阈值 0.08", d);
+            if status != "step-panic" {
+                if action.action_type == "drag" {
+                    note = "drag 降级为 click：源 DB 未存拖拽终点，Stage 2b 补齐".into();
                 }
-            } else if action
-                .after_screenshot
-                .as_deref()
-                .map_or(false, |p| !p.is_empty())
-            {
-                note = "verify-skip：抓屏或预期图不可用".into();
+
+                // 校验门：执行后截图 vs 预期
+                if let Some(d) = diff {
+                    if d > 0.08 {
+                        status = "verify-fail".into();
+                        note = format!("截图差异 {:.2} 超阈值 0.08", d);
+                    }
+                } else if action
+                    .after_screenshot
+                    .as_deref()
+                    .map_or(false, |p| !p.is_empty())
+                {
+                    note = "verify-skip：抓屏或预期图不可用".into();
+                }
             }
 
             outcomes.push(StepOutcome {

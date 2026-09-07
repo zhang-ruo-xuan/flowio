@@ -56,6 +56,36 @@ pub struct DbState(pub Mutex<Connection>);
 
 pub struct RecordingManager(pub Mutex<HashMap<String, Recorder>>);
 
+/// 安装 panic 落盘钩子：任何线程的 panic 都把时间/位置/堆栈追加写入
+/// `D:\录步\flowio_panic.log`，便于远程诊断"闪退"（打包后的 exe 默认吞掉 stderr）。
+fn install_panic_hook() {
+    use std::io::Write;
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let mut msg = String::new();
+        if let Some(s) = info.payload().downcast_ref::<&str>() {
+            msg.push_str(s);
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            msg.push_str(s);
+        }
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let entry = format!("[{}] PANIC at {}: {}\n{:?}\n\n", ts, loc, msg, bt);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"D:\录步\flowio_panic.log")
+        {
+            let _ = f.write_all(entry.as_bytes());
+        }
+        default(info);
+    }));
+}
+
 /// 启动时收到的 deep-link 认证数据，防止前端监听器尚未注册时事件丢失
 pub struct PendingDeepLink(pub Mutex<Option<serde_json::Value>>);
 
@@ -66,6 +96,7 @@ fn get_pending_deep_link(state: tauri::State<'_, PendingDeepLink>) -> Option<ser
 }
 
 pub fn run() {
+    install_panic_hook();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
