@@ -73,7 +73,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
     SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
 };
 
@@ -101,10 +101,25 @@ fn find_window(substring: &str) -> Option<HWND> {
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: windows::Win32::Foundation::LPARAM) -> BOOL {
     let ctx = &mut *(lparam.0 as *mut EnumCtx);
     if IsWindowVisible(hwnd).as_bool() {
+        // 跳过桌面 shell 窗口与录步自身窗口：多软件环境下前台瞬间可能是桌面，
+        // 录制会把 "Program Manager"/空标题记成目标；若在此聚焦桌面，输入全落空、
+        // 文件永远生不出。排除后这些脏标题自然落到「复用上次成功聚焦窗口」回退。
+        let mut cls = [0u16; 64];
+        let cn = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
+        if cn > 0 {
+            let class = String::from_utf16_lossy(&cls[..cn as usize]);
+            if class == "Progman" || class == "WorkerW" || class == "Shell_TrayWnd" {
+                return BOOL(1);
+            }
+        }
         let mut buf = [0u16; 512];
         let n = GetWindowTextW(hwnd, &mut buf);
         if n > 0 {
             let title = String::from_utf16_lossy(&buf[..n as usize]);
+            // 跳过录步自身窗口，避免重放把输入聚焦回自己
+            if title.contains("录步") || title.to_lowercase().contains("flowio") {
+                return BOOL(1);
+            }
             if title.contains(ctx.substring) {
                 ctx.found = Some(hwnd);
                 return BOOL(0); // 停止枚举
