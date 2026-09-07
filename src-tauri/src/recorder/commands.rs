@@ -2113,14 +2113,6 @@ fn spawn_event_thread(
                     ts: key_instant,
                     foreground_pid: fg_pid,
                 }) => {
-                    // DEBUG: combo-key diagnosis log
-                    {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(r"D:\录步\flowio_debug.log") {
-                            let _ = writeln!(f, "[PRESS] key={} ctrl={} alt={} fg_pid={} t={:?}", key_name, ctrl, alt, fg_pid, std::time::Instant::now().elapsed().as_millis());
-                        }
-                    }
-
                     // ★ 修饰键状态校准：钩子的原子标志（CTRL_DOWN/ALT_DOWN 等）
                     // 可能因 keyup 被系统吞掉而卡在 true，导致后续所有普通键被
                     // 错误地当成组合键（如用户只按了 "A" 却录成 "Alt+A"）。
@@ -2183,12 +2175,6 @@ fn spawn_event_thread(
                     // 这类带 Win 的组合能走 Win 分支拿到正确标签，而不是被当成
                     // 普通 Ctrl+Arrow。
                     if ctrl || alt || meta {
-                        {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(r"D:\录步\flowio_debug.log") {
-                                let _ = writeln!(f, "[COMBO] key={} ctrl={} alt={} meta={} -> combo branch", key_name, ctrl, alt, meta);
-                            }
-                        }
                         // 使用真实按键时刻（钩子触发瞬间），不是 channel 消费时刻。
                         // 关键：连按 Ctrl+A→C→V 时三个事件一起被处理，若用消费时刻
                         // 三者 combo_ts 几乎相同，closest_to 都拿最"新"的帧（即
