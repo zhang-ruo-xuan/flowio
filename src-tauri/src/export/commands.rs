@@ -903,39 +903,44 @@ type SkillMachine = std::collections::HashMap<i32, SkillStepData>;
 
 /// 一步操作的机器可执行描述。序列化后写进 `steps.json`，供 Agent 编程消费：
 /// 人读的 SKILL.md 讲「做什么」，这份讲「点哪里、按什么、拿什么校验」。
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct SkillStepData {
     /// 步号（与 SKILL.md 的编号、screenshots/step-NN 一一对应）。
+    #[serde(default)]
     n: i32,
     /// 动作类型：click / dblclick / rightclick / type / paste / drag / scroll / key / hotkey。
+    #[serde(default)]
     action: String,
     /// 人读意图（步骤标题）。
+    #[serde(default)]
     intent: String,
     /// 该意图**没说清点了什么**（形如「点击在「X」中」只报窗口）。
     /// 置 true 时消费方应以截图为准判断目标，别信这行文字。
+    #[serde(default)]
     intent_vague: bool,
     /// 目标窗口标题（录制时的前台窗口）。
+    #[serde(default)]
     window: String,
     /// 录制时的落点（屏幕逻辑坐标）。drag 用真实起点而非裁图框中心。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     point: Option<[i32; 2]>,
     /// 拖拽终点。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     drag_to: Option<[i32; 2]>,
     /// 滚轮增量（正=向上）。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     scroll_delta: Option<i32>,
     /// 结构化组合键，如 `Ctrl+Shift+S`。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     hotkey: Option<String>,
     /// 待输入文本（type / paste 步）。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     /// 控件锚点（类名 + 窗口内归一化比例），比绝对坐标抗窗口移动。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor: Option<serde_json::Value>,
     /// 该步截图在包内的相对路径（bundle 落盘时回填）。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     screenshot: Option<String>,
 }
 
@@ -1012,16 +1017,21 @@ fn title_lacks_target(action_type: &str, title: &str) -> bool {
 
 /// SKILL 包的数据完备度。用于在 SKILL.md 里如实告知消费方哪些信息不可靠——
 /// 与其让 AI 拿着模板标题瞎猜，不如明说「这几步请看图」。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 struct SkillQuality {
+    #[serde(default)]
     total: usize,
-    /// 意图含糊（只报窗口 / 裸动词 / 空）的步数。
+    /// 意图含糊（只报窗口 / 裸动词 / 空）的步数。JSON key 用可读性更强的 `intent_vague`。
+    #[serde(rename = "intent_vague", default)]
     vague: usize,
     /// 有落点坐标的步数。
+    #[serde(default)]
     with_point: usize,
     /// 有控件锚点的步数。
+    #[serde(default)]
     with_anchor: usize,
-    /// 有截图的步数。
+    /// 有截图的步数。JSON key 与导出一致用 `with_screenshot`。
+    #[serde(rename = "with_screenshot", default)]
     with_shot: usize,
 }
 
@@ -1307,6 +1317,11 @@ fn export_skill_bundle(
         .unwrap_or(std::path::Path::new("."));
     let ss_dir = parent.join("screenshots");
     let mut images: Vec<(i32, String)> = Vec::new();
+    // 始终创建 screenshots/ 目录（即便本次没有任何截图）：skill.json 的
+    // files.screenshots 永远指向它，目录缺失会让包在加载/校验时被判坏
+    //（load_skill_package 会据此拒绝登记）。空目录也是合法捆绑包。
+    std::fs::create_dir_all(&ss_dir)
+        .map_err(|e| format!("Failed to create screenshots directory: {}", e))?;
     for s in steps {
         if s.screenshot_path.is_empty() {
             continue;
@@ -1320,8 +1335,6 @@ fn export_skill_bundle(
         } else {
             raw
         };
-        std::fs::create_dir_all(&ss_dir)
-            .map_err(|e| format!("Failed to create screenshots directory: {}", e))?;
         // 扩展名跟随源文件（录制截图实为 jpg），缺省回退 png
         let ext = std::path::Path::new(&s.screenshot_path)
             .extension()
@@ -1446,6 +1459,129 @@ fn export_skill_bundle(
         }
     }
     Ok(output_path.to_string_lossy().to_string())
+}
+
+// ── Skill 包加载 / 校验（route ②「MCP 技能包」的读侧）─────────────
+//
+// `export_skill_bundle` 是写侧：把录制落盘成 SKILL.md + screenshots/ + steps.json
+// + skill.json。光有写侧还不够——一个 MCP host / 外部 Agent 要「登记并执行」这个
+// skill，得先把包**读回来并校验**。`load_skill_package` 就是读侧：解析 skill.json、
+// 核对它引用的文件确实存在、读回步数，返回规范化结构。与写侧对称，构成
+// 导出 ↔ 注册 的可往返契约。
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct SkillManifestFiles {
+    #[serde(default)]
+    skill: String,
+    #[serde(default)]
+    screenshots: String,
+    #[serde(default)]
+    steps: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SkillManifest {
+    schema: String,
+    name: String,
+    title: String,
+    #[serde(default)]
+    app: String,
+    #[serde(default)]
+    recorded_at: String,
+    #[serde(default)]
+    files: SkillManifestFiles,
+    #[serde(default)]
+    quality: SkillQuality,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SkillStepsFile {
+    #[serde(default)]
+    steps: Vec<SkillStepData>,
+}
+
+/// 规范化后的 skill 包视图，供注册表 / 执行器消费。
+#[derive(Debug, Clone)]
+struct SkillPackage {
+    name: String,
+    title: String,
+    app: String,
+    recorded_at: String,
+    skill_md: std::path::PathBuf,
+    screenshots_dir: std::path::PathBuf,
+    steps_file: Option<std::path::PathBuf>,
+    step_count: usize,
+    quality: SkillQuality,
+}
+
+impl SkillPackage {
+    /// 注册表友好摘要（可被 Tauri 命令或 MCP 桥直接序列化出去）。
+    fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "title": self.title,
+            "app": self.app,
+            "recorded_at": self.recorded_at,
+            "skill_md": self.skill_md.to_string_lossy(),
+            "screenshots_dir": self.screenshots_dir.to_string_lossy(),
+            "steps_file": self.steps_file.as_ref().map(|p| p.to_string_lossy()),
+            "step_count": self.step_count,
+            "quality": {
+                "total": self.quality.total,
+                "intent_vague": self.quality.vague,
+                "with_point": self.quality.with_point,
+                "with_anchor": self.quality.with_anchor,
+                "with_shot": self.quality.with_shot,
+            },
+        })
+    }
+}
+
+/// 读取并校验一个导出的 skill 包目录。任一引用缺失 / schema 不符都返回 Err——
+/// 调用方（MCP host）据此拒绝登记坏包，而非带着半截文件去执行。
+fn load_skill_package(dir: &std::path::Path) -> Result<SkillPackage, String> {
+    let manifest_path = dir.join("skill.json");
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("读取 skill.json 失败: {}", e))?;
+    let manifest: SkillManifest =
+        serde_json::from_str(&text).map_err(|e| format!("解析 skill.json 失败: {}", e))?;
+    if manifest.schema != "flowio.skill.manifest/v1" {
+        return Err(format!("skill.json schema 不符，期望 flowio.skill.manifest/v1，实得 {}", manifest.schema));
+    }
+    // 校验被引用的文件确实存在（缺一个都不许登记）。
+    let skill_path = dir.join(&manifest.files.skill);
+    if manifest.files.skill.is_empty() || !skill_path.is_file() {
+        return Err(format!("skill.json 引用的 SKILL.md（{}）不存在", manifest.files.skill));
+    }
+    let ss_dir = dir.join(&manifest.files.screenshots);
+    if manifest.files.screenshots.is_empty() || !ss_dir.is_dir() {
+        return Err(format!("screenshots 目录（{}）不存在", manifest.files.screenshots));
+    }
+    let mut steps_file: Option<std::path::PathBuf> = None;
+    let mut step_count = 0usize;
+    if !manifest.files.steps.is_empty() {
+        let sp = dir.join(&manifest.files.steps);
+        if !sp.is_file() {
+            return Err(format!("skill.json 引用的 steps.json（{}）不存在", manifest.files.steps));
+        }
+        if let Ok(stext) = std::fs::read_to_string(&sp) {
+            if let Ok(file) = serde_json::from_str::<SkillStepsFile>(&stext) {
+                step_count = file.steps.len();
+            }
+        }
+        steps_file = Some(sp);
+    }
+    Ok(SkillPackage {
+        name: manifest.name,
+        title: manifest.title,
+        app: manifest.app,
+        recorded_at: manifest.recorded_at,
+        skill_md: skill_path,
+        screenshots_dir: ss_dir,
+        steps_file,
+        step_count,
+        quality: manifest.quality,
+    })
 }
 
 // ── TXT export ────────────────────────────────────────────────
@@ -2361,6 +2497,140 @@ mod tests {
         assert_eq!(inputs[0]["sample"].as_str(), Some("=XLOOKUP(A2,B:B,C:C)"));
 
         // 清理验证产物，避免污染临时目录
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 导出 ⇄ 加载 可往返：export_skill_bundle 写出的包，load_skill_package 能原样读回并校验。
+    #[test]
+    fn load_skill_package_roundtrips_with_export() {
+        let recording = ExportRecording {
+            id: "r1".into(),
+            title: "XLOOKUP step by step".into(),
+            app_name: "Excel".into(),
+            total_steps: 2,
+            created_at: "2026-09-08T18:31:23".into(),
+        };
+        let steps = vec![
+            ExportStep {
+                id: "s1".into(),
+                order_index: 0,
+                step_number: 1,
+                action_type: "click".into(),
+                title: "点击在「函数参数」中".into(),
+                description: String::new(),
+                tip: String::new(),
+                screenshot_path: String::new(),
+                x: Some(100),
+                y: Some(200),
+                crop_w: None,
+                crop_h: None,
+                is_variable: false,
+                param_name: String::new(),
+            },
+            ExportStep {
+                id: "s2".into(),
+                order_index: 1,
+                step_number: 2,
+                action_type: "type".into(),
+                title: "在「单元格」中输入".into(),
+                description: "=XLOOKUP(...)".into(),
+                tip: String::new(),
+                screenshot_path: String::new(),
+                x: None,
+                y: None,
+                crop_w: None,
+                crop_h: None,
+                is_variable: false,
+                param_name: String::new(),
+            },
+        ];
+        let mut machine: SkillMachine = SkillMachine::new();
+        machine.insert(
+            1,
+            SkillStepData {
+                n: 1,
+                action: "click".into(),
+                intent: "点击在「函数参数」中".into(),
+                intent_vague: true,
+                window: "函数参数".into(),
+                point: Some([100, 200]),
+                ..Default::default()
+            },
+        );
+        machine.insert(
+            2,
+            SkillStepData {
+                n: 2,
+                action: "type".into(),
+                intent: "在「单元格」中输入".into(),
+                intent_vague: true,
+                window: "Excel".into(),
+                text: Some("=XLOOKUP(...)".into()),
+                ..Default::default()
+            },
+        );
+        let dir = std::env::temp_dir().join("flowio_skill_load_rt");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("SKILL.md");
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let res = export_skill_bundle(&out, &recording, &steps, &crop_set, &mut machine);
+        assert!(res.is_ok(), "export failed: {:?}", res.err());
+
+        let pkg = load_skill_package(&dir)
+            .expect("load_skill_package should succeed on a freshly exported bundle");
+        assert_eq!(pkg.name, skill_unique_name(&recording), "name 应与导出时一致");
+        assert_eq!(pkg.title, "XLOOKUP step by step");
+        assert_eq!(pkg.app, "Excel");
+        assert_eq!(pkg.step_count, 2, "steps.json 步数应被读回");
+        assert_eq!(pkg.quality.total, 2);
+        assert_eq!(pkg.quality.vague, 2);
+        assert!(pkg.skill_md.is_file());
+        assert!(pkg.screenshots_dir.is_dir());
+        assert!(pkg
+            .steps_file
+            .as_ref()
+            .map(|p| p.is_file())
+            .unwrap_or(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skill_package_rejects_missing_manifest() {
+        let dir = std::env::temp_dir().join("flowio_skill_load_nomanifest");
+        let _ = std::fs::create_dir_all(&dir);
+        let res = load_skill_package(&dir);
+        assert!(res.is_err(), "无 skill.json 必须拒绝登记");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skill_package_rejects_bad_schema() {
+        let dir = std::env::temp_dir().join("flowio_skill_load_badschema");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("screenshots"));
+        std::fs::write(dir.join("SKILL.md"), "# x\n").unwrap();
+        std::fs::write(
+            dir.join("skill.json"),
+            r#"{"schema":"wrong/v1","name":"n","title":"t","files":{"skill":"SKILL.md","screenshots":"screenshots/","steps":"steps.json"}}"#,
+        )
+        .unwrap();
+        let res = load_skill_package(&dir);
+        assert!(res.is_err(), "schema 不符必须拒绝登记");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skill_package_rejects_missing_skill_md() {
+        let dir = std::env::temp_dir().join("flowio_skill_load_noskillmd");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir_all(dir.join("screenshots"));
+        std::fs::write(
+            dir.join("skill.json"),
+            r#"{"schema":"flowio.skill.manifest/v1","name":"n","title":"t","files":{"skill":"SKILL.md","screenshots":"screenshots/","steps":""}}"#,
+        )
+        .unwrap();
+        let res = load_skill_package(&dir);
+        assert!(res.is_err(), "引用的 SKILL.md 缺失必须拒绝登记");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
