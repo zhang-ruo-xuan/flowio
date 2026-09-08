@@ -137,6 +137,7 @@ fn build_typed_step(
         window_title: window_title.unwrap_or_default(),
         hotkey_combo: String::new(),
         uia_anchor: String::new(),
+        mouse_button: String::new(),
         is_sensitive,
     }
 }
@@ -852,6 +853,7 @@ fn flush_shortcut_step(
         is_sensitive: false,
         hotkey_combo: combo.to_string(),
         uia_anchor: String::new(),
+        mouse_button: String::new(),
     };
 
     let mut pushed: Option<usize> = None;
@@ -1598,6 +1600,7 @@ fn build_click_step(
     ring: &FrameRing,
     step_no: i32,
     is_double: bool,
+    button: &str,
 ) -> Option<StepData> {
     let frame = ring
         .closest_to(click_ts)
@@ -1661,6 +1664,9 @@ fn build_click_step(
     // P1 降噪：双击合并——标题改为「双击」，action_type 保持 "click"
     // （前端/导出/AI 均按 click 渲染，不引入未知类型）。
     let title = if is_double { title.replacen("点击", "双击", 1) } else { title };
+    // 右键点击：标题标「右键」让用户可见；action_type 保持 "click"，
+    // 按键信息落 mouse_button 列，重放端据此下发右键（桌面右键菜单链路依赖）。
+    let title = if button == "right" { title.replacen("点击", "右键点击", 1) } else { title };
 
     Some(StepData {
         id: Uuid::new_v4().to_string(),
@@ -1684,6 +1690,7 @@ fn build_click_step(
             hotkey_combo: String::new(),
             uia_anchor,
             is_sensitive: false,
+            mouse_button: if button == "right" { "right".to_string() } else { "left".to_string() },
     })
 }
 
@@ -1821,6 +1828,7 @@ fn build_drag_step(
             hotkey_combo: String::new(),
             uia_anchor,
             is_sensitive: false,
+            mouse_button: String::new(),
     })
 }
 
@@ -2023,7 +2031,7 @@ fn spawn_event_thread(
                         // 先把那次按下当成点击落成步骤，避免漏步。
                         if let Some((stale_down, _)) = pending_down.take() {
                             let step_no = { let s = cs_for_thread.lock().unwrap(); s.len() as i32 + 1 };
-                            if let Some(step) = build_click_step(stale_down.x, stale_down.y, stale_down.timestamp, &ring, step_no, false) {
+                            if let Some(step) = build_click_step(stale_down.x, stale_down.y, stale_down.timestamp, &ring, step_no, false, &stale_down.button) {
                                 let mut steps = cs_for_thread.lock().unwrap();
                                 if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
                                     steps.push(step);
@@ -2065,7 +2073,7 @@ fn spawn_event_thread(
                             let click_step_no = steps.len() as i32 + 1;
                             if let Some(step) = build_click_step(
                                 click.x, click.y, click.timestamp, &ring, click_step_no,
-                                dbl_prev_id.is_some(),
+                                dbl_prev_id.is_some(), &click.button,
                             ) {
                                 if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
                                     new_click_id = Some(step.id.clone());
@@ -2626,6 +2634,7 @@ fn build_mark_step(
         window_title: String::new(),
         hotkey_combo: String::new(),
         uia_anchor: String::new(),
+        mouse_button: String::new(),
         is_sensitive: false,
     }
 }
@@ -2652,6 +2661,7 @@ fn steps_to_step_saves(steps: &[StepData]) -> Vec<crate::db::StepSave> {
             window_title: s.window_title.clone(),
             hotkey_combo: s.hotkey_combo.clone(),
             uia_anchor: s.uia_anchor.clone(),
+            mouse_button: s.mouse_button.clone(),
         })
         .collect()
 }
@@ -3222,6 +3232,7 @@ mod commands_tests {
             is_sensitive: false,
             hotkey_combo: String::new(),
             uia_anchor: String::new(),
+            mouse_button: String::new(),
         }
     }
 

@@ -141,6 +141,7 @@ mod state_tests {
             is_sensitive: false,
             hotkey_combo: String::new(),
             uia_anchor: String::new(),
+            mouse_button: String::new(),
         }
     }
 

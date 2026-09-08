@@ -17,6 +17,10 @@ pub trait ReplayBackend {
     /// 按控件锚点（Stage 2b）反算点击坐标；无锚点或定位失败时回退到 (fallback_x, fallback_y)。
     /// 锚点 JSON 为空 / 解析失败 → 直接按回退坐标点击。
     fn click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32);
+    /// 右键点击（桌面右键菜单等场景）。
+    fn right_click(&self, x: i32, y: i32);
+    /// 右键 + 控件锚点：同 click_anchored，但下发右键。
+    fn right_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32);
 }
 
 // ── 测试后端：只记录动作，不碰真实桌面 ──────────────────────
@@ -61,13 +65,23 @@ impl ReplayBackend for DryRunBackend {
             fallback_x, fallback_y, anchor_json
         ));
     }
+    fn right_click(&self, x: i32, y: i32) {
+        self.actions.lock().unwrap().push(format!("right_click({},{})", x, y));
+    }
+    fn right_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
+        self.actions.lock().unwrap().push(format!(
+            "right_click_anchored({},{},{})",
+            fallback_x, fallback_y, anchor_json
+        ));
+    }
 }
 
 // ── 真实 Win32 后端 ────────────────────────────────────────
 use windows::Win32::Foundation::{BOOL, HWND};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    SendInput, VIRTUAL_KEY, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, mouse_event, VK_APPS,
+    SendInput, VIRTUAL_KEY, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, mouse_event, VK_APPS,
     VK_BACK, VK_CAPITAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT,
     VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SNAPSHOT,
     VK_SPACE, VK_TAB, VK_UP,
@@ -270,6 +284,17 @@ fn click(x: i32, y: i32) {
     }
 }
 
+/// 右键点击：桌面/文件右键菜单（新建文件等）链路依赖。
+fn right_click(x: i32, y: i32) {
+    unsafe {
+        let _ = SetCursorPos(x, y);
+        std::thread::sleep(Duration::from_millis(10));
+        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+        std::thread::sleep(Duration::from_millis(10));
+        mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+    }
+}
+
 fn drag(x1: i32, y1: i32, x2: i32, y2: i32) {
     unsafe {
         let _ = SetCursorPos(x1, y1);
@@ -451,6 +476,28 @@ impl ReplayBackend for WindowsBackend {
         match locate_click(&anchor, hwnd) {
             Some((cx, cy)) => self.click(cx, cy),
             None => self.click(fallback_x, fallback_y),
+        }
+    }
+    fn right_click(&self, x: i32, y: i32) {
+        right_click(x, y);
+    }
+    fn right_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
+        let anchor = match ControlAnchor::from_str(anchor_json) {
+            Some(a) if !a.is_empty() => a,
+            _ => {
+                self.right_click(fallback_x, fallback_y);
+                return;
+            }
+        };
+        // focus() 已把目标窗口设为前景窗口；取其句柄在当前窗口内定位控件。
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            self.right_click(fallback_x, fallback_y);
+            return;
+        }
+        match locate_click(&anchor, hwnd) {
+            Some((cx, cy)) => self.right_click(cx, cy),
+            None => self.right_click(fallback_x, fallback_y),
         }
     }
 }

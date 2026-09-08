@@ -26,6 +26,9 @@ pub struct ReplayAction {
     /// 控件锚点 JSON（Stage 2b）：点击处控件类名 + 归一化点击比例，分辨率无关重放用。
     /// 为空表示无锚点，回退到录制坐标。
     pub uia_anchor: Option<String>,
+    /// 鼠标按键（"left"/"right"，空=left）。click 步为 "right" 时重放下发右键。
+    /// 旧录制该列为空 → 按左键（旧行为）。
+    pub mouse_button: String,
 }
 
 /// 从源 DB 读取某录制的重放计划。
@@ -37,7 +40,7 @@ pub fn load_replay_plan(
 ) -> Result<Vec<ReplayAction>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor \
+            "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -62,6 +65,7 @@ pub fn load_replay_plan(
                     Some(a) if !a.trim().is_empty() => Some(a),
                     _ => None,
                 },
+                mouse_button: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -103,13 +107,23 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
     match action.action_type.as_str() {
         // click/drag：优先按控件锚点（Stage 2b 分辨率无关）；无锚点回退录制坐标。
         "click" | "drag" => {
+            // 右键点击：桌面右键菜单（新建文件等）链路依赖；仅对 click 步生效。
+            let is_right = action.action_type == "click" && action.mouse_button == "right";
             if let Some(anchor) = action.uia_anchor.as_deref() {
                 if !anchor.trim().is_empty() {
-                    backend.click_anchored(anchor, x, y);
+                    if is_right {
+                        backend.right_click_anchored(anchor, x, y);
+                    } else {
+                        backend.click_anchored(anchor, x, y);
+                    }
                     return;
                 }
             }
-            backend.click(x, y);
+            if is_right {
+                backend.right_click(x, y);
+            } else {
+                backend.click(x, y);
+            }
         }
         "type" | "input" => backend.type_text(action.text.as_deref().unwrap_or("")),
         // copy/paste 是语义化的组合键步骤：直接下发对应组合键
@@ -173,7 +187,7 @@ mod tests {
                 id TEXT, recording_id TEXT, order_index INTEGER,
                 step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER,
                 window_title TEXT, description TEXT, after_screenshot_path TEXT,
-                hotkey_combo TEXT, uia_anchor TEXT
+                hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT
             )",
             [],
         )
@@ -186,9 +200,9 @@ mod tests {
         ];
         for (i, (si, at, x, y, wt, d, a, hk)) in rows.iter().enumerate() {
             conn.execute(
-                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                params!["s{i}", "rec1", i as i32, *si, at, *x, *y, wt, d, a, hk, ""],
+                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params!["s{i}", "rec1", i as i32, *si, at, *x, *y, wt, d, a, hk, "", ""],
             )
             .unwrap();
         }
@@ -230,12 +244,12 @@ mod tests {
     fn test_no_coord_step_only_focuses() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','')",
+            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','','')",
             [],
         )
         .unwrap();
@@ -252,8 +266,8 @@ mod tests {
     fn test_hotkey_press_combo_dispatched() {
         let conn = mem_db();
         conn.execute(
-            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) \
-             VALUES ('s5','rec1',4,5,'hotkey',10,20,'记事本','',NULL,'Ctrl+S','')",
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) \
+             VALUES ('s5','rec1',4,5,'hotkey',10,20,'记事本','',NULL,'Ctrl+S','','')",
             [],
         )
         .unwrap();
@@ -273,8 +287,8 @@ mod tests {
     #[test]
     fn test_copy_paste_press_combo() {
         let conn = mem_db();
-        conn.execute("INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) VALUES ('s6','rec1',5,6,'copy',0,0,'WPS','',NULL,'Ctrl+C','')", []).unwrap();
-        conn.execute("INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) VALUES ('s7','rec1',6,7,'paste',0,0,'WPS','',NULL,'Ctrl+V','')", []).unwrap();
+        conn.execute("INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) VALUES ('s6','rec1',5,6,'copy',0,0,'WPS','',NULL,'Ctrl+C','','')", []).unwrap();
+        conn.execute("INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) VALUES ('s7','rec1',6,7,'paste',0,0,'WPS','',NULL,'Ctrl+V','','')", []).unwrap();
         let plan = load_replay_plan(&conn, "rec1").unwrap();
         let backend = crate::executor::backend::DryRunBackend::new();
         run_replay(&plan, &backend, 0);
@@ -287,8 +301,8 @@ mod tests {
     fn test_click_uses_anchor_when_present() {
         let conn = mem_db();
         conn.execute(
-            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) \
-             VALUES ('s9','rec1',7,9,'click',100,200,'WPS','',NULL,'','{\"cls\":\"Button\",\"fx\":0.5,\"fy\":0.5,\"wx\":0.3,\"wy\":0.2}')",
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) \
+             VALUES ('s9','rec1',7,9,'click',100,200,'WPS','',NULL,'','{\"cls\":\"Button\",\"fx\":0.5,\"fy\":0.5,\"wx\":0.3,\"wy\":0.2}','')",
             [],
         )
         .unwrap();
@@ -329,6 +343,64 @@ mod tests {
         );
     }
 
+    /// 锁定右键重放契约：click 步 mouse_button="right" → 必须下发 right_click（锚点路径同理）。
+    /// 桌面右键菜单（新建文件等）链路依赖此行为；若派发被回退成左键，该测试立即失败。
+    #[test]
+    fn test_right_click_step_dispatches_right_button() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT)",
+            [],
+        )
+        .unwrap();
+        // 无锚点右键
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) VALUES ('r1','rec1',0,1,'click',655,269,'Program Manager','','','','','right')",
+            [],
+        )
+        .unwrap();
+        // 带锚点右键
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) VALUES ('r2','rec1',1,2,'click',701,460,'Program Manager','','','','{\"cls\":\"Button\",\"fx\":0.5,\"fy\":0.5,\"wx\":0.5,\"wy\":0.5}','right')",
+            [],
+        )
+        .unwrap();
+        // 对照组：左键 click 不受影响
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) VALUES ('r3','rec1',2,3,'click',100,100,'Program Manager','','','','','left')",
+            [],
+        )
+        .unwrap();
+        let plan = load_replay_plan(&conn, "rec1").unwrap();
+        assert_eq!(plan[0].mouse_button, "right");
+        let backend = DryRunBackend::new();
+        for action in &plan {
+            run_action(action, &backend);
+        }
+        let acts = backend.actions.lock().unwrap().clone();
+        assert!(
+            acts.iter().any(|a| a.contains("right_click(655")),
+            "右键步应下发 right_click，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().any(|a| a.contains("right_click_anchored(701")),
+            "带锚点右键步应走 right_click_anchored，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().any(|a| a.contains("click(100")),
+            "左键步行为不变，acts={:?}",
+            acts
+        );
+        // 右键不得再走左键路径
+        assert!(
+            !acts.iter().any(|a| a.starts_with("click(655")),
+            "右键步不应退化成左键，acts={:?}",
+            acts
+        );
+    }
+
     #[test]
     fn test_classify_sensitivity() {
         assert!(!classify_sensitivity("click"));
@@ -352,6 +424,7 @@ mod tests {
             after_screenshot: None,
             hotkey_combo: None,
             uia_anchor: None,
+            mouse_button: String::new(),
         };
         let plan_only_click = vec![click.clone()];
         assert!(!plan_requires_approval(&plan_only_click));
@@ -367,6 +440,7 @@ mod tests {
             after_screenshot: None,
             hotkey_combo: Some("Ctrl+C".into()),
             uia_anchor: None,
+            mouse_button: String::new(),
         });
         assert!(plan_requires_approval(&mixed));
     }
@@ -390,7 +464,7 @@ mod tests {
     fn test_save_as_replay_sequence_locks_create_file_flow() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT)",
             [],
         )
         .unwrap();
@@ -401,8 +475,8 @@ mod tests {
         ];
         for (i, (si, at, x, y, wt, d, hk)) in rows.iter().enumerate() {
             conn.execute(
-                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                rusqlite::params!["s{i}", "rec1", i as i32, *si, at, *x, *y, wt, d, "", hk, ""],
+                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                rusqlite::params!["s{i}", "rec1", i as i32, *si, at, *x, *y, wt, d, "", hk, "", ""],
             )
             .unwrap();
         }

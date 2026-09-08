@@ -57,6 +57,11 @@ pub struct StepData {
     /// 空串表示未抓取 / 无需锚点（重放回退到录制坐标）。缺省空串以兼容旧数据。
     #[serde(default)]
     pub uia_anchor: String,
+    /// 鼠标按键（"left" / "right"；其他/空 = left）。仅 click 步骤有意义。
+    /// 右键步骤重放时下发右键——桌面右键菜单（新建文件等）链路依赖它。
+    /// 缺省空串以兼容旧数据（旧录制无按键信息，按左键重放）。
+    #[serde(default)]
+    pub mouse_button: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,6 +126,7 @@ mod tests {
             is_sensitive: false,
             hotkey_combo: String::new(),
             uia_anchor: String::new(),
+            mouse_button: String::new(),
         }
     }
 

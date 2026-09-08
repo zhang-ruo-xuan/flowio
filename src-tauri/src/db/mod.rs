@@ -30,6 +30,9 @@ pub struct StepSave {
     /// 控件锚点 JSON（Stage 2b）：点击处控件类名 + 归一化点击比例，分辨率无关重放用。
     /// 空串表示未抓取 / 无需锚点（回退到录制坐标）。
     pub uia_anchor: String,
+    /// 鼠标按键（"left" / "right"；空 = left）。右键步骤重放下发右键。
+    #[serde(default)]
+    pub mouse_button: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,8 +61,8 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
         let step_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = conn.execute(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, \
-             title, description, tip, screenshot_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, hotkey_combo, uia_anchor) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             title, description, tip, screenshot_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, hotkey_combo, uia_anchor, mouse_button) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 step_id,
                 recording.id,
@@ -80,6 +83,7 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
                 step.window_title,
                 step.hotkey_combo,
                 step.uia_anchor,
+                step.mouse_button,
             ],
         ) {
             let _ = conn.execute("ROLLBACK", []);
@@ -281,6 +285,13 @@ pub fn init_db(conn: &Connection) {
     let _ = conn.execute_batch(
         "ALTER TABLE steps ADD COLUMN uia_anchor TEXT NOT NULL DEFAULT ''",
     );
+
+    // ── Migrations: 鼠标按键（"left"/"right"，空=left）──
+    // 右键步骤重放时下发右键——桌面右键菜单（新建文件等）链路依赖它。
+    // 旧库/存量步骤该列为 ''，按左键重放（旧行为）；新录制由 build_click_step 写入。
+    let _ = conn.execute_batch(
+        "ALTER TABLE steps ADD COLUMN mouse_button TEXT NOT NULL DEFAULT ''",
+    );
 }
 
 /// 读取译文本来的 JSON 字符串（旧库/未翻译 → None；必须 Option 读，NULL 安全）。
@@ -377,6 +388,7 @@ mod db_tests {
             window_title: format!("Window {}", num),
             hotkey_combo: String::new(),
             uia_anchor: String::new(),
+            mouse_button: String::new(),
         }
     }
 

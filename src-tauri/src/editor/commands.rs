@@ -50,6 +50,9 @@ pub struct Step {
     /// 变量参数名（如 order_id），is_variable 为 true 时有意义
     #[serde(default)]
     pub param_name: String,
+    /// 鼠标按键（"left"/"right"，空=left）。右键步骤重放下发右键。
+    #[serde(default)]
+    pub mouse_button: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,7 +109,7 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
              title, description, tip, screenshot_path, annotated_path, \
              before_screenshot_path, created_at, \
              x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, \
-             is_variable, param_name \
+             is_variable, param_name, mouse_button \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -138,6 +141,7 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
                 window_title: row.get(18)?,
                 is_variable: row.get::<_, i64>(19)? != 0,
                 param_name: row.get(20)?,
+                mouse_button: row.get::<_, Option<String>>(21)?.unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1020,6 +1024,9 @@ struct EditorSnapshotStep {
     window_title: Option<String>,
     is_variable: bool,
     param_name: String,
+    /// 鼠标按键（"left"/"right"，空=left）。旧快照 JSON 缺该字段 → serde default ''。
+    #[serde(default)]
+    mouse_button: String,
 }
 
 /// 一次快照 = 录制标题 + 全部步骤行。
@@ -1054,7 +1061,7 @@ fn capture_editor_snapshot(
         .prepare(
             "SELECT id, order_index, step_number, action_type, title, description, tip, \
              screenshot_path, annotated_path, before_screenshot_path, after_screenshot_path, \
-             x, y, crop_w, crop_h, timestamp, window_title, is_variable, param_name \
+             x, y, crop_w, crop_h, timestamp, window_title, is_variable, param_name, mouse_button \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -1080,6 +1087,7 @@ fn capture_editor_snapshot(
                 window_title: r.get(16)?,
                 is_variable: r.get::<_, i64>(17)? != 0,
                 param_name: r.get(18)?,
+                mouse_button: r.get::<_, Option<String>>(19)?.unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?
@@ -1169,13 +1177,13 @@ fn restore_editor_snapshot(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
              description, tip, screenshot_path, annotated_path, before_screenshot_path, \
              after_screenshot_path, x, y, crop_w, crop_h, timestamp, window_title, \
-             is_variable, param_name) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+             is_variable, param_name, mouse_button) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 s.id, recording_id, i as i32, i as i32 + 1, s.action_type, s.title,
                 s.description, s.tip, shot, ann, before, after,
                 s.x, s.y, s.crop_w, s.crop_h, s.timestamp, s.window_title,
-                s.is_variable, s.param_name,
+                s.is_variable, s.param_name, s.mouse_button,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -2186,6 +2194,7 @@ fn build_new_step(
         window_title: step_data.window_title,
         is_variable: false,
         param_name: String::new(),
+        mouse_button: String::new(),
     }
 }
 
@@ -2373,6 +2382,7 @@ mod editor_tests {
             window_title: "记事本".into(),
             is_variable: false,
             param_name: String::new(),
+            mouse_button: String::new(),
         };
         let json = serde_json::to_string(&s).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2600,6 +2610,7 @@ mod editor_tests {
             window_title: "".into(),
             is_variable: false,
             param_name: String::new(),
+            mouse_button: String::new(),
         };
         populate_step_screenshot_base64(&mut step);
         assert!(step.screenshot_base64.is_some());
@@ -2640,6 +2651,7 @@ mod editor_tests {
             window_title: "".into(),
             is_variable: false,
             param_name: String::new(),
+            mouse_button: String::new(),
         };
         populate_step_screenshot_base64(&mut step);
         assert!(step.screenshot_base64.is_none());
