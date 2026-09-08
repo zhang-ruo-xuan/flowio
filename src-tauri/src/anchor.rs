@@ -38,6 +38,20 @@ pub struct ControlAnchor {
     /// 重放时落点名称不符则在窗口 UIA 树内按名称找回。空串 = 未捕获 / 旧数据。
     #[serde(default)]
     pub name: String,
+    /// 点击在「名称元素」矩形内的横向相对位置 (0..1)，默认 0.5（中心）。
+    ///
+    /// 必要性：WPS「最近」列表等自绘控件只暴露整行元素，文件名文本没有独立
+    /// UIA 元素——此时按名称只能定位到整行，取行中心会点进路径列并跳转文件夹。
+    /// 记录录制时点击在行内的相对位置，重放时按同一比例还原列位置。
+    #[serde(default = "default_half")]
+    pub nfx: f64,
+    /// 点击在「名称元素」矩形内的纵向相对位置 (0..1)，默认 0.5。
+    #[serde(default = "default_half")]
+    pub nfy: f64,
+}
+
+fn default_half() -> f64 {
+    0.5
 }
 
 impl ControlAnchor {
@@ -117,9 +131,18 @@ pub fn capture_anchor(screen_x: i32, screen_y: i32) -> Option<ControlAnchor> {
         let fy = ((screen_y - ctrl_rect.top) as f64 / ctrl_h).clamp(0.0, 1.0);
 
         let cls = class_name_of(hwnd);
-        // Stage 2c：尽力抓取落点元素的 UIA 名称（列表项文件名等）；
-        // 失败/空名留空 —— 重放端名称为空即走既有 Win32 路径，零回归。
-        let name = crate::uia::element_name_at(screen_x, screen_y).unwrap_or_default();
+        // Stage 2c：尽力抓取落点元素的 UIA 名称（列表项文件名等）与点击在该元素
+        // 矩形内的相对位置；失败/空名留空 —— 重放端名称为空即走既有 Win32 路径，零回归。
+        let (name, nfx, nfy) = match crate::uia::element_at(screen_x, screen_y) {
+            Some((n, r)) => {
+                let w = (r.right - r.left).max(1) as f64;
+                let h = (r.bottom - r.top).max(1) as f64;
+                let rx = ((screen_x - r.left) as f64 / w).clamp(0.0, 1.0);
+                let ry = ((screen_y - r.top) as f64 / h).clamp(0.0, 1.0);
+                (n, rx, ry)
+            }
+            None => (String::new(), 0.5, 0.5),
+        };
         Some(ControlAnchor {
             cls,
             fx,
@@ -127,6 +150,8 @@ pub fn capture_anchor(screen_x: i32, screen_y: i32) -> Option<ControlAnchor> {
             wx,
             wy,
             name,
+            nfx,
+            nfy,
         })
     }
 }
@@ -235,6 +260,8 @@ mod tests {
             wx: 0.3,
             wy: 0.2,
             name: String::new(),
+            nfx: 0.5,
+            nfy: 0.5,
         };
         let s = serde_json::to_string(&a).unwrap();
         let b = ControlAnchor::from_str(&s).unwrap();
@@ -270,6 +297,23 @@ mod tests {
     }
 
     #[test]
+    fn anchor_legacy_json_defaults_name_offset_to_center() {
+        // 旧数据无 nfx/nfy → 默认 0.5（等价改前「取中心」行为），零回归。
+        let a = ControlAnchor::from_str(r#"{"cls":"Button","fx":0.5,"fy":0.5,"wx":0.3,"wy":0.2}"#)
+            .unwrap();
+        assert_eq!(a.nfx, 0.5);
+        assert_eq!(a.nfy, 0.5);
+        // 新数据带行内相对偏移 → 完整保留。
+        let b = ControlAnchor::from_str(
+            r#"{"cls":"OpusApp","fx":0.1,"fy":0.2,"wx":0.3,"wy":0.4,"name":"x.xlsx","nfx":0.18,"nfy":0.5}"#,
+        )
+        .unwrap();
+        assert_eq!(b.name, "x.xlsx");
+        assert_eq!(b.nfx, 0.18);
+        assert_eq!(b.nfy, 0.5);
+    }
+
+    #[test]
     fn empty_anchor_detected() {
         let a = ControlAnchor::default();
         assert!(a.is_empty());
@@ -280,6 +324,8 @@ mod tests {
             wx: 0.4,
             wy: 0.5,
             name: String::new(),
+            nfx: 0.5,
+            nfy: 0.5,
         };
         assert!(!b.is_empty());
     }

@@ -280,6 +280,7 @@ pub fn wait_window_ready(title: &str, timeout_ms: u64) -> Option<u64> {
         return None;
     }
     let start = std::time::Instant::now();
+    let mut first_seen: Option<std::time::Instant> = None;
     loop {
         if let Some(h) = find_window(t) {
             if window_responsive(h) {
@@ -289,6 +290,19 @@ pub fn wait_window_ready(title: &str, timeout_ms: u64) -> Option<u64> {
                 if elapsed > 0 {
                     std::thread::sleep(Duration::from_millis(400));
                 }
+                return Some(elapsed);
+            }
+            // 窗口已存在但持续不可响应（WPS 加载大文档时 SendMessageTimeout 会一直
+            // 失败）：只再给 2s 宽限就继续，避免每步白等满 8s 把全程预算烧光，
+            // 导致后续对话框步骤反而没有等待额度。
+            let seen = *first_seen.get_or_insert_with(std::time::Instant::now);
+            if seen.elapsed().as_millis() >= 2000 {
+                let elapsed = start.elapsed().as_millis() as u64;
+                replay_log(&format!(
+                    "[wait] 目标窗口 '{}' 已存在但持续不可响应（仍在加载）{}ms，宽限 2s 后继续",
+                    t, elapsed
+                ));
+                std::thread::sleep(Duration::from_millis(400));
                 return Some(elapsed);
             }
         }
@@ -918,7 +932,7 @@ impl ReplayBackend for WindowsBackend {
                 let (cx, cy) = if anchor.name.is_empty() {
                     (cx, cy)
                 } else {
-                    crate::uia::locate_by_name(hwnd, &anchor.name, cx, cy).unwrap_or((cx, cy))
+                    crate::uia::locate_by_name(hwnd, &anchor.name, anchor.nfx, anchor.nfy, Some(fallback_x), Some(fallback_y), cx, cy).unwrap_or((cx, cy))
                 };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(
@@ -975,7 +989,7 @@ impl ReplayBackend for WindowsBackend {
                 let (cx, cy) = if anchor.name.is_empty() {
                     (cx, cy)
                 } else {
-                    crate::uia::locate_by_name(hwnd, &anchor.name, cx, cy).unwrap_or((cx, cy))
+                    crate::uia::locate_by_name(hwnd, &anchor.name, anchor.nfx, anchor.nfy, Some(fallback_x), Some(fallback_y), cx, cy).unwrap_or((cx, cy))
                 };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(
@@ -1027,7 +1041,7 @@ impl ReplayBackend for WindowsBackend {
                 let (cx, cy) = if anchor.name.is_empty() {
                     (cx, cy)
                 } else {
-                    crate::uia::locate_by_name(hwnd, &anchor.name, cx, cy).unwrap_or((cx, cy))
+                    crate::uia::locate_by_name(hwnd, &anchor.name, anchor.nfx, anchor.nfy, Some(fallback_x), Some(fallback_y), cx, cy).unwrap_or((cx, cy))
                 };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(

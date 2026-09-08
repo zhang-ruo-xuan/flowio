@@ -35,17 +35,40 @@ fn automation() -> Option<IUIAutomation> {
 
 /// 取屏幕坐标处 UIA 元素的名称（列表项文件名等）。空名 / 失败返回 None。
 pub fn element_name_at(x: i32, y: i32) -> Option<String> {
+    element_at(x, y).map(|(n, _)| n)
+}
+
+/// 取屏幕坐标处 UIA 元素的 (名称, 矩形)。失败 / 空名返回 None。
+///
+/// 矩形用于记录「点击点在元素内的相对位置」：WPS「最近」列表等自绘控件
+/// 只暴露整行元素（文件名文本无独立 UIA 元素），此时只能按行内相对偏移
+/// 还原列位置，取行中心会点进路径列并跳转文件夹。
+pub fn element_at(x: i32, y: i32) -> Option<(String, RECT)> {
     let auto = automation()?;
     let el = unsafe { auto.ElementFromPoint(POINT { x, y }) }.ok()?;
     let name = unsafe { el.CurrentName() }.ok()?;
-    to_name(&name)
+    let name = to_name(&name)?;
+    let r = unsafe { el.CurrentBoundingRectangle() }.ok()?;
+    if r.right <= r.left || r.bottom <= r.top {
+        return None;
+    }
+    Some((name, r))
 }
 
 /// 名称锚点定位：在窗口 hwnd 的 UIA 子树内按名称找出全部同名元素，选矩形最小者
 /// （真正的文本元素，而非整行容器），返回其当前矩形中心。
 /// 找不到时回退校验落点 (cx, cy) 处元素名称，一致则维持落点。
 /// 任何失败返回 None（上层维持原落点）。全过程留痕 replay_log。
-pub fn locate_by_name(hwnd: HWND, name: &str, cx: i32, cy: i32) -> Option<(i32, i32)> {
+pub fn locate_by_name(
+    hwnd: HWND,
+    name: &str,
+    nfx: f64,
+    nfy: f64,
+    hint_x: Option<i32>,
+    hint_y: Option<i32>,
+    cx: i32,
+    cy: i32,
+) -> Option<(i32, i32)> {
     if name.trim().is_empty() {
         return None;
     }
@@ -86,13 +109,43 @@ pub fn locate_by_name(hwnd: HWND, name: &str, cx: i32, cy: i32) -> Option<(i32, 
                     }
                 }
                 if let Some(r) = best {
-                    let p = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+                    // 行内相对位置：自绘列表只暴露整行时，取行中心会点进路径列，
+                    // 必须用「点击在行内的相对位置」还原列位置。优先级：
+                    //   1) 新录制带 nfx/nfy → 直接用；
+                    //   2) 旧录制（nfx/nfy 为默认 0.5）且命中元素是宽容器
+                    //      → 用录制绝对点击坐标反推相对位置（窗口几何一致时准确）；
+                    //   3) 否则取中心（与改前一致，零回归）。
+                    let w = r.right - r.left;
+                    let h = r.bottom - r.top;
+                    let is_container = w > 300 || h > 200;
+                    let (nfx, nfy) = if (nfx - 0.5).abs() > 0.0001 || (nfy - 0.5).abs() > 0.0001 {
+                        (nfx, nfy)
+                    } else if let (Some(hx), Some(hy)) = (hint_x, hint_y) {
+                        if is_container {
+                            (
+                                ((hx - r.left) as f64 / w.max(1) as f64).clamp(0.02, 0.98),
+                                ((hy - r.top) as f64 / h.max(1) as f64).clamp(0.02, 0.98),
+                            )
+                        } else {
+                            (0.5, 0.5)
+                        }
+                    } else {
+                        (0.5, 0.5)
+                    };
+                    let p = (
+                        (r.left as f64 + nfx.clamp(0.02, 0.98) * w as f64).round() as i32,
+                        (r.top as f64 + nfy.clamp(0.02, 0.98) * h as f64).round() as i32,
+                    );
                     log(&format!(
-                        "name='{}' 树内命中 {} 个同名元素 -> 取最小矩形 {}x{} 落点 ({},{})",
+                        "name='{}' 树内命中 {} 个同名元素 -> 最小矩形 {}x{} at({},{}) nf=({:.3},{:.3}) 落点 ({},{})",
                         name,
                         len,
-                        r.right - r.left,
-                        r.bottom - r.top,
+                        w,
+                        h,
+                        r.left,
+                        r.top,
+                        nfx,
+                        nfy,
                         p.0,
                         p.1
                     ));
