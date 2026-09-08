@@ -479,15 +479,23 @@ fn ocr_text_at(img: &DynamicImage, cx: i32, cy: i32) -> Option<String> {
     None
 }
 
-/// 重放端 OCR 兜底：控件类名 / UIA 名称都失配时（WPS 自绘控件稀疏），对当前前台
-/// 窗口截图做 OCR，找出包含 `text` 的文本行，按其边界框 + (nfx,nfy) 反算落点。
+/// 重放端 OCR 兜底：控件类名 / UIA 名称都失配时（WPS 自绘控件稀疏），对目标窗口区域
+/// 截图做 OCR，找出与 `text` 最相似的文本行，按其边界框 + (nfx,nfy) 反算落点。
+///
+/// 稳化措施（更稳的 OCR 重放）：
+/// 1. 优先把全屏截图裁剪到目标窗口矩形，缩小 OCR 范围、提速、并减少跨窗口误命中；
+/// 2. 用「相似度」而非朴素 contains：精确相等最佳，包含时按「目标占行文本比例」打分，
+///    比例 < 0.5 视为长文本裹挟短词（如「保存并退出」里找「保存」），丢弃；多候选取最像的。
+///
 /// 任何失败返回 None（上层维持原落点）。仅在前端带非空 ocr 锚点时调用 -> 零回归。
 pub fn locate_by_ocr(window: HWND, text: &str, nfx: f64, nfy: f64) -> Option<(i32, i32)> {
     if text.trim().is_empty() {
         return None;
     }
-    let _ = window; // 当前基于全屏 OCR；window 作语义占位（未来可裁剪该窗口区域提速）。
-    let (img, ox, oy) = crate::recorder::screenshot::capture_fullscreen_with_origin().ok()?;
+    let (img, base_ox, base_oy) = crate::recorder::screenshot::capture_fullscreen_with_origin().ok()?;
+    // 优先裁剪到目标窗口区域；拿不到矩形则退回全屏。
+    let (img, ox, oy) = crop_to_window(img.clone(), base_ox, base_oy, window)
+        .unwrap_or((img, base_ox, base_oy));
     let tmp = std::env::temp_dir().join(format!("flowio_replay_ocr_{}.png", std::process::id()));
     {
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -502,15 +510,63 @@ pub fn locate_by_ocr(window: HWND, text: &str, nfx: f64, nfy: f64) -> Option<(i3
     let _ = std::fs::remove_file(&tmp);
     let lines = lines?;
     let target = text.trim().to_lowercase();
+    let mut best: Option<(i32, i32, f64)> = None;
     for l in &lines {
-        if l.text.to_lowercase().contains(&target) {
-            let (lx, ly, lw, lh) = (l.x as f64, l.y as f64, l.w as f64, l.h as f64);
-            let px = (lx + nfx.clamp(0.02, 0.98) * lw) as i32 + ox;
-            let py = (ly + nfy.clamp(0.02, 0.98) * lh) as i32 + oy;
-            return Some((px, py));
+        let lt = l.text.trim().to_lowercase();
+        if lt.is_empty() {
+            continue;
+        }
+        // 相似度：精确相等 = 1.0；包含时 = 目标占行文本比例；否则 0。
+        let ratio = if lt == target {
+            1.0
+        } else if lt.contains(&target) {
+            target.len() as f64 / lt.len() as f64
+        } else {
+            0.0
+        };
+        // 占比 < 0.5 视为长文本裹挟短词，丢弃，避免误命中。
+        if ratio < 0.5 {
+            continue;
+        }
+        let px = (l.x as f64 + nfx.clamp(0.02, 0.98) * l.w as f64) as i32 + ox;
+        let py = (l.y as f64 + nfy.clamp(0.02, 0.98) * l.h as f64) as i32 + oy;
+        if best.as_ref().map_or(true, |(_, _, b)| ratio > *b) {
+            best = Some((px, py, ratio));
         }
     }
-    None
+    best.map(|(px, py, _)| (px, py))
+}
+
+/// 把全屏截图裁剪到 `window` 的窗口矩形，返回裁剪图与新的截图原点（屏幕坐标）。
+/// 失败（窗口无效 / 矩形非法 / 越界）返回 None，调用方退回全屏。
+fn crop_to_window(
+    img: image::DynamicImage,
+    base_ox: i32,
+    base_oy: i32,
+    window: HWND,
+) -> Option<(image::DynamicImage, i32, i32)> {
+    let mut rect = RECT::default();
+    unsafe {
+        if GetWindowRect(window, &mut rect).is_err() {
+            return None;
+        }
+    }
+    let w = rect.right - rect.left;
+    let h = rect.bottom - rect.top;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    // 截图坐标系：截图原点为 (base_ox, base_oy)；窗口在屏幕坐标为 (rect.left, rect.top)。
+    let x0 = (rect.left - base_ox).clamp(0, iw - 1) as u32;
+    let y0 = (rect.top - base_oy).clamp(0, ih - 1) as u32;
+    let x1 = (rect.right - base_ox).clamp(0, iw) as u32;
+    let y1 = (rect.bottom - base_oy).clamp(0, ih) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let cropped = img.crop_imm(x0, y0, x1 - x0, y1 - y0);
+    Some((cropped, rect.left, rect.top))
 }
 
 #[cfg(test)]

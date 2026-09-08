@@ -144,6 +144,31 @@ pub fn set_redaction_config(db: State<DbState>, config: serde_json::Value) -> Re
     Ok(())
 }
 
+// ── 通用 settings 键值读写（供设置页勾选框直接读写，避免触碰数据库细节） ──
+
+/// 读取 settings 表中任意 key 的字符串值；不存在或空值返回 None。
+#[tauri::command]
+pub fn get_setting(db: State<DbState>, key: String) -> Result<Option<String>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM settings WHERE key = ?1")
+        .map_err(|e| e.to_string())?;
+    let v: Option<String> = stmt.query_row(params![key], |row| row.get(0)).ok();
+    Ok(v.filter(|s| !s.is_empty()))
+}
+
+/// 写入 settings 表中任意 key 的字符串值（INSERT OR REPLACE）。
+#[tauri::command]
+pub fn set_setting(db: State<DbState>, key: String, value: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 读取脱敏配置（供 redaction 命令使用），缺失时返回默认全量配置。
 pub fn read_redaction_config(conn: &rusqlite::Connection) -> crate::redaction::RedactionConfig {
     let mut stmt = match conn.prepare("SELECT value FROM settings WHERE key = ?1") {

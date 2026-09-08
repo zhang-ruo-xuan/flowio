@@ -260,6 +260,8 @@ pub fn run() {
             export::commands::load_skill_package,
             settings::commands::get_redaction_config,
             settings::commands::set_redaction_config,
+            settings::commands::get_setting,
+            settings::commands::set_setting,
             redaction::commands::redact_recording_text,
             redaction::commands::redact_step_screenshot,
             redaction::commands::scan_redact_screenshots,
