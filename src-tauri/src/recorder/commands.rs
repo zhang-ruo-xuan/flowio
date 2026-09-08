@@ -364,6 +364,15 @@ fn display_shortcut_key(key: &str) -> String {
         "Grave" => "`".to_string(),
         "Num0" | "Num1" | "Num2" | "Num3" | "Num4" | "Num5" | "Num6" | "Num7"
         | "Num8" | "Num9" => key.trim_start_matches("Num").to_string(),
+        // ★ 方向键三种命名必须收敛到 "Arrow*"：hook 产出 "UpArrow"、
+        // common_combo_label 认 "KeyUpArrow"，而重放端 token_to_vk 只认
+        // "ArrowUp"。不收敛的话方向键要么被静默丢弃、要么录到了也执行不了。
+        // ⚠️ 必须排在下面的 `starts_with("Key")` 兜底分支之前，否则
+        // "KeyUpArrow" 会被截成 "UPARROW"（被单测抓到过）。
+        "UpArrow" | "KeyUpArrow" => "ArrowUp".to_string(),
+        "DownArrow" | "KeyDownArrow" => "ArrowDown".to_string(),
+        "LeftArrow" | "KeyLeftArrow" => "ArrowLeft".to_string(),
+        "RightArrow" | "KeyRightArrow" => "ArrowRight".to_string(),
         s if s.starts_with("Key") => s.strip_prefix("Key").unwrap_or(s).to_uppercase(),
         s if s.starts_with("F") => s.to_string(),
         s if s.starts_with("Arrow") || s.ends_with("Arrow") => s.to_string(),
@@ -603,10 +612,12 @@ fn standalone_key_label(key: &str) -> Option<String> {
 /// 统一补成快捷键步骤，replay 端 press_combo 已能映射出对应虚拟键。
 fn action_key_label(key: &str) -> Option<String> {
     let label = match key {
-        "ArrowUp" => "↑ 上移",
-        "ArrowDown" => "↓ 下移",
-        "ArrowLeft" => "← 左移",
-        "ArrowRight" => "→ 右移",
+        // 同时接受规范化名（"ArrowUp"）与 hook 原始名（"UpArrow"）——
+        // 只认前者会让方向键在录制时被整段丢弃（同 KeyTab 的命名坑）。
+        "ArrowUp" | "UpArrow" | "KeyUpArrow" => "↑ 上移",
+        "ArrowDown" | "DownArrow" | "KeyDownArrow" => "↓ 下移",
+        "ArrowLeft" | "LeftArrow" | "KeyLeftArrow" => "← 左移",
+        "ArrowRight" | "RightArrow" | "KeyRightArrow" => "→ 右移",
         "Backspace" => "Backspace 删除",
         "Delete" => "Delete 删除",
         "Home" => "Home 行首",
@@ -3747,6 +3758,36 @@ mod commands_tests {
         assert!(!is_nav_key("a"));
         assert!(!is_nav_key("Backspace"));
         assert!(!is_nav_key("Shift"));
+    }
+
+    /// 锁定「hook 键名 → 可录制步骤 → 重放端可解析 combo」三段命名一致性。
+    /// 方向键的 hook 产出是 "UpArrow"、组合键标签用 "KeyUpArrow"、重放端只认
+    /// "ArrowUp"——三段任一处改名都会让按键被静默丢弃或录到却执行不了。
+    #[test]
+    fn hook_key_names_are_recordable_and_replayable() {
+        // Tab：hook 名 KeyTab → 导航步骤 → combo "Tab"
+        assert_eq!(display_shortcut_key("KeyTab"), "Tab");
+        // 方向键：三种命名统一收敛为 "Arrow*"
+        for (raw, norm) in [
+            ("UpArrow", "ArrowUp"),
+            ("DownArrow", "ArrowDown"),
+            ("LeftArrow", "ArrowLeft"),
+            ("RightArrow", "ArrowRight"),
+            ("KeyUpArrow", "ArrowUp"),
+            ("KeyDownArrow", "ArrowDown"),
+            ("KeyLeftArrow", "ArrowLeft"),
+            ("KeyRightArrow", "ArrowRight"),
+        ] {
+            assert_eq!(display_shortcut_key(raw), norm, "raw={}", raw);
+        }
+        // 两种命名都必须能落到可录制步骤上（否则录制时整段消失）
+        assert!(action_key_label("UpArrow").is_some());
+        assert!(action_key_label("ArrowUp").is_some());
+        assert!(action_key_label("LeftArrow").is_some());
+        assert!(action_key_label("KeyLeftArrow").is_some());
+        // 其它导航/编辑键保持原样
+        assert_eq!(display_shortcut_key("Return"), "Enter");
+        assert_eq!(display_shortcut_key("Escape"), "Esc");
     }
 
     #[test]

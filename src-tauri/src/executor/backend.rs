@@ -899,10 +899,12 @@ fn token_to_vk(token: &str) -> Option<VIRTUAL_KEY> {
         "Insert" => Some(VK_INSERT),
         "PageUp" | "PgUp" => Some(VK_PRIOR),
         "PageDown" | "PgDn" => Some(VK_NEXT),
-        "Left" | "ArrowLeft" => Some(VK_LEFT),
-        "Right" | "ArrowRight" => Some(VK_RIGHT),
-        "Up" | "ArrowUp" => Some(VK_UP),
-        "Down" | "ArrowDown" => Some(VK_DOWN),
+        // "LeftArrow"/"KeyLeftArrow" 是录制端历史命名（hook::vk_to_key_name 与
+        // common_combo_label 的产出），新录制已收敛为 "ArrowLeft"，旧数据仍需能跑。
+        "Left" | "ArrowLeft" | "LeftArrow" | "KeyLeftArrow" => Some(VK_LEFT),
+        "Right" | "ArrowRight" | "RightArrow" | "KeyRightArrow" => Some(VK_RIGHT),
+        "Up" | "ArrowUp" | "UpArrow" | "KeyUpArrow" => Some(VK_UP),
+        "Down" | "ArrowDown" | "DownArrow" | "KeyDownArrow" => Some(VK_DOWN),
         "PrintScreen" | "PrtSc" => Some(VK_SNAPSHOT),
         "CapsLock" => Some(VK_CAPITAL),
         "Menu" => Some(VK_APPS),
@@ -1211,6 +1213,14 @@ mod tests {
             ("ArrowDown", VK_DOWN),
             ("ArrowLeft", VK_LEFT),
             ("ArrowRight", VK_RIGHT),
+            // 录制端历史命名（hook::vk_to_key_name / common_combo_label 产出），
+            // 旧录制里存在，重放端必须照样能解析，否则方向键步骤空转。
+            ("UpArrow", VK_UP),
+            ("DownArrow", VK_DOWN),
+            ("LeftArrow", VK_LEFT),
+            ("RightArrow", VK_RIGHT),
+            ("KeyUpArrow", VK_UP),
+            ("KeyLeftArrow", VK_LEFT),
             ("Backspace", VK_BACK),
             ("Delete", VK_DELETE),
             ("Home", VK_HOME),
