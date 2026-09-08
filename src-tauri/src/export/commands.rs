@@ -1333,6 +1333,84 @@ fn export_skill_bundle(
             let _ = std::fs::write(parent.join("steps.json"), text);
         }
     }
+    // skill.json：给「技能注册表 / MCP host」用的自描述清单——让外部 Agent 或
+    // MCP 消费方无需解析 SKILL.md 即可登记并执行这个 skill（route ②「双输出：
+    // 脚本 + SKILL.md/MCP 技能包」的收口）。写失败只是少一份注册元数据，
+    // SKILL.md 与 steps.json 已落盘，绝不因此让整个导出报错（与 steps.json 同策略）。
+    {
+        // 动作直方图：消费方据以判断自身是否具备执行能力（如是否需要键盘注入）。
+        let mut actions: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for d in machine.values() {
+            *actions.entry(d.action.clone()).or_insert(0) += 1;
+        }
+        let action_counts: std::collections::BTreeMap<String, u32> = actions.into_iter().collect();
+        // 意图含糊的步号（对照 SKILL.md「执行须知」的免责段落）。
+        let mut vague_steps: Vec<i32> = machine
+            .values()
+            .filter(|d| d.intent_vague)
+            .map(|d| d.n)
+            .collect();
+        vague_steps.sort_unstable();
+        let q = skill_quality(machine);
+        // 变量步骤（若有）→ 消费方需要填的入参清单。
+        let inputs: Vec<serde_json::Value> = steps
+            .iter()
+            .filter(|s| s.is_variable && !s.param_name.trim().is_empty())
+            .map(|s| {
+                let sample = if matches!(s.action_type.as_str(), "type" | "paste") {
+                    s.description.trim()
+                } else {
+                    ""
+                };
+                serde_json::json!({
+                    "name": s.param_name.trim(),
+                    "sample": sample,
+                })
+            })
+            .collect();
+        let mut manifest = serde_json::json!({
+            "schema": "flowio.skill.manifest/v1",
+            "name": skill_slug_name(&recording.title),
+            "title": recording.title,
+            "description": format!("由「录步 Flowio」录制并导出的桌面操作教程：{}。", recording.title),
+            "version": "1.0.0",
+            "generated_by": "录步 Flowio",
+            "app": recording.app_name,
+            "recorded_at": recording.created_at,
+            "files": {
+                "skill": "SKILL.md",
+                "screenshots": "screenshots/"
+            },
+            "execution": {
+                "entry": "SKILL.md",
+                "coordinate_space": "录制机屏幕逻辑像素，左上角为原点；分辨率/缩放/窗口位置变化后坐标会失效，须以 screenshots/ 下截图重新定位",
+                "runtime": "桌面 GUI 自动化（鼠标点击 / 键盘输入注入），需在目标应用已打开的桌面会话中执行",
+                "fallback": "坐标或意图不可靠的步骤，以对应 step-NN 截图为准重新定位"
+            },
+            "quality": {
+                "total": q.total,
+                "intent_vague": q.vague,
+                "with_point": q.with_point,
+                "with_anchor": q.with_anchor,
+                "with_screenshot": q.with_shot
+            },
+            "steps_summary": {
+                "total": recording.total_steps,
+                "actions": action_counts,
+                "vague_steps": vague_steps
+            }
+        });
+        // steps.json 仅在 machine 非空时落盘，清单据此决定是否引用。
+        if !machine.is_empty() {
+            manifest["files"]["steps"] = serde_json::json!("steps.json");
+        }
+        if !inputs.is_empty() {
+            manifest["inputs"] = serde_json::json!(inputs);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&manifest) {
+            let _ = std::fs::write(parent.join("skill.json"), text);
+        }
+    }
     Ok(output_path.to_string_lossy().to_string())
 }
 
@@ -2134,6 +2212,111 @@ mod tests {
         )
         .unwrap();
         println!("== variable ==\n{}", &variable);
+    }
+
+    /// 单元验证：export_skill_bundle 除 SKILL.md / steps.json 外，还应落盘
+    /// skill.json 自描述清单（route ②「MCP 技能包」的注册元数据）——让外部
+    /// Agent / MCP host 无需解析 SKILL.md 即可登记并执行这个 skill。
+    #[test]
+    fn export_skill_bundle_writes_manifest() {
+        let recording = ExportRecording {
+            id: "r1".into(),
+            title: "XLOOKUP step by step".into(),
+            app_name: "Excel".into(),
+            total_steps: 2,
+            created_at: "2026-09-08T18:31:23".into(),
+        };
+        let steps = vec![
+            ExportStep {
+                id: "s1".into(),
+                order_index: 0,
+                step_number: 1,
+                action_type: "click".into(),
+                title: "点击在「函数参数」中".into(),
+                description: String::new(),
+                tip: String::new(),
+                screenshot_path: String::new(),
+                x: Some(100),
+                y: Some(200),
+                crop_w: None,
+                crop_h: None,
+                is_variable: false,
+                param_name: String::new(),
+            },
+            ExportStep {
+                id: "s2".into(),
+                order_index: 1,
+                step_number: 2,
+                action_type: "type".into(),
+                title: "在「单元格」中输入".into(),
+                description: "=XLOOKUP(A2,B:B,C:C)".into(),
+                tip: String::new(),
+                screenshot_path: String::new(),
+                x: None,
+                y: None,
+                crop_w: None,
+                crop_h: None,
+                is_variable: true,
+                param_name: "lookup_value".into(),
+            },
+        ];
+        let mut machine: SkillMachine = SkillMachine::new();
+        machine.insert(
+            1,
+            SkillStepData {
+                n: 1,
+                action: "click".into(),
+                intent: "点击在「函数参数」中".into(),
+                intent_vague: true,
+                window: "函数参数".into(),
+                point: Some([100, 200]),
+                ..Default::default()
+            },
+        );
+        machine.insert(
+            2,
+            SkillStepData {
+                n: 2,
+                action: "type".into(),
+                intent: "在「单元格」中输入".into(),
+                intent_vague: true,
+                window: "Excel".into(),
+                text: Some("=XLOOKUP(A2,B:B,C:C)".into()),
+                ..Default::default()
+            },
+        );
+        let dir = std::env::temp_dir().join("flowio_skill_manifest_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("SKILL.md");
+        let crop_set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let res = export_skill_bundle(&out, &recording, &steps, &crop_set, &mut machine);
+        assert!(res.is_ok(), "export_skill_bundle failed: {:?}", res.err());
+
+        let manifest_path = dir.join("skill.json");
+        assert!(manifest_path.exists(), "skill.json should be written");
+        let text = std::fs::read_to_string(&manifest_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("skill.json must be valid JSON");
+
+        assert_eq!(v["schema"].as_str(), Some("flowio.skill.manifest/v1"));
+        assert_eq!(v["name"].as_str(), Some("xlookup-step-by-step"));
+        assert_eq!(v["files"]["skill"].as_str(), Some("SKILL.md"));
+        assert_eq!(v["files"]["steps"].as_str(), Some("steps.json"));
+        assert_eq!(v["files"]["screenshots"].as_str(), Some("screenshots/"));
+        assert_eq!(v["execution"]["entry"].as_str(), Some("SKILL.md"));
+        assert_eq!(v["quality"]["total"].as_i64(), Some(2));
+        assert_eq!(v["quality"]["intent_vague"].as_i64(), Some(2));
+        assert_eq!(v["steps_summary"]["total"].as_i64(), Some(2));
+        let actions = v["steps_summary"]["actions"].as_object().expect("actions object");
+        assert!(actions.contains_key("click"), "action histogram should list click");
+        assert!(actions.contains_key("type"), "action histogram should list type");
+        // 变量步骤 → 清单应含 inputs（消费方需要填的入参）
+        let inputs = v["inputs"].as_array().expect("inputs array");
+        assert_eq!(inputs.len(), 1, "one variable step → one input");
+        assert_eq!(inputs[0]["name"].as_str(), Some("lookup_value"));
+        assert_eq!(inputs[0]["sample"].as_str(), Some("=XLOOKUP(A2,B:B,C:C)"));
+
+        // 清理验证产物，避免污染临时目录
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 本文件源码，供静态防线扫描（编译期嵌入，改完文件 cargo test 立即生效）。
