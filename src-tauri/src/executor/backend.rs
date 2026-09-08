@@ -104,9 +104,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
-    SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
-    WindowFromPoint,
+    EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
+    SendMessageW, SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE,
+    SW_MINIMIZE, SW_RESTORE, WM_COMMAND, WindowFromPoint,
 };
 
 struct EnumCtx<'a> {
@@ -258,6 +258,80 @@ fn window_desc(hwnd: HWND) -> String {
         };
         format!("'{}' [{}]", title, cls)
     }
+}
+
+/// 显示桌面（Shell 的 MIN_ALL 命令）：最小化桌面上所有普通窗口。
+///
+/// 用途：重放「桌面」类流程（桌面右键→新建文件、桌面图标双击等）时，录制坐标系
+/// 是桌面；若执行时桌面上有最大化/置顶的第三方窗口（Chrome、WPS…），绝对坐标点击
+/// 会直接落进那个窗口，整条链路空转且不报错。显示桌面可保证落点命中桌面。
+/// 仅重放含桌面步骤的计划时调用；新打开的窗口（记事本等）不受影响。
+pub fn show_desktop() -> bool {
+    unsafe {
+        let cls: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+        let hwnd = FindWindowW(windows::core::PCWSTR(cls.as_ptr()), windows::core::PCWSTR::null())
+            .unwrap_or_default();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        // 407 = MIN_ALL（Shell_TrayWnd 的「显示桌面」），与用户点任务栏按钮等效。
+        SendMessageW(
+            hwnd,
+            WM_COMMAND,
+            windows::Win32::Foundation::WPARAM(407),
+            windows::Win32::Foundation::LPARAM(0),
+        );
+        true
+    }
+}
+
+struct MinimizeCtx<'a> {
+    substr: &'a str,
+    count: usize,
+}
+
+/// 按标题子串最小化窗口（Win32 硬兜底），返回实际最小化的窗口数。
+///
+/// Tauri 的 WebviewWindow::minimize() 在个别 label 解析异常场景下可能拿不到窗口；
+/// 这里直接用 Win32 按可见标题最小化，确保「执行期间录步窗口让位」这一契约成立。
+pub fn minimize_windows_by_title(substr: &str) -> usize {
+    let mut ctx = MinimizeCtx { substr, count: 0 };
+    unsafe {
+        EnumWindows(
+            Some(minimize_windows_proc),
+            windows::Win32::Foundation::LPARAM(&mut ctx as *mut _ as isize),
+        )
+        .ok();
+    }
+    ctx.count
+}
+
+unsafe extern "system" fn minimize_windows_proc(
+    hwnd: HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> BOOL {
+    let ctx = &mut *(lparam.0 as *mut MinimizeCtx);
+    if IsWindowVisible(hwnd).as_bool() {
+        // 桌面 shell 不最小化（最小化了也无效，且会干扰显示桌面逻辑）
+        let mut cls = [0u16; 64];
+        let cn = GetClassNameW(hwnd, &mut cls);
+        if cn > 0 {
+            let class = String::from_utf16_lossy(&cls[..cn as usize]);
+            if class == "Progman" || class == "WorkerW" || class == "Shell_TrayWnd" {
+                return BOOL(1);
+            }
+        }
+        let mut buf = [0u16; 512];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        if n > 0 {
+            let title = String::from_utf16_lossy(&buf[..n as usize]);
+            if title.contains(ctx.substr) {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                ctx.count += 1;
+            }
+        }
+    }
+    BOOL(1)
 }
 
 /// 取屏幕坐标处实际命中的窗口描述（诊断用）。

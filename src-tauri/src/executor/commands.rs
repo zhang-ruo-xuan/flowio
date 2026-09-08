@@ -218,6 +218,16 @@ pub fn execute_recording(
         load_replay_plan(&conn, &recording_id)?
     };
 
+    // ── 诊断：确认本次执行所用 exe 是否含窗口最小化逻辑，以及主窗口命中情况 ──
+    // 放在最前，便于一眼判断「用户是否启动了带最小化逻辑的新包」：
+    // 若日志首行出现本行且 main_window_exists=true，说明新包在跑、能拿到主窗口。
+    let _diag_main = app.get_webview_window("main");
+    let _diag_total = app.webview_windows().len();
+    crate::executor::backend::replay_log(&format!(
+        "[window] enter execute_recording: dry_run={} main_window_exists={} total_windows={}",
+        dry_run, _diag_main.is_some(), _diag_total
+    ));
+
     // ── Stage 3 审批闸门：上闸则不做任何桌面动作，仅留痕并返回 needs-approval ──
     let requires = plan_requires_approval(&plan);
     let mode = approval_mode.unwrap_or_else(|| "off".to_string());
@@ -301,12 +311,40 @@ pub fn execute_recording(
         for w in &windows_to_minimize {
             let _ = w.minimize();
         }
+        // Win32 硬兜底：若 Tauri 层因 label 解析异常未命中窗口（此前用户侧实测日志
+        // 全程无 [window] 行），这里按可见标题再最小化一次，双重保证「执行期间让位」。
+        let win32_minimized = crate::executor::backend::minimize_windows_by_title("录步");
         crate::executor::backend::replay_log(&format!(
-            "[window] 执行开始，已最小化 {} 个录步窗口（避免遮挡目标坐标）",
-            windows_to_minimize.len()
+            "[window] 执行开始，已最小化录步窗口（Tauri {} 个 / Win32 {} 个，避免遮挡目标坐标）",
+            windows_to_minimize.len(),
+            win32_minimized
         ));
         // 等最小化动画结束、桌面就绪，避免首步点击落在还在收缩的窗口上
         std::thread::sleep(Duration::from_millis(400));
+
+        // ── 桌面类流程：显示桌面，避免第三方窗口吃掉桌面坐标 ──
+        // 取证（2026-09-08 13:03 重放）：末步 at=(1574,192) hit='Chrome Legacy Window'，
+        // 桌面坐标被 Chrome 占据 → 点击落进 Chrome，整条「右键新建文件」链路空转。
+        // 仅当计划含桌面/空标题步骤时才显示桌面，不打扰纯应用内流程的现有窗口。
+        if plan.iter().any(|a| {
+            let t = a.window_title.trim();
+            t.is_empty()
+                || t == "Program Manager"
+                || t.contains("文件资源管理器")
+                || t.eq_ignore_ascii_case("Windows Explorer")
+                || t.contains("Windows-Explorer")
+        }) {
+            if crate::executor::backend::show_desktop() {
+                crate::executor::backend::replay_log(
+                    "[window] 计划含桌面步骤 → 已显示桌面(MIN_ALL)，确保桌面坐标不被第三方窗口吃掉",
+                );
+                std::thread::sleep(Duration::from_millis(300));
+            } else {
+                crate::executor::backend::replay_log(
+                    "[window] 计划含桌面步骤，但显示桌面失败（未找到 Shell_TrayWnd）",
+                );
+            }
+        }
 
         let backend = WindowsBackend;
         // 降频校验：长录制每 2~3 步抽验一次（末步必验），显著减少每步全屏截图次数，
