@@ -150,6 +150,55 @@ fn step_intent(a: &ReplayAction, intents: &std::collections::HashMap<i32, String
     }
 }
 
+/// 该动作是否属于「AI 改个落点就能救」的类型。
+///
+/// 拖拽/滚轮/组合键都不算：拖拽的两个端点语义模型很难同时答对，滚轮和
+/// 快捷键根本没有「点哪里」这个问题，问了也是白问还拖慢执行。
+fn ai_pointable(action_type: &str) -> bool {
+    matches!(
+        action_type,
+        "click" | "double_click" | "right_click" | "type" | "input"
+    )
+}
+
+/// 向视觉模型问这一步「现在该点哪里」（Stage 4）。
+///
+/// 只负责「问」，不碰桌面；落点由调用方决定怎么用。失败一律 Err，
+/// 日志里带上 provider/model，便于一眼看出走的是哪个通道。
+fn ai_ask(
+    cfg: &crate::ai::types::AiConfig,
+    action: &ReplayAction,
+    intents: &std::collections::HashMap<i32, String>,
+    prev: String,
+    next: String,
+    reason: &str,
+) -> Result<crate::executor::ai_fallback::AiPoint, String> {
+    crate::executor::backend::replay_log(&format!(
+        "[ai-fallback] 第 {} 步请求视觉兜底（{}，通道 {}/{}）",
+        action.step_number, reason, cfg.provider.name, cfg.provider.model
+    ));
+    let (rx, ry) = delta_reference(action);
+    let intent = step_intent(action, intents);
+    let ctx = crate::executor::ai_fallback::FallbackContext {
+        step_number: action.step_number,
+        action_type: &action.action_type,
+        window_title: &action.window_title,
+        step_title: &intent,
+        text: action.text.as_deref(),
+        recorded: match (rx, ry) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        },
+        prev_intent: &prev,
+        next_intent: &next,
+        reason,
+        // 真实喂图尺寸在 resolve_via_ai 内部覆盖，这里只给占位
+        img_w: 0,
+        img_h: 0,
+    };
+    crate::executor::ai_fallback::resolve_via_ai(cfg, &ctx)
+}
+
 fn primary_target_app(plan: &[ReplayAction]) -> String {
     plan.iter()
         .filter_map(|a| {
@@ -541,29 +590,106 @@ pub fn execute_recording(
                 );
             }
 
-            // 单步隔离：任何一步的 unsafe Windows 调用或截图校验若 panic，
-            // 只标记该步失败并继续，绝不拖垮整个进程（直接缓解"闪退"）。
-            let step_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_action(action, &backend);
-                if do_verify {
-                    verify_step(&action.after_screenshot)
-                } else {
-                    None
+            // ── Stage 4：AI 兜底「预判路径」──
+            // 目标窗口没起来时，run_action 会拿录制坐标盲点一次，随后 AI 再点
+            // 一次——输入框类步骤会把文本打进两个地方（WPS 里尤其致命）。
+            // 开启兜底后改为：先探一次焦点，探不到就直奔 AI，**全程只执行一次**。
+            // 关闭兜底时本段完全不进入，行为与旧版逐字一致。
+            let mut ai_pre_handled = false;
+            if ai_budget > 0
+                && ai_pointable(&action.action_type)
+                && action.x.is_some()
+                && action.y.is_some()
+                && !action.window_title.trim().is_empty()
+            {
+                backend.focus(&action.window_title);
+                if crate::executor::backend::take_focus_ok() == Some(false) {
+                    ai_pre_handled = true;
+                    ai_budget -= 1;
+                    let prev = if i > 0 {
+                        step_intent(&plan[i - 1], &ai_intents)
+                    } else {
+                        String::new()
+                    };
+                    let next = plan
+                        .get(i + 1)
+                        .map(|a| step_intent(a, &ai_intents))
+                        .unwrap_or_default();
+                    match ai_cfg
+                        .as_ref()
+                        .ok_or_else(|| "AI 配置缺失".to_string())
+                        .and_then(|cfg| ai_ask(cfg, action, &ai_intents, prev, next, "focus-failed"))
+                    {
+                        Ok(p) => {
+                            crate::executor::backend::replay_log(&format!(
+                                "[ai-fallback] 第 {} 步改点 ({},{})，理由：{}",
+                                action.step_number,
+                                p.x,
+                                p.y,
+                                if p.why.is_empty() { "未说明" } else { &p.why }
+                            ));
+                            crate::executor::ai_fallback::reissue(
+                                &backend,
+                                &action.action_type,
+                                &p,
+                                action.text.as_deref(),
+                            );
+                            status = "ai-recovered".into();
+                            note = format!(
+                                "目标窗口『{}』未出现，AI 兜底定位 ({},{}){}",
+                                action.window_title,
+                                p.x,
+                                p.y,
+                                if p.why.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("：{}", p.why)
+                                }
+                            );
+                        }
+                        Err(e) => {
+                            // 问不出来就退回「盲点一次」的旧行为，绝不静默跳过——
+                            // 至少保留与未开启兜底时相同的结果。
+                            crate::executor::backend::replay_log(&format!(
+                                "[ai-fallback] 第 {} 步未生效：{}（退回录制坐标执行）",
+                                action.step_number, e
+                            ));
+                            ai_pre_handled = false;
+                            note = format!("AI 兜底未生效：{}", e);
+                        }
+                    }
                 }
-            }));
-            match step_result {
-                Ok(d) => diff = d,
-                Err(_) => {
-                    status = "step-panic".into();
-                    note = "该步执行时发生异常，已隔离，不影响后续步骤".into();
+            }
+
+            if !ai_pre_handled {
+                // 单步隔离：任何一步的 unsafe Windows 调用或截图校验若 panic，
+                // 只标记该步失败并继续，绝不拖垮整个进程（直接缓解"闪退"）。
+                let step_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_action(action, &backend);
+                    if do_verify {
+                        verify_step(&action.after_screenshot)
+                    } else {
+                        None
+                    }
+                }));
+                match step_result {
+                    Ok(d) => diff = d,
+                    Err(_) => {
+                        status = "step-panic".into();
+                        note = "该步执行时发生异常，已隔离，不影响后续步骤".into();
+                    }
                 }
             }
 
             // 聚焦结果必须在判定前取出（take 语义），否则会被下一步的聚焦覆盖。
-            let focus_failed = crate::executor::backend::take_focus_ok() == Some(false)
-                && !action.window_title.trim().is_empty();
+            let focus_failed = if ai_pre_handled {
+                false // 预判路径已消费掉该标记
+            } else {
+                crate::executor::backend::take_focus_ok() == Some(false)
+                    && !action.window_title.trim().is_empty()
+            };
 
-            if status != "step-panic" {
+            if status != "step-panic" && !ai_pre_handled {
                 if action.action_type == "drag" && action.end_x.is_none() {
                     note = "drag 降级为 click：该步无拖拽终点（旧录制）；重新录制后为真拖拽".into();
                 }
@@ -631,25 +757,14 @@ pub fn execute_recording(
                             .map(|a| step_intent(a, &ai_intents))
                             .unwrap_or_default();
                         let (rx, ry) = delta_reference(&action);
-                        let intent = step_intent(action, &ai_intents);
-                        let ctx = crate::executor::ai_fallback::FallbackContext {
-                            step_number: action.step_number,
-                            action_type: &action.action_type,
-                            window_title: &action.window_title,
-                            step_title: &intent,
-                            text: action.text.as_deref(),
-                            recorded: match (rx, ry) {
-                                (Some(a), Some(b)) => Some((a, b)),
-                                _ => None,
-                            },
-                            prev_intent: &prev,
-                            next_intent: &next,
-                            reason: if verify_failed { "verify-failed" } else { "focus-failed" },
-                            // 真实喂图尺寸在 resolve_via_ai 内部覆盖，这里只给占位
-                            img_w: 0,
-                            img_h: 0,
-                        };
-                        match crate::executor::ai_fallback::resolve_via_ai(cfg, &ctx) {
+                        match ai_ask(
+                            cfg,
+                            action,
+                            &ai_intents,
+                            prev,
+                            next,
+                            if verify_failed { "verify-failed" } else { "focus-failed" },
+                        ) {
                             Ok(p) => {
                                 let old = (rx.unwrap_or(p.x), ry.unwrap_or(p.y));
                                 if crate::executor::ai_fallback::worth_reissue(old, (p.x, p.y)) {
@@ -909,6 +1024,53 @@ pub fn get_replay_audit(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// Stage 4：只有「换个落点就能救」的动作才配问 AI。
+    /// 拖拽（两端点语义模型答不准）、滚轮/快捷键（没有「点哪里」这回事）
+    /// 一律不碰——问了既救不回来，还会拖慢执行。
+    #[test]
+    fn ai_pointable_covers_only_rescuable_actions() {
+        for a in ["click", "double_click", "right_click", "type", "input"] {
+            assert!(ai_pointable(a), "{} 应可兜底", a);
+        }
+        for a in ["drag", "scroll", "hotkey", "copy", "paste", "navigate"] {
+            assert!(!ai_pointable(a), "{} 不应兜底", a);
+        }
+    }
+
+    /// 意图表缺内容时必须退回动作类型——总比给模型一段空字符串强。
+    #[test]
+    fn step_intent_falls_back_to_action_type() {
+        use crate::executor::replay::ReplayAction;
+        let mk = || ReplayAction {
+            step_number: 7,
+            action_type: "click".into(),
+            x: Some(1),
+            y: Some(2),
+            window_title: "WPS".into(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: None,
+            uia_anchor: None,
+            mouse_button: String::new(),
+            start_x: None,
+            start_y: None,
+            end_x: None,
+            end_y: None,
+            scroll_delta: None,
+        };
+        let empty = std::collections::HashMap::new();
+        assert_eq!(step_intent(&mk(), &empty), "click");
+
+        let mut m = std::collections::HashMap::new();
+        m.insert(7, "点击 插入函数".to_string());
+        assert_eq!(step_intent(&mk(), &m), "点击 插入函数");
+
+        // 表里有这条但值为空串 → 仍退回动作类型，不能把空串喂给模型
+        let mut blank = std::collections::HashMap::new();
+        blank.insert(7, "  ".to_string());
+        assert_eq!(step_intent(&mk(), &blank), "click");
+    }
 
     /// 偏差基准：drag 用真实起点（start_x/start_y），其余用 x/y；
     /// 旧录制 drag 无起点时降级用 x/y。锁定 2026-09-08 修复：
