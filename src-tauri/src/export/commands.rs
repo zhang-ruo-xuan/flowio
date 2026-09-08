@@ -1465,8 +1465,9 @@ fn export_skill_bundle(
 //
 // `export_skill_bundle` 是写侧：把录制落盘成 SKILL.md + screenshots/ + steps.json
 // + skill.json。光有写侧还不够——一个 MCP host / 外部 Agent 要「登记并执行」这个
-// skill，得先把包**读回来并校验**。`load_skill_package` 就是读侧：解析 skill.json、
-// 核对它引用的文件确实存在、读回步数，返回规范化结构。与写侧对称，构成
+// skill，得先把包**读回来并校验**。`read_skill_package` 就是读侧核心：解析 skill.json、
+// 核对它引用的文件确实存在、读回步数，返回规范化结构。对外的 Tauri 命令
+// `load_skill_package(String)` 直接封装它（JS 传字符串路径）。与写侧对称，构成
 // 导出 ↔ 注册 的可往返契约。
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -1539,7 +1540,9 @@ impl SkillPackage {
 
 /// 读取并校验一个导出的 skill 包目录。任一引用缺失 / schema 不符都返回 Err——
 /// 调用方（MCP host）据此拒绝登记坏包，而非带着半截文件去执行。
-fn load_skill_package(dir: &std::path::Path) -> Result<SkillPackage, String> {
+/// （`#[tauri::command] load_skill_package` 是其对外封装，接收 JS 传来的字符串路径，
+///  本函数是其纯 Rust 内核，接收 `&Path`，单测直接调用它。）
+fn read_skill_package(dir: &std::path::Path) -> Result<SkillPackage, String> {
     let manifest_path = dir.join("skill.json");
     let text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("读取 skill.json 失败: {}", e))?;
@@ -1582,6 +1585,18 @@ fn load_skill_package(dir: &std::path::Path) -> Result<SkillPackage, String> {
         step_count,
         quality: manifest.quality,
     })
+}
+
+/// 对外 Tauri 命令：把一个已导出的 skill 包目录（JS 传来的字符串路径）读回并校验，
+/// 返回注册表友好摘要（`SkillPackage::summary()`）。任一引用缺失 / schema 不符都返回
+/// Err——MCP host / 外部 Agent 据此拒绝登记坏包，而非带着半截文件去执行。
+///
+/// 纯文件读取、同步、快，无需异步运行时。
+#[tauri::command]
+pub fn load_skill_package(dir: String) -> Result<serde_json::Value, String> {
+    let p = std::path::Path::new(&dir);
+    let pkg = read_skill_package(p)?;
+    Ok(pkg.summary())
 }
 
 // ── TXT export ────────────────────────────────────────────────
@@ -2576,8 +2591,8 @@ mod tests {
         let res = export_skill_bundle(&out, &recording, &steps, &crop_set, &mut machine);
         assert!(res.is_ok(), "export failed: {:?}", res.err());
 
-        let pkg = load_skill_package(&dir)
-            .expect("load_skill_package should succeed on a freshly exported bundle");
+        let pkg = read_skill_package(&dir)
+            .expect("read_skill_package should succeed on a freshly exported bundle");
         assert_eq!(pkg.name, skill_unique_name(&recording), "name 应与导出时一致");
         assert_eq!(pkg.title, "XLOOKUP step by step");
         assert_eq!(pkg.app, "Excel");
@@ -2598,7 +2613,7 @@ mod tests {
     fn load_skill_package_rejects_missing_manifest() {
         let dir = std::env::temp_dir().join("flowio_skill_load_nomanifest");
         let _ = std::fs::create_dir_all(&dir);
-        let res = load_skill_package(&dir);
+        let res = read_skill_package(&dir);
         assert!(res.is_err(), "无 skill.json 必须拒绝登记");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2614,7 +2629,7 @@ mod tests {
             r#"{"schema":"wrong/v1","name":"n","title":"t","files":{"skill":"SKILL.md","screenshots":"screenshots/","steps":"steps.json"}}"#,
         )
         .unwrap();
-        let res = load_skill_package(&dir);
+        let res = read_skill_package(&dir);
         assert!(res.is_err(), "schema 不符必须拒绝登记");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2629,7 +2644,7 @@ mod tests {
             r#"{"schema":"flowio.skill.manifest/v1","name":"n","title":"t","files":{"skill":"SKILL.md","screenshots":"screenshots/","steps":""}}"#,
         )
         .unwrap();
-        let res = load_skill_package(&dir);
+        let res = read_skill_package(&dir);
         assert!(res.is_err(), "引用的 SKILL.md 缺失必须拒绝登记");
         let _ = std::fs::remove_dir_all(&dir);
     }

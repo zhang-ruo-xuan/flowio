@@ -257,6 +257,7 @@ pub fn run() {
             editor::commands::upload_step_screenshot,
             editor::commands::delete_step_screenshot,
             export::commands::export_recording,
+            export::commands::load_skill_package,
             settings::commands::get_redaction_config,
             settings::commands::set_redaction_config,
             redaction::commands::redact_recording_text,
