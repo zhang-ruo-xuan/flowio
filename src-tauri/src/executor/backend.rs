@@ -120,7 +120,18 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: windows::Win32::
             if title.contains("录步") || title.to_lowercase().contains("flowio") {
                 return BOOL(1);
             }
-            if title.contains(ctx.substring) {
+            // 匹配策略（两层，任一命中即止）：
+            //   1) 原始子串匹配（覆盖绝大多数正常场景）；
+            //   2) 核心标识符匹配：取搜索串 " - " 前的部分（文件名/主标题），
+            //      在实际窗口标题中查找。解决中文系统下录制拿到英文后缀
+            //      （如 "Notepad"）但实际窗口显示中文（"记事本"）导致
+            //      contains 永远 false → 聚焦全 SKIPPED → 文件不生成的致命 bug。
+            let matches = title.contains(ctx.substring)
+                || ctx.substring
+                    .split(" - ")
+                    .next()
+                    .map_or(false, |core| !core.is_empty() && title.contains(core));
+            if matches {
                 ctx.found = Some(hwnd);
                 return BOOL(0); // 停止枚举
             }
