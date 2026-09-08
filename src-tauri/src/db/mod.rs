@@ -97,6 +97,48 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
     Ok(())
 }
 
+/// 启动时自动备份数据库到 `app_data_dir/backups/`，保留最近 `keep` 份。
+/// 纯防御性措施：任何失败都静默忽略，绝不阻塞启动；DB 不存在时为 no-op。
+/// 背景：2026-09-08 曾发生整个数据目录被外部清空且无任何备份的严重事故。
+pub fn auto_backup_database(db_path: &std::path::Path, keep: usize) -> Option<std::path::PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    if keep == 0 {
+        return None;
+    }
+    if !db_path.is_file() {
+        return None;
+    }
+    let parent = db_path.parent()?;
+    let bak_dir = parent.join("backups");
+    if std::fs::create_dir_all(&bak_dir).is_err() {
+        return None;
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dest = bak_dir.join(format!("flowio.db.bak-{}", ts));
+    if std::fs::copy(db_path, &dest).is_err() {
+        return None;
+    }
+    // 只保留最近 keep 份（文件名以 unix 纳秒结尾，字典序即时间序）
+    if let Ok(entries) = std::fs::read_dir(&bak_dir) {
+        let mut baks: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .map_or(false, |n| n.to_string_lossy().starts_with("flowio.db.bak-"))
+            })
+            .collect();
+        baks.sort();
+        while baks.len() > keep {
+            let oldest = baks.remove(0);
+            let _ = std::fs::remove_file(oldest);
+        }
+    }
+    Some(dest)
+}
+
 /// 将一条仍属本地（`__local__`）的录制精确归属到指定账号。
 /// - 幂等：重复调用不会报错，第二次起返回 false（已不再属于 `__local__`）
 /// - 不抢占：记录已归属其他账号时直接返回 false，不做任何修改
@@ -779,6 +821,34 @@ mod db_tests {
         // 旧记录默认归属 __local__
         seed_recording(&conn, "old", LOCAL_USER);
         assert_eq!(user_id_of(&conn, "old"), LOCAL_USER);
+    }
+
+    #[test]
+    fn auto_backup_creates_rotating_copies() {
+        let dir = std::env::temp_dir().join(format!("flowio_bak_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("flowio.db");
+        std::fs::write(&db_path, b"v1").unwrap();
+        // 第一次备份
+        let b1 = auto_backup_database(&db_path, 2).expect("first backup should succeed");
+        assert!(b1.is_file());
+        assert_eq!(std::fs::read(&b1).unwrap(), b"v1");
+        // DB 更新后再备份，凑满 3 份 > keep=2 → 最旧被轮转掉
+        std::fs::write(&db_path, b"v2").unwrap();
+        auto_backup_database(&db_path, 2);
+        std::fs::write(&db_path, b"v3").unwrap();
+        auto_backup_database(&db_path, 2);
+        let baks: Vec<_> = std::fs::read_dir(dir.join("backups"))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        assert_eq!(baks.len(), 2, "should keep only 2 newest backups");
+        // keep=0 与 DB 不存在均为 no-op
+        assert!(auto_backup_database(&db_path, 0).is_none());
+        let ghost = dir.join("no-such.db");
+        assert!(auto_backup_database(&ghost, 3).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

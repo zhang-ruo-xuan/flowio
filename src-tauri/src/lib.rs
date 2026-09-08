@@ -155,6 +155,11 @@ pub fn run() {
             let app_data_dir = app.path().app_data_dir().expect("failed to get app data dir");
             std::fs::create_dir_all(&app_data_dir).ok();
             let db_path = app_data_dir.join("flowio.db");
+            // 启动即自动备份 DB（保留 5 份）：防数据目录被外部清空/损坏后全灭。
+            // 失败静默，绝不阻塞启动。
+            if let Some(bak) = db::auto_backup_database(&db_path, 5) {
+                println!("[startup] db auto-backup -> {}", bak.display());
+            }
             // 后台线程（语音转写/翻译）也必须用同一个绝对路径，
             // 否则相对路径会在 cwd 另开空库（历史 bug：语音「没有步骤」）
             db::set_db_path(db_path.clone());
