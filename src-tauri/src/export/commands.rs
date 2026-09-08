@@ -225,7 +225,13 @@ pub(crate) fn export_recording_inner(
             // Agent Skills 1.0（SKILL.md）：有任何变量标记步骤 → 变量版（##Inputs + {{param}}），
             // 否则固定版（sample 写死）。固定/变量都是正经 skill（总纲 §4.1）。
             // 截图捆绑到 SKILL.md 同目录 screenshots/ 并在步骤下引用——机看版核心差异。
-            export_skill_bundle(&path, &recording, &steps, &crop_set)
+            // 机器可执行数据另查一张表（见 SkillMachine 文档：不并进 ExportStep）。
+            // 查失败退化成空表 → 只少 steps.json 与定位行，SKILL.md 照常出。
+            let mut machine = match lock_db(&db.0) {
+                Ok(conn) => load_skill_machine(&conn, &id),
+                Err(_) => SkillMachine::new(),
+            };
+            export_skill_bundle(&path, &recording, &steps, &crop_set, &mut machine)
         }
         "long" => {
             export_long_image(&recording, &steps, &path, &crop_set)?;
@@ -852,6 +858,259 @@ fn yaml_oneline(s: &str) -> String {
     s.replace(['\r', '\n'], " ").replace('"', "\\\"")
 }
 
+// ── SKILL 机器可执行数据 ───────────────────────────────────────
+
+/// 步号 → 该步的机器可执行定位数据。
+///
+/// **刻意不并进 `ExportStep`**：那个结构体在本文件里有 17 处测试字面量，加字段
+/// 会全量 E0063。与 executor 侧 `load_step_intents` / `load_step_before_shots`
+/// 同一套做法——附带数据一律另查一张表。
+type SkillMachine = std::collections::HashMap<i32, SkillStepData>;
+
+/// 一步操作的机器可执行描述。序列化后写进 `steps.json`，供 Agent 编程消费：
+/// 人读的 SKILL.md 讲「做什么」，这份讲「点哪里、按什么、拿什么校验」。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct SkillStepData {
+    /// 步号（与 SKILL.md 的编号、screenshots/step-NN 一一对应）。
+    n: i32,
+    /// 动作类型：click / dblclick / rightclick / type / paste / drag / scroll / key / hotkey。
+    action: String,
+    /// 人读意图（步骤标题）。
+    intent: String,
+    /// 该意图**没说清点了什么**（形如「点击在「X」中」只报窗口）。
+    /// 置 true 时消费方应以截图为准判断目标，别信这行文字。
+    intent_vague: bool,
+    /// 目标窗口标题（录制时的前台窗口）。
+    window: String,
+    /// 录制时的落点（屏幕逻辑坐标）。drag 用真实起点而非裁图框中心。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point: Option<[i32; 2]>,
+    /// 拖拽终点。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drag_to: Option<[i32; 2]>,
+    /// 滚轮增量（正=向上）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scroll_delta: Option<i32>,
+    /// 结构化组合键，如 `Ctrl+Shift+S`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hotkey: Option<String>,
+    /// 待输入文本（type / paste 步）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    /// 控件锚点（类名 + 窗口内归一化比例），比绝对坐标抗窗口移动。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor: Option<serde_json::Value>,
+    /// 该步截图在包内的相对路径（bundle 落盘时回填）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screenshot: Option<String>,
+}
+
+/// 键盘类动作：标题里的按键本身就是完整语义（「Enter 确认」），
+/// 不存在「没说清点了什么」的问题。
+fn is_keyboard_action(action_type: &str) -> bool {
+    matches!(
+        action_type,
+        "key" | "keypress" | "hotkey" | "shortcut" | "combo"
+    )
+}
+
+/// 落点基准：drag 的 `x/y` 存的是**裁图框中心**，真实起点在 `start_x/start_y`。
+/// 与 executor 的 `delta_reference` 同一个坑，这里独立实现以免跨模块耦合。
+fn skill_point(
+    action_type: &str,
+    x: Option<i32>,
+    y: Option<i32>,
+    start_x: Option<i32>,
+    start_y: Option<i32>,
+) -> Option<[i32; 2]> {
+    if action_type == "drag" {
+        if let (Some(sx), Some(sy)) = (start_x, start_y) {
+            return Some([sx, sy]);
+        }
+    }
+    match (x, y) {
+        (Some(a), Some(b)) => Some([a, b]),
+        _ => None,
+    }
+}
+
+/// 裸动词表：标题只剩这些词时，等于什么都没说。
+const BARE_VERBS: [&str; 9] = [
+    "点击",
+    "双击",
+    "右键",
+    "右键点击",
+    "输入",
+    "粘贴",
+    "拖拽",
+    "滚动",
+    "单击",
+];
+
+/// 标题是否**没说清操作目标**。
+///
+/// 录制端自动生成的标题形如 `点击在「函数参数」中` / `在「插入函数」中输入`——
+/// 只报得出所在窗口，报不出点的是哪个控件。AI 拿这种文字只能瞎猜，必须显式
+/// 标出来让它改看截图。实测真实库 19 步里有 14 步属于此类。
+fn title_lacks_target(action_type: &str, title: &str) -> bool {
+    if is_keyboard_action(action_type) {
+        return false;
+    }
+    let t = title.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if BARE_VERBS.contains(&t) {
+        return true;
+    }
+    // 剥掉「…」里的窗口名与「在…中」骨架，若只剩一个裸动词 → 模板串
+    if let (Some(a), Some(b)) = (t.find('「'), t.rfind('」')) {
+        if a < b {
+            let outside = format!("{}{}", &t[..a], &t[b + '」'.len_utf8()..]);
+            let skeleton = outside.replace('在', "").replace('中', "");
+            if BARE_VERBS.contains(&skeleton.trim()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// SKILL 包的数据完备度。用于在 SKILL.md 里如实告知消费方哪些信息不可靠——
+/// 与其让 AI 拿着模板标题瞎猜，不如明说「这几步请看图」。
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SkillQuality {
+    total: usize,
+    /// 意图含糊（只报窗口 / 裸动词 / 空）的步数。
+    vague: usize,
+    /// 有落点坐标的步数。
+    with_point: usize,
+    /// 有控件锚点的步数。
+    with_anchor: usize,
+    /// 有截图的步数。
+    with_shot: usize,
+}
+
+fn skill_quality(machine: &SkillMachine) -> SkillQuality {
+    let mut q = SkillQuality {
+        total: machine.len(),
+        ..Default::default()
+    };
+    for d in machine.values() {
+        if d.intent_vague {
+            q.vague += 1;
+        }
+        if d.point.is_some() {
+            q.with_point += 1;
+        }
+        if d.anchor.is_some() {
+            q.with_anchor += 1;
+        }
+        if d.screenshot.is_some() {
+            q.with_shot += 1;
+        }
+    }
+    q
+}
+
+/// 生成「## 执行须知」正文。**含糊步骤为 0 时不产出告知段**（好数据不该被
+/// 免责声明打扰）；有含糊步骤时列出具体步号，让消费方精确知道哪几步别信文字。
+fn skill_notice(machine: &SkillMachine, q: &SkillQuality) -> String {
+    let mut out = String::new();
+    out.push_str("## 执行须知\n\n");
+    out.push_str(
+        "本技能由「录步 Flowio」录制真实桌面操作导出。每步给出目标窗口、录制时的\
+         落点坐标与当时的界面截图（红圈标出点击位置）。\n\n",
+    );
+    out.push_str(
+        "- 坐标是**录制那台机器当时的屏幕逻辑坐标**。分辨率、缩放或窗口位置一变就会失效，\
+         此时以截图为准重新定位，不要直接照抄坐标。\n",
+    );
+    out.push_str("- 完整机器可读数据见同目录 `steps.json`（含控件锚点、组合键、输入文本）。\n");
+    if q.vague > 0 {
+        let mut nums: Vec<i32> = machine
+            .values()
+            .filter(|d| d.intent_vague)
+            .map(|d| d.n)
+            .collect();
+        nums.sort_unstable();
+        let list: Vec<String> = nums.iter().map(|n| n.to_string()).collect();
+        out.push_str(&format!(
+            "- ⚠️ 第 {} 步（共 {} 步中的 {} 步）标题由录制端自动生成，形如「点击在「窗口名」中」，\
+             **只说明了所在窗口、没说明点的是哪个控件**。这些步骤请优先依据截图判断意图，\
+             不要按标题字面理解。\n",
+            list.join("、"),
+            q.total,
+            q.vague
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// 读取机器可执行数据。任一列缺失只影响该字段，不影响整体导出。
+fn load_skill_machine(conn: &rusqlite::Connection, recording_id: &str) -> SkillMachine {
+    let mut map = SkillMachine::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT step_number, COALESCE(action_type,''), COALESCE(title,''), \
+         COALESCE(window_title,''), x, y, start_x, start_y, end_x, end_y, \
+         scroll_delta, hotkey_combo, uia_anchor, COALESCE(description,'') \
+         FROM steps WHERE recording_id = ?1 ORDER BY order_index",
+    ) else {
+        return map;
+    };
+    let rows = stmt.query_map(params![recording_id], |r| {
+        Ok((
+            r.get::<_, i32>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<i32>>(4)?,
+            r.get::<_, Option<i32>>(5)?,
+            r.get::<_, Option<i32>>(6)?,
+            r.get::<_, Option<i32>>(7)?,
+            r.get::<_, Option<i32>>(8)?,
+            r.get::<_, Option<i32>>(9)?,
+            r.get::<_, Option<i32>>(10)?,
+            r.get::<_, Option<String>>(11)?,
+            r.get::<_, Option<String>>(12)?,
+            r.get::<_, String>(13)?,
+        ))
+    });
+    let Ok(rows) = rows else { return map };
+    for row in rows.filter_map(|r| r.ok()) {
+        let (n, action, title, window, x, y, sx, sy, ex, ey, scroll, hotkey, anchor, desc) = row;
+        let is_text = matches!(action.as_str(), "type" | "paste");
+        map.insert(
+            n,
+            SkillStepData {
+                n,
+                intent_vague: title_lacks_target(&action, &title),
+                intent: title.trim().to_string(),
+                window: window.trim().to_string(),
+                point: skill_point(&action, x, y, sx, sy),
+                drag_to: match (ex, ey) {
+                    (Some(a), Some(b)) => Some([a, b]),
+                    _ => None,
+                },
+                scroll_delta: scroll,
+                hotkey: hotkey.filter(|s| !s.trim().is_empty()),
+                text: if is_text && !desc.trim().is_empty() {
+                    Some(desc.trim().to_string())
+                } else {
+                    None
+                },
+                anchor: anchor
+                    .filter(|s| !s.trim().is_empty())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                screenshot: None,
+                action,
+            },
+        );
+    }
+    map
+}
+
 /// 导出 Agent Skills 1.0（SKILL.md）。
 ///
 /// - **变量版**：任一步骤被标记为变量（`is_variable` 且 `param_name` 非空）时输出——
@@ -863,7 +1122,12 @@ fn yaml_oneline(s: &str) -> String {
 /// `images`：(步骤号, 相对路径)。非空时在对应步骤下插入截图引用——
 /// 截图由 `export_skill_bundle` 预先复制到 SKILL.md 同目录（Agent Skills 规范
 /// 支持 bundled resources），多模态执行层看图定位，这是机看版区别于 MD 导出的核心。
-fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep], images: &[(i32, String)]) -> String {
+fn export_skill_md(
+    recording: &ExportRecording,
+    steps: &[ExportStep],
+    images: &[(i32, String)],
+    machine: &SkillMachine,
+) -> String {
     // 收集变量步骤：(step, param_name, sample)
     let variables: Vec<(&ExportStep, String, String)> = steps
         .iter()
@@ -933,6 +1197,28 @@ fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep], images: &[
             body.push_str(&format!("：{}", s.description.trim()));
         }
         body.push('\n');
+        // 机器可执行线索：目标窗口 + 落点 / 组合键。标题说不清目标时这几行就是
+        // 消费方唯一可靠的定位依据，必须写进人读正文而不只藏在 steps.json。
+        if let Some(d) = machine.get(&s.step_number) {
+            if !d.window.is_empty() {
+                body.push_str(&format!("   - 目标窗口：`{}`\n", d.window));
+            }
+            if let Some(hk) = &d.hotkey {
+                body.push_str(&format!("   - 组合键：`{}`\n", hk));
+            }
+            if let Some(p) = d.point {
+                match d.drag_to {
+                    Some(e) => body.push_str(&format!(
+                        "   - 录制落点：`({}, {})` → `({}, {})`（拖拽）\n",
+                        p[0], p[1], e[0], e[1]
+                    )),
+                    None => body.push_str(&format!("   - 录制落点：`({}, {})`\n", p[0], p[1])),
+                }
+            }
+            if d.intent_vague {
+                body.push_str("   - ⚠️ 本步标题未说明点的是哪个控件，请以截图为准定位。\n");
+            }
+        }
         if !s.tip.trim().is_empty() {
             body.push_str(&format!("   > 提示：{}\n", s.tip.trim()));
         }
@@ -948,6 +1234,10 @@ fn export_skill_md(recording: &ExportRecording, steps: &[ExportStep], images: &[
     out.push_str(&format!("description: \"{}\"\n", desc));
     out.push_str("---\n\n");
     out.push_str(&format!("# {}\n\n", recording.title));
+    if !machine.is_empty() {
+        let q = skill_quality(machine);
+        out.push_str(&skill_notice(machine, &q));
+    }
     if variable_mode {
         out.push_str("## Inputs\n\n");
         out.push_str("运行本技能前，由调用方（Agent / 用户 / 外部系统）提供以下参数：\n\n");
@@ -976,6 +1266,7 @@ fn export_skill_bundle(
     recording: &ExportRecording,
     steps: &[ExportStep],
     crop_set: &std::collections::HashSet<&str>,
+    machine: &mut SkillMachine,
 ) -> Result<String, String> {
     let parent = output_path
         .parent()
@@ -1006,12 +1297,42 @@ fn export_skill_bundle(
             .unwrap_or_else(|| "png".to_string());
         let fname = format!("step-{:02}.{}", s.step_number, ext);
         if std::fs::write(ss_dir.join(&fname), &bytes).is_ok() {
-            images.push((s.step_number, format!("screenshots/{}", fname)));
+            let rel = format!("screenshots/{}", fname);
+            if let Some(d) = machine.get_mut(&s.step_number) {
+                d.screenshot = Some(rel.clone());
+            }
+            images.push((s.step_number, rel));
         }
     }
-    let content = export_skill_md(recording, steps, &images);
+    let content = export_skill_md(recording, steps, &images, machine);
     std::fs::write(output_path, content)
         .map_err(|e| format!("Failed to write SKILL.md: {}", e))?;
+    // steps.json：给「有点击工具的 Agent」用的结构化版本。写失败只是少一份
+    // 附属数据，SKILL.md 已落盘，绝不因此让整个导出报错。
+    if !machine.is_empty() {
+        let mut ordered: Vec<&SkillStepData> = machine.values().collect();
+        ordered.sort_by_key(|d| d.n);
+        let q = skill_quality(machine);
+        let payload = serde_json::json!({
+            "skill": skill_slug_name(&recording.title),
+            "title": recording.title,
+            "app": recording.app_name,
+            "recorded_at": recording.created_at,
+            "generated_by": "录步 Flowio",
+            "coordinate_space": "录制机屏幕逻辑像素，左上角为原点；分辨率/缩放变化后需以截图重新定位",
+            "quality": {
+                "total": q.total,
+                "intent_vague": q.vague,
+                "with_point": q.with_point,
+                "with_anchor": q.with_anchor,
+                "with_screenshot": q.with_shot,
+            },
+            "steps": ordered,
+        });
+        if let Ok(text) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(parent.join("steps.json"), text);
+        }
+    }
     Ok(output_path.to_string_lossy().to_string())
 }
 
@@ -1732,9 +2053,12 @@ mod tests {
             Ok(id) if !id.trim().is_empty() => id.trim().to_string(),
             _ => conn
                 .query_row(
-                    "SELECT id FROM recordings WHERE total_steps > 0 AND id IN \
+                    // 取「步数最多」而不是「最新」：最新的往往是 1 步试录，
+                    // 生成出来的样例看不出真实教程的数据完备度。
+                    "SELECT r.id FROM recordings r JOIN steps s ON s.recording_id = r.id \
+                     WHERE r.total_steps > 0 AND r.id IN \
                      (SELECT DISTINCT recording_id FROM steps WHERE action_type = 'type') \
-                     ORDER BY created_at DESC LIMIT 1",
+                     GROUP BY r.id ORDER BY COUNT(s.id) DESC LIMIT 1",
                     [],
                     |r| r.get(0),
                 )
@@ -1791,6 +2115,7 @@ mod tests {
             &recording,
             &steps,
             &std::collections::HashSet::new(),
+            &mut load_skill_machine(&conn, &rid),
         )
         .unwrap();
         println!("== fixed ==\n{}", &fixed);
@@ -1805,6 +2130,7 @@ mod tests {
             &recording,
             &steps,
             &std::collections::HashSet::new(),
+            &mut load_skill_machine(&conn, &rid),
         )
         .unwrap();
         println!("== variable ==\n{}", &variable);
@@ -2324,7 +2650,7 @@ mod tests {
             skill_step(2, "type", "在「订单号」中输入", "SO20260906-001", false, ""),
             skill_step(3, "click", "点击导出按钮", "", false, ""),
         ];
-        let md = export_skill_md(&skill_recording(), &steps, &[]);
+        let md = export_skill_md(&skill_recording(), &steps, &[], &SkillMachine::new());
         assert!(md.starts_with("---\n"));
         assert!(md.contains("name: flowio-skill")); // 中文标题压不出 ASCII → 回退
         assert!(!md.contains("## Inputs")); // 无变量 → 固定版
@@ -2340,7 +2666,7 @@ mod tests {
             skill_step(2, "type", "在「订单号」中输入", "SO20260906-001", true, "order_id"),
             skill_step(3, "type", "在「月份」中输入", "3", true, "month"),
         ];
-        let md = export_skill_md(&skill_recording(), &steps, &[]);
+        let md = export_skill_md(&skill_recording(), &steps, &[], &SkillMachine::new());
         assert!(md.contains("## Inputs"));
         assert!(md.contains("- `order_id` — 示例值：`SO20260906-001`（来自步骤 2）"));
         assert!(md.contains("- `month` — 示例值：`3`（来自步骤 3）"));
@@ -2355,7 +2681,7 @@ mod tests {
             skill_step(1, "type", "输入", "abc", true, "  order_id  "),
             skill_step(2, "type", "输入", "xyz", true, ""),
         ];
-        let md = export_skill_md(&skill_recording(), &steps, &[]);
+        let md = export_skill_md(&skill_recording(), &steps, &[], &SkillMachine::new());
         assert!(md.contains("`order_id`"));
         assert!(!md.contains("{{}}"));
         assert!(md.contains("输入 `xyz`")); // 空参数名的步骤按固定值渲染
@@ -2373,12 +2699,12 @@ mod tests {
             (1, "screenshots/step-01.png".to_string()),
             (3, "screenshots/step-03.png".to_string()),
         ];
-        let md = export_skill_md(&skill_recording(), &steps, &images);
+        let md = export_skill_md(&skill_recording(), &steps, &images, &SkillMachine::new());
         assert!(md.contains("![步骤 1 截图](screenshots/step-01.png)"));
         assert!(md.contains("![步骤 3 截图](screenshots/step-03.png)"));
         assert!(!md.contains("step-02"));
         // 空列表 → 纯文本（旧行为），不出任何图片引用
-        let md_plain = export_skill_md(&skill_recording(), &steps, &[]);
+        let md_plain = export_skill_md(&skill_recording(), &steps, &[], &SkillMachine::new());
         assert!(!md_plain.contains("!["));
     }
 
@@ -2387,6 +2713,165 @@ mod tests {
         assert_eq!(skill_slug_name("Monthly Report 2026!"), "monthly-report-2026");
         assert_eq!(skill_slug_name("纯中文标题"), "flowio-skill");
         assert_eq!(skill_slug_name(""), "flowio-skill");
+    }
+
+    // ── SKILL 机器可执行数据 ───────────────────────────────────
+
+    /// 模板标题判别。样本**全部取自真实库**（2026-09-08 审计：19 步里 14 步含糊），
+    /// 别改成臆造样本——判错会让 AI 拿着「点击在「X」中」当真去猜控件。
+    #[test]
+    fn title_lacks_target_detects_real_templates() {
+        for t in [
+            "点击在「函数参数」中",
+            "点击在「插入函数」中",
+            "点击在「【WPS表格新手入门…」中",
+            "点击在「是否保存文档？」中",
+            "在「插入函数」中输入",
+            "点击",
+            "",
+            "   ",
+        ] {
+            assert!(title_lacks_target("click", t), "应判为含糊：{:?}", t);
+        }
+        for t in [
+            "点击 SUMIF 函数",
+            "点击「确定」按钮",
+            "在「函数参数」中输入 数值1",
+            "拖拽选中",
+        ] {
+            assert!(!title_lacks_target("click", t), "应判为清晰：{:?}", t);
+        }
+    }
+
+    /// 键盘类动作的标题天然自足，不能被误判成含糊——
+    /// 「Enter 确认」已经把该做什么说尽了，硬要求它写控件名是错的。
+    #[test]
+    fn title_lacks_target_keyboard_never_vague() {
+        assert!(!title_lacks_target("key", "Enter 确认"));
+        assert!(!title_lacks_target("hotkey", "快捷键 Alt+Tab · 切换到 录步"));
+        assert!(!title_lacks_target("key", "Tab 切换焦点"));
+        assert!(!title_lacks_target("hotkey", ""));
+        assert!(is_keyboard_action("hotkey") && !is_keyboard_action("click"));
+    }
+
+    /// 落点基准：drag 的 x/y 是裁图框中心，真实起点在 start_x/start_y。
+    /// 与 executor::delta_reference 同一个坑，两边都必须锁住。
+    #[test]
+    fn skill_point_drag_uses_start() {
+        assert_eq!(
+            skill_point("drag", Some(700), Some(400), Some(665), Some(308)),
+            Some([665, 308])
+        );
+        // 旧录制无起点 → 降级用 x/y，绝不返回 None（有个近似值也比没有强）
+        assert_eq!(
+            skill_point("drag", Some(700), Some(400), None, None),
+            Some([700, 400])
+        );
+        assert_eq!(
+            skill_point("click", Some(120), Some(80), None, None),
+            Some([120, 80])
+        );
+        assert_eq!(skill_point("hotkey", None, None, None, None), None);
+    }
+
+    fn mstep(n: i32, action: &str, intent: &str, vague: bool) -> SkillStepData {
+        SkillStepData {
+            n,
+            action: action.into(),
+            intent: intent.into(),
+            intent_vague: vague,
+            window: "插入函数".into(),
+            point: Some([100 + n, 200 + n]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn skill_quality_counts_coverage() {
+        let mut m = SkillMachine::new();
+        m.insert(1, mstep(1, "click", "点击在「插入函数」中", true));
+        m.insert(2, mstep(2, "click", "点击 SUMIF", false));
+        let mut with_shot = mstep(3, "click", "点击 确定", false);
+        with_shot.screenshot = Some("screenshots/step-03.jpg".into());
+        with_shot.anchor = Some(serde_json::json!({"cls":"Button"}));
+        m.insert(3, with_shot);
+        assert_eq!(
+            skill_quality(&m),
+            SkillQuality {
+                total: 3,
+                vague: 1,
+                with_point: 3,
+                with_anchor: 1,
+                with_shot: 1,
+            }
+        );
+    }
+
+    /// 含糊步骤必须**点名到步号**。只说「有些步骤不准」等于没说，
+    /// 消费方无法定位到底该对哪几步改看截图。
+    #[test]
+    fn skill_notice_lists_vague_step_numbers() {
+        let mut m = SkillMachine::new();
+        m.insert(9, mstep(9, "click", "点击在「函数参数」中", true));
+        m.insert(2, mstep(2, "click", "点击在「插入函数」中", true));
+        m.insert(5, mstep(5, "click", "点击 SUMIF", false));
+        let q = skill_quality(&m);
+        let n = skill_notice(&m, &q);
+        assert!(n.contains("第 2、9 步"), "步号需升序点名：{}", n);
+        assert!(n.contains("共 3 步中的 2 步"), "{}", n);
+        assert!(n.contains("steps.json"), "须指向结构化数据：{}", n);
+    }
+
+    /// 数据齐全时不产出免责段落——好数据不该被警告噪音污染。
+    #[test]
+    fn skill_notice_no_warning_when_all_clear() {
+        let mut m = SkillMachine::new();
+        m.insert(1, mstep(1, "click", "点击 SUMIF", false));
+        let q = skill_quality(&m);
+        let n = skill_notice(&m, &q);
+        assert!(!n.contains("⚠️"), "无含糊步骤时不该有警告：{}", n);
+        assert!(n.contains("执行须知"), "{}", n);
+    }
+
+    /// SKILL.md 正文必须带上「目标窗口 + 落点」——标题说不清目标时，
+    /// 这两行是消费方唯一可靠的定位依据，不能只藏在 steps.json 里。
+    #[test]
+    fn skill_md_embeds_machine_locators() {
+        let steps = vec![skill_step(1, "click", "点击在「插入函数」中", "", false, "")];
+        let mut m = SkillMachine::new();
+        m.insert(1, mstep(1, "click", "点击在「插入函数」中", true));
+        let out = export_skill_md(&skill_recording(), &steps, &[], &m);
+        assert!(out.contains("- 目标窗口：`插入函数`"), "{}", out);
+        assert!(out.contains("- 录制落点：`(101, 201)`"), "{}", out);
+        assert!(out.contains("请以截图为准定位"), "{}", out);
+        assert!(out.contains("## 执行须知"), "{}", out);
+    }
+
+    /// 无机器数据时 SKILL.md 必须逐字退回旧格式——老用户导出结果不能因本次
+    /// 改动而变样（查表失败也走这条路）。
+    #[test]
+    fn skill_md_without_machine_stays_legacy() {
+        let steps = vec![skill_step(1, "click", "点击 确定", "", false, "")];
+        let out = export_skill_md(&skill_recording(), &steps, &[], &SkillMachine::new());
+        assert!(!out.contains("## 执行须知"), "{}", out);
+        assert!(!out.contains("目标窗口"), "{}", out);
+    }
+
+    /// drag 步在正文里要给出起点→终点两个坐标，只给一个点没法复现拖拽。
+    #[test]
+    fn skill_md_drag_shows_both_ends() {
+        let steps = vec![skill_step(1, "drag", "拖拽选中", "", false, "")];
+        let mut m = SkillMachine::new();
+        let mut d = mstep(1, "drag", "拖拽选中", false);
+        d.point = Some([665, 308]);
+        d.drag_to = Some([820, 460]);
+        m.insert(1, d);
+        let out = export_skill_md(&skill_recording(), &steps, &[], &m);
+        assert!(
+            out.contains("`(665, 308)` → `(820, 460)`（拖拽）"),
+            "{}",
+            out
+        );
     }
 
     #[test]
