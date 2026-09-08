@@ -278,22 +278,35 @@ pub fn execute_recording(
         // 真实执行会向桌面绝对坐标下发鼠标/键盘；录步窗口若遮挡目标位置
         //（桌面图标、右键菜单落点等）会吃掉点击，导致整条链路空转。
         // Drop guard 保证无论中途成功/失败/提前返回，结束后都还原窗口。
-        struct RestoreWindowOnDrop(Option<tauri::WebviewWindow>);
-        impl Drop for RestoreWindowOnDrop {
+        struct RestoreWindowsOnDrop(Vec<tauri::WebviewWindow>);
+        impl Drop for RestoreWindowsOnDrop {
             fn drop(&mut self) {
-                if let Some(w) = &self.0 {
+                for w in &self.0 {
                     let _ = w.unminimize();
                     let _ = w.set_focus();
                 }
             }
         }
-        let _restore_guard = RestoreWindowOnDrop(app.get_webview_window("main"));
-        if let Some(w) = app.get_webview_window("main") {
+        // 取需要最小化的窗口：优先按默认主窗口 label "main"；若该 label 在运行时
+        // 缺失（极端情况），枚举所有窗口、排除语音字幕窗兜底。Tauri 默认主窗口 label="main"。
+        let windows_to_minimize: Vec<tauri::WebviewWindow> = match app.get_webview_window("main") {
+            Some(w) => vec![w],
+            None => app
+                .webview_windows()
+                .into_values()
+                .filter(|w| w.label() != "voice-caption")
+                .collect(),
+        };
+        let _restore_guard = RestoreWindowsOnDrop(windows_to_minimize.clone());
+        for w in &windows_to_minimize {
             let _ = w.minimize();
-            crate::executor::backend::replay_log("[window] 执行开始，录步窗口已最小化（避免遮挡目标坐标）");
-            // 等最小化动画结束、桌面就绪，避免首步点击落在还在收缩的窗口上
-            std::thread::sleep(Duration::from_millis(400));
         }
+        crate::executor::backend::replay_log(&format!(
+            "[window] 执行开始，已最小化 {} 个录步窗口（避免遮挡目标坐标）",
+            windows_to_minimize.len()
+        ));
+        // 等最小化动画结束、桌面就绪，避免首步点击落在还在收缩的窗口上
+        std::thread::sleep(Duration::from_millis(400));
 
         let backend = WindowsBackend;
         // 降频校验：长录制每 2~3 步抽验一次（末步必验），显著减少每步全屏截图次数，
