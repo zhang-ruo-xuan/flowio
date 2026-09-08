@@ -7,7 +7,7 @@
 //! 由前端先调 `preview_replay` 展示计划、用户点「批准」后再带 `approved=true` 重放。
 
 use crate::DbState;
-use crate::executor::backend::{DryRunBackend, WindowsBackend};
+use crate::executor::backend::{DryRunBackend, ReplayBackend, WindowsBackend};
 use crate::executor::replay::{
     load_replay_plan, run_action, classify_sensitivity, plan_requires_approval, approval_engaged,
     ReplayAction,
@@ -389,6 +389,22 @@ pub fn execute_recording(
 
             let do_verify = verify_every == 1 || (i % verify_every == 0) || i + 1 == n;
 
+            // ── 根因修复：桌面重命名输入前 Ctrl+A 全选 ──
+            // Win11 资源管理器「新建文件」自动重命名只全选主名（新建文本文档），
+            // 不含扩展名 → 输入 name.ext 只替换主名，残留 .txt 得 name.ext.txt
+            // （2026-09-08 14:22 实测 aaaa.txt -> aaaa.txt.txt，手动操作同样中招）。
+            // 先 Ctrl+A 全选整个名字（含扩展名）再输入，整名替换得 name.ext。
+            if action.action_type == "type"
+                && is_desktop_rename_context(&action.window_title)
+                && action.text.as_deref().map_or(false, |t| looks_like_file_name(t))
+            {
+                backend.press_combo("Ctrl+A");
+                std::thread::sleep(Duration::from_millis(80));
+                crate::executor::backend::replay_log(
+                    "[rename] 桌面重命名输入前已 Ctrl+A 全选（整名替换，防主名残留扩展名）",
+                );
+            }
+
             // 单步隔离：任何一步的 unsafe Windows 调用或截图校验若 panic，
             // 只标记该步失败并继续，绝不拖垮整个进程（直接缓解"闪退"）。
             let step_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -455,7 +471,10 @@ pub fn execute_recording(
             } else if action.action_type == "hotkey"
                 && action.hotkey_combo.as_deref() == Some("Enter")
             {
-                if let Some(expected) = pending_rename.take() {
+                // 不 take：实测（14:22）第二个 Enter 确认会让资源管理器再次产生
+                // name.ext.txt，每个桌面 Enter 后都需检查。修正条件极保守
+                // （仅 name.ext.ext 存在且 name.ext 不存在才动手），重复检查无副作用。
+                if let Some(expected) = pending_rename.clone() {
                     // 等资源管理器完成重命名落盘后再检查
                     std::thread::sleep(Duration::from_millis(700));
                     crate::executor::backend::fix_double_extension(&expected);
@@ -465,6 +484,12 @@ pub fn execute_recording(
             if delay > 0 {
                 std::thread::sleep(Duration::from_millis(delay));
             }
+        }
+
+        // 终检：所有步骤结束后（含最后一轮 Explorer 确认事务）再兜底修正一次，
+        // 防止中途修正被资源管理器后续确认覆盖。
+        if let Some(expected) = pending_rename.as_deref() {
+            crate::executor::backend::fix_double_extension(expected);
         }
     }
 
