@@ -1905,8 +1905,18 @@ fn ensure_typing_started(
 }
 
 /// 按键是否属于导航键（Enter/Tab/Escape，触发立即 flush）。
+///
+/// ⚠️ 必须同时接受 hook 原始名与规范化名：`hook::vk_to_key_name` 对 VK_TAB
+/// 返回 **"KeyTab"**（VK_RETURN 返回 "Return"、VK_ESCAPE 返回 "Escape"），
+/// 而这里早先只认 "Tab" → Tab 键既不匹配导航键、也不被
+/// function/standalone/action_key_label 覆盖、ToUnicodeEx 又无字符输出，
+/// 于是被静默丢弃：录制里完全看不到 Tab 步骤，重放自然不会切字段
+/// （用户报「tab 切换键没有执行」）。
 fn is_nav_key(key_name: &str) -> bool {
-    matches!(key_name, "Enter" | "Return" | "KeyEnter" | "Tab" | "Escape")
+    matches!(
+        key_name,
+        "Enter" | "Return" | "KeyEnter" | "Tab" | "KeyTab" | "Escape"
+    )
 }
 
 /// 前台窗口变化时是否触发 flush：两侧均有标题、标题不同、且距上次按键超过 500ms。
@@ -2459,7 +2469,7 @@ fn spawn_event_thread(
                         // 就是输完文件名却不回车 → 文件永远建不出来（用户报的「文件未生成」）。
                         let nav_label = match key_name.as_str() {
                             "Enter" | "Return" | "KeyEnter" => "Enter 确认".to_string(),
-                            "Tab" => "Tab 切换焦点".to_string(),
+                            "Tab" | "KeyTab" => "Tab 切换焦点".to_string(),
                             "Escape" => "Esc 取消".to_string(),
                             other => display_shortcut_key(other),
                         };
@@ -3728,6 +3738,11 @@ mod commands_tests {
     fn is_nav_key_variants() {
         assert!(is_nav_key("Enter"));
         assert!(is_nav_key("Tab"));
+        // ★ 回归：hook 的 vk_to_key_name(VK_TAB) 产出 "KeyTab"，漏了它 Tab 步骤
+        // 会整段消失（重放时不切字段）。
+        assert!(is_nav_key("KeyTab"));
+        assert!(is_nav_key("Return"));
+        assert!(is_nav_key("KeyEnter"));
         assert!(is_nav_key("Escape"));
         assert!(!is_nav_key("a"));
         assert!(!is_nav_key("Backspace"));

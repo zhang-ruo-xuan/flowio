@@ -114,10 +114,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
+    EnumWindows, FindWindowW, GA_ROOT, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowRect,
+    GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsChild, IsWindowVisible,
     SendMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SetCursorPos, SetForegroundWindow,
     SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE,
-    SW_MINIMIZE, SW_RESTORE, WM_COMMAND, WM_NULL, WindowFromPoint,
+    SW_HIDE, SW_MINIMIZE, SW_RESTORE, WM_COMMAND, WM_NULL, WindowFromPoint,
 };
 
 struct EnumCtx<'a> {
@@ -248,6 +249,80 @@ fn point_is_decorative(x: i32, y: i32) -> bool {
     }
     let c = String::from_utf16_lossy(&cls[..n as usize]);
     c.starts_with("KLite") || c.contains("ShadowBorder") || c.contains("Shadow")
+}
+
+/// 取窗口的顶层祖先（GA_ROOT）。
+fn root_of(hwnd: HWND) -> HWND {
+    unsafe {
+        let r = GetAncestor(hwnd, GA_ROOT);
+        if r.0.is_null() {
+            hwnd
+        } else {
+            r
+        }
+    }
+}
+
+/// 落点是否被「瞬态浮层」遮挡。
+///
+/// 真实事故：WPS 表格录制时没有、重放时才冒出来的 Qt 浮层（`Qt5QWindowIcon`
+/// 等）盖在网格上方，点击被它吃掉，表现为「单元格点不中 / 点偏一格」。
+/// 这类窗口对用户无意义，故只**隐藏**（不关闭、不置前目标窗口，避免打断
+/// 模态对话框的合法遮挡），代价最小。只处理小尺寸浮层，宁可漏判也不错伤。
+fn dismiss_occluding_overlay(x: i32, y: i32, target: HWND) {
+    unsafe {
+        if target.0.is_null() {
+            return;
+        }
+        let tgt_root = root_of(target);
+        let mut tcls = [0u16; 128];
+        let tn = GetClassNameW(tgt_root, &mut tcls);
+        if tn > 0 {
+            let tc = String::from_utf16_lossy(&tcls[..tn as usize]);
+            // 桌面/任务栏场景不做规避：那里本就点到各种系统窗口。
+            if matches!(tc.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+                return;
+            }
+        }
+        let hit = WindowFromPoint(POINT { x, y });
+        if hit.0.is_null() {
+            return;
+        }
+        if IsChild(tgt_root, hit).as_bool() || root_of(hit) == tgt_root {
+            return;
+        }
+        let hit_root = root_of(hit);
+        let mut cls = [0u16; 128];
+        let n = GetClassNameW(hit_root, &mut cls);
+        if n == 0 {
+            return;
+        }
+        let c = String::from_utf16_lossy(&cls[..n as usize]);
+        let is_overlay = c.starts_with("Qt5QWindowIcon")
+            || c.starts_with("Qt5QWindowToolSaveBits")
+            || c.starts_with("Qt5QWindowToolTip")
+            || c.starts_with("PopupWindowSiteBridge")
+            || c == "Tooltips_class32"
+            || c == "#32768"
+            || c.contains("ShadowBorder")
+            || c.contains("Shadow");
+        if !is_overlay {
+            return;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hit_root, &mut r).is_ok()
+            && (r.right - r.left > 900 || r.bottom - r.top > 700)
+        {
+            return; // 大窗口不是浮层，别动
+        }
+        replay_log(&format!(
+            "[occlusion] 落点 ({},{}) 被浮层 {} 遮挡 -> 隐藏后继续",
+            x,
+            y,
+            window_desc(hit_root)
+        ));
+        let _ = ShowWindow(hit_root, SW_HIDE);
+    }
 }
 
 /// 窗口当前是否可响应（未挂起）。应用冷启动期间窗口标题已出现但主线程仍在
@@ -949,6 +1024,7 @@ impl ReplayBackend for WindowsBackend {
                     cx,
                     cy
                 ));
+                dismiss_occluding_overlay(cx, cy, hwnd);
                 self.click(cx, cy);
             }
             None => {
@@ -1006,6 +1082,7 @@ impl ReplayBackend for WindowsBackend {
                     cx,
                     cy
                 ));
+                dismiss_occluding_overlay(cx, cy, hwnd);
                 self.double_click(cx, cy);
             }
             None => {
@@ -1058,6 +1135,7 @@ impl ReplayBackend for WindowsBackend {
                     cx,
                     cy
                 ));
+                dismiss_occluding_overlay(cx, cy, hwnd);
                 self.right_click(cx, cy);
             }
             None => {
