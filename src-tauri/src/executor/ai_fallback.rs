@@ -308,7 +308,9 @@ pub fn build_prompt(ctx: &FallbackContext) -> String {
 }
 
 fn reason_cn(r: &str) -> &'static str {
-    if r.contains("verify") {
+    if r.contains("before-drift") {
+        "执行前对账发现当前画面与该步录制时的画面不一致（环境已漂移）"
+    } else if r.contains("verify") {
         "按录制坐标点击后，画面与该步录制时不一致（没打中）"
     } else {
         "目标窗口没有出现在前台（可能没启动 / 被别的窗口挡住）"
@@ -643,5 +645,25 @@ mod ai_fallback_tests {
     #[test]
     fn extract_why_empty_when_missing() {
         assert_eq!(extract_why("{\"x\":1,\"y\":2}"), "");
+    }
+
+    #[test]
+    fn prompt_states_before_drift_reason() {
+        // 事前对账漂移不能再说「目标窗口没出现」——那会把排查方向带偏
+        let p = build_prompt(&FallbackContext {
+            step_number: 9,
+            action_type: "click",
+            window_title: "函数参数",
+            step_title: "点击在「函数参数」中",
+            text: None,
+            recorded: Some((1158, 870)),
+            prev_intent: "",
+            next_intent: "",
+            reason: "before-drift",
+            img_w: 1280,
+            img_h: 720,
+        });
+        assert!(p.contains("环境已漂移"), "{}", p);
+        assert!(!p.contains("目标窗口没有出现在前台"), "{}", p);
     }
 }

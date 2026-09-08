@@ -150,6 +150,47 @@ fn step_intent(a: &ReplayAction, intents: &std::collections::HashMap<i32, String
     }
 }
 
+/// 事前对账判定「画面已经漂移」的差异阈值。
+///
+/// 🔴 为什么比事后校验的 0.08 宽松这么多：录制端**从不写 `after_screenshot_path`**
+/// （`recorder/commands.rs` 的每条保存路径都写死 `None`），所以「执行后 vs 录制后」
+/// 这道校验门在真实录制里一次都没跑过。现在改用 19/19 齐全的 `before_screenshot`
+/// 做事前对账，而 before 图是「点击时刻那一帧」、且被裁掉了顶部录制条，
+/// 与实时抓屏天然存在几百分点的底噪。0.20 足以区分「窗口根本没开/内容变了」
+/// 和「时钟跳了一秒」，再低就会把正常步骤误判成漂移。
+const BEFORE_DRIFT_THRESHOLD: f32 = 0.20;
+
+/// Stage 4：一次性读出每一步的「操作前画面」（step_number → before 截图路径）。
+///
+/// 事前对账的基准：执行第 N 步**之前**，把当前屏幕和录制时第 N 步的画面比一比。
+/// 对不上说明环境已经漂移（对话框没弹出来 / 打开的是另一份文档），这时候再按
+/// 录制坐标点下去必然错，不如直接问 AI。
+/// 不进 [`ReplayAction`] 的原因同 `load_step_intents`：会炸掉十几处测试字面量。
+fn load_step_before_shots(
+    conn: &rusqlite::Connection,
+    recording_id: &str,
+) -> std::collections::HashMap<i32, String> {
+    let mut map = std::collections::HashMap::new();
+    let rows = conn
+        .prepare(
+            "SELECT step_number, COALESCE(before_screenshot_path,'') \
+             FROM steps WHERE recording_id = ?1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![recording_id], |r| {
+                Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    for (n, p) in rows {
+        if !p.trim().is_empty() {
+            map.insert(n, p);
+        }
+    }
+    map
+}
+
 /// 该动作是否属于「AI 改个落点就能救」的类型。
 ///
 /// 拖拽/滚轮/组合键都不算：拖拽的两个端点语义模型很难同时答对，滚轮和
@@ -511,17 +552,23 @@ pub fn execute_recording(
         // ── Stage 4：AI 兜底准备 ──
         // 只在开启时解析一次 AI 配置（走「用户自配 → 内置免费通道」的既定优先级），
         // 后续每步复用，避免反复查库。
-        let (ai_cfg, ai_intents): (
+        let (ai_cfg, ai_intents, ai_before_shots): (
             Option<crate::ai::types::AiConfig>,
+            std::collections::HashMap<i32, String>,
             std::collections::HashMap<i32, String>,
         ) = if ai_enabled {
             let conn = db.0.lock().map_err(|e| e.to_string())?;
             (
                 Some(crate::ai::commands::resolve_ai_config(&conn)),
                 load_step_intents(&conn, &recording_id),
+                load_step_before_shots(&conn, &recording_id),
             )
         } else {
-            (None, std::collections::HashMap::new())
+            (
+                None,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
         };
         let mut ai_budget = if ai_enabled {
             crate::executor::ai_fallback::MAX_CALLS_PER_RUN
@@ -603,7 +650,29 @@ pub fn execute_recording(
                 && !action.window_title.trim().is_empty()
             {
                 backend.focus(&action.window_title);
-                if crate::executor::backend::take_focus_ok() == Some(false) {
+                let focus_ok = crate::executor::backend::take_focus_ok() != Some(false);
+
+                // 事前对账：只在焦点确实切过去之后才做。窗口都没起来时画面
+                // 必然天差地别，比了也是白比，还会把「为什么转 AI」记成漂移。
+                let drift = if focus_ok {
+                    ai_before_shots
+                        .get(&action.step_number)
+                        .and_then(|p| verify_step(&Some(p.clone())))
+                } else {
+                    None
+                };
+                let drifted = drift.map_or(false, |d| d > BEFORE_DRIFT_THRESHOLD);
+                if let Some(d) = drift {
+                    crate::executor::backend::replay_log(&format!(
+                        "[pre-check] 第 {} 步事前对账 差异 {:.3}（阈值 {:.2}）→ {}",
+                        action.step_number,
+                        d,
+                        BEFORE_DRIFT_THRESHOLD,
+                        if drifted { "判定漂移，转 AI" } else { "画面一致" }
+                    ));
+                }
+
+                if !focus_ok || drifted {
                     ai_pre_handled = true;
                     ai_budget -= 1;
                     let prev = if i > 0 {
@@ -615,10 +684,11 @@ pub fn execute_recording(
                         .get(i + 1)
                         .map(|a| step_intent(a, &ai_intents))
                         .unwrap_or_default();
+                    let reason = if focus_ok { "before-drift" } else { "focus-failed" };
                     match ai_cfg
                         .as_ref()
                         .ok_or_else(|| "AI 配置缺失".to_string())
-                        .and_then(|cfg| ai_ask(cfg, action, &ai_intents, prev, next, "focus-failed"))
+                        .and_then(|cfg| ai_ask(cfg, action, &ai_intents, prev, next, reason))
                     {
                         Ok(p) => {
                             crate::executor::backend::replay_log(&format!(
@@ -636,8 +706,15 @@ pub fn execute_recording(
                             );
                             status = "ai-recovered".into();
                             note = format!(
-                                "目标窗口『{}』未出现，AI 兜底定位 ({},{}){}",
-                                action.window_title,
+                                "{}，AI 兜底定位 ({},{}){}",
+                                if focus_ok {
+                                    format!(
+                                        "画面与录制时不一致（差异 {:.2}）",
+                                        drift.unwrap_or_default()
+                                    )
+                                } else {
+                                    format!("目标窗口『{}』未出现", action.window_title)
+                                },
                                 p.x,
                                 p.y,
                                 if p.why.is_empty() {
