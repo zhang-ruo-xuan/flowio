@@ -17,6 +17,7 @@ use chrono::Utc;
 use rusqlite::params;
 use serde::Serialize;
 use std::time::Duration;
+use tauri::Manager;
 use uuid::Uuid;
 
 /// 单步执行结果（审计/校验产物）
@@ -200,6 +201,7 @@ fn map_audit_row(row: &rusqlite::Row) -> Result<AuditRecord, rusqlite::Error> {
 /// 无坐标步仅聚焦窗口。详见 executor-stage2a-trae-brief.md。
 #[tauri::command]
 pub fn execute_recording(
+    app: tauri::AppHandle,
     db: tauri::State<'_, DbState>,
     recording_id: String,
     dry_run: bool,
@@ -271,6 +273,28 @@ pub fn execute_recording(
     } else {
         // 重放前清空焦点缓存，避免上一轮残留窗口句柄误导本轮首步聚焦。
         crate::executor::backend::reset_replay_focus_cache();
+
+        // ── 执行期间最小化录步自身窗口 ──
+        // 真实执行会向桌面绝对坐标下发鼠标/键盘；录步窗口若遮挡目标位置
+        //（桌面图标、右键菜单落点等）会吃掉点击，导致整条链路空转。
+        // Drop guard 保证无论中途成功/失败/提前返回，结束后都还原窗口。
+        struct RestoreWindowOnDrop(Option<tauri::WebviewWindow>);
+        impl Drop for RestoreWindowOnDrop {
+            fn drop(&mut self) {
+                if let Some(w) = &self.0 {
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+        }
+        let _restore_guard = RestoreWindowOnDrop(app.get_webview_window("main"));
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.minimize();
+            crate::executor::backend::replay_log("[window] 执行开始，录步窗口已最小化（避免遮挡目标坐标）");
+            // 等最小化动画结束、桌面就绪，避免首步点击落在还在收缩的窗口上
+            std::thread::sleep(Duration::from_millis(400));
+        }
+
         let backend = WindowsBackend;
         // 降频校验：长录制每 2~3 步抽验一次（末步必验），显著减少每步全屏截图次数，
         // 缓解"卡顿"；短录制仍逐步骤验，校验门功能不变。
