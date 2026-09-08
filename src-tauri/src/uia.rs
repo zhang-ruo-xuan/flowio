@@ -2,20 +2,25 @@
 //!
 //! 动机：WPS「最近」列表等自绘控件按使用状态动态排序，Win32 类名锚点只能定位到
 //! 列表控件本身，列表项位置漂移后会点错文档。录制时额外记录落点元素的 UIA 名称
-//! （列表项的 Name 通常是文件名），重放时若落点名称不符则在窗口 UIA 树内按名称
-//! 找回该元素，点其当前位置中心 —— 与位置无关，列表重排也不怕。
+//! （列表项的 Name 通常是文件名），重放时在窗口 UIA 子树内按名称找回该元素，
+//! 点其当前位置中心 —— 与位置无关，列表重排也不怕。
 //!
-//! 设计取舍：尽力而为。任何 UIA 失败（COM 未初始化异常、元素不可达、名称为空、
-//! 超出遍历预算）都返回 None，上层回退到既有 Win32 路径 —— 永不引入回归。
+//! 🔑 最小矩形规则（2026-09-08 实测教训）：WPS 最近列表「整行容器」的 Name 也是
+//! 文件名，先序遍历/FindFirst 会先命中行容器，其 BoundingRectangle 中心在窗口
+//! 最大化时恰好落在路径列（点击即跳转文件夹）。因此必须 FindAll 取全部同名元素，
+//! 选 **矩形面积最小** 的那个 —— 那才是真正的文件名文本元素。
+//!
+//! 设计取舍：尽力而为。任何 UIA 失败（元素不可达、名称为空、无匹配）都返回 None，
+//! 上层回退到既有 Win32 路径 —— 永不引入回归。
 //! COM 初始化：线程内首次调用 CoInitializeEx(APARTMENTTHREADED)，之后复用；
 //! 若线程已按其他模式初始化（RPC_E_CHANGED_MODE），UIA 在 MTA 下同样可用，继续。
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Subtree, UIA_NamePropertyId,
 };
 
 /// 获取（并按需初始化 COM 后创建）UIA 自动化对象。
@@ -36,31 +41,87 @@ pub fn element_name_at(x: i32, y: i32) -> Option<String> {
     to_name(&name)
 }
 
-/// 名称锚点定位：校验落点 (cx, cy) 处元素名称是否仍与录制一致；一致则维持落点，
-/// 不一致（列表重排/内容变化）则在窗口 hwnd 的 UIA 子树内按名称找回元素，
-/// 返回其当前矩形中心。任何失败返回 None（上层维持原落点）。
+/// 名称锚点定位：在窗口 hwnd 的 UIA 子树内按名称找出全部同名元素，选矩形最小者
+/// （真正的文本元素，而非整行容器），返回其当前矩形中心。
+/// 找不到时回退校验落点 (cx, cy) 处元素名称，一致则维持落点。
+/// 任何失败返回 None（上层维持原落点）。全过程留痕 replay_log。
 pub fn locate_by_name(hwnd: HWND, name: &str, cx: i32, cy: i32) -> Option<(i32, i32)> {
     if name.trim().is_empty() {
         return None;
     }
-    let auto = automation()?;
+    let log = |msg: &str| crate::executor::backend::replay_log(&format!("[anchor-name] {}", msg));
 
-    // 1) 落点校验：名称仍一致 → 无漂移，直接用原落点。
-    if let Ok(el) = unsafe { auto.ElementFromPoint(POINT { x: cx, y: cy }) } {
-        if let Ok(n) = unsafe { el.CurrentName() } {
+    let Some(auto) = automation() else {
+        log("UIA 不可用 -> 维持原落点");
+        return None;
+    };
+    let Ok(root) = (unsafe { auto.ElementFromHandle(hwnd) }) else {
+        log("目标窗口 UIA 根元素不可达 -> 维持原落点");
+        return None;
+    };
+
+    // 1) 原生 FindAll 按名称找全部匹配，选最小矩形（文本元素）。
+    if let Ok(cond) = (unsafe {
+        auto.CreatePropertyCondition(UIA_NamePropertyId, &windows::core::VARIANT::from(name))
+    }) {
+        if let Ok(arr) = (unsafe { root.FindAll(TreeScope_Subtree, &cond) }) {
+            if let Ok(len) = (unsafe { arr.Length() }) {
+                let mut best: Option<RECT> = None;
+                let mut best_area = i64::MAX;
+                for i in 0..len {
+                    let Ok(el) = (unsafe { arr.GetElement(i) }) else {
+                        continue;
+                    };
+                    let Ok(r) = (unsafe { el.CurrentBoundingRectangle() }) else {
+                        continue;
+                    };
+                    let (w, h) = (r.right - r.left, r.bottom - r.top);
+                    if w <= 0 || h <= 0 {
+                        continue;
+                    }
+                    let area = (w as i64) * (h as i64);
+                    if area < best_area {
+                        best = Some(r);
+                        best_area = area;
+                    }
+                }
+                if let Some(r) = best {
+                    let p = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+                    log(&format!(
+                        "name='{}' 树内命中 {} 个同名元素 -> 取最小矩形 {}x{} 落点 ({},{})",
+                        name,
+                        len,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        p.0,
+                        p.1
+                    ));
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    // 2) 树内无匹配：校验落点处元素名称，一致则维持原落点（无漂移场景）。
+    if let Ok(el) = (unsafe { auto.ElementFromPoint(POINT { x: cx, y: cy }) }) {
+        if let Ok(n) = (unsafe { el.CurrentName() }) {
             if let Some(s) = to_name(&n) {
                 if s == name {
+                    log(&format!(
+                        "name='{}' 树内未命中但落点名称一致 -> 维持 ({},{})",
+                        name, cx, cy
+                    ));
                     return Some((cx, cy));
                 }
             }
         }
     }
 
-    // 2) 落点漂移 → 在目标窗口子树内按名称找回。
-    let root = unsafe { auto.ElementFromHandle(hwnd) }.ok()?;
-    let walker = unsafe { auto.ControlViewWalker() }.ok()?;
-    let mut budget: usize = 1200; // 节点预算：防超大 UIA 树拖慢执行
-    dfs_by_name(&root, &walker, name, &mut budget)
+    log(&format!(
+        "name='{}' 未命中且落点 ({},{}) 名称不符 -> 维持原落点",
+        name, cx, cy
+    ));
+    None
 }
 
 fn to_name(b: &windows::core::BSTR) -> Option<String> {
@@ -71,38 +132,4 @@ fn to_name(b: &windows::core::BSTR) -> Option<String> {
     } else {
         Some(t.to_string())
     }
-}
-
-/// 深度优先按名称精确匹配元素，返回其 BoundingRectangle 中心（屏幕坐标）。
-fn dfs_by_name(
-    el: &IUIAutomationElement,
-    walker: &IUIAutomationTreeWalker,
-    name: &str,
-    budget: &mut usize,
-) -> Option<(i32, i32)> {
-    if *budget == 0 {
-        return None;
-    }
-    *budget -= 1;
-    if let Ok(n) = unsafe { el.CurrentName() } {
-        if let Some(s) = to_name(&n) {
-            if s == name {
-                if let Ok(r) = unsafe { el.CurrentBoundingRectangle() } {
-                    return Some(((r.left + r.right) / 2, (r.top + r.bottom) / 2));
-                }
-            }
-        }
-    }
-    // 遍历子树（ControlView）：先子后弟。
-    let mut child = unsafe { walker.GetFirstChildElement(el) }.ok();
-    while let Some(c) = child {
-        if let Some(p) = dfs_by_name(&c, walker, name, budget) {
-            return Some(p);
-        }
-        if *budget == 0 {
-            return None;
-        }
-        child = unsafe { walker.GetNextSiblingElement(&c) }.ok();
-    }
-    None
 }
