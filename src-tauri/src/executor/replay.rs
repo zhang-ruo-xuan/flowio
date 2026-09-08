@@ -214,13 +214,47 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
                 backend.scroll(x, y, d);
             }
         }
-        "type" | "input" => backend.type_text(action.text.as_deref().unwrap_or("")),
+        // type/input：字符只能进「当前键盘焦点」所在的控件。focus 失败说明前台
+        // 不是录制时的目标窗口（典型：对话框没打开/被别的窗口抢了焦点），此时
+        // 补聚焦一次再输入——否则文本会打进上一个控件，表现为「输入没生效」，
+        // 后续步骤（如 Enter 触发确定）必然级联失败且极难排查。
+        "type" | "input" => {
+            if !focused && !action.window_title.trim().is_empty() {
+                crate::executor::backend::replay_log(&format!(
+                    "[type-warn] 焦点未切到 '{}' → 补聚焦一次再输入（原窗口可能未打开）",
+                    action.window_title
+                ));
+                let retry = backend.focus(&action.window_title);
+                std::thread::sleep(Duration::from_millis(120));
+                crate::executor::backend::replay_log(&format!(
+                    "[type-warn] 补聚焦结果={}（仍失败则文本会进错控件）",
+                    retry
+                ));
+            }
+            backend.type_text(action.text.as_deref().unwrap_or(""));
+        }
         // copy/paste 是语义化的组合键步骤：直接下发对应组合键
         "copy" => backend.press_combo(action.hotkey_combo.as_deref().unwrap_or("Ctrl+C")),
         "paste" => backend.press_combo(action.hotkey_combo.as_deref().unwrap_or("Ctrl+V")),
         "hotkey" => {
             if let Some(combo) = action.hotkey_combo.as_deref() {
                 if !combo.is_empty() {
+                    // 与 type 同理：Enter/Tab 等按键交给「键盘焦点」所在的窗口。
+                    // 焦点不在目标窗口时补聚焦一次，否则 Enter 打在旧窗口上，
+                    // 表现为「按了没反应，对话框一直不弹」（2026-09-08 WPS 实测：
+                    // 插入函数里 Enter 后『函数参数』8 秒不出现 → 后续 8 步全废）。
+                    if !focused && !action.window_title.trim().is_empty() {
+                        crate::executor::backend::replay_log(&format!(
+                            "[hotkey-warn] 焦点未切到 '{}' → 补聚焦一次再发 '{}'",
+                            action.window_title, combo
+                        ));
+                        let retry = backend.focus(&action.window_title);
+                        std::thread::sleep(Duration::from_millis(120));
+                        crate::executor::backend::replay_log(&format!(
+                            "[hotkey-warn] 补聚焦结果={}（仍失败则按键会发给旧窗口）",
+                            retry
+                        ));
+                    }
                     backend.press_combo(combo);
                 }
             }
