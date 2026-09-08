@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::anchor::{locate_click, ControlAnchor};
+use crate::anchor::{locate_click_with_hint, ControlAnchor};
 
 /// 重放执行后端抽象。真实环境用 [`WindowsBackend`]，单测用 [`DryRunBackend`]。
 pub trait ReplayBackend {
@@ -925,7 +925,7 @@ impl ReplayBackend for WindowsBackend {
             self.click(fallback_x, fallback_y);
             return;
         }
-        match locate_click(&anchor, hwnd) {
+        match locate_click_with_hint(&anchor, hwnd, Some(fallback_x), Some(fallback_y)) {
             Some((cx, cy)) => {
                 // Stage 2c 名称锚点：列表位置漂移场景（WPS「最近」列表重排等），
                 // 落点名称与录制不符时按名称在窗口 UIA 树内找回元素当前位置。
@@ -984,7 +984,7 @@ impl ReplayBackend for WindowsBackend {
             self.double_click(fallback_x, fallback_y);
             return;
         }
-        match locate_click(&anchor, hwnd) {
+        match locate_click_with_hint(&anchor, hwnd, Some(fallback_x), Some(fallback_y)) {
             Some((cx, cy)) => {
                 let (cx, cy) = if anchor.name.is_empty() {
                     (cx, cy)
@@ -1036,7 +1036,7 @@ impl ReplayBackend for WindowsBackend {
             self.right_click(fallback_x, fallback_y);
             return;
         }
-        match locate_click(&anchor, hwnd) {
+        match locate_click_with_hint(&anchor, hwnd, Some(fallback_x), Some(fallback_y)) {
             Some((cx, cy)) => {
                 let (cx, cy) = if anchor.name.is_empty() {
                     (cx, cy)
