@@ -2859,6 +2859,36 @@ fn recording_title_or_default(title: &str) -> String {
     }
 }
 
+/// 从录制步骤里推断「主应用」名称，写入 recording.app_name，
+/// 让导出的 SKILL.md / steps.json 的 `app` 字段不再是空串（此前恒为 ""）。
+///
+/// 取出现频率最高的、非桌面/非自身窗口的 window_title 作为应用标识。
+/// 录制时每一步都记了前台窗口标题，这里直接聚合即可，零额外开销、零外部依赖。
+fn derive_app_name(steps: &[StepData]) -> String {
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for s in steps {
+        let t = s.window_title.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // 跳过无应用标识的窗口：桌面 shell / 录步自身
+        if t == "Program Manager"
+            || t == "FolderView"
+            || t.contains("录步")
+            || t.contains("Flowio")
+        {
+            continue;
+        }
+        *counts.entry(t).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(t, _)| t.to_string())
+        .unwrap_or_default()
+}
+
 /// 组装 RecordingSave 并生成描述性 rec_id。
 fn build_recording_save(
     id: String,
@@ -2871,7 +2901,7 @@ fn build_recording_save(
     let save = crate::db::RecordingSave {
         id: id.clone(),
         title: recording_title_or_default(title),
-        app_name: String::new(),
+        app_name: derive_app_name(steps),
         target_app,
         steps: saves,
     };
@@ -3817,6 +3847,30 @@ mod commands_tests {
         let (save, rec_id) = build_recording_save("rec-0".into(), "空", &[], None);
         assert_eq!(save.steps.len(), 0);
         assert_eq!(rec_id, "rec-0 (0 steps)");
+    }
+
+    #[test]
+    fn derive_app_name_picks_dominant_non_shell_window() {
+        // 3 步 WPS + 1 步 Chrome + 1 步桌面 shell（应被忽略）
+        let steps = vec![
+            typed_step("a", "WPS 表格 XLOOKUP.xlsx - WPS Office", "x"),
+            typed_step("b", "WPS 表格 XLOOKUP.xlsx - WPS Office", "y"),
+            typed_step("c", "WPS 表格 XLOOKUP.xlsx - WPS Office", "z"),
+            typed_step("d", "Chrome - 百度", "q"),
+            typed_step("e", "Program Manager", "p"),
+        ];
+        let (save, _) = build_recording_save("rec-x".into(), "t", &steps, None);
+        assert_eq!(save.app_name, "WPS 表格 XLOOKUP.xlsx - WPS Office");
+    }
+
+    #[test]
+    fn derive_app_name_empty_when_all_shell_or_blank() {
+        let steps = vec![
+            typed_step("a", "", "x"),
+            typed_step("b", "Program Manager", "y"),
+        ];
+        let (save, _) = build_recording_save("rec-y".into(), "t", &steps, None);
+        assert_eq!(save.app_name, "");
     }
 
     // ── is_active_recording_state ─────────────────────────────────

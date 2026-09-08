@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::db::{RecordingSave, LOCAL_USER};
 use crate::DbState;
@@ -206,14 +206,60 @@ pub fn delete_recordings(db: State<DbState>, ids: Vec<String>) -> Result<u32, St
 
 #[tauri::command]
 pub fn save_recording(
+    app: AppHandle,
     db: State<DbState>,
     mut recording: RecordingSave,
 ) -> Result<(), String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    // 自动命名（时间戳）可能与其他录制撞名（如快速连续停止两次录制），
-    // 此处统一做去重兜底，确保入库标题唯一。
-    recording.title = find_unique_title(&conn, &recording.title);
-    crate::db::save_recording_to_db(&conn, &recording)
+    let already_enhanced = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        // 自动命名（时间戳）可能与其他录制撞名（如快速连续停止两次录制），
+        // 此处统一做去重兜底，确保入库标题唯一。
+        recording.title = find_unique_title(&conn, &recording.title);
+        crate::db::save_recording_to_db(&conn, &recording)?;
+        // 已自动补写过的录制（ai_generated=1）不再重复触发，
+        // 避免编辑/另存为后反复调用 LLM 烧额度/撞频限。
+        conn.query_row(
+            "SELECT ai_generated FROM recordings WHERE id = ?1",
+            params![recording.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            == 1
+    };
+
+    // 录制后自动 AI 补写：后台、非阻塞、失败静默。默认开启，
+    // 可在 settings 表写入 `ai_auto_enhance = "false"` 关闭。
+    if ai_auto_enhance_enabled(&db) && !already_enhanced {
+        let rid = recording.id.clone();
+        tauri::async_runtime::spawn(async move {
+            // State 有生命周期约束、不能直接移入 'static 任务；
+            // 改用 AppHandle 在任务内重新取状态句柄（AppHandle 本身是 'static）。
+            let db = app.state::<DbState>();
+            let _ = crate::ai::commands::run_ai_enhancement(db, rid, None).await;
+        });
+    }
+    Ok(())
+}
+
+/// 录制后是否自动跑 AI 补写（生成语义化标题/描述）。
+/// settings 表 `ai_auto_enhance` 为 "false"/"0" 时关闭，缺省默认开启。
+fn ai_auto_enhance_enabled(db: &State<DbState>) -> bool {
+    let conn = match db.0.lock() {
+        Ok(c) => c,
+        Err(_) => return true, // 锁异常时默认开启，不阻断保存
+    };
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = 'ai_auto_enhance'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| match v.as_str() {
+        "false" | "0" => Some(false),
+        "true" | "1" => Some(true),
+        _ => None,
+    })
+    .unwrap_or(true)
 }
 
 /// 根据基础标题生成一个在 recordings 表中不重复的标题。

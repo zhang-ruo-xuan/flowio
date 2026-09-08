@@ -304,15 +304,12 @@ pub(crate) fn resolve_ai_config(conn: &rusqlite::Connection) -> AiConfig {
     }
 }
 
-/// Trigger AI-powered step generation for a recording.
+/// 录制后自动 AI 补写 / 手动「AI 生成」共用的核心逻辑。
 ///
-/// Reads all steps from the database for the given `recording_id`,
-/// builds an [`AiJob`], and runs the AI pipeline on a background
-/// thread to keep the UI responsive. When the pipeline completes,
-/// step titles, descriptions, action types, and tips are written
-/// back to the database.
-#[tauri::command]
-pub async fn generate_ai_steps(
+/// 从 DB 载入配置与步骤 → 后台线程跑 AI 管道 → 结果写回 DB。
+/// `save_recording` 在录制结束时以「后台、非阻塞、失败静默」方式调用它，
+/// 让导出的 SKILL.md 直接带语义化标题/描述，无需手动点按钮。
+pub(crate) async fn run_ai_enhancement(
     db: State<'_, DbState>,
     recording_id: String,
     domain_mode: Option<String>,
@@ -335,7 +332,7 @@ pub async fn generate_ai_steps(
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
-            .query_map(params![recording_id], |row| {
+            .query_map(params![recording_id.clone()], |row| {
                 Ok(StepRow {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -398,6 +395,16 @@ pub async fn generate_ai_steps(
     apply_pipeline_result(db.inner(), &recording_id, &result);
 
     summarize_generate_result(generated, total_steps, error_count, &result.errors)
+}
+
+/// 手动「AI 生成」按钮入口。具体逻辑见 [`run_ai_enhancement`]。
+#[tauri::command]
+pub async fn generate_ai_steps(
+    db: State<'_, DbState>,
+    recording_id: String,
+    domain_mode: Option<String>,
+) -> Result<String, String> {
+    run_ai_enhancement(db, recording_id, domain_mode).await
 }
 
 /// Retrieve the stored AI configuration for a specific provider.
