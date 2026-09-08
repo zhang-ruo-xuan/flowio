@@ -28,6 +28,10 @@ pub trait ReplayBackend {
     fn double_click(&self, x: i32, y: i32);
     /// 双击 + 控件锚点：同 click_anchored，但下发双击。
     fn double_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32);
+    /// 菜单项点击：锚点 cls 指向右键/下拉菜单窗口时专用。
+    /// 菜单窗口是全局可查的（与「focus 是否成功」无关），用其当前矩形 × (fx, fy)
+    /// 反算落点；菜单未出现则用录制绝对坐标回退。
+    fn click_menu_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32);
 }
 
 // ── 测试后端：只记录动作，不碰真实桌面 ──────────────────────
@@ -91,10 +95,16 @@ impl ReplayBackend for DryRunBackend {
             fallback_x, fallback_y, anchor_json
         ));
     }
+    fn click_menu_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
+        self.actions.lock().unwrap().push(format!(
+            "click_menu_anchored({},{},{})",
+            fallback_x, fallback_y, anchor_json
+        ));
+    }
 }
 
 // ── 真实 Win32 后端 ────────────────────────────────────────
-use windows::Win32::Foundation::{BOOL, HWND, POINT};
+use windows::Win32::Foundation::{BOOL, HWND, POINT, RECT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     SendInput, VIRTUAL_KEY, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN,
@@ -104,7 +114,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
+    EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
     SendMessageW, SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE,
     SW_MINIMIZE, SW_RESTORE, WM_COMMAND, WindowFromPoint,
 };
@@ -285,6 +295,88 @@ pub fn show_desktop() -> bool {
     }
 }
 
+// ── 右键/下拉菜单就绪检测 ──────────────────────────────────
+// 取证（2026-09-08 13:45 重放）：step1 右键桌面 → step2 点击菜单项，但 step2 落点
+// hit='FolderView'（桌面）而非菜单 —— Win11 的右键菜单（WinUI 弹出层）有展开动画，
+// 菜单尚未出现时点击会直接落空并顺手把菜单关掉，整条链路从第二步起全错。
+
+/// 菜单窗口类名判定：Win11 新菜单（WinUI 弹出层）与经典菜单（#32768）都覆盖。
+pub fn is_menu_class(class: &str) -> bool {
+    class == "#32768" || class.contains("PopupWindowSiteBridge")
+}
+
+struct MenuCtx {
+    found: Option<HWND>,
+}
+
+/// 查找当前存在的菜单窗口句柄（任一即可）。
+fn find_menu_window() -> Option<HWND> {
+    let mut ctx = MenuCtx { found: None };
+    unsafe {
+        EnumWindows(
+            Some(find_menu_proc),
+            windows::Win32::Foundation::LPARAM(&mut ctx as *mut _ as isize),
+        )
+        .ok();
+    }
+    ctx.found
+}
+
+unsafe extern "system" fn find_menu_proc(
+    hwnd: HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> BOOL {
+    let ctx = &mut *(lparam.0 as *mut MenuCtx);
+    if IsWindowVisible(hwnd).as_bool() {
+        let mut cls = [0u16; 256];
+        let cn = GetClassNameW(hwnd, &mut cls);
+        if cn > 0 {
+            let class = String::from_utf16_lossy(&cls[..cn as usize]);
+            if is_menu_class(&class) {
+                ctx.found = Some(hwnd);
+                return BOOL(0);
+            }
+        }
+    }
+    BOOL(1)
+}
+
+/// 该步骤的锚点是否指向菜单窗口（右键/下拉菜单项点击）。
+pub fn is_menu_anchor(anchor_json: &str) -> bool {
+    ControlAnchor::from_str(anchor_json).map_or(false, |a| is_menu_class(&a.cls))
+}
+
+/// 等待菜单窗口出现（轮询 30ms）。返回句柄；超时返回 None。
+pub fn wait_menu_window(timeout_ms: u32) -> Option<HWND> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
+    loop {
+        if let Some(hwnd) = find_menu_window() {
+            // 多等一帧，让菜单完成展开动画、布局稳定后再接受点击
+            std::thread::sleep(Duration::from_millis(80));
+            return Some(hwnd);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// 若该步骤的锚点指向菜单窗口，则在点击前等待菜单就绪并留痕。
+/// 对非菜单类步骤是 no-op（零风险）。
+pub fn ensure_menu_ready(anchor_json: &str) {
+    let Some(anchor) = ControlAnchor::from_str(anchor_json) else {
+        return;
+    };
+    if !is_menu_class(&anchor.cls) {
+        return;
+    }
+    match wait_menu_window(900) {
+        Some(hwnd) => replay_log(&format!("[menu] 菜单窗口已就绪 {}", window_desc(hwnd))),
+        None => replay_log("[menu] ⚠ 未检测到菜单窗口（右键菜单可能未弹出或已被关闭）"),
+    }
+}
+
 struct MinimizeCtx<'a> {
     substr: &'a str,
     count: usize,
@@ -455,6 +547,13 @@ fn right_click(x: i32, y: i32) {
         point_window_desc(x, y),
         foreground_window_desc()
     ));
+    // 右键几乎必然要拉出上下文菜单；Win11 的 WinUI 菜单有展开动画，若下一步立刻
+    // 用录制坐标点菜单项，会在菜单出现前落空并顺手把菜单关掉（13:45 实测故障）。
+    // 这里等菜单出现后再返回，最多等 500ms；非菜单场景（应用内右键）超时即放行。
+    match wait_menu_window(500) {
+        Some(hwnd) => replay_log(&format!("[menu] 右键后菜单已弹出 {}", window_desc(hwnd))),
+        None => replay_log("[menu] 右键后未检测到菜单窗口（500ms 超时）"),
+    }
 }
 
 /// 双击：两次快速左键（间隔远小于系统双击时间），打开文件/进入编辑场景依赖。
@@ -786,6 +885,50 @@ impl ReplayBackend for WindowsBackend {
                 self.right_click(fallback_x, fallback_y);
             }
         }
+    }
+
+    fn click_menu_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
+        let Some(anchor) = ControlAnchor::from_str(anchor_json) else {
+            replay_log("[menu] 锚点解析失败 -> 回退录制坐标");
+            self.click(fallback_x, fallback_y);
+            return;
+        };
+        match wait_menu_window(900) {
+            Some(hwnd) => {
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok()
+                    && rect.right > rect.left
+                    && rect.bottom > rect.top
+                {
+                    let w = (rect.right - rect.left) as f64;
+                    let h = (rect.bottom - rect.top) as f64;
+                    let cx = rect.left + (anchor.fx * w) as i32;
+                    let cy = rect.top + (anchor.fy * h) as i32;
+                    replay_log(&format!(
+                        "[menu] 命中菜单 {} 矩形(l={},t={},r={},b={}) × (fx={:.3},fy={:.3}) -> 落点 ({},{})",
+                        window_desc(hwnd),
+                        rect.left,
+                        rect.top,
+                        rect.right,
+                        rect.bottom,
+                        anchor.fx,
+                        anchor.fy,
+                        cx,
+                        cy
+                    ));
+                    self.click(cx, cy);
+                    return;
+                }
+                replay_log("[menu] 菜单矩形读取失败 -> 回退录制坐标");
+            }
+            None => replay_log("[menu] 未检测到菜单窗口 -> 回退录制坐标"),
+        }
+        self.click(fallback_x, fallback_y);
     }
 }
 

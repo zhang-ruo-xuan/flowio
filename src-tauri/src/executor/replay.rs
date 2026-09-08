@@ -137,6 +137,18 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
             let is_right = action.action_type == "click" && action.mouse_button == "right";
             let is_double =
                 action.action_type == "click" && action.mouse_button.ends_with("-double");
+            // 菜单项点击（锚点 cls 指向右键/下拉菜单窗口）：菜单窗口全局可查，与 focus
+            // 结果无关，也不能走 wx/wy 窗口级回退（录制时菜单窗口的 wx/wy 常为 1.0/1.0
+            // 无效值）—— 必须等菜单弹出后按「菜单矩形 × fx/fy」反算，否则会在菜单出现
+            // 前落空并顺手把菜单关掉（13:45 实测：step2 打进桌面 FolderView）。
+            if !is_right && !is_double {
+                if let Some(a) = action.uia_anchor.as_deref() {
+                    if crate::executor::backend::is_menu_anchor(a) {
+                        backend.click_menu_anchored(a, x, y);
+                        return;
+                    }
+                }
+            }
             if let Some(anchor) = anchor_json {
                 if is_right {
                     backend.right_click_anchored(anchor, x, y);
@@ -246,6 +258,39 @@ mod tests {
         fn double_click_anchored(&self, a: &str, x: i32, y: i32) {
             self.inner.double_click_anchored(a, x, y);
         }
+        fn click_menu_anchored(&self, a: &str, x: i32, y: i32) {
+            self.inner.click_menu_anchored(a, x, y);
+        }
+    }
+
+    #[test]
+    fn test_menu_anchor_uses_menu_channel_not_absolute() {
+        // 回归：菜单项步骤的锚点 cls 指向右键菜单窗口；即使 focus 失败（桌面场景
+        // 必失败），也必须走 click_menu_anchored（等菜单弹出后按菜单矩形反算），
+        // 不能被「focus 失败禁用锚点」规则降级成绝对坐标——那会在菜单出现前落空。
+        let backend = FailingFocusBackend {
+            inner: DryRunBackend::new(),
+        };
+        let anchor = r#"{"cls":"Microsoft.UI.Content.PopupWindowSiteBridge","fx":0.342,"fy":0.847,"wx":1.0,"wy":1.0}"#;
+        let action = ReplayAction {
+            step_number: 2,
+            action_type: "click".into(),
+            x: Some(996),
+            y: Some(635),
+            window_title: String::new(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: None,
+            uia_anchor: Some(anchor.into()),
+            mouse_button: "left".into(),
+        };
+        run_action(&action, &backend);
+        let acts = backend.inner.actions.lock().unwrap().clone();
+        assert!(
+            acts.iter().any(|a| a.starts_with("click_menu_anchored(")),
+            "菜单锚点步骤必须走菜单通道, acts={:?}",
+            acts
+        );
     }
 
     #[test]
