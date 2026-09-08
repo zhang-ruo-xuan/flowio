@@ -476,6 +476,27 @@ pub fn execute_recording(
                     note = "drag 降级为 click：该步无拖拽终点（旧录制）；重新录制后为真拖拽".into();
                 }
 
+                // 目标窗口没出现：这是级联失败的头号起点（后续步骤会在错误的
+                // 前台空转）。写进每步记录 + 醒目日志，用户不看日志也能在结果
+                // 面板里看到「卡在第几步、卡在哪个窗口」。
+                if crate::executor::backend::take_focus_ok() == Some(false)
+                    && !action.window_title.trim().is_empty()
+                {
+                    let msg = format!(
+                        "目标窗口『{}』未出现/未聚焦 → 已回退录制坐标执行",
+                        action.window_title
+                    );
+                    crate::executor::backend::replay_log(&format!(
+                        "[stuck] 第 {} 步 title='{}'：{}（后续依赖该窗口的步骤预计连锁失败）",
+                        action.step_number, action.window_title, msg
+                    ));
+                    if note.is_empty() {
+                        note = msg;
+                    } else {
+                        note = format!("{}；{}", note, msg);
+                    }
+                }
+
                 // 校验门：执行后截图 vs 预期
                 if let Some(d) = diff {
                     if d > 0.08 {

@@ -206,6 +206,21 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: windows::Win32::
 /// 此时复用上一次成功聚焦的窗口，避免键盘输入落到桌面导致「文件没建出来」。
 static LAST_FOCUS: Mutex<Option<usize>> = Mutex::new(None);
 
+/// 最近一次 focus 的结果（take 语义）。执行主干据此把「目标窗口没出现」
+/// 写进每步的执行记录——否则用户点完执行只看结果面板，根本不知道卡在哪一步。
+static FOCUS_LAST_OK: Mutex<Option<bool>> = Mutex::new(None);
+
+/// 取走并清空最近一次 focus 结果（None = 本步没调用过 focus）。
+pub fn take_focus_ok() -> Option<bool> {
+    FOCUS_LAST_OK.lock().ok().and_then(|mut g| g.take())
+}
+
+fn set_focus_ok(ok: bool) {
+    if let Ok(mut g) = FOCUS_LAST_OK.lock() {
+        *g = Some(ok);
+    }
+}
+
 /// 新一次重放开始时清空缓存，避免上一轮残留的窗口句柄干扰本轮首步。
 pub fn reset_replay_focus_cache() {
     if let Ok(mut g) = LAST_FOCUS.lock() {
@@ -736,6 +751,7 @@ fn focus_window(title: &str) -> bool {
             "[focus] <<< NO WINDOW for title='{}' (no candidate & no cached) -> focus SKIPPED",
             t
         ));
+        set_focus_ok(false);
         return false;
     };
     let fg_before = foreground_title();
@@ -759,6 +775,7 @@ fn focus_window(title: &str) -> bool {
         ok,
         foreground_title()
     ));
+    set_focus_ok(ok);
     ok
 }
 
