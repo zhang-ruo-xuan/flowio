@@ -168,12 +168,12 @@ fn force_foreground(hwnd: HWND) -> bool {
 /// 重放中某些步（如 Ctrl+S 后弹出的「另存为」对话框）目标窗口可能尚未被枚举到，
 /// 立即查找会失败；重试几次可等到对话框真正出现在窗口列表中，避免键盘落到错误窗口。
 fn find_window_retry(substring: &str) -> Option<HWND> {
-    for attempt in 0..3 {
+    for attempt in 0..5 {
         if let Some(h) = find_window(substring) {
             return Some(h);
         }
-        if attempt < 2 {
-            std::thread::sleep(Duration::from_millis(120));
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(150));
         }
     }
     None
