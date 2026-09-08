@@ -713,7 +713,7 @@ pub(crate) fn replay_log(line: &str) {
 fn focus_window(title: &str) -> bool {
     let t = title.trim();
     replay_log(&format!("[focus] >>> enter title='{}'", t));
-    // 解析目标句柄：有标题按子串找（带重试，等对话框就绪）；无标题/找不到则复用上一次成功聚焦的窗口。
+    // 解析目标句柄：有标题按子串找（带重试，等对话框就绪）；无标题复用上一次成功聚焦的窗口。
     let candidate = if t.is_empty() {
         None
     } else {
@@ -725,7 +725,12 @@ fn focus_window(title: &str) -> bool {
         .and_then(|g| *g)
         .map(|raw| HWND(raw as *mut std::ffi::c_void))
         .filter(|h| unsafe { IsWindowVisible(*h).as_bool() });
-    let hwnd = candidate.or(cached);
+    // 🔴 有标题时必须真实命中目标窗口；找不到绝不能用缓存窗口冒充——
+    // 那会把 force_foreground 打在错误的窗口上还返回 true（2026-09-08 WPS
+    // 实测：'函数参数'不存在 → 缓存冒充 → 前台仍是'插入函数' → 锚点反算
+    // 套错参照系偏 144px → 对话框永远打不开 → 后续步骤级联全废）。
+    // 缓存只服务于空标题场景（沿用上一个窗口的语义）。
+    let hwnd = if t.is_empty() { candidate.or(cached) } else { candidate };
     let Some(hwnd) = hwnd else {
         replay_log(&format!(
             "[focus] <<< NO WINDOW for title='{}' (no candidate & no cached) -> focus SKIPPED",
@@ -733,7 +738,16 @@ fn focus_window(title: &str) -> bool {
         ));
         return false;
     };
-    let ok = force_foreground(hwnd);
+    let fg_before = foreground_title();
+    let ok = force_foreground(hwnd) && foreground_title().contains(t);
+    if !ok {
+        replay_log(&format!(
+            "[focus] title='{}' 前台未切换成功（fg_before='{}' fg_after='{}'）→ 视为失败",
+            t,
+            fg_before,
+            foreground_title()
+        ));
+    }
     if ok {
         if let Ok(mut g) = LAST_FOCUS.lock() {
             *g = Some(hwnd.0 as usize);

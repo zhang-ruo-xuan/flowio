@@ -84,6 +84,19 @@ pub struct AuditRecord {
 }
 
 /// 取计划的主要目标应用（首个非空 window_title），用于审计留痕。
+/// 落点偏差采集的「录制基准坐标」。
+/// 🔴 drag 必须用真实起点 `start_x/start_y`：x/y 存的是裁图框中心（编辑器裁切
+/// 用），拿它对比会虚报几十像素假偏差（2026-09-08 实测：拖拽定位只差 2px 却
+/// 报成 Δy-56，把排查方向带偏两轮）。旧录制 drag 无起点（降级 click）沿用 x/y。
+fn delta_reference(a: &ReplayAction) -> (Option<i32>, Option<i32>) {
+    if a.action_type == "drag" {
+        if let (Some(sx), Some(sy)) = (a.start_x, a.start_y) {
+            return (Some(sx), Some(sy));
+        }
+    }
+    (a.x, a.y)
+}
+
 fn primary_target_app(plan: &[ReplayAction]) -> String {
     plan.iter()
         .filter_map(|a| {
@@ -484,7 +497,11 @@ pub fn execute_recording(
             // ── 落点偏差采集：录制坐标 vs 锚点反算后的真实落点 ──
             // 锚点每一代演进都在「改这里」，但用户看到的现象只会是「点偏了」。
             // 攒一份清单，让执行末尾一行日志说清「哪几步被挪了、挪了多少」。
-            if let (Some(rx), Some(ry)) = (action.x, action.y) {
+            // 🔴 drag 的 x/y 存的是「裁图框中心」（编辑器裁切用），真实起点在
+            // start_x/start_y —— 拿 x/y 对比会虚报几十像素的假偏差（实测
+            // 定位只差 2px 却报了 Δy-56，误导两轮排查方向）。
+            let (rx, ry) = delta_reference(&action);
+            if let (Some(rx), Some(ry)) = (rx, ry) {
                 if let Some((ax, ay)) = crate::executor::backend::take_point() {
                     let d = (((ax - rx).pow(2) + (ay - ry).pow(2)) as f64).sqrt();
                     if d >= 24.0 {
@@ -688,6 +705,41 @@ pub fn get_replay_audit(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// 偏差基准：drag 用真实起点（start_x/start_y），其余用 x/y；
+    /// 旧录制 drag 无起点时降级用 x/y。锁定 2026-09-08 修复：
+    /// 拿裁图框中心 x/y 对比曾把「定位只差 2px」虚报成 Δy-56。
+    #[test]
+    fn delta_reference_drag_uses_start_point() {
+        use crate::executor::replay::ReplayAction;
+        let mk = |at: &str| ReplayAction {
+            step_number: 1,
+            action_type: at.into(),
+            x: Some(666),
+            y: Some(364),
+            window_title: "WPS".into(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: None,
+            uia_anchor: None,
+            mouse_button: String::new(),
+            start_x: Some(665),
+            start_y: Some(308),
+            end_x: Some(667),
+            end_y: Some(420),
+            scroll_delta: None,
+        };
+        let (rx, ry) = delta_reference(&mk("drag"));
+        assert_eq!((rx, ry), (Some(665), Some(308)));
+        let (rx, ry) = delta_reference(&mk("click"));
+        assert_eq!((rx, ry), (Some(666), Some(364)));
+        // 旧录制：无起点 → 沿用 x/y
+        let mut old = mk("drag");
+        old.start_x = None;
+        old.start_y = None;
+        let (rx, ry) = delta_reference(&old);
+        assert_eq!((rx, ry), (Some(666), Some(364)));
+    }
 
     fn audit_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
