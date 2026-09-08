@@ -74,6 +74,17 @@ fn resolve_typed_title(window_title: Option<&str>, domain: AppDomain) -> String 
     }
 }
 
+/// 录制打字步骤时，在「flush 时刻」取前台窗口标题，而非首键时刻。
+///
+/// 首键时刻常处在对话框弹出 / 焦点切换的过渡期，标题会抓错（如抓到桌面
+/// `Program Manager`），导致重放时聚焦错窗口、键盘落到错误位置、文件永远
+/// 建不出来。flush 时刻前台已稳定（用户正在输入的那一个对话框），此时抓取
+/// 最可靠。这与快捷键步骤（flush_shortcut_step 内部直接取
+/// `get_active_window_title()`）的语义保持一致。
+fn flush_time_window_title() -> String {
+    activity::get_active_window_title().unwrap_or_default()
+}
+
 /// Re-index drained captured steps onto the recorder's step list:
 /// `order_index` starts at `base_idx`, `step_number` = order_index + 1.
 fn reindex_steps(captured: Vec<StepData>, base_idx: i32) -> Vec<StepData> {
@@ -2002,7 +2013,7 @@ fn spawn_event_thread(
                         // Flush pending keystrokes before the click step
                         if !accumulated_keys.is_empty() {
                             let typed = std::mem::take(&mut accumulated_keys);
-                            let win_title = typing_window_title.take().unwrap_or_default();
+                            let win_title = flush_time_window_title();
                             flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
                         }
                         last_key_time = Instant::now();
@@ -2141,29 +2152,31 @@ fn spawn_event_thread(
                     // 错误地当成组合键（如用户只按了 "A" 却录成 "Alt+A"）。
                     // 每次消费 KeyEvent 时用 GetAsyncKeyState 查询真实硬件状态，
                     // 覆盖钩子快照中可能过时的修饰位。
-                    {
+                    // 修饰键状态校准：钩子的原子标志（CTRL_DOWN/ALT_DOWN 等）可能因
+                    // keyup 被系统吞掉而卡在 true，导致后续所有普通键被错误当成组合键
+                    // （如只按了 "A" 却录成 "Ctrl+A"）。每次消费 KeyEvent 用
+                    // GetAsyncKeyState 查询真实硬件状态覆盖钩子快照。仅允许 down→up
+                    // 方向校准（解除卡死），绝不把物理按住的组合键误判为松开
+                    // （那样会破坏「按住 Ctrl 再按 C」这类真实组合）。
+                    let (cal_ctrl, cal_shift, cal_alt, cal_meta) = {
                         use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN};
                         let real_ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as i16) < 0;
                         let real_shift = (unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } as i16) < 0;
                         let real_alt = (unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } as i16) < 0;
                         let real_meta = (unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) } as i16) < 0
                             || (unsafe { GetAsyncKeyState(0x5C /* VK_RWIN */) } as i16) < 0;
-                        // Only calibrate down → up (unstuck).  Never force a key
-                        // that is physically held down to look released — that would
-                        // break genuine combos like "hold Ctrl then press C".
                         if ctrl && !real_ctrl {
                             eprintln!("[BG] modifier calibration: forcing ctrl=false (was stuck)");
-                            // Cannot mutate the received event directly; flag below.
                         }
                         if alt && !real_alt {
                             eprintln!("[BG] modifier calibration: forcing alt=false (was stuck)");
                         }
-                        // Override the snapshot for the combo decision below.
-                        let ctrl = ctrl && real_ctrl;
-                        let shift = shift && real_shift;
-                        let alt = alt && real_alt;
-                        let meta = meta && real_meta;
-                    }
+                        (ctrl && real_ctrl, shift && real_shift, alt && real_alt, meta && real_meta)
+                    };
+                    let ctrl = cal_ctrl;
+                    let shift = cal_shift;
+                    let alt = cal_alt;
+                    let meta = cal_meta;
 
                     // Self-filter using PID captured at hook time: 键盘分支此前
                     // 未过滤 Flowio 自身窗口的输入，在 Flowio 内编辑标题/备注时
@@ -2209,7 +2222,7 @@ fn spawn_event_thread(
                         // merged into the preceding type step.
                         if !accumulated_keys.is_empty() {
                             let typed = std::mem::take(&mut accumulated_keys);
-                            let win_title = typing_window_title.take().unwrap_or_default();
+                            let win_title = flush_time_window_title();
                             flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
                         }
                         typing_window_title = None;
@@ -2416,7 +2429,7 @@ fn spawn_event_thread(
                                 key_name
                             );
                             let typed = std::mem::take(&mut accumulated_keys);
-                            let win_title = typing_window_title.take().unwrap_or_default();
+                            let win_title = flush_time_window_title();
                             flush_key_step(&typed, Some(win_title), &cs_for_thread, final_uia, keyboard_before_path.take(), &ring, last_key_time, false);
                         }
                         // ★ 修复：导航键本身必须有可重放步骤，否则「回车确认保存 /
@@ -2456,7 +2469,7 @@ fn spawn_event_thread(
                     {
                         if !accumulated_keys.is_empty() {
                             let typed = std::mem::take(&mut accumulated_keys);
-                            let win_title = typing_window_title.take().unwrap_or_default();
+                            let win_title = flush_time_window_title();
                             flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
                         }
                         typing_window_title = None;
@@ -2531,7 +2544,7 @@ fn spawn_event_thread(
                     last_key_time.elapsed()
                 );
                 let typed = std::mem::take(&mut accumulated_keys);
-                let win_title = typing_window_title.take().unwrap_or_default();
+                let win_title = flush_time_window_title();
                 flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, can_merge_type);
                 // P1 降噪：本步允许下一轮输入继续并进来（连续停顿不拆步）
                 can_merge_type = true;
@@ -2553,7 +2566,7 @@ fn spawn_event_thread(
                             last, curr
                         );
                         let typed = std::mem::take(&mut accumulated_keys);
-                        let win_title = typing_window_title.take().unwrap_or_default();
+                        let win_title = flush_time_window_title();
                         flush_key_step(&typed, Some(win_title), &cs_for_thread, last_uia_text.take(), keyboard_before_path.take(), &ring, last_key_time, false);
                         can_merge_type = false; // 切窗打断输入连续性
                     } else if last != curr {

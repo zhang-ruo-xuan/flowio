@@ -105,7 +105,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: windows::Win32::
         // 录制会把 "Program Manager"/空标题记成目标；若在此聚焦桌面，输入全落空、
         // 文件永远生不出。排除后这些脏标题自然落到「复用上次成功聚焦窗口」回退。
         let mut cls = [0u16; 64];
-        let cn = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32);
+        let cn = GetClassNameW(hwnd, &mut cls);
         if cn > 0 {
             let class = String::from_utf16_lossy(&cls[..cn as usize]);
             if class == "Progman" || class == "WorkerW" || class == "Shell_TrayWnd" {
