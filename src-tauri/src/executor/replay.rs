@@ -114,7 +114,22 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
             return;
         }
     };
-    backend.focus(&action.window_title);
+    // focus 结果决定锚点是否可用：wx/wy 锚点是相对「录制时根窗口」的比例，
+    // focus 失败说明前台不是目标窗口（如目标是桌面/标题已变），此时用前台窗口
+    // 反算必然系统性错位（曾把桌面右键点进 Flowio 自己的窗口）。禁用锚点，
+    // 直接用录制时的绝对屏幕坐标——与 Stage 2b 之前的行为一致，永不引入回归。
+    let focused = backend.focus(&action.window_title);
+    let anchor_json = if focused {
+        action.uia_anchor.as_deref().filter(|s| !s.trim().is_empty())
+    } else {
+        if !action.window_title.trim().is_empty() {
+            crate::executor::backend::replay_log(&format!(
+                "[anchor] focus 失败 title='{}' -> 禁用锚点，回退录制绝对坐标 ({},{})",
+                action.window_title, x, y
+            ));
+        }
+        None
+    };
     match action.action_type.as_str() {
         // click/drag：优先按控件锚点（Stage 2b 分辨率无关）；无锚点回退录制坐标。
         "click" | "drag" => {
@@ -122,17 +137,15 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
             let is_right = action.action_type == "click" && action.mouse_button == "right";
             let is_double =
                 action.action_type == "click" && action.mouse_button.ends_with("-double");
-            if let Some(anchor) = action.uia_anchor.as_deref() {
-                if !anchor.trim().is_empty() {
-                    if is_right {
-                        backend.right_click_anchored(anchor, x, y);
-                    } else if is_double {
-                        backend.double_click_anchored(anchor, x, y);
-                    } else {
-                        backend.click_anchored(anchor, x, y);
-                    }
-                    return;
+            if let Some(anchor) = anchor_json {
+                if is_right {
+                    backend.right_click_anchored(anchor, x, y);
+                } else if is_double {
+                    backend.double_click_anchored(anchor, x, y);
+                } else {
+                    backend.click_anchored(anchor, x, y);
                 }
+                return;
             }
             if is_right {
                 backend.right_click(x, y);
@@ -196,6 +209,92 @@ mod tests {
     use super::*;
     use crate::executor::backend::DryRunBackend;
     use rusqlite::Connection;
+
+    /// focus 永远失败的后端：模拟目标窗口找不到（如桌面 'Program Manager'）。
+    struct FailingFocusBackend {
+        inner: DryRunBackend,
+    }
+    impl ReplayBackend for FailingFocusBackend {
+        fn focus(&self, title: &str) -> bool {
+            let _ = self.inner.focus(title);
+            false
+        }
+        fn click(&self, x: i32, y: i32) {
+            self.inner.click(x, y);
+        }
+        fn drag(&self, x1: i32, y1: i32, x2: i32, y2: i32) {
+            self.inner.drag(x1, y1, x2, y2);
+        }
+        fn type_text(&self, text: &str) {
+            self.inner.type_text(text);
+        }
+        fn press_combo(&self, combo: &str) {
+            self.inner.press_combo(combo);
+        }
+        fn click_anchored(&self, a: &str, x: i32, y: i32) {
+            self.inner.click_anchored(a, x, y);
+        }
+        fn right_click(&self, x: i32, y: i32) {
+            self.inner.right_click(x, y);
+        }
+        fn right_click_anchored(&self, a: &str, x: i32, y: i32) {
+            self.inner.right_click_anchored(a, x, y);
+        }
+        fn double_click(&self, x: i32, y: i32) {
+            self.inner.double_click(x, y);
+        }
+        fn double_click_anchored(&self, a: &str, x: i32, y: i32) {
+            self.inner.double_click_anchored(a, x, y);
+        }
+    }
+
+    #[test]
+    fn test_focus_fail_disables_anchor_falls_back_to_absolute() {
+        // 回归：桌面右键流程 focus('Program Manager') 必然失败，
+        // 锚点 wx/wy 若仍相对前台窗口（Flowio 自己）反算会系统性错位。
+        // focus 失败时必须禁用锚点，直接用录制绝对坐标下发。
+        let backend = FailingFocusBackend {
+            inner: DryRunBackend::new(),
+        };
+        let anchor = r#"{"cls":"SysListView32","fx":0.38,"fy":0.16,"wx":0.38,"wy":0.16}"#;
+        let action = ReplayAction {
+            step_number: 1,
+            action_type: "click".into(),
+            x: Some(746),
+            y: Some(181),
+            window_title: "Program Manager".into(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: None,
+            uia_anchor: Some(anchor.into()),
+            mouse_button: "right".into(),
+        };
+        run_action(&action, &backend);
+        let acts = backend.inner.actions.lock().unwrap().clone();
+        // focus 记录 + 绝对坐标右键（非 right_click_anchored）
+        assert_eq!(acts.len(), 2, "acts={:?}", acts);
+        assert!(acts[0].starts_with("focus(Program Manager)"));
+        assert!(
+            acts.iter().any(|a| a.starts_with("right_click(746,181)")),
+            "focus 失败应回退绝对坐标右键，acts={:?}",
+            acts
+        );
+        assert!(
+            !acts.iter().any(|a| a.contains("anchored")),
+            "focus 失败不得走锚点路径，acts={:?}", acts
+        );
+
+        // 对照组：focus 成功（DryRunBackend）且有锚点 → 仍走锚点路径
+        let ok_backend = DryRunBackend::new();
+        run_action(&action, &ok_backend);
+        let ok_acts = ok_backend.actions.lock().unwrap().clone();
+        assert!(
+            ok_acts.iter().any(|a| a.contains("right_click_anchored")),
+            "focus 成功应保留锚点路径，acts={:?}",
+            ok_acts
+        );
+    }
+
 
     fn mem_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

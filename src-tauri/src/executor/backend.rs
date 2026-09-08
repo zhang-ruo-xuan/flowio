@@ -7,7 +7,9 @@ use crate::anchor::{locate_click, ControlAnchor};
 
 /// 重放执行后端抽象。真实环境用 [`WindowsBackend`]，单测用 [`DryRunBackend`]。
 pub trait ReplayBackend {
-    fn focus(&self, title: &str);
+    /// 聚焦目标窗口；返回是否成功。失败时调用方必须禁用锚点反算（wx/wy 是相对
+    /// 录制根窗口的比例，前台不是目标窗口时反算必然错位）。
+    fn focus(&self, title: &str) -> bool;
     fn click(&self, x: i32, y: i32);
     fn drag(&self, x1: i32, y1: i32, x2: i32, y2: i32);
     fn type_text(&self, text: &str);
@@ -40,8 +42,9 @@ impl DryRunBackend {
     }
 }
 impl ReplayBackend for DryRunBackend {
-    fn focus(&self, title: &str) {
+    fn focus(&self, title: &str) -> bool {
         self.actions.lock().unwrap().push(format!("focus({})", title));
+        true
     }
     fn click(&self, x: i32, y: i32) {
         self.actions.lock().unwrap().push(format!("click({},{}", x, y));
@@ -91,7 +94,7 @@ impl ReplayBackend for DryRunBackend {
 }
 
 // ── 真实 Win32 后端 ────────────────────────────────────────
-use windows::Win32::Foundation::{BOOL, HWND};
+use windows::Win32::Foundation::{BOOL, HWND, POINT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     SendInput, VIRTUAL_KEY, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN,
@@ -103,6 +106,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
     SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
+    WindowFromPoint,
 };
 
 struct EnumCtx<'a> {
@@ -235,6 +239,50 @@ fn foreground_title() -> String {
     }
 }
 
+/// 取窗口「标题 [类名]」描述（真实执行诊断用）。
+fn window_desc(hwnd: HWND) -> String {
+    unsafe {
+        let mut buf = [0u16; 512];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        let title = if n > 0 {
+            String::from_utf16_lossy(&buf[..n as usize])
+        } else {
+            String::new()
+        };
+        let mut cbuf = [0u16; 256];
+        let cn = GetClassNameW(hwnd, &mut cbuf);
+        let cls = if cn > 0 {
+            String::from_utf16_lossy(&cbuf[..cn as usize])
+        } else {
+            String::new()
+        };
+        format!("'{}' [{}]", title, cls)
+    }
+}
+
+/// 取屏幕坐标处实际命中的窗口描述（诊断用）。
+fn point_window_desc(x: i32, y: i32) -> String {
+    unsafe {
+        let hwnd = WindowFromPoint(POINT { x, y });
+        if hwnd.0.is_null() {
+            "(none)".to_string()
+        } else {
+            window_desc(hwnd)
+        }
+    }
+}
+
+fn foreground_window_desc() -> String {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            "(none)".to_string()
+        } else {
+            window_desc(hwnd)
+        }
+    }
+}
+
 /// 重放诊断日志：每步记录聚焦结果，供「重放鼠标在动但文件没生成」类问题远程定位。
 /// 仅在重放时写入，频率 = 每步一次（非录制期每按键），且只在执行真实桌面动作时触发，开销可忽略。
 pub(crate) fn replay_log(line: &str) {
@@ -308,6 +356,13 @@ fn click(x: i32, y: i32) {
         std::thread::sleep(Duration::from_millis(10));
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
     }
+    replay_log(&format!(
+        "[click] at=({},{}) hit={} fg={}",
+        x,
+        y,
+        point_window_desc(x, y),
+        foreground_window_desc()
+    ));
 }
 
 /// 右键点击：桌面/文件右键菜单（新建文件等）链路依赖。
@@ -319,6 +374,13 @@ fn right_click(x: i32, y: i32) {
         std::thread::sleep(Duration::from_millis(10));
         mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
     }
+    replay_log(&format!(
+        "[right_click] at=({},{}) hit={} fg={}",
+        x,
+        y,
+        point_window_desc(x, y),
+        foreground_window_desc()
+    ));
 }
 
 /// 双击：两次快速左键（间隔远小于系统双击时间），打开文件/进入编辑场景依赖。
@@ -334,6 +396,13 @@ fn double_click(x: i32, y: i32) {
             std::thread::sleep(Duration::from_millis(80));
         }
     }
+    replay_log(&format!(
+        "[double_click] at=({},{}) hit={} fg={}",
+        x,
+        y,
+        point_window_desc(x, y),
+        foreground_window_desc()
+    ));
 }
 
 fn drag(x1: i32, y1: i32, x2: i32, y2: i32) {
@@ -348,6 +417,15 @@ fn drag(x1: i32, y1: i32, x2: i32, y2: i32) {
         }
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
     }
+    replay_log(&format!(
+        "[drag] ({},{}) -> ({},{}) hit={} fg={}",
+        x1,
+        y1,
+        x2,
+        y2,
+        point_window_desc(x2, y2),
+        foreground_window_desc()
+    ));
 }
 
 /// 通过 SendInput 以 Unicode 方式注入文本（跳过输入法，中文直接落字）。
@@ -458,8 +536,8 @@ fn token_to_vk(token: &str) -> Option<VIRTUAL_KEY> {
 /// 真实 Win32 执行后端。
 pub struct WindowsBackend;
 impl ReplayBackend for WindowsBackend {
-    fn focus(&self, title: &str) {
-        focus_window(title);
+    fn focus(&self, title: &str) -> bool {
+        focus_window(title)
     }
     fn click(&self, x: i32, y: i32) {
         click(x, y);
@@ -468,9 +546,15 @@ impl ReplayBackend for WindowsBackend {
         drag(x1, y1, x2, y2);
     }
     fn type_text(&self, text: &str) {
+        replay_log(&format!(
+            "[type] chars={} fg={}",
+            text.chars().count(),
+            foreground_window_desc()
+        ));
         send_text(text);
     }
     fn press_combo(&self, combo: &str) {
+        let fg_before = foreground_window_desc();
         let mut mods: Vec<VIRTUAL_KEY> = Vec::new();
         let mut main_key: Option<VIRTUAL_KEY> = None;
         for part in combo.split('+') {
@@ -487,6 +571,7 @@ impl ReplayBackend for WindowsBackend {
             }
         }
         let Some(mk) = main_key else {
+            replay_log(&format!("[combo] '{}' 解析失败，未下发", combo));
             eprintln!("[replay] press_combo: 无法解析组合键 '{}'", combo);
             return;
         };
@@ -499,11 +584,21 @@ impl ReplayBackend for WindowsBackend {
         for m in mods.iter().rev() {
             send_key(*m, false);
         }
+        replay_log(&format!(
+            "[combo] '{}' fg_before={} fg_after={}",
+            combo,
+            fg_before,
+            foreground_window_desc()
+        ));
     }
     fn click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
         let anchor = match ControlAnchor::from_str(anchor_json) {
             Some(a) if !a.is_empty() => a,
             _ => {
+                replay_log(&format!(
+                    "[anchor] 空/无效锚点 -> 回退录制坐标 ({},{})",
+                    fallback_x, fallback_y
+                ));
                 self.click(fallback_x, fallback_y);
                 return;
             }
@@ -511,12 +606,28 @@ impl ReplayBackend for WindowsBackend {
         // focus() 已把目标窗口设为前景窗口；取其句柄在当前窗口内定位控件。
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.0.is_null() {
+            replay_log("[anchor] 无前台窗口 -> 回退录制坐标");
             self.click(fallback_x, fallback_y);
             return;
         }
         match locate_click(&anchor, hwnd) {
-            Some((cx, cy)) => self.click(cx, cy),
-            None => self.click(fallback_x, fallback_y),
+            Some((cx, cy)) => {
+                replay_log(&format!(
+                    "[anchor] cls='{}' root={} -> 反算 ({},{})",
+                    anchor.cls,
+                    window_desc(hwnd),
+                    cx,
+                    cy
+                ));
+                self.click(cx, cy);
+            }
+            None => {
+                replay_log(&format!(
+                    "[anchor] cls='{}' 未命中 -> 回退录制坐标 ({},{})",
+                    anchor.cls, fallback_x, fallback_y
+                ));
+                self.click(fallback_x, fallback_y);
+            }
         }
     }
     fn right_click(&self, x: i32, y: i32) {
@@ -529,24 +640,48 @@ impl ReplayBackend for WindowsBackend {
         let anchor = match ControlAnchor::from_str(anchor_json) {
             Some(a) if !a.is_empty() => a,
             _ => {
+                replay_log(&format!(
+                    "[anchor] 空/无效锚点(双击) -> 回退录制坐标 ({},{})",
+                    fallback_x, fallback_y
+                ));
                 self.double_click(fallback_x, fallback_y);
                 return;
             }
         };
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.0.is_null() {
+            replay_log("[anchor] 无前台窗口(双击) -> 回退录制坐标");
             self.double_click(fallback_x, fallback_y);
             return;
         }
         match locate_click(&anchor, hwnd) {
-            Some((cx, cy)) => self.double_click(cx, cy),
-            None => self.double_click(fallback_x, fallback_y),
+            Some((cx, cy)) => {
+                replay_log(&format!(
+                    "[anchor] cls='{}'(双击) root={} -> 反算 ({},{})",
+                    anchor.cls,
+                    window_desc(hwnd),
+                    cx,
+                    cy
+                ));
+                self.double_click(cx, cy);
+            }
+            None => {
+                replay_log(&format!(
+                    "[anchor] cls='{}'(双击) 未命中 -> 回退录制坐标 ({},{})",
+                    anchor.cls, fallback_x, fallback_y
+                ));
+                self.double_click(fallback_x, fallback_y);
+            }
         }
     }
     fn right_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
         let anchor = match ControlAnchor::from_str(anchor_json) {
             Some(a) if !a.is_empty() => a,
             _ => {
+                replay_log(&format!(
+                    "[anchor] 空/无效锚点(右键) -> 回退录制坐标 ({},{})",
+                    fallback_x, fallback_y
+                ));
                 self.right_click(fallback_x, fallback_y);
                 return;
             }
@@ -554,12 +689,28 @@ impl ReplayBackend for WindowsBackend {
         // focus() 已把目标窗口设为前景窗口；取其句柄在当前窗口内定位控件。
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.0.is_null() {
+            replay_log("[anchor] 无前台窗口(右键) -> 回退录制坐标");
             self.right_click(fallback_x, fallback_y);
             return;
         }
         match locate_click(&anchor, hwnd) {
-            Some((cx, cy)) => self.right_click(cx, cy),
-            None => self.right_click(fallback_x, fallback_y),
+            Some((cx, cy)) => {
+                replay_log(&format!(
+                    "[anchor] cls='{}'(右键) root={} -> 反算 ({},{})",
+                    anchor.cls,
+                    window_desc(hwnd),
+                    cx,
+                    cy
+                ));
+                self.right_click(cx, cy);
+            }
+            None => {
+                replay_log(&format!(
+                    "[anchor] cls='{}'(右键) 未命中 -> 回退录制坐标 ({},{})",
+                    anchor.cls, fallback_x, fallback_y
+                ));
+                self.right_click(fallback_x, fallback_y);
+            }
         }
     }
 }
