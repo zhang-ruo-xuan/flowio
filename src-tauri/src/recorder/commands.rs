@@ -1702,9 +1702,15 @@ fn build_click_step(
 
     // Stage 2b：抓取点击处的控件锚点（控件类名 + 归一化点击比例），用于分辨率无关重放。
     // 任何失败返回空串，重放端回退到录制坐标。
-    let uia_anchor = crate::anchor::capture_anchor(x as i32, y as i32)
-        .map(|a| serde_json::to_string(&a).unwrap_or_default())
-        .unwrap_or_default();
+    let uia_anchor = crate::anchor::capture_anchor_with_image(
+        x as i32,
+        y as i32,
+        &clean_before,
+        win_cx,
+        win_cy,
+    )
+    .map(|a| serde_json::to_string(&a).unwrap_or_default())
+    .unwrap_or_default();
 
     let window_title = activity::get_active_window_title();
     let click_domain = window_title

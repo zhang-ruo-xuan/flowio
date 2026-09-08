@@ -10,6 +10,7 @@
 //! 任何失败都返回 None，由上层回退到录制坐标 —— 永不引入回归。
 
 use serde::{Deserialize, Serialize};
+use image::DynamicImage;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetClassNameW, GetParent, GetWindowRect, IsWindowVisible,
@@ -59,6 +60,12 @@ pub struct ControlAnchor {
     /// 点击相对控件矩形左上角的像素偏移（纵向）。-1 = 旧数据未记录。
     #[serde(default = "default_neg1")]
     pub ay: i32,
+    /// 点击处可见文本的 OCR 兜底锚点（Stage 2d）：WPS「最近」列表等自绘控件既不暴露
+    /// 稳定 UIA 名称、类名又稀疏时，录制端在 UIA 名称为空的情况下用系统内置 OCR 读取
+    /// 落点处的可见文本（如文件名），重放端再按该文本在窗口内找回当前位置。
+    /// 空串 = 未捕获 / 旧数据（旧数据无此字段，反序列化默认空），上层走既有 Win32 路径。
+    #[serde(default)]
+    pub ocr: String,
 }
 
 fn default_half() -> f64 {
@@ -98,7 +105,7 @@ fn class_name_of(hwnd: HWND) -> String {
 
 /// 录制端：在虚拟屏幕坐标 (screen_x, screen_y) 处抓取控件锚点。
 /// 任何失败返回 None（上层回退到录制坐标）。
-pub fn capture_anchor(screen_x: i32, screen_y: i32) -> Option<ControlAnchor> {
+fn capture_anchor_core(screen_x: i32, screen_y: i32) -> Option<(ControlAnchor, RECT)> {
     unsafe {
         let pt = POINT {
             x: screen_x,
@@ -162,19 +169,46 @@ pub fn capture_anchor(screen_x: i32, screen_y: i32) -> Option<ControlAnchor> {
             }
             None => (String::new(), 0.5, 0.5),
         };
-        Some(ControlAnchor {
-            cls,
-            fx,
-            fy,
-            wx,
-            wy,
-            name,
-            nfx,
-            nfy,
-            ax,
-            ay,
-        })
+        Some((
+            ControlAnchor {
+                cls,
+                fx,
+                fy,
+                wx,
+                wy,
+                name,
+                nfx,
+                nfy,
+                ax,
+                ay,
+                ocr: String::new(),
+            },
+            ctrl_rect,
+        ))
     }
+}
+
+/// 录制端：与 `capture_anchor_core` 同语义，但只返回锚点（不含控件矩形）。
+pub fn capture_anchor(screen_x: i32, screen_y: i32) -> Option<ControlAnchor> {
+    capture_anchor_core(screen_x, screen_y).map(|(a, _)| a)
+}
+
+/// 录制端增强版：在 UIA 名称为空（WPS 自绘控件稀疏）时，对已有的录制帧截图做 OCR，
+/// 抓取落点处的可见文本作为 `ocr` 兜底锚点；任何失败留空 -> 零回归。
+pub fn capture_anchor_with_image(
+    screen_x: i32,
+    screen_y: i32,
+    img: &DynamicImage,
+    img_click_x: i32,
+    img_click_y: i32,
+) -> Option<ControlAnchor> {
+    let (mut anchor, _) = capture_anchor_core(screen_x, screen_y)?;
+    if anchor.name.is_empty() {
+        if let Some(text) = ocr_text_at(img, img_click_x, img_click_y) {
+            anchor.ocr = text;
+        }
+    }
+    Some(anchor)
 }
 
 struct LocateCtx<'a> {
@@ -391,6 +425,94 @@ pub fn locate_click_with_hint(
     }
 }
 
+/// 在已有录制帧截图上，取点击点处的 OCR 文本行，用作兜底锚点。
+/// 只裁剪点击点周围小区域 + 落临时文件 + 调系统内置 OCR；任何失败返回 None。
+fn ocr_text_at(img: &DynamicImage, cx: i32, cy: i32) -> Option<String> {
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    if iw <= 0 || ih <= 0 {
+        return None;
+    }
+    // 裁剪点击点周围区域，限制 OCR 范围、提速（WPS 自绘列表项文本就在落点附近）。
+    let half_w = 320i32.min(iw / 2);
+    let half_h = 160i32.min(ih / 2);
+    let x0 = (cx - half_w).clamp(0, iw) as u32;
+    let y0 = (cy - half_h).clamp(0, ih) as u32;
+    let x1 = (cx + half_w).clamp(0, iw) as u32;
+    let y1 = (cy + half_h).clamp(0, ih) as u32;
+    let cw = x1.saturating_sub(x0);
+    let ch = y1.saturating_sub(y0);
+    if cw < 8 || ch < 8 {
+        return None;
+    }
+    let crop = img.crop_imm(x0, y0, cw, ch);
+    let tmp = std::env::temp_dir().join(format!(
+        "flowio_anchor_ocr_{}_{}.png",
+        std::process::id(),
+        cx.wrapping_add(cy)
+    ));
+    {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        if crop.write_to(&mut buf, image::ImageFormat::Png).is_err() {
+            return None;
+        }
+        if std::fs::write(&tmp, buf.into_inner()).is_err() {
+            return None;
+        }
+    }
+    let lines = crate::redaction::ocr::recognize_image(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+    let lines = lines?;
+    // 点击点在裁剪图内的坐标
+    let (lx, ly) = (cx - x0 as i32, cy - y0 as i32);
+    for l in &lines {
+        if lx >= l.x as i32
+            && lx <= (l.x + l.w) as i32
+            && ly >= l.y as i32
+            && ly <= (l.y + l.h) as i32
+        {
+            let t = l.text.trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// 重放端 OCR 兜底：控件类名 / UIA 名称都失配时（WPS 自绘控件稀疏），对当前前台
+/// 窗口截图做 OCR，找出包含 `text` 的文本行，按其边界框 + (nfx,nfy) 反算落点。
+/// 任何失败返回 None（上层维持原落点）。仅在前端带非空 ocr 锚点时调用 -> 零回归。
+pub fn locate_by_ocr(window: HWND, text: &str, nfx: f64, nfy: f64) -> Option<(i32, i32)> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let _ = window; // 当前基于全屏 OCR；window 作语义占位（未来可裁剪该窗口区域提速）。
+    let (img, ox, oy) = crate::recorder::screenshot::capture_fullscreen_with_origin().ok()?;
+    let tmp = std::env::temp_dir().join(format!("flowio_replay_ocr_{}.png", std::process::id()));
+    {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        if img.write_to(&mut buf, image::ImageFormat::Png).is_err() {
+            return None;
+        }
+        if std::fs::write(&tmp, buf.into_inner()).is_err() {
+            return None;
+        }
+    }
+    let lines = crate::redaction::ocr::recognize_image(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+    let lines = lines?;
+    let target = text.trim().to_lowercase();
+    for l in &lines {
+        if l.text.to_lowercase().contains(&target) {
+            let (lx, ly, lw, lh) = (l.x as f64, l.y as f64, l.w as f64, l.h as f64);
+            let px = (lx + nfx.clamp(0.02, 0.98) * lw) as i32 + ox;
+            let py = (ly + nfy.clamp(0.02, 0.98) * lh) as i32 + oy;
+            return Some((px, py));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,5 +614,25 @@ mod tests {
             ay: -1,
         };
         assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn anchor_legacy_json_without_ocr_field() {
+        // 旧数据无 ocr 字段 -> 解析成功且 ocr 为空（走既有 Win32 路径），零回归。
+        let a = ControlAnchor::from_str(r#"{"cls":"Button","fx":0.5,"fy":0.5,"wx":0.3,"wy":0.2}"#)
+            .unwrap();
+        assert!(a.ocr.is_empty());
+    }
+
+    #[test]
+    fn anchor_roundtrip_with_ocr() {
+        let a = ControlAnchor {
+            cls: "OpusApp".into(),
+            ocr: "【WPS表格】SUM函数.xlsx".into(),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        let b = ControlAnchor::from_str(&s).unwrap();
+        assert_eq!(b.ocr, "【WPS表格】SUM函数.xlsx");
     }
 }

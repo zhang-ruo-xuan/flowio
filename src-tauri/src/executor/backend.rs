@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::anchor::{locate_click_with_hint, ControlAnchor};
+use crate::anchor::{locate_by_ocr, locate_click_with_hint, ControlAnchor};
 
 /// 重放执行后端抽象。真实环境用 [`WindowsBackend`]，单测用 [`DryRunBackend`]。
 pub trait ReplayBackend {
@@ -1095,10 +1095,12 @@ impl ReplayBackend for WindowsBackend {
             Some((cx, cy)) => {
                 // Stage 2c 名称锚点：列表位置漂移场景（WPS「最近」列表重排等），
                 // 落点名称与录制不符时按名称在窗口 UIA 树内找回元素当前位置。
-                let (cx, cy) = if anchor.name.is_empty() {
-                    (cx, cy)
-                } else {
+                let (cx, cy) = if !anchor.name.is_empty() {
                     crate::uia::locate_by_name(hwnd, &anchor.name, anchor.nfx, anchor.nfy, Some(fallback_x), Some(fallback_y), cx, cy).unwrap_or((cx, cy))
+                } else if anchor.cls.is_empty() && !anchor.ocr.is_empty() {
+                    locate_by_ocr(hwnd, &anchor.ocr, anchor.nfx, anchor.nfy).unwrap_or((cx, cy))
+                } else {
+                    (cx, cy)
                 };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(
@@ -1147,9 +1149,7 @@ impl ReplayBackend for WindowsBackend {
         // 起点按锚点反算（录制端锚点就是在按下点抓的，故 hint 传录制起点）。
         let (sx, sy) = locate_click_with_hint(&anchor, hwnd, Some(fx), Some(fy))
             .unwrap_or((fx, fy));
-        let (sx, sy) = if anchor.name.is_empty() {
-            (sx, sy)
-        } else {
+        let (sx, sy) = if !anchor.name.is_empty() {
             crate::uia::locate_by_name(
                 hwnd,
                 &anchor.name,
@@ -1161,6 +1161,10 @@ impl ReplayBackend for WindowsBackend {
                 sy,
             )
             .unwrap_or((sx, sy))
+        } else if anchor.cls.is_empty() && !anchor.ocr.is_empty() {
+            locate_by_ocr(hwnd, &anchor.ocr, 0.5, 0.5).unwrap_or((sx, sy))
+        } else {
+            (sx, sy)
         };
         // 终点同步补偿起点被锚点挪动的量，否则「起点准了、终点没动」→ 选区被拉偏。
         let (dx, dy) = (sx - fx, sy - fy);
@@ -1198,10 +1202,12 @@ impl ReplayBackend for WindowsBackend {
         }
         match locate_click_with_hint(&anchor, hwnd, Some(fallback_x), Some(fallback_y)) {
             Some((cx, cy)) => {
-                let (cx, cy) = if anchor.name.is_empty() {
-                    (cx, cy)
-                } else {
+                let (cx, cy) = if !anchor.name.is_empty() {
                     crate::uia::locate_by_name(hwnd, &anchor.name, anchor.nfx, anchor.nfy, Some(fallback_x), Some(fallback_y), cx, cy).unwrap_or((cx, cy))
+                } else if anchor.cls.is_empty() && !anchor.ocr.is_empty() {
+                    locate_by_ocr(hwnd, &anchor.ocr, anchor.nfx, anchor.nfy).unwrap_or((cx, cy))
+                } else {
+                    (cx, cy)
                 };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(
@@ -1254,10 +1260,12 @@ impl ReplayBackend for WindowsBackend {
         }
         match locate_click_with_hint(&anchor, hwnd, Some(fallback_x), Some(fallback_y)) {
             Some((cx, cy)) => {
-                let (cx, cy) = if anchor.name.is_empty() {
-                    (cx, cy)
-                } else {
+                let (cx, cy) = if !anchor.name.is_empty() {
                     crate::uia::locate_by_name(hwnd, &anchor.name, anchor.nfx, anchor.nfy, Some(fallback_x), Some(fallback_y), cx, cy).unwrap_or((cx, cy))
+                } else if anchor.cls.is_empty() && !anchor.ocr.is_empty() {
+                    locate_by_ocr(hwnd, &anchor.ocr, anchor.nfx, anchor.nfy).unwrap_or((cx, cy))
+                } else {
+                    (cx, cy)
                 };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(
