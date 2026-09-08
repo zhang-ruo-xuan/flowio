@@ -913,6 +913,13 @@ impl ReplayBackend for WindowsBackend {
         }
         match locate_click(&anchor, hwnd) {
             Some((cx, cy)) => {
+                // Stage 2c 名称锚点：列表位置漂移场景（WPS「最近」列表重排等），
+                // 落点名称与录制不符时按名称在窗口 UIA 树内找回元素当前位置。
+                let (cx, cy) = if anchor.name.is_empty() {
+                    (cx, cy)
+                } else {
+                    crate::uia::locate_by_name(hwnd, &anchor.name, cx, cy).unwrap_or((cx, cy))
+                };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(
                         "[anchor] 反算落点 ({},{}) 命中装饰窗口 -> 回退录制坐标 ({},{})",
@@ -965,6 +972,11 @@ impl ReplayBackend for WindowsBackend {
         }
         match locate_click(&anchor, hwnd) {
             Some((cx, cy)) => {
+                let (cx, cy) = if anchor.name.is_empty() {
+                    (cx, cy)
+                } else {
+                    crate::uia::locate_by_name(hwnd, &anchor.name, cx, cy).unwrap_or((cx, cy))
+                };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(
                         "[anchor] 反算落点 ({},{})(双击) 命中装饰窗口 -> 回退录制坐标 ({},{})",
@@ -1012,6 +1024,11 @@ impl ReplayBackend for WindowsBackend {
         }
         match locate_click(&anchor, hwnd) {
             Some((cx, cy)) => {
+                let (cx, cy) = if anchor.name.is_empty() {
+                    (cx, cy)
+                } else {
+                    crate::uia::locate_by_name(hwnd, &anchor.name, cx, cy).unwrap_or((cx, cy))
+                };
                 if point_is_decorative(cx, cy) {
                     replay_log(&format!(
                         "[anchor] 反算落点 ({},{})(右键) 命中装饰窗口 -> 回退录制坐标 ({},{})",

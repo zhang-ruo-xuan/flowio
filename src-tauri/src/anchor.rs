@@ -33,6 +33,11 @@ pub struct ControlAnchor {
     /// 点击在所属顶层窗口矩形内的纵向归一化位置 (0..1)。
     #[serde(default)]
     pub wy: f64,
+    /// 点击目标元素的 UIA 名称（Stage 2c 名称锚点）：WPS「最近」列表等自绘控件
+    /// 按使用状态动态排序，位置会漂移；录制时记录元素名称（列表项通常是文件名），
+    /// 重放时落点名称不符则在窗口 UIA 树内按名称找回。空串 = 未捕获 / 旧数据。
+    #[serde(default)]
+    pub name: String,
 }
 
 impl ControlAnchor {
@@ -112,12 +117,16 @@ pub fn capture_anchor(screen_x: i32, screen_y: i32) -> Option<ControlAnchor> {
         let fy = ((screen_y - ctrl_rect.top) as f64 / ctrl_h).clamp(0.0, 1.0);
 
         let cls = class_name_of(hwnd);
+        // Stage 2c：尽力抓取落点元素的 UIA 名称（列表项文件名等）；
+        // 失败/空名留空 —— 重放端名称为空即走既有 Win32 路径，零回归。
+        let name = crate::uia::element_name_at(screen_x, screen_y).unwrap_or_default();
         Some(ControlAnchor {
             cls,
             fx,
             fy,
             wx,
             wy,
+            name,
         })
     }
 }
@@ -225,6 +234,7 @@ mod tests {
             fy: 0.5,
             wx: 0.3,
             wy: 0.2,
+            name: String::new(),
         };
         let s = serde_json::to_string(&a).unwrap();
         let b = ControlAnchor::from_str(&s).unwrap();
@@ -245,6 +255,21 @@ mod tests {
     }
 
     #[test]
+    fn anchor_legacy_json_without_name_field() {
+        // 旧数据锚点 JSON 无 name 字段 → 解析成功且 name 为空（走既有 Win32 路径）。
+        let a = ControlAnchor::from_str(r#"{"cls":"Button","fx":0.5,"fy":0.5,"wx":0.3,"wy":0.2}"#)
+            .unwrap();
+        assert!(a.name.is_empty());
+        assert_eq!(a.cls, "Button");
+        // 新数据带 name → 完整保留。
+        let b = ControlAnchor::from_str(
+            r#"{"cls":"Btn","fx":0.1,"fy":0.2,"wx":0.3,"wy":0.4,"name":"【WPS表格】SUM函数.xlsx"}"#,
+        )
+        .unwrap();
+        assert_eq!(b.name, "【WPS表格】SUM函数.xlsx");
+    }
+
+    #[test]
     fn empty_anchor_detected() {
         let a = ControlAnchor::default();
         assert!(a.is_empty());
@@ -254,6 +279,7 @@ mod tests {
             fy: 0.0,
             wx: 0.4,
             wy: 0.5,
+            name: String::new(),
         };
         assert!(!b.is_empty());
     }

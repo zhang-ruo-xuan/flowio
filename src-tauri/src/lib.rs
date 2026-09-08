@@ -12,6 +12,7 @@ mod voice;
 mod job_notify;
 mod executor;
 mod anchor;
+mod uia;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
