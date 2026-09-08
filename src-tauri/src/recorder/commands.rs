@@ -1666,7 +1666,7 @@ fn build_click_step(
     let title = if is_double { title.replacen("点击", "双击", 1) } else { title };
     // 右键点击：标题标「右键」让用户可见；action_type 保持 "click"，
     // 按键信息落 mouse_button 列，重放端据此下发右键（桌面右键菜单链路依赖）。
-    let title = if button == "right" { title.replacen("点击", "右键点击", 1) } else { title };
+    let title = if button.eq_ignore_ascii_case("right") { title.replacen("点击", "右键点击", 1) } else { title };
 
     Some(StepData {
         id: Uuid::new_v4().to_string(),
@@ -1692,13 +1692,20 @@ fn build_click_step(
             is_sensitive: false,
             // 按键 × 双击编码进 mouse_button：left/right/left-double/right-double。
             // 双击识别当前只对左键触发（dbl_prev_id 要求 left），右键分支保持对称。
-            mouse_button: match (button, is_double) {
-                ("right", true) => "right-double".to_string(),
-                ("right", false) => "right".to_string(),
-                (_, true) => "left-double".to_string(),
-                (_, false) => "left".to_string(),
-            },
+            mouse_button: encode_mouse_button(button, is_double),
     })
+}
+
+/// 按键 × 双击 → mouse_button 列编码（纯函数，便于单测锁契约）。
+/// ⚠️ 必须先归一化小写：hook 历史上曾发 "Right"/"Left"（首字母大写），
+/// 大小写不匹配会让右键/双击全部静默退化为 left（2026-09-08 事故根因）。
+fn encode_mouse_button(button: &str, is_double: bool) -> String {
+    match (button.to_lowercase().as_str(), is_double) {
+        ("right", true) => "right-double".to_string(),
+        ("right", false) => "right".to_string(),
+        (_, true) => "left-double".to_string(),
+        (_, false) => "left".to_string(),
+    }
 }
 
 /// Build a drag step: the fullscreen frame captured at *release* time (so the
@@ -2052,7 +2059,7 @@ fn spawn_event_thread(
                         // 为「双击」步骤（如 WPS 单元格「点两下才进编辑」）。
                         let dbl_prev_id = match last_click {
                             Some((lx, ly, lts, ref lid, lpid))
-                                if click.button == "left"
+                                if click.button.eq_ignore_ascii_case("left")
                                     && lpid == click.foreground_pid
                                     && is_double_click(
                                         click.x - lx,
@@ -3169,6 +3176,22 @@ mod commands_tests {
     use super::*;
 
     // ── drag_crop_box（drag 裁图上下文外扩） ────────────────────
+
+    #[test]
+    fn encode_mouse_button_handles_hook_casing() {
+        // 2026-09-08 事故回归：hook 曾发 "Right"/"Left"（首字母大写），
+        // 编码端只认小写 → 右键/双击全部静默退化为 left。
+        // 契约：无论钩子发什么大小写，编码必须正确。
+        assert_eq!(encode_mouse_button("Right", false), "right");
+        assert_eq!(encode_mouse_button("RIGHT", false), "right");
+        assert_eq!(encode_mouse_button("right", false), "right");
+        assert_eq!(encode_mouse_button("Left", false), "left");
+        assert_eq!(encode_mouse_button("left", false), "left");
+        assert_eq!(encode_mouse_button("Left", true), "left-double");
+        assert_eq!(encode_mouse_button("Right", true), "right-double");
+        // 未知按键（如中键）按左键处理，绝不产生 "middle"
+        assert_eq!(encode_mouse_button("Middle", false), "left");
+    }
 
     #[test]
     fn drag_crop_box_wide_selection_gets_vertical_context() {

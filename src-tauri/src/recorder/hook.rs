@@ -262,9 +262,9 @@ unsafe extern "system" fn mouse_hook_proc(
         let x = info.pt.x as f64;
         let y = info.pt.y as f64;
         let button = match msg {
-            WM_LBUTTONDOWN | WM_LBUTTONUP => "Left",
-            WM_RBUTTONDOWN | WM_RBUTTONUP => "Right",
-            _ => "Middle",
+            WM_LBUTTONDOWN | WM_LBUTTONUP => "left",
+            WM_RBUTTONDOWN | WM_RBUTTONUP => "right",
+            _ => "middle",
         };
 
         // Record timestamp BEFORE dispatching click.
