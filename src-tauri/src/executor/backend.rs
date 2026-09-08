@@ -21,6 +21,11 @@ pub trait ReplayBackend {
     fn right_click(&self, x: i32, y: i32);
     /// 右键 + 控件锚点：同 click_anchored，但下发右键。
     fn right_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32);
+    /// 双击（打开文件/进入编辑等场景）。录制端把两次快速点击合并为一步，
+    /// 重放必须还原为真正的双击，否则「双击打开文件」会退化为单击选中。
+    fn double_click(&self, x: i32, y: i32);
+    /// 双击 + 控件锚点：同 click_anchored，但下发双击。
+    fn double_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32);
 }
 
 // ── 测试后端：只记录动作，不碰真实桌面 ──────────────────────
@@ -71,6 +76,15 @@ impl ReplayBackend for DryRunBackend {
     fn right_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
         self.actions.lock().unwrap().push(format!(
             "right_click_anchored({},{},{})",
+            fallback_x, fallback_y, anchor_json
+        ));
+    }
+    fn double_click(&self, x: i32, y: i32) {
+        self.actions.lock().unwrap().push(format!("double_click({},{})", x, y));
+    }
+    fn double_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
+        self.actions.lock().unwrap().push(format!(
+            "double_click_anchored({},{},{})",
             fallback_x, fallback_y, anchor_json
         ));
     }
@@ -307,6 +321,21 @@ fn right_click(x: i32, y: i32) {
     }
 }
 
+/// 双击：两次快速左键（间隔远小于系统双击时间），打开文件/进入编辑场景依赖。
+fn double_click(x: i32, y: i32) {
+    unsafe {
+        let _ = SetCursorPos(x, y);
+        for _ in 0..2 {
+            std::thread::sleep(Duration::from_millis(10));
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            std::thread::sleep(Duration::from_millis(10));
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+            // 两次按下间隔 ~80ms：稳在系统双击时间内（默认 500ms），且不会快到被驱动丢弃。
+            std::thread::sleep(Duration::from_millis(80));
+        }
+    }
+}
+
 fn drag(x1: i32, y1: i32, x2: i32, y2: i32) {
     unsafe {
         let _ = SetCursorPos(x1, y1);
@@ -492,6 +521,27 @@ impl ReplayBackend for WindowsBackend {
     }
     fn right_click(&self, x: i32, y: i32) {
         right_click(x, y);
+    }
+    fn double_click(&self, x: i32, y: i32) {
+        double_click(x, y);
+    }
+    fn double_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
+        let anchor = match ControlAnchor::from_str(anchor_json) {
+            Some(a) if !a.is_empty() => a,
+            _ => {
+                self.double_click(fallback_x, fallback_y);
+                return;
+            }
+        };
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            self.double_click(fallback_x, fallback_y);
+            return;
+        }
+        match locate_click(&anchor, hwnd) {
+            Some((cx, cy)) => self.double_click(cx, cy),
+            None => self.double_click(fallback_x, fallback_y),
+        }
     }
     fn right_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
         let anchor = match ControlAnchor::from_str(anchor_json) {

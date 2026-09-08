@@ -1690,7 +1690,14 @@ fn build_click_step(
             hotkey_combo: String::new(),
             uia_anchor,
             is_sensitive: false,
-            mouse_button: if button == "right" { "right".to_string() } else { "left".to_string() },
+            // 按键 × 双击编码进 mouse_button：left/right/left-double/right-double。
+            // 双击识别当前只对左键触发（dbl_prev_id 要求 left），右键分支保持对称。
+            mouse_button: match (button, is_double) {
+                ("right", true) => "right-double".to_string(),
+                ("right", false) => "right".to_string(),
+                (_, true) => "left-double".to_string(),
+                (_, false) => "left".to_string(),
+            },
     })
 }
 

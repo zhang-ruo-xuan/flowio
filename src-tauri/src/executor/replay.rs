@@ -40,15 +40,26 @@ pub fn load_replay_plan(
 ) -> Result<Vec<ReplayAction>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button \
+            "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button, title \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![recording_id], |row| {
+            // 旧数据兜底：mouse_button 列加入前的「双击」步骤（标题含「双击」）
+            // 没有按键信息，按左键双击还原，避免老教程双击退化为单击。
+            let action_type: String = row.get(1)?;
+            let mut mouse_button = row.get::<_, Option<String>>(9)?.unwrap_or_default();
+            if action_type == "click" && mouse_button.is_empty() {
+                if let Ok(Some(t)) = row.get::<_, Option<String>>(10) {
+                    if t.contains("双击") {
+                        mouse_button = "left-double".to_string();
+                    }
+                }
+            }
             Ok(ReplayAction {
                 step_number: row.get(0)?,
-                action_type: row.get(1)?,
+                action_type,
                 x: row.get(2)?,
                 y: row.get(3)?,
                 window_title: row.get(4)?,
@@ -65,7 +76,7 @@ pub fn load_replay_plan(
                     Some(a) if !a.trim().is_empty() => Some(a),
                     _ => None,
                 },
-                mouse_button: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                mouse_button,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -107,12 +118,16 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
     match action.action_type.as_str() {
         // click/drag：优先按控件锚点（Stage 2b 分辨率无关）；无锚点回退录制坐标。
         "click" | "drag" => {
-            // 右键点击：桌面右键菜单（新建文件等）链路依赖；仅对 click 步生效。
+            // 右键/双击：桌面右键菜单、双击打开文件等链路依赖；仅对 click 步生效。
             let is_right = action.action_type == "click" && action.mouse_button == "right";
+            let is_double =
+                action.action_type == "click" && action.mouse_button.ends_with("-double");
             if let Some(anchor) = action.uia_anchor.as_deref() {
                 if !anchor.trim().is_empty() {
                     if is_right {
                         backend.right_click_anchored(anchor, x, y);
+                    } else if is_double {
+                        backend.double_click_anchored(anchor, x, y);
                     } else {
                         backend.click_anchored(anchor, x, y);
                     }
@@ -121,6 +136,8 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
             }
             if is_right {
                 backend.right_click(x, y);
+            } else if is_double {
+                backend.double_click(x, y);
             } else {
                 backend.click(x, y);
             }
@@ -187,7 +204,7 @@ mod tests {
                 id TEXT, recording_id TEXT, order_index INTEGER,
                 step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER,
                 window_title TEXT, description TEXT, after_screenshot_path TEXT,
-                hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT
+                hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT
             )",
             [],
         )
@@ -244,12 +261,12 @@ mod tests {
     fn test_no_coord_step_only_focuses() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','','')",
+            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','','','')",
             [],
         )
         .unwrap();
@@ -349,7 +366,7 @@ mod tests {
     fn test_right_click_step_dispatches_right_button() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT)",
             [],
         )
         .unwrap();
@@ -397,6 +414,76 @@ mod tests {
         assert!(
             !acts.iter().any(|a| a.starts_with("click(655")),
             "右键步不应退化成左键，acts={:?}",
+            acts
+        );
+    }
+
+    /// 锁定双击重放契约：click 步 mouse_button="left-double" → 必须下发 double_click；
+    /// 旧数据兜底：mouse_button 为空但标题含「双击」→ 同样下发 double_click。
+    /// 双击打开文件等链路依赖此行为；若退化为单击，该测试立即失败。
+    #[test]
+    fn test_double_click_step_dispatches_double_click() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT)",
+            [],
+        )
+        .unwrap();
+        // 新数据：mouse_button 显式 left-double
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button, title) VALUES ('d1','rec1',0,1,'click',300,200,'Program Manager','','','','','left-double','双击 文件')",
+            [],
+        )
+        .unwrap();
+        // 旧数据兜底：mouse_button 为空 + 标题含「双击」
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button, title) VALUES ('d2','rec1',1,2,'click',300,200,'Program Manager','','','','','','双击 新建文档')",
+            [],
+        )
+        .unwrap();
+        // 带锚点双击
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button, title) VALUES ('d3','rec1',2,3,'click',120,80,'Program Manager','','','','{\"cls\":\"Button\",\"fx\":0.5,\"fy\":0.5,\"wx\":0.5,\"wy\":0.5}','left-double','双击 图标')",
+            [],
+        )
+        .unwrap();
+        // 对照组：普通左键不受兜底影响
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button, title) VALUES ('d4','rec1',3,4,'click',50,50,'Program Manager','','','','','left','点击 桌面')",
+            [],
+        )
+        .unwrap();
+        let plan = load_replay_plan(&conn, "rec1").unwrap();
+        assert_eq!(plan[0].mouse_button, "left-double");
+        assert_eq!(plan[1].mouse_button, "left-double", "旧数据应按标题兜底为 left-double");
+        let backend = DryRunBackend::new();
+        for action in &plan {
+            run_action(action, &backend);
+        }
+        let acts = backend.actions.lock().unwrap().clone();
+        assert!(
+            acts.iter().any(|a| a.contains("double_click(300")),
+            "双击步应下发 double_click，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().filter(|a| a.contains("double_click(300")).count() == 2,
+            "新旧两条双击数据都应下发 double_click，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().any(|a| a.contains("double_click_anchored(120")),
+            "带锚点双击步应走 double_click_anchored，acts={:?}",
+            acts
+        );
+        assert!(
+            acts.iter().any(|a| a.contains("click(50")),
+            "普通左键行为不变，acts={:?}",
+            acts
+        );
+        assert!(
+            !acts.iter().any(|a| a.starts_with("click(300")),
+            "双击步不应退化成单击，acts={:?}",
             acts
         );
     }
@@ -464,7 +551,7 @@ mod tests {
     fn test_save_as_replay_sequence_locks_create_file_flow() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT)",
             [],
         )
         .unwrap();
