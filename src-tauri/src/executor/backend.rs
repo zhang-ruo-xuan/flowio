@@ -35,6 +35,8 @@ pub trait ReplayBackend {
     /// 拖拽 + 控件锚点：按下点按锚点反算，松开点按「同样的平移量」补偿后下发。
     /// 只有起点被锚点校正、终点不动会导致拖出来的选区被整体拉偏。
     fn drag_anchored(&self, anchor_json: &str, fx: i32, fy: i32, tx: i32, ty: i32);
+    /// 滚轮：delta 正=向上，负=向下（单位为 WHEEL_DELTA 倍数，一格通常 120）。
+    fn scroll(&self, x: i32, y: i32, delta: i32);
 }
 
 // ── 测试后端：只记录动作，不碰真实桌面 ──────────────────────
@@ -110,6 +112,12 @@ impl ReplayBackend for DryRunBackend {
             fx, fy, tx, ty, anchor_json
         ));
     }
+    fn scroll(&self, x: i32, y: i32, delta: i32) {
+        self.actions
+            .lock()
+            .unwrap()
+            .push(format!("scroll({},{},{})", x, y, delta));
+    }
 }
 
 // ── 真实 Win32 后端 ────────────────────────────────────────
@@ -117,7 +125,7 @@ use windows::Win32::Foundation::{BOOL, HWND, POINT, RECT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     SendInput, VIRTUAL_KEY, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, mouse_event, VK_APPS,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, mouse_event, VK_APPS,
     VK_BACK, VK_CAPITAL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT,
     VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SNAPSHOT,
     VK_SPACE, VK_TAB, VK_UP,
@@ -773,6 +781,30 @@ fn click(x: i32, y: i32) {
     ));
 }
 
+/// 滚轮：先把光标移到录制时的位置（滚哪个窗口下的内容由光标位置决定），
+/// 再按增量下发。delta 正=向上，负=向下；一次 EVENTF_WHEEL 只能带 ±120 的
+/// 整数倍，故按格拆分多次下发，避免大增量被系统截断。
+fn scroll(x: i32, y: i32, delta: i32) {
+    unsafe {
+        let _ = SetCursorPos(x, y);
+        std::thread::sleep(Duration::from_millis(10));
+        let step = if delta >= 0 { 120 } else { -120 };
+        let times = (delta.abs() / 120).max(1);
+        for _ in 0..times {
+            mouse_event(MOUSEEVENTF_WHEEL, 0, 0, step, 0);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    replay_log(&format!(
+        "[scroll] at=({},{}) delta={} ({} 格) hit={}",
+        x,
+        y,
+        delta,
+        (delta.abs() / 120).max(1),
+        point_window_desc(x, y)
+    ));
+}
+
 /// 右键点击：桌面/文件右键菜单（新建文件等）链路依赖。
 fn right_click(x: i32, y: i32) {
     unsafe {
@@ -1166,6 +1198,9 @@ impl ReplayBackend for WindowsBackend {
                 self.double_click(fallback_x, fallback_y);
             }
         }
+    }
+    fn scroll(&self, x: i32, y: i32, delta: i32) {
+        scroll(x, y, delta);
     }
     fn right_click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32) {
         let anchor = match ControlAnchor::from_str(anchor_json) {

@@ -15,7 +15,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowsHookExW,
     UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
     WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 
@@ -253,8 +254,31 @@ unsafe extern "system" fn mouse_hook_proc(
             crate::recorder::mouse::ClickPhase::Up
         } else if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
             crate::recorder::mouse::ClickPhase::Down
+        } else if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+            // ★ 滚轮：以前被直接丢弃（"e.g. wheel. Skip"）→ 教程里的滚动操作
+            // 完全录不下来，重放不滚动，后续点击全落在错误位置。
+            // 现在按 CapturedClick 上报（button="wheel"，增量在 wheel_delta），
+            // 由事件线程做时间窗合并后生成一条 scroll 步骤。
+            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            let raw = (((info.mouseData >> 16) & 0xFFFF) as u16) as i16 as i32;
+            let fg_pid = get_fg_pid();
+            if let Ok(guard) = MOUSE_TX.lock() {
+                if let Some(ref tx) = *guard {
+                    let _ = tx.send(CapturedClick {
+                        x: info.pt.x as f64,
+                        y: info.pt.y as f64,
+                        button: "wheel".to_string(),
+                        phase: crate::recorder::mouse::ClickPhase::Down,
+                        timestamp: std::time::Instant::now(),
+                        foreground_pid: fg_pid,
+                        wheel_delta: raw,
+                    });
+                }
+            }
+            CallNextHookEx(None, code, wparam, lparam);
+            return LRESULT(0);
         } else {
-            // Not a button press/release we care about (e.g. wheel). Skip.
+            // Not a button press/release we care about. Skip.
             CallNextHookEx(None, code, wparam, lparam);
             return LRESULT(0);
         };
@@ -283,6 +307,7 @@ unsafe extern "system" fn mouse_hook_proc(
                     phase,
                     timestamp: click_ts,
                     foreground_pid: fg_pid,
+                    wheel_delta: 0,
                 });
             }
         }

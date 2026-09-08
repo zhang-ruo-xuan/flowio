@@ -43,6 +43,9 @@ pub struct StepSave {
     pub end_x: Option<i32>,
     #[serde(default)]
     pub end_y: Option<i32>,
+    /// 滚轮增量（仅 scroll 步骤有值；正=向上，负=向下，一格通常 ±120）。
+    #[serde(default)]
+    pub scroll_delta: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,8 +75,8 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
         if let Err(e) = conn.execute(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, \
              title, description, tip, screenshot_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, hotkey_combo, uia_anchor, mouse_button, \
-             start_x, start_y, end_x, end_y) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+             start_x, start_y, end_x, end_y, scroll_delta) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 step_id,
                 recording.id,
@@ -99,6 +102,7 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
                 step.start_y,
                 step.end_x,
                 step.end_y,
+                step.scroll_delta,
             ],
         ) {
             let _ = conn.execute("ROLLBACK", []);
@@ -355,7 +359,7 @@ pub fn init_db(conn: &Connection) {
     // 在生成步骤时就丢了 → 重放只能降级为一次 click，选不中区域（用户报「不能拖拽」）。
     // 这里补 start_*/end_* 四点；旧库/存量步骤为 NULL，重放端按「无终点 → 维持
     // 旧降级 click」处理，天然兼容。注意 x/y 语义保持不变（仍是裁图框中心）。
-    for col in &["start_x", "start_y", "end_x", "end_y"] {
+    for col in &["start_x", "start_y", "end_x", "end_y", "scroll_delta"] {
         let _ = conn.execute_batch(&format!("ALTER TABLE steps ADD COLUMN {} INTEGER", col));
     }
 }
@@ -433,6 +437,7 @@ mod db_tests {
 
     fn step(order: i32, num: i32, opt: bool) -> StepSave {
         StepSave {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None,
             order_index: order,
             step_number: num,

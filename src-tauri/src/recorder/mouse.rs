@@ -35,6 +35,11 @@ pub struct CapturedClick {
     /// Used for self-filter / target-filter so filtering decisions are based on
     /// the foreground window at the moment of the click, not at processing time.
     pub foreground_pid: u32,
+    /// 滚轮增量（仅滚轮事件有值；正=向上/向前，负=向下/向后，单位为 WHEEL_DELTA
+    /// 的倍数，一格通常 120）。非滚轮事件为 0。
+    /// 此前滚轮被 hook 直接丢弃（"e.g. wheel. Skip"）→ 教程里的滚动操作完全
+    /// 录不下来，重放自然不会滚，后续点击全落在错误位置。
+    pub wheel_delta: i32,
 }
 
 // NOTE: mouse hook initialization has been moved into
@@ -55,6 +60,7 @@ mod tests {
             phase: ClickPhase::Down,
             timestamp: now,
             foreground_pid: 1234,
+            wheel_delta: 0,
         };
         assert_eq!(click.x, 12.5);
         assert_eq!(click.y, 88.25);
@@ -74,6 +80,7 @@ mod tests {
             phase: ClickPhase::Up,
             timestamp: now,
             foreground_pid: 0,
+            wheel_delta: 0,
         };
         let b = a.clone();
         assert_eq!(a.button, b.button);

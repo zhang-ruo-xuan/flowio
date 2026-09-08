@@ -45,6 +45,9 @@ pub struct StepData {
     /// 拖拽松开点 Y（仅 drag 步骤有值）
     #[serde(default)]
     pub end_y: Option<i32>,
+    /// 滚轮增量（仅 scroll 步骤有值；正=向上，负=向下，一格通常 ±120）。
+    #[serde(default)]
+    pub scroll_delta: Option<i32>,
     /// Focused element rectangle width (screen pixels), for Scribe-style crop.
     #[serde(default)]
     pub crop_w: Option<i32>,
@@ -118,6 +121,7 @@ mod tests {
 
     fn step_data(id: &str, n: i32) -> StepData {
         StepData {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None,
             id: id.into(),
             order_index: n,

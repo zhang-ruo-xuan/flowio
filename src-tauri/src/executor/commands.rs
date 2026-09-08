@@ -757,22 +757,27 @@ mod tests {
     #[test]
     fn describe_target_variants() {
         let click = ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None, step_number: 1, action_type: "click".into(), x: Some(10), y: Some(20), window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() };
         assert_eq!(describe_target(&click), "坐标 (10, 20)");
 
         let anchor = ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None, step_number: 2, action_type: "click".into(), x: Some(1), y: Some(2), window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: Some("{\"cls\":\"Button\",\"fx\":0.5,\"fy\":0.5,\"wx\":0.3,\"wy\":0.2}".into()), mouse_button: String::new() };
         assert!(describe_target(&anchor).contains("Button"), "got: {}", describe_target(&anchor));
 
         let copy = ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None, step_number: 3, action_type: "copy".into(), x: None, y: None, window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: Some("Ctrl+C".into()), uia_anchor: None, mouse_button: String::new() };
         assert_eq!(describe_target(&copy), "复制（剪贴板）");
 
         let hk = ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None, step_number: 4, action_type: "hotkey".into(), x: None, y: None, window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: Some("Ctrl+S".into()), uia_anchor: None, mouse_button: String::new() };
         assert_eq!(describe_target(&hk), "组合键 Ctrl+S");
 
         let ty = ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None, step_number: 5, action_type: "type".into(), x: None, y: None, window_title: "WPS".into(), text: Some("hi".into()), after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() };
         assert_eq!(describe_target(&ty), "输入文本");
     }
@@ -781,8 +786,10 @@ mod tests {
     fn primary_target_app_picks_first_nonempty() {
         let plan: Vec<ReplayAction> = vec![
             ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None, step_number: 1, action_type: "click".into(), x: Some(1), y: Some(1), window_title: "".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() },
             ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None, step_number: 2, action_type: "type".into(), x: None, y: None, window_title: "WPS 文档".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() },
         ];
         assert_eq!(primary_target_app(&plan), "WPS 文档");

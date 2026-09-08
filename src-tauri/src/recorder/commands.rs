@@ -117,6 +117,7 @@ fn build_typed_step(
         .map(crate::ai::domain::detect_domain)
         .unwrap_or(AppDomain::Other);
     StepData {
+            scroll_delta: None,
         id: Uuid::new_v4().to_string(),
         order_index: 0,
         step_number: 0,
@@ -330,6 +331,36 @@ fn merge_typed_step(prev: &mut StepData, new: &StepData, desc_from_uia: bool, ne
 /// `dx`/`dy` 为两次点击坐标差，`gap_ms` 为间隔，`dbl_ms` 为系统双击速度
 /// （GetDoubleClickTime()，通常 500ms）。距离阈值 8px（略宽于系统 4px，
 /// 触屏/高 DPI 下更稳）。
+/// 滚轮合并窗口：同方向、间隔小于此值的滚动累积成一步（滚轮事件极密集，
+/// 逐事件落步会把教程炸成上百步）。
+const SCROLL_MERGE_MS: u128 = 400;
+/// 小于此增量（约一格 = 120）不生成步骤，过滤误触/微滚。
+const SCROLL_MIN_DELTA: i32 = 100;
+
+/// 滚轮累积决策（纯函数，便于单测）。
+///
+/// 输入：上一段累积 (delta, 起始时刻)、本次增量、本次时刻、合并窗口。
+/// 返回 `(是否要先 flush 上一段, 新的累积值)`——新累积值已包含本次增量。
+/// 规则：反向滚动或超出合并窗口 → 先 flush 旧的，本次另起一段；否则同向累加。
+fn scroll_accumulate(
+    pending: Option<(i32, std::time::Instant)>,
+    delta: i32,
+    now: std::time::Instant,
+    merge_ms: u128,
+) -> (bool, i32) {
+    match pending {
+        None => (false, delta),
+        Some((acc, last)) => {
+            let same_dir = (acc > 0 && delta > 0) || (acc < 0 && delta < 0);
+            if same_dir && now.duration_since(last).as_millis() <= merge_ms {
+                (false, acc + delta)
+            } else {
+                (true, delta)
+            }
+        }
+    }
+}
+
 fn is_double_click(dx: f64, dy: f64, gap_ms: u64, dbl_ms: u64) -> bool {
     gap_ms <= dbl_ms && dx.abs() <= 8.0 && dy.abs() <= 8.0
 }
@@ -847,6 +878,7 @@ fn flush_shortcut_step(
 
     let window_title = activity::get_active_window_title();
     let step = StepData {
+            scroll_delta: None,
         id: Uuid::new_v4().to_string(),
         order_index: 0,
         step_number: 0,
@@ -1688,6 +1720,7 @@ fn build_click_step(
     let title = if button.eq_ignore_ascii_case("right") { title.replacen("点击", "右键点击", 1) } else { title };
 
     Some(StepData {
+            scroll_delta: None,
         id: Uuid::new_v4().to_string(),
         order_index: 0,
         step_number: 0,
@@ -1844,6 +1877,7 @@ fn build_drag_step(
         .unwrap_or_default();
 
     Some(StepData {
+            scroll_delta: None,
         id: Uuid::new_v4().to_string(),
         order_index: 0,
         step_number: 0,
@@ -1983,6 +2017,8 @@ fn spawn_event_thread(
         let mut last_window_title: Option<String> = None;
         let mut last_uia_text: Option<(String, bool)> = None;
         let mut keyboard_before_path: Option<String> = None;
+        // 滚轮累积段：(累积增量, 该段最后一次滚动时刻, x, y)
+        let mut pending_scroll: Option<(i32, std::time::Instant, f64, f64)> = None;
         // 按住 Alt 连按 Tab 时，把多次切换合并进同一个步骤：
         // (最后一次 Tab 的时刻, 该步骤在 captured 中的下标)
         let mut last_alt_tab: Option<(Instant, usize)> = None;
@@ -2069,6 +2105,30 @@ fn spawn_event_thread(
                             );
                             continue;
                         }
+                    }
+
+                    // ── 滚轮：合并成 scroll 步骤 ──
+                    // hook 以前直接丢弃滚轮 → 教程里的滚动完全录不下来，重放不滚动、
+                    // 后续点击全落在错误位置。这里按「同向累积 + 400ms 窗口」合并，
+                    // 避免滚一下生成几十步。
+                    if click.button == "wheel" {
+                        let now = Instant::now();
+                        let (flush_old, acc) = scroll_accumulate(
+                            pending_scroll.map(|(d, t, _, _)| (d, t)),
+                            click.wheel_delta,
+                            now,
+                            SCROLL_MERGE_MS,
+                        );
+                        if flush_old {
+                            if let Some((old, _t, sx, sy)) = pending_scroll.take() {
+                                if old.abs() >= SCROLL_MIN_DELTA {
+                                    push_scroll_step(old, sx, sy, &cs_for_thread, &ring);
+                                }
+                            }
+                        }
+                        pending_scroll = Some((acc, now, click.x, click.y));
+                        last_key_time = now;
+                        continue;
                     }
 
                     if is_down {
@@ -2646,6 +2706,16 @@ fn spawn_event_thread(
             }
             last_window_title = current_title;
 
+            // 滚轮段超时 → flush，避免最后一段滚动滞留在缓冲区里丢失。
+            if let Some((acc, t, sx, sy)) = pending_scroll {
+                if t.elapsed().as_millis() > SCROLL_MERGE_MS {
+                    pending_scroll = None;
+                    if acc.abs() >= SCROLL_MIN_DELTA {
+                        push_scroll_step(acc, sx, sy, &cs_for_thread, &ring);
+                    }
+                }
+            }
+
             std::thread::sleep(Duration::from_millis(50));
         }
 
@@ -2654,6 +2724,54 @@ fn spawn_event_thread(
 }
 
 // ── Tauri commands ─────────────────────────────────────────────────────
+
+/// 生成一条 scroll 步骤并入队（带当帧截图，便于编辑器展示/导出）。
+/// `delta` 为正 = 向上滚动，为负 = 向下滚动。
+fn push_scroll_step(
+    delta: i32,
+    x: f64,
+    y: f64,
+    cs: &Arc<Mutex<Vec<StepData>>>,
+    ring: &FrameRing,
+) {
+    let img = ring
+        .closest_to(Instant::now())
+        .map(|f| f.image.clone())
+        .or_else(|| screenshot::capture_fullscreen().ok());
+    let Some(mut clean) = img else {
+        return;
+    };
+    screenshot::crop_watermark(&mut clean);
+    let path = screenshot::next_screenshot_path("scroll");
+    if screenshot::capture_frame_jpeg(&clean, &path).is_err() {
+        return;
+    }
+    let idx = {
+        let s = cs.lock().unwrap();
+        s.len() as i32
+    };
+    let mut sd = build_mark_step(
+        if delta > 0 {
+            "向上滚动".to_string()
+        } else {
+            "向下滚动".to_string()
+        },
+        Some(x.round() as i32),
+        Some(y.round() as i32),
+        Some("scroll".to_string()),
+        None,
+        Some(path.to_string_lossy().to_string()),
+        None,
+        idx,
+        current_time_millis(),
+    );
+    sd.scroll_delta = Some(delta);
+    eprintln!("[BG] scroll step: delta={} at ({},{})", delta, x, y);
+    let mut steps = cs.lock().unwrap();
+    if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
+        steps.push(sd);
+    }
+}
 
 /// 组装手动标记截图步骤（mark_screenshot_step 的 StepData 构造，便于单测）。
 fn build_mark_step(
@@ -2668,6 +2786,7 @@ fn build_mark_step(
     timestamp: i64,
 ) -> StepData {
     StepData {
+            scroll_delta: None,
         id: Uuid::new_v4().to_string(),
         order_index: step_index,
         step_number: step_index + 1,
@@ -2724,6 +2843,7 @@ fn steps_to_step_saves(steps: &[StepData]) -> Vec<crate::db::StepSave> {
             start_y: s.start_y,
             end_x: s.end_x,
             end_y: s.end_y,
+            scroll_delta: s.scroll_delta,
         })
         .collect()
 }
@@ -3289,6 +3409,7 @@ mod commands_tests {
 
     fn make_step(order_index: i32) -> StepData {
         StepData {
+            scroll_delta: None,
             id: format!("s{}", order_index),
             order_index,
             step_number: order_index + 1,
@@ -3819,6 +3940,35 @@ mod commands_tests {
         // 其它导航/编辑键保持原样
         assert_eq!(display_shortcut_key("Return"), "Enter");
         assert_eq!(display_shortcut_key("Escape"), "Esc");
+    }
+
+    /// 滚轮合并：同向累积、反向/超时先 flush。滚轮事件极密集，不合并会把
+    /// 教程炸成上百步；反之若永不 flush，最后一段滚动会滞留丢失。
+    #[test]
+    fn scroll_accumulate_merges_same_direction() {
+        let t0 = std::time::Instant::now();
+        // 首事件：不 flush，累积 = delta
+        assert_eq!(
+            scroll_accumulate(None, -120, t0, SCROLL_MERGE_MS),
+            (false, -120)
+        );
+        // 同向 + 窗口内 → 累加
+        let t1 = t0 + std::time::Duration::from_millis(100);
+        assert_eq!(
+            scroll_accumulate(Some((-120, t0)), -120, t1, SCROLL_MERGE_MS),
+            (false, -240)
+        );
+        // 反向 → 先 flush 旧的
+        assert_eq!(
+            scroll_accumulate(Some((-240, t1)), 120, t1, SCROLL_MERGE_MS),
+            (true, 120)
+        );
+        // 超时 → 先 flush 旧的
+        let t2 = t1 + std::time::Duration::from_millis(SCROLL_MERGE_MS as u64 + 50);
+        assert_eq!(
+            scroll_accumulate(Some((-240, t1)), -120, t2, SCROLL_MERGE_MS),
+            (true, -120)
+        );
     }
 
     #[test]

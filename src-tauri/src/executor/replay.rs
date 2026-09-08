@@ -10,6 +10,7 @@ use std::time::Duration;
 /// 单步重放动作（从源 DB 映射而来，已含坐标锚点）
 #[derive(Debug, Clone)]
 pub struct ReplayAction {
+        pub scroll_delta: Option<i32>,
     pub step_number: i32,
     pub action_type: String,
     /// 屏幕坐标锚点；None 表示该步录制时未落坐标（如窗口聚焦前的首点）
@@ -46,7 +47,7 @@ pub fn load_replay_plan(
     let mut stmt = conn
         .prepare(
             "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button, title, \
-             start_x, start_y, end_x, end_y \
+             start_x, start_y, end_x, end_y, scroll_delta \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -87,6 +88,7 @@ pub fn load_replay_plan(
                 start_y: row.get(12).unwrap_or(None).or_else(|| row.get(3).ok()),
                 end_x: row.get(13).unwrap_or(None),
                 end_y: row.get(14).unwrap_or(None),
+                scroll_delta: row.get(15).unwrap_or(None),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -204,6 +206,14 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
                 }
             }
         }
+        // scroll：滚轮步骤（正=向上，负=向下）。录制端此前完全不产生这类步骤
+        // （hook 把滚轮事件丢了）→ 教程里的滚动重放不出来，后续点击全错位。
+        "scroll" => {
+            let d = action.scroll_delta.unwrap_or(0);
+            if d != 0 {
+                backend.scroll(x, y, d);
+            }
+        }
         "type" | "input" => backend.type_text(action.text.as_deref().unwrap_or("")),
         // copy/paste 是语义化的组合键步骤：直接下发对应组合键
         "copy" => backend.press_combo(action.hotkey_combo.as_deref().unwrap_or("Ctrl+C")),
@@ -301,6 +311,9 @@ mod tests {
         fn drag_anchored(&self, a: &str, fx: i32, fy: i32, tx: i32, ty: i32) {
             self.inner.drag_anchored(a, fx, fy, tx, ty);
         }
+        fn scroll(&self, x: i32, y: i32, delta: i32) {
+            self.inner.scroll(x, y, delta);
+        }
     }
 
     #[test]
@@ -309,6 +322,7 @@ mod tests {
         // 永远选不中区域（用户报「不能拖拽」）。有 start_*/end_* 时必须真拖。
         let backend = DryRunBackend::new();
         let action = ReplayAction {
+            scroll_delta: None,
             step_number: 1,
             action_type: "drag".into(),
             x: Some(500),
@@ -338,6 +352,7 @@ mod tests {
         // 旧录制（列加之前）没有终点：维持降级 click，不引入回归。
         let backend = DryRunBackend::new();
         let action = ReplayAction {
+            scroll_delta: None,
             step_number: 1,
             action_type: "drag".into(),
             x: Some(500),
@@ -363,6 +378,37 @@ mod tests {
     }
 
     #[test]
+    fn scroll_step_dispatches_wheel() {
+        // 回归：滚轮此前被 hook 丢弃（"e.g. wheel. Skip"），教程录不到滚动，
+        // 重放也无从下发 → 网页/长文档类教程后续点击全错位。
+        let backend = DryRunBackend::new();
+        let action = ReplayAction {
+            step_number: 1,
+            action_type: "scroll".into(),
+            x: Some(800),
+            y: Some(500),
+            window_title: "Browser".into(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: None,
+            uia_anchor: None,
+            mouse_button: String::new(),
+            start_x: None,
+            start_y: None,
+            end_x: None,
+            end_y: None,
+            scroll_delta: Some(-360),
+        };
+        run_action(&action, &backend);
+        let acts = backend.actions.lock().unwrap();
+        assert!(
+            acts.iter().any(|a| a.starts_with("scroll(800,500,-360)")),
+            "应下发滚轮，实际: {:?}",
+            acts
+        );
+    }
+
+    #[test]
     fn test_menu_anchor_uses_menu_channel_not_absolute() {
         // 回归：菜单项步骤的锚点 cls 指向右键菜单窗口；即使 focus 失败（桌面场景
         // 必失败），也必须走 click_menu_anchored（等菜单弹出后按菜单矩形反算），
@@ -372,6 +418,7 @@ mod tests {
         };
         let anchor = r#"{"cls":"Microsoft.UI.Content.PopupWindowSiteBridge","fx":0.342,"fy":0.847,"wx":1.0,"wy":1.0}"#;
         let action = ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None,
             step_number: 2,
             action_type: "click".into(),
@@ -403,6 +450,7 @@ mod tests {
         };
         let anchor = r#"{"cls":"SysListView32","fx":0.38,"fy":0.16,"wx":0.38,"wy":0.16}"#;
         let action = ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None,
             step_number: 1,
             action_type: "click".into(),
@@ -450,7 +498,8 @@ mod tests {
                 step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER,
                 window_title TEXT, description TEXT, after_screenshot_path TEXT,
                 hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT,
-                start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER
+                start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER,
+                scroll_delta INTEGER
             )",
             [],
         )
@@ -507,12 +556,12 @@ mod tests {
     fn test_no_coord_step_only_focuses() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER, scroll_delta INTEGER)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','','','',NULL,NULL,NULL,NULL)",
+            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','','','',NULL,NULL,NULL,NULL,NULL)",
             [],
         )
         .unwrap();
@@ -612,7 +661,7 @@ mod tests {
     fn test_right_click_step_dispatches_right_button() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER, scroll_delta INTEGER)",
             [],
         )
         .unwrap();
@@ -671,7 +720,7 @@ mod tests {
     fn test_double_click_step_dispatches_double_click() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER, scroll_delta INTEGER)",
             [],
         )
         .unwrap();
@@ -748,6 +797,7 @@ mod tests {
     #[test]
     fn test_plan_requires_approval() {
         let click = ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None,
             step_number: 1,
             action_type: "click".into(),
@@ -765,6 +815,7 @@ mod tests {
 
         let mut mixed = plan_only_click;
         mixed.push(ReplayAction {
+            scroll_delta: None,
             start_x: None, start_y: None, end_x: None, end_y: None,
             step_number: 2,
             action_type: "copy".into(),
@@ -799,7 +850,7 @@ mod tests {
     fn test_save_as_replay_sequence_locks_create_file_flow() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER, scroll_delta INTEGER)",
             [],
         )
         .unwrap();
