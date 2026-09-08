@@ -115,8 +115,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible,
-    SendMessageW, SetCursorPos, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE,
-    SW_MINIMIZE, SW_RESTORE, WM_COMMAND, WindowFromPoint,
+    SendMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SetCursorPos, SetForegroundWindow,
+    SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE,
+    SW_MINIMIZE, SW_RESTORE, WM_COMMAND, WM_NULL, WindowFromPoint,
 };
 
 struct EnumCtx<'a> {
@@ -230,6 +231,77 @@ fn find_window_retry(substring: &str) -> Option<HWND> {
         }
     }
     None
+}
+
+/// 落点是否命中“装饰性窗口”（WPS/金山的 KLite 阴影边框等，无内容，点上去等于空点）。
+/// 锚点反算偶尔会算到窗口边缘这类噪声层上（实测「是否保存文档？」对话框落点
+/// 落在 [KLiteMainWindowShadowBorder]），此时回退录制坐标才是正确选择。
+fn point_is_decorative(x: i32, y: i32) -> bool {
+    let hwnd = unsafe { WindowFromPoint(POINT { x, y }) };
+    if hwnd.0.is_null() {
+        return true;
+    }
+    let mut cls = [0u16; 128];
+    let n = unsafe { GetClassNameW(hwnd, &mut cls) };
+    if n == 0 {
+        return false;
+    }
+    let c = String::from_utf16_lossy(&cls[..n as usize]);
+    c.starts_with("KLite") || c.contains("ShadowBorder") || c.contains("Shadow")
+}
+
+/// 窗口当前是否可响应（未挂起）。应用冷启动期间窗口标题已出现但主线程仍在
+/// 加载（标题栏“未响应”），此时下发的点击/输入会被系统丢弃——需等到可响应。
+/// 用 SendMessageTimeoutW(WM_NULL) 判定，超时即视为挂起。
+fn window_responsive(hwnd: HWND) -> bool {
+    let mut result: usize = 0;
+    let r = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            300,
+            Some(&mut result),
+        )
+    };
+    r.0 != 0
+}
+
+/// 等待目标窗口出现**且可响应**。返回等待毫秒数；窗口已就绪时立即返回 0；
+/// 超时返回 None（调用方按旧行为继续，绝不阻塞流程）。
+///
+/// 面向重应用冷启动（WPS/Office 等启动需数秒，且窗口先出现后加载）：
+/// 仅“窗口不存在”或“窗口挂起”时才等，命中即返回，正常流程零额外延迟。
+pub fn wait_window_ready(title: &str, timeout_ms: u64) -> Option<u64> {
+    let t = title.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(h) = find_window(t) {
+            if window_responsive(h) {
+                let elapsed = start.elapsed().as_millis() as u64;
+                // 等出来（而非一开始就在）的窗口：再给 400ms 稳定期，
+                // 避免点在第一帧尚未渲染完成的界面上。
+                if elapsed > 0 {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                return Some(elapsed);
+            }
+        }
+        let elapsed = start.elapsed().as_millis() as u64;
+        if elapsed >= timeout_ms {
+            replay_log(&format!(
+                "[wait] 目标窗口 '{}' 等待 {}ms 仍未就绪，按原行为继续",
+                t, timeout_ms
+            ));
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }
 
 /// 取当前前台窗口标题（诊断用）。
@@ -841,6 +913,14 @@ impl ReplayBackend for WindowsBackend {
         }
         match locate_click(&anchor, hwnd) {
             Some((cx, cy)) => {
+                if point_is_decorative(cx, cy) {
+                    replay_log(&format!(
+                        "[anchor] 反算落点 ({},{}) 命中装饰窗口 -> 回退录制坐标 ({},{})",
+                        cx, cy, fallback_x, fallback_y
+                    ));
+                    self.click(fallback_x, fallback_y);
+                    return;
+                }
                 replay_log(&format!(
                     "[anchor] cls='{}' root={} -> 反算 ({},{})",
                     anchor.cls,
@@ -885,6 +965,14 @@ impl ReplayBackend for WindowsBackend {
         }
         match locate_click(&anchor, hwnd) {
             Some((cx, cy)) => {
+                if point_is_decorative(cx, cy) {
+                    replay_log(&format!(
+                        "[anchor] 反算落点 ({},{})(双击) 命中装饰窗口 -> 回退录制坐标 ({},{})",
+                        cx, cy, fallback_x, fallback_y
+                    ));
+                    self.double_click(fallback_x, fallback_y);
+                    return;
+                }
                 replay_log(&format!(
                     "[anchor] cls='{}'(双击) root={} -> 反算 ({},{})",
                     anchor.cls,
@@ -924,6 +1012,14 @@ impl ReplayBackend for WindowsBackend {
         }
         match locate_click(&anchor, hwnd) {
             Some((cx, cy)) => {
+                if point_is_decorative(cx, cy) {
+                    replay_log(&format!(
+                        "[anchor] 反算落点 ({},{})(右键) 命中装饰窗口 -> 回退录制坐标 ({},{})",
+                        cx, cy, fallback_x, fallback_y
+                    ));
+                    self.right_click(fallback_x, fallback_y);
+                    return;
+                }
                 replay_log(&format!(
                     "[anchor] cls='{}'(右键) root={} -> 反算 ({},{})",
                     anchor.cls,

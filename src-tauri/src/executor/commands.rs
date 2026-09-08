@@ -382,12 +382,37 @@ pub fn execute_recording(
         let n = plan.len();
         // 「新建文件重命名」双后缀修正的待确认名（13:59 实测 qqqq.txt -> qqqq.txt.txt）
         let mut pending_rename: Option<String> = None;
+        // 冷启动等待总预算：全程累计最多等 30 秒，避免多步各自等待导致执行过慢
+        let mut wait_budget_ms: u64 = 30_000;
         for (i, action) in plan.iter().enumerate() {
             let mut status = "ok".to_string();
             let mut note = String::new();
             let mut diff: Option<f32> = None;
 
             let do_verify = verify_every == 1 || (i % verify_every == 0) || i + 1 == n;
+
+            // ── 冷启动等待：目标窗口出现且可响应后再操作 ──
+            // WPS/Office 等重应用启动需数秒，窗口标题出现后主线程可能仍在加载
+            // （“未响应”），此时下发的点击/输入会被系统丢弃 → 整链空转。
+            // 仅在窗口不存在或挂起时等待，命中即返回（正常流程零额外延迟）；
+            // 单次上限 8s、全程预算 30s，超时按旧行为继续，绝不拖死执行。
+            if wait_budget_ms > 0
+                && !action.window_title.trim().is_empty()
+                && !is_desktop_rename_context(&action.window_title)
+            {
+                let timeout = wait_budget_ms.min(8_000);
+                let t0 = std::time::Instant::now();
+                match crate::executor::backend::wait_window_ready(&action.window_title, timeout) {
+                    Some(waited) if waited > 0 => {
+                        crate::executor::backend::replay_log(&format!(
+                            "[wait] 目标窗口 '{}' 等待 {}ms 后就绪（应用启动/加载完成）",
+                            action.window_title, waited
+                        ));
+                    }
+                    _ => {}
+                }
+                wait_budget_ms = wait_budget_ms.saturating_sub(t0.elapsed().as_millis() as u64);
+            }
 
             // ── 根因修复：桌面重命名输入前 Ctrl+A 全选 ──
             // Win11 资源管理器「新建文件」自动重命名只全选主名（新建文本文档），
