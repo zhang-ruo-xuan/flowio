@@ -97,6 +97,35 @@ fn primary_target_app(plan: &[ReplayAction]) -> String {
         .unwrap_or_default()
 }
 
+/// 该步骤窗口是否为「桌面 / 资源管理器」上下文（新建文件重命名发生的场景）。
+fn is_desktop_rename_context(title: &str) -> bool {
+    let t = title.trim();
+    t.is_empty()
+        || t == "Program Manager"
+        || t.contains("资源管理器")
+        || t.contains("Explorer")
+        || t.eq_ignore_ascii_case("Windows Explorer")
+}
+
+/// 文本是否形如文件名（name.ext，ext 为 1-5 位字母数字）。
+/// 用于识别「重命名输入」候选；识别错了也无副作用——修正仅在
+/// 「name.ext.ext 存在且 name.ext 不存在」时才会真正动手。
+fn looks_like_file_name(t: &str) -> bool {
+    let t = t.trim();
+    if t.is_empty() || t.contains('\\') || t.contains('/') || t.contains('\n') {
+        return false;
+    }
+    match t.rsplit_once('.') {
+        Some((base, ext)) => {
+            !base.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 5
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
 /// 生成单步的人类可读目标描述（供审批 UI 展示）。
 fn describe_target(action: &ReplayAction) -> String {
     match action.action_type.as_str() {
@@ -351,6 +380,8 @@ pub fn execute_recording(
         // 缓解"卡顿"；短录制仍逐步骤验，校验门功能不变。
         let verify_every: usize = if total > 30 { 3 } else if total > 15 { 2 } else { 1 };
         let n = plan.len();
+        // 「新建文件重命名」双后缀修正的待确认名（13:59 实测 qqqq.txt -> qqqq.txt.txt）
+        let mut pending_rename: Option<String> = None;
         for (i, action) in plan.iter().enumerate() {
             let mut status = "ok".to_string();
             let mut note = String::new();
@@ -406,6 +437,30 @@ pub fn execute_recording(
                 note,
                 diff_ratio: diff,
             });
+
+            // ── 「新建文件重命名」双后缀修正 ──
+            // 桌面/资源管理器重命名场景输入 name.ext 后，Enter 确认可能落盘为
+            // name.ext.ext。结果导向保守修正：紧随 Enter 后若双后缀文件存在且
+            // 期望名不存在，改回期望名。仅在桌面/资源管理器上下文触发。
+            if action.action_type == "type" {
+                if is_desktop_rename_context(&action.window_title) {
+                    if let Some(t) = action.text.as_deref() {
+                        if looks_like_file_name(t) {
+                            pending_rename = Some(t.trim().to_string());
+                        }
+                    }
+                } else {
+                    pending_rename = None;
+                }
+            } else if action.action_type == "hotkey"
+                && action.hotkey_combo.as_deref() == Some("Enter")
+            {
+                if let Some(expected) = pending_rename.take() {
+                    // 等资源管理器完成重命名落盘后再检查
+                    std::thread::sleep(Duration::from_millis(700));
+                    crate::executor::backend::fix_double_extension(&expected);
+                }
+            }
 
             if delay > 0 {
                 std::thread::sleep(Duration::from_millis(delay));
@@ -617,5 +672,27 @@ mod tests {
             ReplayAction { step_number: 2, action_type: "type".into(), x: None, y: None, window_title: "WPS 文档".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() },
         ];
         assert_eq!(primary_target_app(&plan), "WPS 文档");
+    }
+
+    #[test]
+    fn desktop_rename_context_detection() {
+        assert!(is_desktop_rename_context("Program Manager"));
+        assert!(is_desktop_rename_context(""));
+        assert!(is_desktop_rename_context("文件资源管理器"));
+        assert!(!is_desktop_rename_context("*qqqq.txt - Notepad"));
+        assert!(!is_desktop_rename_context("WPS x.xlsx"));
+    }
+
+    #[test]
+    fn file_name_like_detection() {
+        assert!(looks_like_file_name("qqqq.txt"));
+        assert!(looks_like_file_name("report.docx"));
+        assert!(looks_like_file_name("a.b"));
+        assert!(!looks_like_file_name("no-ext"));
+        assert!(!looks_like_file_name("multi\nline.txt"));
+        assert!(!looks_like_file_name("path/to.txt"));
+        assert!(!looks_like_file_name(".hidden"));
+        assert!(!looks_like_file_name("name.toolongext"));
+        assert!(!looks_like_file_name("是地方还是看"));
     }
 }

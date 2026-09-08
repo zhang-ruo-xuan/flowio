@@ -426,6 +426,62 @@ unsafe extern "system" fn minimize_windows_proc(
     BOOL(1)
 }
 
+// ── 「新建文件重命名」双后缀修正 ────────────────────────────
+// 实测（2026-09-08 13:59）：桌面新建文本文档 → 重命名输入 qqqq.txt → Enter，
+// 结果得到 qqqq.txt.txt（后缀被追加了一层）。机理与资源管理器状态相关，难以在
+// 输入前预判，故采用结果导向的保守修正：Enter 确认落盘后，若目录中出现
+// 「name.ext.ext」且「name.ext」不存在，则改回「name.ext」——永不误伤已有文件。
+
+fn desktop_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var("USERPROFILE").ok()?;
+    let p = std::path::PathBuf::from(&home).join("Desktop");
+    if p.is_dir() {
+        return Some(p);
+    }
+    let od = std::path::PathBuf::from(&home).join("OneDrive").join("Desktop");
+    if od.is_dir() {
+        return Some(od);
+    }
+    None
+}
+
+/// 修正重命名后的双后缀文件名。返回是否发生了修正。
+pub fn fix_double_extension(expected_name: &str) -> bool {
+    let expected = expected_name.trim();
+    let Some((base, ext)) = expected.rsplit_once('.') else {
+        return false;
+    };
+    if base.is_empty()
+        || base.contains('\\')
+        || base.contains('/')
+        || ext.is_empty()
+        || ext.len() > 5
+        || !ext.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    let Some(dir) = desktop_dir() else {
+        return false;
+    };
+    let double = format!("{}.{}", expected, ext);
+    let dp = dir.join(&double);
+    let ep = dir.join(expected);
+    if dp.exists() && !ep.exists() {
+        match std::fs::rename(&dp, &ep) {
+            Ok(()) => {
+                replay_log(&format!("[rename] 已修正双后缀: {} -> {}", double, expected));
+                true
+            }
+            Err(e) => {
+                replay_log(&format!("[rename] 修正双后缀失败 {} -> {}: {:?}", double, expected, e));
+                false
+            }
+        }
+    } else {
+        false
+    }
+}
+
 /// 取屏幕坐标处实际命中的窗口描述（诊断用）。
 fn point_window_desc(x: i32, y: i32) -> String {
     unsafe {
