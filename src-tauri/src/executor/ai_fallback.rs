@@ -37,6 +37,12 @@ pub const MAX_CALLS_PER_RUN: usize = 3;
 /// [`compute_unit`] 补偿，精度损失 < 1 逻辑像素。
 const MAX_FEED_WIDTH: u32 = 1280;
 
+/// 参照图（录制时那一帧）的最大宽度。
+///
+/// 比当前屏幕的 1280 更小：它只用于让模型「认出是哪个元素」，而坐标一律
+/// 从当前屏幕图上取，缩这里不会损失任何定位精度，却能明显省 token。
+const MAX_REFERENCE_WIDTH: u32 = 960;
+
 /// 判定为「AI 已经把点带偏」的最小位移：小于该值认为没救回来，不占用额度。
 const MIN_RECOVER_PX: i32 = 8;
 
@@ -250,8 +256,16 @@ pub struct FallbackContext<'a> {
     pub prev_intent: &'a str,
     /// 下一步要做什么（帮助模型判断「点开后应该出现什么」）。
     pub next_intent: &'a str,
-    /// 触发兜底的原因（"focus-failed" / "verify-failed"）。
+    /// 触发兜底的原因（"focus-failed" / "before-drift" / "verify-failed"）。
     pub reason: &'a str,
+    /// 录制时那一帧**带红圈标注**的截图路径（`steps.screenshot_path`）。
+    ///
+    /// 真实录制里语义标题只有 5/19 是「人话」（其余是「点击在「X」中」这种
+    /// 模板串，只说得出窗口说不出点了什么），光靠文字意图模型只能瞎猜。
+    /// 但这张图 19/19 齐全，红圈直接标出了当时点的位置——把它和当前屏幕
+    /// 一起喂进去，模型做的是**视觉比对**（「找找这个元素现在跑哪去了」），
+    /// 难度从「理解意图」降到「找相同图案」，准确率完全不是一个量级。
+    pub reference_path: Option<&'a str>,
     /// 截图尺寸（输出给模型的图），用于在提示词里声明坐标系范围。
     pub img_w: u32,
     pub img_h: u32,
@@ -259,10 +273,11 @@ pub struct FallbackContext<'a> {
 
 pub const SYSTEM_PROMPT: &str = "你是一个 Windows 桌面自动化执行器的视觉兜底模块。\
 确定性重放按录制坐标点了下去，但没有命中预期目标。\
-你会收到一张当前屏幕截图和这一步的意图，请判断**现在应该点击哪里**。\
+你会收到两张图：图1 是**录制时**的画面（红圈标出了当时点击的位置），图2 是**现在**的画面。\
+请在图2 里找到图1 红圈所指的那个元素的对应位置，输出它现在应该点击的坐标。\
 只输出一个 JSON：{\"x\": <整数图像像素横坐标>, \"y\": <整数图像像素纵坐标>, \"why\": \"一句中文说明\"}。\
-坐标必须是**截图图像内的像素坐标**（左上角为 0,0）。不要输出除 JSON 以外的任何内容。\
-如果截图里确实找不到该目标，输出 {\"x\": -1, \"y\": -1, \"why\": \"原因\"}。";
+坐标必须是**图2 图像内的像素坐标**（左上角为 0,0）。不要输出除 JSON 以外的任何内容。\
+如果图2 里确实找不到该目标，输出 {\"x\": -1, \"y\": -1, \"why\": \"原因\"}。";
 
 /// 组装用户提示词（含意图、坐标系声明、上下文）。
 pub fn build_prompt(ctx: &FallbackContext) -> String {
@@ -306,6 +321,10 @@ pub fn build_prompt(ctx: &FallbackContext) -> String {
     }
     s
 }
+
+/// 参照图说明词。两张图的区别必须讲清楚，否则模型可能对着录制图给坐标。
+pub const REFERENCE_NOTE: &str =
+    "图1＝录制时的画面（红圈是当时点击的位置）；图2＝当前的画面。请在图2 中定位图1 红圈所指的元素。";
 
 fn reason_cn(r: &str) -> &'static str {
     if r.contains("before-drift") {
@@ -376,10 +395,34 @@ pub fn resolve_via_ai(cfg: &AiConfig, ctx: &FallbackContext) -> Result<AiPoint, 
         prev_intent: ctx.prev_intent,
         next_intent: ctx.next_intent,
         reason: ctx.reason,
+        reference_path: ctx.reference_path,
         img_w: ow,
         img_h: oh,
     };
     let prompt = build_prompt(&ctx2);
+
+    // 参照图（录制时那一帧，带红圈标注）：把「找意图」降级成「找相同图案」。
+    // 加载失败就退化成单图提问——有参照更好，没有也不能拖垮兜底。
+    let ref_b64 = ctx
+        .reference_path
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| encode_reference_jpeg(p).ok());
+
+    let mut parts: Vec<serde_json::Value> = vec![json!({ "type": "text", "text": prompt })];
+    if let Some(r) = &ref_b64 {
+        parts.push(json!({
+            "type": "text",
+            "text": REFERENCE_NOTE,
+        }));
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:image/jpeg;base64,{}", r) },
+        }));
+    }
+    parts.push(json!({
+        "type": "image_url",
+        "image_url": { "url": format!("data:image/jpeg;base64,{}", b64) },
+    }));
 
     let messages = vec![
         Message {
@@ -388,16 +431,17 @@ pub fn resolve_via_ai(cfg: &AiConfig, ctx: &FallbackContext) -> Result<AiPoint, 
         },
         Message {
             role: "user".to_string(),
-            content: json!([
-                { "type": "text", "text": prompt },
-                { "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{}", b64) } },
-            ]),
+            content: serde_json::Value::Array(parts),
         },
     ];
 
     replay_log(&format!(
-        "[ai-fallback] 第 {} 步请求视觉兜底（{}，图 {}x{}）",
-        ctx.step_number, ctx.reason, ow, oh
+        "[ai-fallback] 第 {} 步请求视觉兜底（{}，图 {}x{}，参照图 {}）",
+        ctx.step_number,
+        ctx.reason,
+        ow,
+        oh,
+        if ref_b64.is_some() { "已附" } else { "无" }
     ));
 
     let raw = call_llm(cfg, messages).map_err(|e| format!("视觉模型调用失败：{}", e))?;
@@ -415,6 +459,27 @@ pub fn resolve_via_ai(cfg: &AiConfig, ctx: &FallbackContext) -> Result<AiPoint, 
     let (sx, sy) = image_to_screen(u, v, ox, oy, unit);
     let why = extract_why(&raw);
     Ok(AiPoint { x: sx, y: sy, why })
+}
+
+/// 把录制时那一帧编码成尺寸可控的 JPEG base64。
+///
+/// 参照图只是给模型「认图案」用的，不需要原分辨率——缩到 960 宽后
+/// 坐标精度对它毫无影响（模型只从**当前屏幕图**上取坐标）。
+fn encode_reference_jpeg(path: &str) -> Result<String, String> {
+    let img = image::open(path).map_err(|e| format!("参照图打不开：{}", e))?;
+    let out = if img.width() > MAX_REFERENCE_WIDTH {
+        let h =
+            (img.height() as f32 * (MAX_REFERENCE_WIDTH as f32 / img.width() as f32)).round() as u32;
+        img.resize(MAX_REFERENCE_WIDTH, h.max(1), image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgb = out.to_rgb8();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 75);
+    enc.encode(&rgb, out.width(), out.height(), image::ExtendedColorType::Rgb8)
+        .map_err(|e| format!("参照图编码失败：{}", e))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(buf.into_inner()))
 }
 
 /// 从回复里摘 `why` 字段；没有就用空串（结果面板留空，不编造理由）。
@@ -605,6 +670,7 @@ mod ai_fallback_tests {
             prev_intent: "点击 B2 单元格",
             next_intent: "输入 =SUMIF(",
             reason: "focus-failed",
+            reference_path: None,
             img_w: 1280,
             img_h: 720,
         });
@@ -628,6 +694,7 @@ mod ai_fallback_tests {
             prev_intent: "",
             next_intent: "",
             reason: "verify-failed",
+            reference_path: None,
             img_w: 100,
             img_h: 100,
         });
@@ -660,10 +727,30 @@ mod ai_fallback_tests {
             prev_intent: "",
             next_intent: "",
             reason: "before-drift",
+            reference_path: None,
             img_w: 1280,
             img_h: 720,
         });
         assert!(p.contains("环境已漂移"), "{}", p);
         assert!(!p.contains("目标窗口没有出现在前台"), "{}", p);
+    }
+
+    #[test]
+    fn system_prompt_demands_coords_from_second_image() {
+        // 两张图时必须锁死「坐标取图2（当前屏幕）」，否则模型会照着录制图答
+        assert!(SYSTEM_PROMPT.contains("图2"), "{}", SYSTEM_PROMPT);
+        assert!(SYSTEM_PROMPT.contains("图2 图像内的像素坐标"), "{}", SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn reference_note_names_both_images() {
+        assert!(REFERENCE_NOTE.contains("图1"), "{}", REFERENCE_NOTE);
+        assert!(REFERENCE_NOTE.contains("图2"), "{}", REFERENCE_NOTE);
+        assert!(REFERENCE_NOTE.contains("红圈"), "{}", REFERENCE_NOTE);
+    }
+
+    #[test]
+    fn encode_reference_jpeg_rejects_missing_file() {
+        assert!(encode_reference_jpeg("C:/no/such/file.jpg").is_err());
     }
 }

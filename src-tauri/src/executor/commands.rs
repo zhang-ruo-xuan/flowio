@@ -166,26 +166,34 @@ const BEFORE_DRIFT_THRESHOLD: f32 = 0.20;
 /// 对不上说明环境已经漂移（对话框没弹出来 / 打开的是另一份文档），这时候再按
 /// 录制坐标点下去必然错，不如直接问 AI。
 /// 不进 [`ReplayAction`] 的原因同 `load_step_intents`：会炸掉十几处测试字面量。
-fn load_step_before_shots(
+/// 返回 `(before_path, annotated_path)`：
+/// - `before` 做事前对账的基准（干净画面，无红圈）；
+/// - `annotated` 给 AI 当参照图（带红圈，红圈就是当时点的位置）。
+fn load_step_shots(
     conn: &rusqlite::Connection,
     recording_id: &str,
-) -> std::collections::HashMap<i32, String> {
+) -> std::collections::HashMap<i32, (String, String)> {
     let mut map = std::collections::HashMap::new();
     let rows = conn
         .prepare(
-            "SELECT step_number, COALESCE(before_screenshot_path,'') \
+            "SELECT step_number, COALESCE(before_screenshot_path,''), \
+                    COALESCE(screenshot_path,'') \
              FROM steps WHERE recording_id = ?1",
         )
         .and_then(|mut stmt| {
             stmt.query_map(rusqlite::params![recording_id], |r| {
-                Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, i32>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         })
         .unwrap_or_default();
-    for (n, p) in rows {
-        if !p.trim().is_empty() {
-            map.insert(n, p);
+    for (n, before, annotated) in rows {
+        if !before.trim().is_empty() || !annotated.trim().is_empty() {
+            map.insert(n, (before, annotated));
         }
     }
     map
@@ -210,6 +218,7 @@ fn ai_ask(
     cfg: &crate::ai::types::AiConfig,
     action: &ReplayAction,
     intents: &std::collections::HashMap<i32, String>,
+    shots: &std::collections::HashMap<i32, (String, String)>,
     prev: String,
     next: String,
     reason: &str,
@@ -220,6 +229,10 @@ fn ai_ask(
     ));
     let (rx, ry) = delta_reference(action);
     let intent = step_intent(action, intents);
+    let action_ref = shots
+        .get(&action.step_number)
+        .map(|(_, annotated)| annotated.clone())
+        .unwrap_or_default();
     let ctx = crate::executor::ai_fallback::FallbackContext {
         step_number: action.step_number,
         action_type: &action.action_type,
@@ -233,6 +246,8 @@ fn ai_ask(
         prev_intent: &prev,
         next_intent: &next,
         reason,
+        // 录制时那一帧（带红圈）：让模型做视觉比对，而不是靠语义标题瞎猜
+        reference_path: Some(action_ref.as_str()),
         // 真实喂图尺寸在 resolve_via_ai 内部覆盖，这里只给占位
         img_w: 0,
         img_h: 0,
@@ -555,13 +570,13 @@ pub fn execute_recording(
         let (ai_cfg, ai_intents, ai_before_shots): (
             Option<crate::ai::types::AiConfig>,
             std::collections::HashMap<i32, String>,
-            std::collections::HashMap<i32, String>,
+            std::collections::HashMap<i32, (String, String)>,
         ) = if ai_enabled {
             let conn = db.0.lock().map_err(|e| e.to_string())?;
             (
                 Some(crate::ai::commands::resolve_ai_config(&conn)),
                 load_step_intents(&conn, &recording_id),
-                load_step_before_shots(&conn, &recording_id),
+                load_step_shots(&conn, &recording_id),
             )
         } else {
             (
@@ -657,7 +672,9 @@ pub fn execute_recording(
                 let drift = if focus_ok {
                     ai_before_shots
                         .get(&action.step_number)
-                        .and_then(|p| verify_step(&Some(p.clone())))
+                        .map(|(before, _)| before.clone())
+                        .filter(|p| !p.trim().is_empty())
+                        .and_then(|p| verify_step(&Some(p)))
                 } else {
                     None
                 };
@@ -688,7 +705,7 @@ pub fn execute_recording(
                     match ai_cfg
                         .as_ref()
                         .ok_or_else(|| "AI 配置缺失".to_string())
-                        .and_then(|cfg| ai_ask(cfg, action, &ai_intents, prev, next, reason))
+                        .and_then(|cfg| ai_ask(cfg, action, &ai_intents, &ai_before_shots, prev, next, reason))
                     {
                         Ok(p) => {
                             crate::executor::backend::replay_log(&format!(
@@ -838,6 +855,7 @@ pub fn execute_recording(
                             cfg,
                             action,
                             &ai_intents,
+                            &ai_before_shots,
                             prev,
                             next,
                             if verify_failed { "verify-failed" } else { "focus-failed" },
