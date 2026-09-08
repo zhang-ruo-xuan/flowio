@@ -32,6 +32,9 @@ pub trait ReplayBackend {
     /// 菜单窗口是全局可查的（与「focus 是否成功」无关），用其当前矩形 × (fx, fy)
     /// 反算落点；菜单未出现则用录制绝对坐标回退。
     fn click_menu_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32);
+    /// 拖拽 + 控件锚点：按下点按锚点反算，松开点按「同样的平移量」补偿后下发。
+    /// 只有起点被锚点校正、终点不动会导致拖出来的选区被整体拉偏。
+    fn drag_anchored(&self, anchor_json: &str, fx: i32, fy: i32, tx: i32, ty: i32);
 }
 
 // ── 测试后端：只记录动作，不碰真实桌面 ──────────────────────
@@ -99,6 +102,12 @@ impl ReplayBackend for DryRunBackend {
         self.actions.lock().unwrap().push(format!(
             "click_menu_anchored({},{},{})",
             fallback_x, fallback_y, anchor_json
+        ));
+    }
+    fn drag_anchored(&self, anchor_json: &str, fx: i32, fy: i32, tx: i32, ty: i32) {
+        self.actions.lock().unwrap().push(format!(
+            "drag_anchored({},{}->{},{},{})",
+            fx, fy, tx, ty, anchor_json
         ));
     }
 }
@@ -1054,6 +1063,51 @@ impl ReplayBackend for WindowsBackend {
                 self.click(fallback_x, fallback_y);
             }
         }
+    }
+    fn drag_anchored(&self, anchor_json: &str, fx: i32, fy: i32, tx: i32, ty: i32) {
+        let anchor = match ControlAnchor::from_str(anchor_json) {
+            Some(a) if !a.is_empty() => a,
+            _ => {
+                replay_log(&format!(
+                    "[anchor] 空/无效锚点(拖拽) -> 用录制起止点 ({},{})->({},{})",
+                    fx, fy, tx, ty
+                ));
+                self.drag(fx, fy, tx, ty);
+                return;
+            }
+        };
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            self.drag(fx, fy, tx, ty);
+            return;
+        }
+        // 起点按锚点反算（录制端锚点就是在按下点抓的，故 hint 传录制起点）。
+        let (sx, sy) = locate_click_with_hint(&anchor, hwnd, Some(fx), Some(fy))
+            .unwrap_or((fx, fy));
+        let (sx, sy) = if anchor.name.is_empty() {
+            (sx, sy)
+        } else {
+            crate::uia::locate_by_name(
+                hwnd,
+                &anchor.name,
+                anchor.nfx,
+                anchor.nfy,
+                Some(fx),
+                Some(fy),
+                sx,
+                sy,
+            )
+            .unwrap_or((sx, sy))
+        };
+        // 终点同步补偿起点被锚点挪动的量，否则「起点准了、终点没动」→ 选区被拉偏。
+        let (dx, dy) = (sx - fx, sy - fy);
+        let (ex, ey) = (tx + dx, ty + dy);
+        dismiss_occluding_overlay(sx, sy, hwnd);
+        replay_log(&format!(
+            "[drag] 录制 ({},{})->({},{})；锚点校正 Δ({},{}) -> 实际 ({},{})->({},{})",
+            fx, fy, tx, ty, dx, dy, sx, sy, ex, ey
+        ));
+        self.drag(sx, sy, ex, ey);
     }
     fn right_click(&self, x: i32, y: i32) {
         right_click(x, y);

@@ -33,6 +33,16 @@ pub struct StepSave {
     /// 鼠标按键（"left" / "right"；空 = left）。右键步骤重放下发右键。
     #[serde(default)]
     pub mouse_button: String,
+    /// 拖拽按下点/松开点（仅 drag 步骤有值；None = 旧数据或无拖拽）。
+    /// x/y 是裁图框中心（编辑器裁切用），真拖拽必须靠这四个点。
+    #[serde(default)]
+    pub start_x: Option<i32>,
+    #[serde(default)]
+    pub start_y: Option<i32>,
+    #[serde(default)]
+    pub end_x: Option<i32>,
+    #[serde(default)]
+    pub end_y: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,8 +71,9 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
         let step_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = conn.execute(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, \
-             title, description, tip, screenshot_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, hotkey_combo, uia_anchor, mouse_button) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+             title, description, tip, screenshot_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, hotkey_combo, uia_anchor, mouse_button, \
+             start_x, start_y, end_x, end_y) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 step_id,
                 recording.id,
@@ -84,6 +95,10 @@ pub fn save_recording_to_db(conn: &Connection, recording: &RecordingSave) -> Res
                 step.hotkey_combo,
                 step.uia_anchor,
                 step.mouse_button,
+                step.start_x,
+                step.start_y,
+                step.end_x,
+                step.end_y,
             ],
         ) {
             let _ = conn.execute("ROLLBACK", []);
@@ -334,6 +349,15 @@ pub fn init_db(conn: &Connection) {
     let _ = conn.execute_batch(
         "ALTER TABLE steps ADD COLUMN mouse_button TEXT NOT NULL DEFAULT ''",
     );
+
+    // ── Migrations: 拖拽起止点（真·拖拽重放，Stage 2b 补齐）──
+    // drag 步骤此前只落了「裁图框中心」到 x/y（编辑器裁切要用），按下点与松开点
+    // 在生成步骤时就丢了 → 重放只能降级为一次 click，选不中区域（用户报「不能拖拽」）。
+    // 这里补 start_*/end_* 四点；旧库/存量步骤为 NULL，重放端按「无终点 → 维持
+    // 旧降级 click」处理，天然兼容。注意 x/y 语义保持不变（仍是裁图框中心）。
+    for col in &["start_x", "start_y", "end_x", "end_y"] {
+        let _ = conn.execute_batch(&format!("ALTER TABLE steps ADD COLUMN {} INTEGER", col));
+    }
 }
 
 /// 读取译文本来的 JSON 字符串（旧库/未翻译 → None；必须 Option 读，NULL 安全）。
@@ -409,6 +433,7 @@ mod db_tests {
 
     fn step(order: i32, num: i32, opt: bool) -> StepSave {
         StepSave {
+            start_x: None, start_y: None, end_x: None, end_y: None,
             order_index: order,
             step_number: num,
             title: format!("Step {}", num),

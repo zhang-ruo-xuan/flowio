@@ -459,8 +459,8 @@ pub fn execute_recording(
             }
 
             if status != "step-panic" {
-                if action.action_type == "drag" {
-                    note = "drag 降级为 click：源 DB 未存拖拽终点，Stage 2b 补齐".into();
+                if action.action_type == "drag" && action.end_x.is_none() {
+                    note = "drag 降级为 click：该步无拖拽终点（旧录制）；重新录制后为真拖拽".into();
                 }
 
                 // 校验门：执行后截图 vs 预期
@@ -756,27 +756,34 @@ mod tests {
 
     #[test]
     fn describe_target_variants() {
-        let click = ReplayAction { step_number: 1, action_type: "click".into(), x: Some(10), y: Some(20), window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() };
+        let click = ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None, step_number: 1, action_type: "click".into(), x: Some(10), y: Some(20), window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() };
         assert_eq!(describe_target(&click), "坐标 (10, 20)");
 
-        let anchor = ReplayAction { step_number: 2, action_type: "click".into(), x: Some(1), y: Some(2), window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: Some("{\"cls\":\"Button\",\"fx\":0.5,\"fy\":0.5,\"wx\":0.3,\"wy\":0.2}".into()), mouse_button: String::new() };
+        let anchor = ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None, step_number: 2, action_type: "click".into(), x: Some(1), y: Some(2), window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: Some("{\"cls\":\"Button\",\"fx\":0.5,\"fy\":0.5,\"wx\":0.3,\"wy\":0.2}".into()), mouse_button: String::new() };
         assert!(describe_target(&anchor).contains("Button"), "got: {}", describe_target(&anchor));
 
-        let copy = ReplayAction { step_number: 3, action_type: "copy".into(), x: None, y: None, window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: Some("Ctrl+C".into()), uia_anchor: None, mouse_button: String::new() };
+        let copy = ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None, step_number: 3, action_type: "copy".into(), x: None, y: None, window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: Some("Ctrl+C".into()), uia_anchor: None, mouse_button: String::new() };
         assert_eq!(describe_target(&copy), "复制（剪贴板）");
 
-        let hk = ReplayAction { step_number: 4, action_type: "hotkey".into(), x: None, y: None, window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: Some("Ctrl+S".into()), uia_anchor: None, mouse_button: String::new() };
+        let hk = ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None, step_number: 4, action_type: "hotkey".into(), x: None, y: None, window_title: "WPS".into(), text: None, after_screenshot: None, hotkey_combo: Some("Ctrl+S".into()), uia_anchor: None, mouse_button: String::new() };
         assert_eq!(describe_target(&hk), "组合键 Ctrl+S");
 
-        let ty = ReplayAction { step_number: 5, action_type: "type".into(), x: None, y: None, window_title: "WPS".into(), text: Some("hi".into()), after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() };
+        let ty = ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None, step_number: 5, action_type: "type".into(), x: None, y: None, window_title: "WPS".into(), text: Some("hi".into()), after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() };
         assert_eq!(describe_target(&ty), "输入文本");
     }
 
     #[test]
     fn primary_target_app_picks_first_nonempty() {
         let plan: Vec<ReplayAction> = vec![
-            ReplayAction { step_number: 1, action_type: "click".into(), x: Some(1), y: Some(1), window_title: "".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() },
-            ReplayAction { step_number: 2, action_type: "type".into(), x: None, y: None, window_title: "WPS 文档".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() },
+            ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None, step_number: 1, action_type: "click".into(), x: Some(1), y: Some(1), window_title: "".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() },
+            ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None, step_number: 2, action_type: "type".into(), x: None, y: None, window_title: "WPS 文档".into(), text: None, after_screenshot: None, hotkey_combo: None, uia_anchor: None, mouse_button: String::new() },
         ];
         assert_eq!(primary_target_app(&plan), "WPS 文档");
     }

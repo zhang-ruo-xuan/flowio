@@ -120,6 +120,7 @@ mod state_tests {
 
     fn make_step() -> StepData {
         StepData {
+            start_x: None, start_y: None, end_x: None, end_y: None,
             id: "s1".into(),
             order_index: 0,
             step_number: 1,

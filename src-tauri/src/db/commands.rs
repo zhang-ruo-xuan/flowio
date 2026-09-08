@@ -534,6 +534,7 @@ mod tests {
 
     fn step(num: i32, with_after: bool) -> StepSave {
         StepSave {
+            start_x: None, start_y: None, end_x: None, end_y: None,
             order_index: num,
             step_number: num,
             title: format!("Step {}", num),

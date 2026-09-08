@@ -29,6 +29,11 @@ pub struct ReplayAction {
     /// 鼠标按键（"left"/"right"，空=left）。click 步为 "right" 时重放下发右键。
     /// 旧录制该列为空 → 按左键（旧行为）。
     pub mouse_button: String,
+    /// 拖拽按下点 / 松开点（仅 drag 步有值；None = 旧录制，降级为 click）。
+    pub start_x: Option<i32>,
+    pub start_y: Option<i32>,
+    pub end_x: Option<i32>,
+    pub end_y: Option<i32>,
 }
 
 /// 从源 DB 读取某录制的重放计划。
@@ -40,7 +45,8 @@ pub fn load_replay_plan(
 ) -> Result<Vec<ReplayAction>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button, title \
+            "SELECT step_number, action_type, x, y, window_title, description, after_screenshot_path, hotkey_combo, uia_anchor, mouse_button, title, \
+             start_x, start_y, end_x, end_y \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -77,6 +83,10 @@ pub fn load_replay_plan(
                     _ => None,
                 },
                 mouse_button,
+                start_x: row.get(11).unwrap_or(None).or_else(|| row.get(2).ok()),
+                start_y: row.get(12).unwrap_or(None).or_else(|| row.get(3).ok()),
+                end_x: row.get(13).unwrap_or(None),
+                end_y: row.get(14).unwrap_or(None),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -91,7 +101,9 @@ pub fn load_replay_plan(
 ///
 /// - 有坐标 → 先聚焦窗口再按动作类型派发；
 /// - 无坐标（x/y 为 None）→ 仅聚焦窗口（通常是"首点激活窗口"语义）；
-/// - click/drag → 鼠标点击（drag 当前降级为 click，终点缺失，Stage 2b 补）；
+/// - click → 鼠标点击（右键/双击按 mouse_button 派发）；
+/// - drag → 真拖拽（按下点→松开点，起点锚点校正、终点同步平移补偿）；
+///   旧录制无终点时降级为 click（兼容存量数据，不引入回归）；
 /// - type/input → 文本注入；
 /// - copy/paste → 按结构化组合键下发（如 Ctrl+C / Ctrl+V，不依赖 title 解析）；
 /// - hotkey → 按结构化组合键下发（如 Alt+Tab / Win+D）；
@@ -131,12 +143,11 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
         None
     };
     match action.action_type.as_str() {
-        // click/drag：优先按控件锚点（Stage 2b 分辨率无关）；无锚点回退录制坐标。
-        "click" | "drag" => {
-            // 右键/双击：桌面右键菜单、双击打开文件等链路依赖；仅对 click 步生效。
-            let is_right = action.action_type == "click" && action.mouse_button == "right";
-            let is_double =
-                action.action_type == "click" && action.mouse_button.ends_with("-double");
+        // click：优先按控件锚点（Stage 2b 分辨率无关）；无锚点回退录制坐标。
+        "click" => {
+            // 右键/双击：桌面右键菜单、双击打开文件等链路依赖。
+            let is_right = action.mouse_button == "right";
+            let is_double = action.mouse_button.ends_with("-double");
             // 菜单项点击（锚点 cls 指向右键/下拉菜单窗口）：菜单窗口全局可查，与 focus
             // 结果无关，也不能走 wx/wy 窗口级回退（录制时菜单窗口的 wx/wy 常为 1.0/1.0
             // 无效值）—— 必须等菜单弹出后按「菜单矩形 × fx/fy」反算，否则会在菜单出现
@@ -165,6 +176,32 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
                 backend.double_click(x, y);
             } else {
                 backend.click(x, y);
+            }
+        }
+        // drag：录制端已存下「按下点 → 松开点」（start_*/end_*），重放真拖拽；
+        // 旧录制没有终点（列加之前的存量数据）→ 维持旧的降级 click，不引入回归。
+        "drag" => {
+            match (action.end_x, action.end_y) {
+                (Some(tx), Some(ty)) => {
+                    let (sx, sy) = (
+                        action.start_x.unwrap_or(x),
+                        action.start_y.unwrap_or(y),
+                    );
+                    match anchor_json {
+                        Some(anchor) => backend.drag_anchored(anchor, sx, sy, tx, ty),
+                        None => backend.drag(sx, sy, tx, ty),
+                    }
+                }
+                _ => {
+                    crate::executor::backend::replay_log(&format!(
+                        "[drag] 该步无终点（旧录制）→ 降级为 click ({},{})",
+                        x, y
+                    ));
+                    match anchor_json {
+                        Some(anchor) => backend.click_anchored(anchor, x, y),
+                        None => backend.click(x, y),
+                    }
+                }
             }
         }
         "type" | "input" => backend.type_text(action.text.as_deref().unwrap_or("")),
@@ -261,6 +298,68 @@ mod tests {
         fn click_menu_anchored(&self, a: &str, x: i32, y: i32) {
             self.inner.click_menu_anchored(a, x, y);
         }
+        fn drag_anchored(&self, a: &str, fx: i32, fy: i32, tx: i32, ty: i32) {
+            self.inner.drag_anchored(a, fx, fy, tx, ty);
+        }
+    }
+
+    #[test]
+    fn drag_with_end_point_issues_real_drag() {
+        // 回归：drag 步骤此前只有「裁图框中心」一个坐标，重放被降级成 click，
+        // 永远选不中区域（用户报「不能拖拽」）。有 start_*/end_* 时必须真拖。
+        let backend = DryRunBackend::new();
+        let action = ReplayAction {
+            step_number: 1,
+            action_type: "drag".into(),
+            x: Some(500),
+            y: Some(400), // 裁图框中心（旧语义）
+            window_title: "WPS".into(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: None,
+            uia_anchor: None,
+            mouse_button: String::new(),
+            start_x: Some(300),
+            start_y: Some(300),
+            end_x: Some(900),
+            end_y: Some(500),
+        };
+        run_action(&action, &backend);
+        let acts = backend.actions.lock().unwrap();
+        assert!(
+            acts.iter().any(|a| a.starts_with("drag(300,300->900,500")),
+            "应按 drag 起止点下发真拖拽，实际: {:?}",
+            acts
+        );
+    }
+
+    #[test]
+    fn drag_without_end_point_falls_back_to_click() {
+        // 旧录制（列加之前）没有终点：维持降级 click，不引入回归。
+        let backend = DryRunBackend::new();
+        let action = ReplayAction {
+            step_number: 1,
+            action_type: "drag".into(),
+            x: Some(500),
+            y: Some(400),
+            window_title: "WPS".into(),
+            text: None,
+            after_screenshot: None,
+            hotkey_combo: None,
+            uia_anchor: None,
+            mouse_button: String::new(),
+            start_x: None,
+            start_y: None,
+            end_x: None,
+            end_y: None,
+        };
+        run_action(&action, &backend);
+        let acts = backend.actions.lock().unwrap();
+        assert!(
+            acts.iter().any(|a| a.starts_with("click(500,400")),
+            "无终点应降级为 click，实际: {:?}",
+            acts
+        );
     }
 
     #[test]
@@ -273,6 +372,7 @@ mod tests {
         };
         let anchor = r#"{"cls":"Microsoft.UI.Content.PopupWindowSiteBridge","fx":0.342,"fy":0.847,"wx":1.0,"wy":1.0}"#;
         let action = ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None,
             step_number: 2,
             action_type: "click".into(),
             x: Some(996),
@@ -303,6 +403,7 @@ mod tests {
         };
         let anchor = r#"{"cls":"SysListView32","fx":0.38,"fy":0.16,"wx":0.38,"wy":0.16}"#;
         let action = ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None,
             step_number: 1,
             action_type: "click".into(),
             x: Some(746),
@@ -348,7 +449,8 @@ mod tests {
                 id TEXT, recording_id TEXT, order_index INTEGER,
                 step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER,
                 window_title TEXT, description TEXT, after_screenshot_path TEXT,
-                hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT
+                hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT,
+                start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER
             )",
             [],
         )
@@ -405,12 +507,12 @@ mod tests {
     fn test_no_coord_step_only_focuses() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','','','')",
+            "INSERT INTO steps VALUES ('s0','rec1',0,1,'click',NULL,NULL,'记事本','',NULL,'','','','',NULL,NULL,NULL,NULL)",
             [],
         )
         .unwrap();
@@ -510,7 +612,7 @@ mod tests {
     fn test_right_click_step_dispatches_right_button() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER)",
             [],
         )
         .unwrap();
@@ -569,7 +671,7 @@ mod tests {
     fn test_double_click_step_dispatches_double_click() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER)",
             [],
         )
         .unwrap();
@@ -646,6 +748,7 @@ mod tests {
     #[test]
     fn test_plan_requires_approval() {
         let click = ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None,
             step_number: 1,
             action_type: "click".into(),
             x: Some(1),
@@ -662,6 +765,7 @@ mod tests {
 
         let mut mixed = plan_only_click;
         mixed.push(ReplayAction {
+            start_x: None, start_y: None, end_x: None, end_y: None,
             step_number: 2,
             action_type: "copy".into(),
             x: None,
@@ -695,7 +799,7 @@ mod tests {
     fn test_save_as_replay_sequence_locks_create_file_flow() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
-            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT)",
+            "CREATE TABLE steps (id TEXT, recording_id TEXT, order_index INTEGER, step_number INTEGER, action_type TEXT, x INTEGER, y INTEGER, window_title TEXT, description TEXT, after_screenshot_path TEXT, hotkey_combo TEXT, uia_anchor TEXT, mouse_button TEXT, title TEXT, start_x INTEGER, start_y INTEGER, end_x INTEGER, end_y INTEGER)",
             [],
         )
         .unwrap();

@@ -32,6 +32,19 @@ pub struct StepData {
     pub x: Option<i32>,
     /// Click / tap coordinate Y (screen pixels)
     pub y: Option<i32>,
+    /// 拖拽按下点 X（仅 drag 步骤有值）。x/y 存的是裁图框中心（编辑器裁切依赖），
+    /// 真正的按下/松开点在 start_* / end_*，重放据此下发真拖拽。
+    #[serde(default)]
+    pub start_x: Option<i32>,
+    /// 拖拽按下点 Y（仅 drag 步骤有值）
+    #[serde(default)]
+    pub start_y: Option<i32>,
+    /// 拖拽松开点 X（仅 drag 步骤有值）
+    #[serde(default)]
+    pub end_x: Option<i32>,
+    /// 拖拽松开点 Y（仅 drag 步骤有值）
+    #[serde(default)]
+    pub end_y: Option<i32>,
     /// Focused element rectangle width (screen pixels), for Scribe-style crop.
     #[serde(default)]
     pub crop_w: Option<i32>,
@@ -105,6 +118,7 @@ mod tests {
 
     fn step_data(id: &str, n: i32) -> StepData {
         StepData {
+            start_x: None, start_y: None, end_x: None, end_y: None,
             id: id.into(),
             order_index: n,
             step_number: n,
