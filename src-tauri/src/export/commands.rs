@@ -853,6 +853,40 @@ fn skill_slug_name(title: &str) -> String {
     }
 }
 
+/// 导出 skill 的**唯一**注册名（Agent Skills 1.0 要求 name 在注册表内唯一）。
+///
+/// 纯 `skill_slug_name` 对中文标题一律回退 `flowio-skill`，多个中文教程会互相覆盖——
+/// MCP / 注册表无法区分。这里在 slug 后拼一段**由 `recording.id` 派生的稳定短后缀**
+/// （仅 ASCII 字母数字，最长 8 位），保证同名不同教程也能共存，且仍满足
+/// `^[a-z0-9][a-z0-9-]{0,63}$`（slug 已合规，后缀只追加合法字符）。
+fn skill_unique_name(recording: &ExportRecording) -> String {
+    let base = skill_slug_name(&recording.title);
+    let clean: String = recording
+        .id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    // 取 id 末尾 8 位作为稳定后缀（短 id 则取全部）。
+    let suffix: String = clean
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let suffix = if suffix.is_empty() {
+        "skill".to_string()
+    } else {
+        suffix
+    };
+    if base == "flowio-skill" {
+        format!("flowio-skill-{}", suffix)
+    } else {
+        format!("{}-{}", base, suffix)
+    }
+}
+
 /// YAML 单行字符串转义：换行压成空格、双引号转义。
 fn yaml_oneline(s: &str) -> String {
     s.replace(['\r', '\n'], " ").replace('"', "\\\"")
@@ -1143,7 +1177,7 @@ fn export_skill_md(
     let variable_mode = !variables.is_empty();
 
     // ── frontmatter ──
-    let name = skill_slug_name(&recording.title);
+    let name = skill_unique_name(recording);
     let mut desc = format!(
         "在 {} 中「{}」的分步操作流程，共 {} 步。",
         if recording.app_name.is_empty() { "目标应用" } else { &recording.app_name },
@@ -1314,7 +1348,7 @@ fn export_skill_bundle(
         ordered.sort_by_key(|d| d.n);
         let q = skill_quality(machine);
         let payload = serde_json::json!({
-            "skill": skill_slug_name(&recording.title),
+            "skill": skill_unique_name(recording),
             "title": recording.title,
             "app": recording.app_name,
             "recorded_at": recording.created_at,
@@ -1370,7 +1404,7 @@ fn export_skill_bundle(
             .collect();
         let mut manifest = serde_json::json!({
             "schema": "flowio.skill.manifest/v1",
-            "name": skill_slug_name(&recording.title),
+            "name": skill_unique_name(recording),
             "title": recording.title,
             "description": format!("由「录步 Flowio」录制并导出的桌面操作教程：{}。", recording.title),
             "version": "1.0.0",
@@ -2298,7 +2332,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).expect("skill.json must be valid JSON");
 
         assert_eq!(v["schema"].as_str(), Some("flowio.skill.manifest/v1"));
-        assert_eq!(v["name"].as_str(), Some("xlookup-step-by-step"));
+        // name 现在是 slug + recording-id 后缀（保证注册唯一，避免中文标题都回退 flowio-skill）
+        let name = v["name"].as_str().expect("name should be a string");
+        assert!(
+            name.starts_with("xlookup-step-by-step-"),
+            "name should keep slug prefix, got {}",
+            name
+        );
+        assert!(
+            name.ends_with("r1"),
+            "name should carry recording-id suffix (recording id = r1), got {}",
+            name
+        );
         assert_eq!(v["files"]["skill"].as_str(), Some("SKILL.md"));
         assert_eq!(v["files"]["steps"].as_str(), Some("steps.json"));
         assert_eq!(v["files"]["screenshots"].as_str(), Some("screenshots/"));
@@ -2896,6 +2941,45 @@ mod tests {
         assert_eq!(skill_slug_name("Monthly Report 2026!"), "monthly-report-2026");
         assert_eq!(skill_slug_name("纯中文标题"), "flowio-skill");
         assert_eq!(skill_slug_name(""), "flowio-skill");
+    }
+
+    /// 注册名必须**唯一**：多个中文标题教程若都叫 `flowio-skill`，MCP / 注册表会互相覆盖。
+    /// 修正：slug 后拼 recording-id 派生的稳定短后缀，同名不同教程也能共存。
+    #[test]
+    fn skill_unique_name_is_unique_per_recording() {
+        fn rec(id: &str, title: &str) -> ExportRecording {
+            ExportRecording {
+                id: id.into(),
+                title: title.into(),
+                app_name: String::new(),
+                total_steps: 1,
+                created_at: String::new(),
+            }
+        }
+        let chinese_a = rec("rec-001", "测试教程");
+        let chinese_b = rec("rec-002", "测试教程"); // 同标题不同 id
+        let ascii = rec("rec-003", "XLOOKUP tutorial");
+
+        let n1 = skill_unique_name(&chinese_a);
+        let n2 = skill_unique_name(&chinese_b);
+        let n3 = skill_unique_name(&ascii);
+
+        assert_ne!(n1, n2, "同中文标题、不同 recording 必须不重名");
+        assert!(
+            n1.starts_with("flowio-skill-"),
+            "中文标题 → flowio-skill-<后缀>，got {}",
+            n1
+        );
+        assert!(
+            n3.starts_with("xlookup-tutorial-"),
+            "ASCII 标题保留 slug 前缀，got {}",
+            n3
+        );
+        // 仍满足 Agent Skills 1.0 name 合法字符集 / 长度
+        assert!(n1.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(!n1.starts_with('-') && n1.len() <= 64, "name 非法：{}", n1);
+        // 同 recording 多次导出 → 名字稳定（注册表幂等）
+        assert_eq!(skill_unique_name(&chinese_a), n1);
     }
 
     // ── SKILL 机器可执行数据 ───────────────────────────────────
