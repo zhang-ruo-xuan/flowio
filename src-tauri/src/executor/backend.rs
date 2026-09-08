@@ -225,6 +225,18 @@ fn foreground_title() -> String {
 /// 仅在重放时写入，频率 = 每步一次（非录制期每按键），且只在执行真实桌面动作时触发，开销可忽略。
 pub(crate) fn replay_log(line: &str) {
     use std::io::Write;
+    // cargo test 会真实执行 run_action/focus 路径；若写死生产路径，假日志会污染
+    // D:\录步\flowio_replay.log，干扰「读日志定位重放问题」的远程诊断闭环。
+    // 测试环境（cargo test 注入）改为写到临时目录。
+    if std::env::var("FLOWIO_TEST_MODE").is_ok() || cfg!(test) {
+        let tmp = std::env::temp_dir().join("flowio_replay_test.log");
+        if let Ok(mut f) =
+            std::fs::OpenOptions::new().create(true).append(true).open(&tmp)
+        {
+            let _ = writeln!(f, "{}", line);
+        }
+        return;
+    }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
