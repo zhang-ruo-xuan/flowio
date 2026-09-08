@@ -290,6 +290,16 @@ pub fn execute_recording(
     // ── 正常重放（与 Stage 2a/2b 逻辑一致）──
     let total = plan.len();
     let mut outcomes = Vec::with_capacity(total);
+    /// 落点被锚点修正的步骤（执行摘要用，见文件末尾 [summary] 日志）。
+    struct DeltaRow {
+        step: i32,
+        rx: i32,
+        ry: i32,
+        ax: i32,
+        ay: i32,
+        d: i32,
+    }
+    let mut deltas: Vec<DeltaRow> = Vec::new();
 
     if dry_run {
         let backend = DryRunBackend::new();
@@ -471,6 +481,25 @@ pub fn execute_recording(
                 }
             }
 
+            // ── 落点偏差采集：录制坐标 vs 锚点反算后的真实落点 ──
+            // 锚点每一代演进都在「改这里」，但用户看到的现象只会是「点偏了」。
+            // 攒一份清单，让执行末尾一行日志说清「哪几步被挪了、挪了多少」。
+            if let (Some(rx), Some(ry)) = (action.x, action.y) {
+                if let Some((ax, ay)) = crate::executor::backend::take_point() {
+                    let d = (((ax - rx).pow(2) + (ay - ry).pow(2)) as f64).sqrt();
+                    if d >= 24.0 {
+                        deltas.push(DeltaRow {
+                            step: action.step_number,
+                            rx,
+                            ry,
+                            ax,
+                            ay,
+                            d: d.round() as i32,
+                        });
+                    }
+                }
+            }
+
             outcomes.push(StepOutcome {
                 step_number: action.step_number,
                 action_type: action.action_type.clone(),
@@ -515,6 +544,34 @@ pub fn execute_recording(
         // 防止中途修正被资源管理器后续确认覆盖。
         if let Some(expected) = pending_rename.as_deref() {
             crate::executor::backend::fix_double_extension(expected);
+        }
+
+        // ── 执行摘要：一次看清锚点把哪些步挪了多少 ──
+        // 目的是把「点偏了」这类靠肉眼/翻长日志才能定位的问题，压缩成一行结论。
+        if deltas.is_empty() {
+            crate::executor::backend::replay_log(
+                "[summary] 落点与录制坐标全部一致（锚点未做修正）",
+            );
+        } else {
+            let mut rows = deltas;
+            rows.sort_by(|a, b| b.d.cmp(&a.d));
+            let worst = &rows[0];
+            let list: Vec<String> = rows
+                .iter()
+                .take(8)
+                .map(|r| format!("#{} Δx{:+} Δy{:+}", r.step, r.ax - r.rx, r.ay - r.ry))
+                .collect();
+            crate::executor::backend::replay_log(&format!(
+                "[summary] 锚点修正 {} 步；最大 {}px（第 {} 步 录制({},{}) → 落点({},{})）；明细 {}",
+                rows.len(),
+                worst.d,
+                worst.step,
+                worst.rx,
+                worst.ry,
+                worst.ax,
+                worst.ay,
+                list.join(" ")
+            ));
         }
     }
 

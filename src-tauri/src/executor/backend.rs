@@ -731,7 +731,23 @@ fn focus_window(title: &str) -> bool {
     ok
 }
 
+/// 最近一次真实落点（供执行摘要统计「录制坐标 → 实际落点」偏差）。
+static LAST_POINT: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+/// 记录一次真实落点（click/drag 调用）。
+fn note_point(x: i32, y: i32) {
+    if let Ok(mut g) = LAST_POINT.lock() {
+        *g = Some((x, y));
+    }
+}
+
+/// 取走最近一次落点（take 语义，避免跨步骤串味）。
+pub fn take_point() -> Option<(i32, i32)> {
+    LAST_POINT.lock().ok().and_then(|mut g| g.take())
+}
+
 fn click(x: i32, y: i32) {
+    note_point(x, y);
     unsafe {
         let _ = SetCursorPos(x, y);
         std::thread::sleep(Duration::from_millis(10));
@@ -796,6 +812,7 @@ fn double_click(x: i32, y: i32) {
 }
 
 fn drag(x1: i32, y1: i32, x2: i32, y2: i32) {
+    note_point(x1, y1);
     unsafe {
         let _ = SetCursorPos(x1, y1);
         mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
