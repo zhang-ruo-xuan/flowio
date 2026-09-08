@@ -232,6 +232,11 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
                     retry
                 ));
             }
+            // 重放输入模式：replace = 先 Ctrl+A 全选清空再输入（防旧内容串味）；
+            // 缺省 append（保持原行为，零回归）。由 settings.replay_type_mode 控制。
+            if crate::db::get_setting("replay_type_mode").as_deref() == Some("replace") {
+                backend.press_combo("Ctrl+A");
+            }
             backend.type_text(action.text.as_deref().unwrap_or(""));
         }
         // copy/paste 是语义化的组合键步骤：直接下发对应组合键

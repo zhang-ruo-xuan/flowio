@@ -227,8 +227,8 @@ pub fn save_recording(
             == 1
     };
 
-    // 录制后自动 AI 补写：后台、非阻塞、失败静默。默认开启，
-    // 可在 settings 表写入 `ai_auto_enhance = "false"` 关闭。
+    // 录制后自动 AI 补写：后台、非阻塞、失败静默。缺省关闭（opt-in），
+    // 需在 settings 表写入 `ai_auto_enhance = "true"` 才开启（用户决定主要做自动化、AI 生成暂不需要）。
     if ai_auto_enhance_enabled(&db) && !already_enhanced {
         let rid = recording.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -242,11 +242,11 @@ pub fn save_recording(
 }
 
 /// 录制后是否自动跑 AI 补写（生成语义化标题/描述）。
-/// settings 表 `ai_auto_enhance` 为 "false"/"0" 时关闭，缺省默认开启。
+/// settings 表 `ai_auto_enhance` 为 "true"/"1" 时开启，缺省默认关闭（opt-in）。
 fn ai_auto_enhance_enabled(db: &State<DbState>) -> bool {
     let conn = match db.0.lock() {
         Ok(c) => c,
-        Err(_) => return true, // 锁异常时默认开启，不阻断保存
+        Err(_) => return false, // 锁异常时默认关闭，不阻断保存
     };
     conn.query_row(
         "SELECT value FROM settings WHERE key = 'ai_auto_enhance'",
@@ -259,7 +259,7 @@ fn ai_auto_enhance_enabled(db: &State<DbState>) -> bool {
         "true" | "1" => Some(true),
         _ => None,
     })
-    .unwrap_or(true)
+    .unwrap_or(false)
 }
 
 /// 根据基础标题生成一个在 recordings 表中不重复的标题。

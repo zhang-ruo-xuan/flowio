@@ -410,6 +410,19 @@ pub fn set_db_path(path: PathBuf) {
     let _ = DB_PATH_OVERRIDE.set(path);
 }
 
+/// 读取 settings 表某个 key 的 value；无 DB 路径注入 / 无该 key / 查询失败均返回 None。
+/// 用于重放派发层（无 State 句柄）读取用户设置（如 `replay_type_mode`）。
+pub fn get_setting(key: &str) -> Option<String> {
+    let path = DB_PATH_OVERRIDE.get()?;
+    let conn = Connection::open(path).ok()?;
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
 /// Open (or create) the database file and run migrations.
 pub fn init_db_file() -> Connection {
     let conn = match DB_PATH_OVERRIDE.get() {
