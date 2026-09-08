@@ -4,6 +4,7 @@
 //! 用 Win32 确定性重放，每步后截图校验。相较 Stage 1 的通用 SKILL.md 导出
 //! （无坐标、靠视觉语义定位、不精准），这里是壁垒的第一层。
 
+pub mod ai_fallback;
 pub mod backend;
 pub mod commands;
 pub mod replay;

@@ -438,6 +438,18 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     drag: "拖拽", key: "按键", scroll: "滚动", select: "选择", nav: "导航",
     screenshot: "截图", other: "其它",
   };
+  // Stage 4：AI 兜底开关——确定性重放没打中时，让视觉模型判断「现在该点哪里」。
+  // 默认关闭（不联网、零成本、零延迟），用户显式勾选后才启用，并按本地偏好记住。
+  const [aiFallback, setAiFallback] = useState<boolean>(() => {
+    try { return localStorage.getItem("flowio.aiFallback") === "1"; } catch { return false; }
+  });
+  const toggleAiFallback = useCallback(() => {
+    setAiFallback((v) => {
+      const next = !v;
+      try { localStorage.setItem("flowio.aiFallback", next ? "1" : "0"); } catch { /* 忽略 */ }
+      return next;
+    });
+  }, []);
   // Stage 3：执行审计历史面板（get_replay_audit）
   const [showAudit, setShowAudit] = useState(false);
   const [auditLoading, setAuditLoading] = useState(false);
@@ -1743,12 +1755,14 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         await new Promise((r) => setTimeout(r, 300));
         const report = await invoke<any>("execute_recording", {
           recordingId, dryRun: false, stepDelayMs: 300, approvalMode, approved: true,
+          aiFallback,
         });
+        const rescued = (report.outcomes || []).filter((o: any) => o.status === "ai-recovered").length;
         const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
         const panics = (report.outcomes || []).filter((o: any) => o.status === "step-panic").length;
         setToast({
           type: fails > 0 || panics > 0 ? "error" : "success",
-          message: `执行完成：${report.total} 步，校验异常 ${fails} 步${panics > 0 ? `，异常步 ${panics} 步` : ""}`,
+          message: `执行完成：${report.total} 步，校验异常 ${fails} 步${rescued > 0 ? `，AI 兜底救回 ${rescued} 步` : ""}${panics > 0 ? `，异常步 ${panics} 步` : ""}`,
         });
       } catch (err) {
         setToast({ type: "error", message: `执行失败：${String(err)}` });
@@ -1758,7 +1772,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         try { await win.setFocus(); } catch { /* 忽略 */ }
       }
     },
-    [recordingId]
+    [recordingId, aiFallback]
   );
 
   const handleExecute = useCallback(
@@ -2922,6 +2936,19 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                 演练
               </button>
             </div>
+            <label
+              onMouseDown={(e) => e.stopPropagation()}
+              data-tip={"AI 兜底（Stage 4）\n默认关闭。勾选后，若某一步按录制坐标没打中（目标窗口没起来 / 画面与录制时不一致），\n会截一张当前屏幕连同该步意图问视觉模型「现在该点哪里」，拿到坐标重发一次。\n单轮最多 3 次，失败静默、不改变其余步骤行为"}
+              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: aiFallback ? "#3fb950" : "#9da7b3", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
+            >
+              <input
+                type="checkbox"
+                checked={aiFallback}
+                onChange={toggleAiFallback}
+                style={{ width: 12, height: 12, margin: 0, cursor: "pointer", accentColor: "#3fb950" }}
+              />
+              AI 兜底
+            </label>
             <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
               <button
                 onClick={() => { setShowAudit(true); loadAudit(); }}

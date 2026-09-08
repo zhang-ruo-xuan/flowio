@@ -10,7 +10,8 @@ use std::time::Duration;
 /// 单步重放动作（从源 DB 映射而来，已含坐标锚点）
 #[derive(Debug, Clone)]
 pub struct ReplayAction {
-        pub scroll_delta: Option<i32>,
+    /// 滚轮：delta 正=向上，负=向下（单位为 WHEEL_DELTA 倍数，一格通常 120）。
+    pub scroll_delta: Option<i32>,
     pub step_number: i32,
     pub action_type: String,
     /// 屏幕坐标锚点；None 表示该步录制时未落坐标（如窗口聚焦前的首点）

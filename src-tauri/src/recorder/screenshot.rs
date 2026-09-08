@@ -304,6 +304,50 @@ pub fn capture_fullscreen() -> Result<DynamicImage, String> {
     capture_fullscreen_with_origin().map(|(img, _, _)| img)
 }
 
+/// 带几何信息的全屏截图：除图像与虚拟屏幕原点外，还返回该显示器在
+/// **逻辑像素**下的宽度（`logical_w`）。
+///
+/// # 为什么必须返回逻辑宽度
+/// xcap 的 `Monitor::width()` 取 `dmPelsWidth`，是**物理像素**；而
+/// `SetCursorPos` / `GetCursorPos` 用的是**逻辑像素**。缩放下（如 125%）
+/// 截图宽 2400px 却只对应 1920 逻辑像素，若按 1:1 换算会把 AI 给的坐标
+/// 放大 25%——这正是「点偏了」最难查的一类根因。
+///
+/// 这里不直接返回 `scale_factor()`（DPI 虚拟化时它会退化为 1.0，而真实
+/// 位图可能仍是逻辑尺寸），而是给出逻辑宽度，让调用方按
+/// `unit = logical_w / out_img_w` 换算。无论位图是物理尺寸还是被系统虚拟化
+/// 成逻辑尺寸，`unit` 都能自动得到正确结果（自校正）。
+pub fn capture_fullscreen_geometry() -> Result<(DynamicImage, i32, i32, f32), String> {
+    let monitors =
+        xcap::Monitor::all().map_err(|e| format!("xcap: failed to enumerate monitors: {}", e))?;
+    if monitors.is_empty() {
+        return Err("xcap: no monitor found".to_string());
+    }
+    let (cx, cy) = get_cursor_pos().unwrap_or((0, 0));
+    let monitor = monitors
+        .iter()
+        .find(|m| {
+            let (mx, my) = (m.x(), m.y());
+            let (mw, mh) = (m.width() as i32, m.height() as i32);
+            cx >= mx && cx < mx + mw && cy >= my && cy < my + mh
+        })
+        .or_else(|| monitors.iter().find(|m| m.is_primary()))
+        .unwrap_or(&monitors[0]);
+    let (ox, oy) = (monitor.x(), monitor.y());
+    let img = monitor
+        .capture_image()
+        .map_err(|e| format!("xcap: failed to capture image: {}", e))?;
+    let img = DynamicImage::ImageRgba8(img);
+    // 物理宽 / 缩放系数 = 逻辑宽。缩放系数不可信（≤0 / 异常）时按位图宽度兜底。
+    let sf = monitor.scale_factor();
+    let logical_w = if sf > 0.01 {
+        (monitor.width() as f32 / sf).max(1.0)
+    } else {
+        img.width() as f32
+    };
+    Ok((img, ox, oy, logical_w))
+}
+
 /// Crop the top of an image to remove Flowio's own recording status bar.
 ///
 /// The REC bar has a dark background (#24292e-ish) with red text (R>180, G<80, B<80).

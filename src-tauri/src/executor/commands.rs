@@ -97,6 +97,59 @@ fn delta_reference(a: &ReplayAction) -> (Option<i32>, Option<i32>) {
     (a.x, a.y)
 }
 
+/// Stage 4：一次性读出每一步的「人话意图」（step_number → 意图文本）。
+///
+/// AI 兜底必须告诉视觉模型这一步**想干什么**：只有坐标时模型只能看到
+/// 「原本打算点这里」，却不知道要找什么，判断不出该改点哪里。
+/// 意图优先取步骤标题（如「点击 插入函数」），其次 description，都没有则留空。
+///
+/// 刻意不把 title/description 加进 [`ReplayAction`]：那会让十几处测试里的
+/// 结构体字面量全部编译失败（E0063），收益却只有「少查一次库」。
+fn load_step_intents(
+    conn: &rusqlite::Connection,
+    recording_id: &str,
+) -> std::collections::HashMap<i32, String> {
+    use rusqlite::params;
+    let mut map = std::collections::HashMap::new();
+    let rows = conn
+        .prepare(
+            "SELECT step_number, COALESCE(title,''), COALESCE(description,'') \
+             FROM steps WHERE recording_id = ?1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![recording_id], |r| {
+                Ok((
+                    r.get::<_, i32>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    for (n, title, desc) in rows {
+        let t = title.trim();
+        let d = desc.trim();
+        let intent = if !t.is_empty() {
+            t.to_string()
+        } else if !d.is_empty() {
+            d.chars().take(40).collect()
+        } else {
+            String::new()
+        };
+        map.insert(n, intent);
+    }
+    map
+}
+
+/// 取一步的意图文本；表里没有就退回动作类型（总比什么都不说强）。
+fn step_intent(a: &ReplayAction, intents: &std::collections::HashMap<i32, String>) -> String {
+    match intents.get(&a.step_number) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => a.action_type.clone(),
+    }
+}
+
 fn primary_target_app(plan: &[ReplayAction]) -> String {
     plan.iter()
         .filter_map(|a| {
@@ -239,6 +292,12 @@ fn map_audit_row(row: &rusqlite::Row) -> Result<AuditRecord, rusqlite::Error> {
 ///   返回 `overall_status="needs-approval"` 且**不下发任何桌面动作**。
 /// - `approved`：用户在预览 UI 点「批准」后传 true，解除闸门。
 ///
+/// Stage 4 扩展：`ai_fallback` —— AI 视觉兜底，**默认关闭**（不传/传 false）。
+/// 开启后，确定性重放判定某步没打中（目标窗口没聚焦上 / 截图校验失败）时，抓当前
+/// 屏幕连同该步意图问视觉模型「现在该点哪里」，拿到坐标重发一次；单轮最多
+/// [`crate::executor::ai_fallback::MAX_CALLS_PER_RUN`] 次。模型不可用/解析失败
+/// 一律静默，行为等同未开启。
+///
 /// 已知边界（MVP）：同机同分辨率；drag 降级为 click（端点未存）；
 /// 无坐标步仅聚焦窗口。详见 executor-stage2a-trae-brief.md。
 #[tauri::command]
@@ -250,8 +309,10 @@ pub fn execute_recording(
     step_delay_ms: Option<u64>,
     approval_mode: Option<String>,
     approved: Option<bool>,
+    ai_fallback: Option<bool>,
 ) -> Result<ExecReport, String> {
     let delay = step_delay_ms.unwrap_or(300);
+    let ai_enabled = ai_fallback.unwrap_or(false);
     let run_id = Uuid::new_v4().to_string();
     let started_at = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -398,6 +459,33 @@ pub fn execute_recording(
             }
         }
 
+        // ── Stage 4：AI 兜底准备 ──
+        // 只在开启时解析一次 AI 配置（走「用户自配 → 内置免费通道」的既定优先级），
+        // 后续每步复用，避免反复查库。
+        let (ai_cfg, ai_intents): (
+            Option<crate::ai::types::AiConfig>,
+            std::collections::HashMap<i32, String>,
+        ) = if ai_enabled {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            (
+                Some(crate::ai::commands::resolve_ai_config(&conn)),
+                load_step_intents(&conn, &recording_id),
+            )
+        } else {
+            (None, std::collections::HashMap::new())
+        };
+        let mut ai_budget = if ai_enabled {
+            crate::executor::ai_fallback::MAX_CALLS_PER_RUN
+        } else {
+            0
+        };
+        if ai_enabled {
+            crate::executor::backend::replay_log(&format!(
+                "[ai-fallback] 已开启：单轮最多 {} 次视觉兜底",
+                ai_budget
+            ));
+        }
+
         let backend = WindowsBackend;
         // 降频校验：长录制每 2~3 步抽验一次（末步必验），显著减少每步全屏截图次数，
         // 缓解"卡顿"；短录制仍逐步骤验，校验门功能不变。
@@ -471,6 +559,10 @@ pub fn execute_recording(
                 }
             }
 
+            // 聚焦结果必须在判定前取出（take 语义），否则会被下一步的聚焦覆盖。
+            let focus_failed = crate::executor::backend::take_focus_ok() == Some(false)
+                && !action.window_title.trim().is_empty();
+
             if status != "step-panic" {
                 if action.action_type == "drag" && action.end_x.is_none() {
                     note = "drag 降级为 click：该步无拖拽终点（旧录制）；重新录制后为真拖拽".into();
@@ -479,8 +571,7 @@ pub fn execute_recording(
                 // 目标窗口没出现：这是级联失败的头号起点（后续步骤会在错误的
                 // 前台空转）。写进每步记录 + 醒目日志，用户不看日志也能在结果
                 // 面板里看到「卡在第几步、卡在哪个窗口」。
-                if crate::executor::backend::take_focus_ok() == Some(false)
-                    && !action.window_title.trim().is_empty()
+                if focus_failed
                 {
                     let msg = format!(
                         "目标窗口『{}』未出现/未聚焦 → 已回退录制坐标执行",
@@ -512,6 +603,98 @@ pub fn execute_recording(
                     note = "verify-skip：抓屏或预期图不可用".into();
                 } else if !do_verify {
                     note = format!("verify-sampled（每 {} 步抽验，本步跳过）", verify_every);
+                }
+            }
+
+            // ── Stage 4：AI 视觉兜底 ──
+            // 确定性执行已经判定这一步没打中（窗口没聚焦上 / 截图对不上），
+            // 与其继续在错误的窗口里空转导致后续连锁失败，不如问一次视觉模型
+            // 「现在该点哪里」。额度用完或模型不可用则完全静默，行为等同未开启。
+            if ai_budget > 0 && status != "step-panic" {
+                let verify_failed = status == "verify-fail";
+                let has_point = action.x.is_some() && action.y.is_some();
+                if crate::executor::ai_fallback::should_attempt(
+                    &action.action_type,
+                    has_point,
+                    focus_failed,
+                    verify_failed,
+                ) {
+                    if let Some(cfg) = &ai_cfg {
+                        ai_budget -= 1;
+                        let prev = if i > 0 {
+                            step_intent(&plan[i - 1], &ai_intents)
+                        } else {
+                            String::new()
+                        };
+                        let next = plan
+                            .get(i + 1)
+                            .map(|a| step_intent(a, &ai_intents))
+                            .unwrap_or_default();
+                        let (rx, ry) = delta_reference(&action);
+                        let intent = step_intent(action, &ai_intents);
+                        let ctx = crate::executor::ai_fallback::FallbackContext {
+                            step_number: action.step_number,
+                            action_type: &action.action_type,
+                            window_title: &action.window_title,
+                            step_title: &intent,
+                            text: action.text.as_deref(),
+                            recorded: match (rx, ry) {
+                                (Some(a), Some(b)) => Some((a, b)),
+                                _ => None,
+                            },
+                            prev_intent: &prev,
+                            next_intent: &next,
+                            reason: if verify_failed { "verify-failed" } else { "focus-failed" },
+                            // 真实喂图尺寸在 resolve_via_ai 内部覆盖，这里只给占位
+                            img_w: 0,
+                            img_h: 0,
+                        };
+                        match crate::executor::ai_fallback::resolve_via_ai(cfg, &ctx) {
+                            Ok(p) => {
+                                let old = (rx.unwrap_or(p.x), ry.unwrap_or(p.y));
+                                if crate::executor::ai_fallback::worth_reissue(old, (p.x, p.y)) {
+                                    crate::executor::ai_fallback::reissue(
+                                        &backend,
+                                        &action.action_type,
+                                        &p,
+                                        action.text.as_deref(),
+                                    );
+                                    crate::executor::backend::replay_log(&format!(
+                                        "[ai-fallback] 第 {} 步改点 ({},{})（原 {}），理由：{}",
+                                        action.step_number, p.x, p.y,
+                                        format!("({},{})", old.0, old.1),
+                                        if p.why.is_empty() { "未说明" } else { &p.why }
+                                    ));
+                                    let tail = format!(
+                                        "AI 兜底改点 ({},{}){}",
+                                        p.x,
+                                        p.y,
+                                        if p.why.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!("：{}", p.why)
+                                        }
+                                    );
+                                    note = if note.is_empty() { tail } else { format!("{}；{}", note, tail) };
+                                    // 已救回 → 不再计入失败统计（前端按 verify-fail 计数）
+                                    status = "ai-recovered".into();
+                                } else {
+                                    crate::executor::backend::replay_log(&format!(
+                                        "[ai-fallback] 第 {} 步模型给的落点与原落点几乎重合，未重发",
+                                        action.step_number
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                crate::executor::backend::replay_log(&format!(
+                                    "[ai-fallback] 第 {} 步未生效：{}",
+                                    action.step_number, e
+                                ));
+                                let tail = format!("AI 兜底未生效：{}", e);
+                                note = if note.is_empty() { tail } else { format!("{}；{}", note, tail) };
+                            }
+                        }
+                    }
                 }
             }
 
