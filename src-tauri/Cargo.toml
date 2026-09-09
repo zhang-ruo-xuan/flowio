@@ -4,6 +4,14 @@ version = "0.2.0"
 edition = "2021"
 description = "录步 Flowio - 桌面端录步应用"
 
+# 自动化能力构建开关（cherry 自 develop a54a378，版本号保持 stable 0.2.x 不动）：
+# - master（stable 线）默认 [] = 非自动化：普通 cargo build 即不含重放/审计/AI 兜底，
+#   前端自动化入口随 VITE_AUTOMATION 隐藏——忘加参数也安全
+# - develop（自动化线）default = ["automation"]：普通构建即全功能自动化版
+[features]
+default = []
+automation = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -10,6 +10,16 @@ mod redaction;
 mod hotkey;
 mod voice;
 mod job_notify;
+// 自动化执行器（重放/审计/AI 兜底）：
+// - 默认（自动化版）：编译真实实现 executor/
+// - --no-default-features（非自动化版）：编译 executor_stub.rs 桩，
+//   三个命令名保持一致（误调用返回明确错误），重放代码整体不进二进制。
+// anchor/uia 是录制侧精准采集，稳定版教程质量也依赖，保持始终编译。
+#[cfg(feature = "automation")]
+#[path = "executor/mod.rs"]
+mod executor;
+#[cfg(not(feature = "automation"))]
+#[path = "executor_stub.rs"]
 mod executor;
 mod anchor;
 mod uia;

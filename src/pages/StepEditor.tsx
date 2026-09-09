@@ -36,6 +36,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import FileSaveDialog from "../components/FileSaveDialog";
+import { AUTOMATION_ENABLED } from "../config/automation";
 import AnnotationsOverlay from "../components/AnnotationsOverlay";
 import LoginSaveModal from "../components/LoginSaveModal";
 import type { Annotation } from "../lib/annotate";
@@ -2916,48 +2917,53 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                 </div>
               )}
             </div>
-            <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-              <button
-                onClick={() => handleExecute(false)}
-                disabled={executing}
-                data-tip={"精准执行\n按录制时的屏幕坐标确定性重放（非 AI 猜点），在目标窗口自动点选；每步后截图校验"}
-                style={{ background: "transparent", border: "1px solid #3fb950", color: "#3fb950", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-              >
-                ▶ 执行{executing ? "中…" : ""}
-              </button>
-            </div>
-            <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-              <button
-                onClick={() => handleExecute(true)}
-                disabled={executing}
-                data-tip={"演练（dry-run）\n只生成动作序列、不操作桌面，用于验证重放逻辑"}
-                style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-              >
-                演练
-              </button>
-            </div>
-            <label
-              onMouseDown={(e) => e.stopPropagation()}
-              data-tip={"AI 兜底（Stage 4）\n默认关闭。勾选后，若某一步按录制坐标没打中（目标窗口没起来 / 画面与录制时不一致），\n会截一张当前屏幕连同该步意图问视觉模型「现在该点哪里」，拿到坐标重发一次。\n单轮最多 3 次，失败静默、不改变其余步骤行为"}
-              style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: aiFallback ? "#3fb950" : "#9da7b3", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
-            >
-              <input
-                type="checkbox"
-                checked={aiFallback}
-                onChange={toggleAiFallback}
-                style={{ width: 12, height: 12, margin: 0, cursor: "pointer", accentColor: "#3fb950" }}
-              />
-              AI 兜底
-            </label>
-            <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-              <button
-                onClick={() => { setShowAudit(true); loadAudit(); }}
-                data-tip={"执行历史\n查看本教程历次重放的审计记录（时间 / 结果 / 步数）"}
-                style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-              >
-                执行历史
-              </button>
-            </div>
+            {/* 自动化执行面（执行/演练/AI兜底/执行历史）：非自动化构建整体隐藏 */}
+            {AUTOMATION_ENABLED && (
+              <>
+                <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+                  <button
+                    onClick={() => handleExecute(false)}
+                    disabled={executing}
+                    data-tip={"精准执行\n按录制时的屏幕坐标确定性重放（非 AI 猜点），在目标窗口自动点选；每步后截图校验"}
+                    style={{ background: "transparent", border: "1px solid #3fb950", color: "#3fb950", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+                  >
+                    ▶ 执行{executing ? "中…" : ""}
+                  </button>
+                </div>
+                <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+                  <button
+                    onClick={() => handleExecute(true)}
+                    disabled={executing}
+                    data-tip={"演练（dry-run）\n只生成动作序列、不操作桌面，用于验证重放逻辑"}
+                    style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+                  >
+                    演练
+                  </button>
+                </div>
+                <label
+                  onMouseDown={(e) => e.stopPropagation()}
+                  data-tip={"AI 兜底（Stage 4）\n默认关闭。勾选后，若某一步按录制坐标没打中（目标窗口没起来 / 画面与录制时不一致），\n会截一张当前屏幕连同该步意图问视觉模型「现在该点哪里」，拿到坐标重发一次。\n单轮最多 3 次，失败静默、不改变其余步骤行为"}
+                  style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: aiFallback ? "#3fb950" : "#9da7b3", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={aiFallback}
+                    onChange={toggleAiFallback}
+                    style={{ width: 12, height: 12, margin: 0, cursor: "pointer", accentColor: "#3fb950" }}
+                  />
+                  AI 兜底
+                </label>
+                <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+                  <button
+                    onClick={() => { setShowAudit(true); loadAudit(); }}
+                    data-tip={"执行历史\n查看本教程历次重放的审计记录（时间 / 结果 / 步数）"}
+                    style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+                  >
+                    执行历史
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         )}
 
