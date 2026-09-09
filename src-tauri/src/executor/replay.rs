@@ -3,6 +3,7 @@
 //! 读取录制源 DB 的 steps（母版锚点：x/y/window_title/description/after_screenshot_path），
 //! 生成确定性重放动作序列。不依赖任何 LLM / 视觉模型——这是 Stage 2 壁垒的第一层。
 
+use crate::anchor::ControlAnchor;
 use crate::executor::backend::ReplayBackend;
 use rusqlite::params;
 use std::time::Duration;
@@ -100,6 +101,30 @@ pub fn load_replay_plan(
     Ok(plan)
 }
 
+/// 该步是否录制到表格单元格地址（用于零漂移跳格）。无锚点 / 无地址返回 None。
+fn cell_ref_of(action: &ReplayAction) -> Option<String> {
+    let a = action.uia_anchor.as_deref()?;
+    let anchor = ControlAnchor::from_str(a)?;
+    let c = anchor.cell_ref.trim();
+    if c.is_empty() {
+        None
+    } else {
+        Some(c.to_string())
+    }
+}
+
+/// 该步是否录制到视觉模板（用于图标 SSD 匹配）。无锚点 / 无模板返回 None。
+fn template_of(action: &ReplayAction) -> Option<String> {
+    let a = action.uia_anchor.as_deref()?;
+    let anchor = ControlAnchor::from_str(a)?;
+    let t = anchor.click_template.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 /// 执行单步到指定后端（focus / click / drag / type / press_combo）。
 ///
 /// - 有坐标 → 先聚焦窗口再按动作类型派发；
@@ -161,6 +186,29 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
                         backend.click_menu_anchored(a, x, y);
                         return;
                     }
+                }
+            }
+            // 单元格确定性地址寻址（WPS/Excel）：Ctrl+G 跳格，零漂移。
+            // 单元格是画布绘制、无稳定控件，像素坐标随滚动/缩放漂移；录制时已抓到
+            // 单元格地址（如 B5），重放用 Ctrl+G + 输入地址 + Enter 直接跳过去。
+            if !is_right && !is_double {
+                if let Some(cell) = cell_ref_of(action) {
+                    crate::executor::backend::replay_log(&format!(
+                        "[cell] 地址寻址 '{}' -> Ctrl+G + 输入 + Enter (回退 {},{})",
+                        cell, x, y
+                    ));
+                    backend.press_combo("Ctrl+g");
+                    backend.type_text(&cell);
+                    backend.press_combo("Enter");
+                    return;
+                }
+            }
+            // 图标模板匹配（顶部栏自绘按钮等无稳定名称的目标）：在已聚焦窗口内 SSD 匹配，
+            // 命中即点该处，天然纠正滚动/缩放/UI 重排带来的漂移。未命中由后端回退录制坐标。
+            if !is_right && !is_double {
+                if let Some(tpl) = template_of(action) {
+                    backend.click_template(&tpl, x, y);
+                    return;
                 }
             }
             if let Some(anchor) = anchor_json {
@@ -332,6 +380,9 @@ mod tests {
         }
         fn click_anchored(&self, a: &str, x: i32, y: i32) {
             self.inner.click_anchored(a, x, y);
+        }
+        fn click_template(&self, tpl: &str, x: i32, y: i32) {
+            self.inner.click_template(tpl, x, y);
         }
         fn right_click(&self, x: i32, y: i32) {
             self.inner.right_click(x, y);

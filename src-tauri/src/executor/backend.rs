@@ -19,6 +19,9 @@ pub trait ReplayBackend {
     /// 按控件锚点（Stage 2b）反算点击坐标；无锚点或定位失败时回退到 (fallback_x, fallback_y)。
     /// 锚点 JSON 为空 / 解析失败 → 直接按回退坐标点击。
     fn click_anchored(&self, anchor_json: &str, fallback_x: i32, fallback_y: i32);
+    /// 图标模板匹配点击：在已聚焦窗口内用视觉模板 SSD 匹配命中点并点击；
+    /// 未命中 / 失败回退到 (fallback_x, fallback_y)。用于顶部栏自绘按钮等无稳定名称的目标。
+    fn click_template(&self, template_b64: &str, fallback_x: i32, fallback_y: i32);
     /// 右键点击（桌面右键菜单等场景）。
     fn right_click(&self, x: i32, y: i32);
     /// 右键 + 控件锚点：同 click_anchored，但下发右键。
@@ -80,6 +83,12 @@ impl ReplayBackend for DryRunBackend {
         self.actions.lock().unwrap().push(format!(
             "click_anchored({},{},{})",
             fallback_x, fallback_y, anchor_json
+        ));
+    }
+    fn click_template(&self, template_b64: &str, fallback_x: i32, fallback_y: i32) {
+        self.actions.lock().unwrap().push(format!(
+            "click_template({},{},{}b)",
+            fallback_x, fallback_y, template_b64.len()
         ));
     }
     fn right_click(&self, x: i32, y: i32) {
@@ -1125,6 +1134,25 @@ impl ReplayBackend for WindowsBackend {
                     "[anchor] cls='{}' 未命中 -> 回退录制坐标 ({},{})",
                     anchor.cls, fallback_x, fallback_y
                 ));
+                self.click(fallback_x, fallback_y);
+            }
+        }
+    }
+    fn click_template(&self, template_b64: &str, fallback_x: i32, fallback_y: i32) {
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            replay_log("[template] 无前台窗口 -> 回退录制坐标");
+            self.click(fallback_x, fallback_y);
+            return;
+        }
+        match crate::anchor::match_click_template(template_b64, hwnd) {
+            Some((cx, cy)) => {
+                replay_log(&format!("[template] SSD 命中 ({},{}) -> 点击", cx, cy));
+                dismiss_occluding_overlay(cx, cy, hwnd);
+                self.click(cx, cy);
+            }
+            None => {
+                replay_log("[template] 未命中 -> 回退录制坐标");
                 self.click(fallback_x, fallback_y);
             }
         }

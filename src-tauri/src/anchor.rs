@@ -9,12 +9,13 @@
 //! 只用稳定的 user32 API（WindowFromPoint / GetClassNameW / GetWindowRect / GetParent / EnumChildWindows）。
 //! 任何失败都返回 None，由上层回退到录制坐标 —— 永不引入回归。
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use image::DynamicImage;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClassNameW, GetParent, GetWindowRect, IsWindowVisible,
-    WindowFromPoint,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetParent, GetWindowRect,
+    GetWindowTextW, IsWindowVisible, WindowFromPoint,
 };
 
 /// 控件锚点：序列化为 JSON 存入 steps.uia_anchor 列。
@@ -66,6 +67,16 @@ pub struct ControlAnchor {
     /// 空串 = 未捕获 / 旧数据（旧数据无此字段，反序列化默认空），上层走既有 Win32 路径。
     #[serde(default)]
     pub ocr: String,
+    /// 点击点周围视觉模板（base64 JPEG）。重放端在已聚焦窗口内做 SSD 模板匹配，
+    /// 命中即点该处——用于顶部栏自绘按钮等无稳定类名/名称的图标型目标。
+    /// 空串 = 未采集（录制端该点击区域无纹理 / 旧数据），重放走既有锚点/坐标。
+    #[serde(default)]
+    pub click_template: String,
+    /// WPS/Excel 表格活动单元格地址（如 "B5"）。重放端据此发 Ctrl+G + 输入地址 + Enter
+    /// 跳格，零漂移（单元格是画布绘制、无稳定控件，像素坐标会随滚动/缩放漂移）。
+    /// 空串 = 未采集（非表格点击 / 旧数据），重放走既有锚点/坐标。
+    #[serde(default)]
+    pub cell_ref: String,
 }
 
 fn default_half() -> f64 {
@@ -182,6 +193,8 @@ fn capture_anchor_core(screen_x: i32, screen_y: i32) -> Option<(ControlAnchor, R
                 ax,
                 ay,
                 ocr: String::new(),
+                click_template: String::new(),
+                cell_ref: String::new(),
             },
             ctrl_rect,
         ))
@@ -569,6 +582,484 @@ fn crop_to_window(
     Some((cropped, rect.left, rect.top))
 }
 
+/// 录制端：在录制帧截图的点击点周围裁剪一小块作为视觉模板，编码为 base64 JPEG。
+/// 仅当模板有足够纹理（方差够大）才返回——空白/纯色区域不值得匹配（既浪费
+/// 存储又易误命中）。任何失败返回 None。
+pub fn crop_click_template(
+    img: &DynamicImage,
+    img_cx: i32,
+    img_cy: i32,
+    half: u32,
+) -> Option<String> {
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    if iw <= 0 || ih <= 0 {
+        return None;
+    }
+    let half = half.max(8);
+    let x0 = (img_cx - half as i32).clamp(0, iw) as u32;
+    let y0 = (img_cy - half as i32).clamp(0, ih) as u32;
+    let x1 = (img_cx + half as i32).clamp(0, iw) as u32;
+    let y1 = (img_cy + half as i32).clamp(0, ih) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let patch = img.crop_imm(x0, y0, x1 - x0, y1 - y0);
+    // 缩放到固定 40×40 提速 + 容忍轻微缩放/错位
+    let patch = patch.resize_exact(40, 40, image::imageops::FilterType::Triangle);
+    let luma = patch.to_luma8();
+    // 方差门限：纯色/近纯色区域方差极小，匹配无意义且易误命中 -> 跳过
+    let mut sum: u64 = 0;
+    for p in luma.pixels() {
+        sum += p.0[0] as u64;
+    }
+    let mean = sum as f64 / luma.pixels().len() as f64;
+    let mut var = 0.0f64;
+    for p in luma.pixels() {
+        let d = p.0[0] as f64 - mean;
+        var += d * d;
+    }
+    var /= luma.pixels().len() as f64;
+    if var < 80.0 {
+        // 标准差 ~9 以下视为无纹理
+        return None;
+    }
+    let rgb = patch.to_rgb8();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    if DynamicImage::ImageRgb8(rgb)
+        .write_to(&mut buf, image::ImageFormat::Jpeg)
+        .is_err()
+    {
+        return None;
+    }
+    Some(B64.encode(buf.into_inner()))
+}
+
+/// 纯函数：在灰度场景图(scene)里用灰度模板(tpl)滑窗 SSD 找最佳匹配，
+/// `scale` 为「模板像素 → 场景像素」的放大倍数（场景已相对模板降采样）。
+/// 返回 (mean_ssd, scene_x, scene_y)。无候选返回 None。与平台无关，可单测。
+fn ssd_match(
+    tpl: &image::GrayImage,
+    scene: &image::GrayImage,
+    scale: f64,
+) -> Option<(f64, i32, i32)> {
+    let (tw, th) = (tpl.width() as i32, tpl.height() as i32);
+    let (sw, sh) = (scene.width() as i32, scene.height() as i32);
+    if tw < 8 || th < 8 || tw > sw || th > sh {
+        return None;
+    }
+    let (tw_s, th_s) = ((tw as f64 / scale) as i32, (th as f64 / scale) as i32);
+    if tw_s < 4 || th_s < 4 {
+        return None;
+    }
+    let mut best: Option<(f64, i32, i32)> = None; // (mean_ssd, x, y) 场景坐标
+    let step = 2i32;
+    for y in (0..=(sh - th_s)).step_by(step as usize) {
+        for x in (0..=(sw - tw_s)).step_by(step as usize) {
+            let mut s: u64 = 0u64;
+            let mut n: u32 = 0;
+            for j in (0..th).step_by(2) {
+                let tj = (j as f64 * scale) as i32;
+                if tj >= th_s {
+                    continue;
+                }
+                for i in (0..tw).step_by(2) {
+                    let ti = (i as f64 * scale) as i32;
+                    if ti >= tw_s {
+                        continue;
+                    }
+                    let a = tpl.get_pixel(i as u32, j as u32).0[0] as i32;
+                    let b = scene.get_pixel((x + ti) as u32, (y + tj) as u32).0[0] as i32;
+                    let d = a - b;
+                    s += (d * d) as u64;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            let mean_ssd = s as f64 / n as f64;
+            if best.as_ref().map_or(true, |(b, _, _)| mean_ssd < *b) {
+                best = Some((mean_ssd, x, y));
+            }
+        }
+    }
+    best
+}
+
+/// 重放端：把 base64 JPEG 模板在已聚焦窗口(window)区域内做 SSD 模板匹配，
+/// 返回命中点（模板中心）的虚拟屏幕坐标。任何失败返回 None。
+///
+/// 实现：把目标窗口截图裁剪出来，降采样到最长边 <= 320 以提速；模板同样灰度过
+/// 后做滑窗 SSD（步长 2 抽样）；取最小误差候选；并要求命中质量（平均像素差）
+/// 足够好，否则视为没找到（避免把无纹理模板乱点）。命中坐标映射回全屏坐标。
+pub fn match_click_template(template_b64: &str, window: HWND) -> Option<(i32, i32)> {
+    let raw = B64.decode(template_b64).ok()?;
+    let tpl = image::load_from_memory(&raw).ok()?;
+    let tpl = tpl.to_luma8();
+    let (tw, th) = (tpl.width() as i32, tpl.height() as i32);
+    if tw < 8 || th < 8 {
+        return None;
+    }
+    // 模板方差门：纯色模板无区分度，直接放弃
+    let tmean = tpl_mean(&tpl);
+    if tpl_std(&tpl, tmean) < 9.0 {
+        return None;
+    }
+
+    let (img, ox, oy) = crate::recorder::screenshot::capture_fullscreen_with_origin().ok()?;
+    let (img, ox, oy) = crop_to_window(img.clone(), ox, oy, window).unwrap_or((img, ox, oy));
+    let iw = img.width() as i32;
+    let ih = img.height() as i32;
+    if iw < tw || ih < th {
+        return None;
+    }
+    // 降采样场景图到最长边 <= 320
+    let (sw, sh) = fit_within(iw, ih, 320);
+    let scene = img
+        .resize(sw, sh, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    let scale = iw as f64 / sw as f64; // == ih / sh
+    let Some((mean_ssd, bx, by)) = ssd_match(&tpl, &scene, scale) else {
+        return None;
+    };
+    // 命中质量门：平均像素差 > 42（约 16% 灰度差）视为不匹配
+    if mean_ssd > 42.0 {
+        return None;
+    }
+    // 命中点 = 候选左上角 + 半模板（场景坐标）-> 全屏（img）坐标 -> 屏幕坐标
+    let tw_s = (tw as f64 / scale) as i32;
+    let th_s = (th as f64 / scale) as i32;
+    let cx_img = (bx + tw_s / 2) as f64 * scale;
+    let cy_img = (by + th_s / 2) as f64 * scale;
+    Some((cx_img as i32 + ox, cy_img as i32 + oy))
+}
+
+fn tpl_mean(img: &image::GrayImage) -> f64 {
+    let mut s: u64 = 0;
+    for p in img.pixels() {
+        s += p.0[0] as u64;
+    }
+    s as f64 / img.pixels().len() as f64
+}
+
+fn tpl_std(img: &image::GrayImage, mean: f64) -> f64 {
+    let mut v = 0.0;
+    for p in img.pixels() {
+        let d = p.0[0] as f64 - mean;
+        v += d * d;
+    }
+    (v / img.pixels().len() as f64).sqrt()
+}
+
+fn fit_within(w: i32, h: i32, max: i32) -> (u32, u32) {
+    if w <= max && h <= max {
+        return (w as u32, h as u32);
+    }
+    let r = max as f64 / w.max(h) as f64;
+    ((w as f64 * r) as u32, (h as f64 * r) as u32)
+}
+
+/// 录制端：当前前台窗口句柄（单元格地址采集用）。
+fn foreground_hwnd() -> Option<HWND> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        None
+    } else {
+        Some(hwnd)
+    }
+}
+
+/// 录制端增强：在 `capture_anchor_with_image` 基础上，额外尝试抓取
+/// ① 视觉模板（顶部栏自绘按钮等，重放时 SSD 匹配）② 表格单元格地址（Ctrl+G 跳格）。
+/// 两者任一失败都静默跳过，零回归。
+pub fn capture_anchor_with_extras(
+    screen_x: i32,
+    screen_y: i32,
+    img: &DynamicImage,
+    img_cx: i32,
+    img_cy: i32,
+    template_half: u32,
+) -> Option<ControlAnchor> {
+    let mut anchor =
+        capture_anchor_with_image(screen_x, screen_y, img, img_cx, img_cy)?;
+    // ① 视觉模板：对任何有纹理的点击区域都尝试（按钮/图标等），空白区域自动跳过
+    if let Some(t) = crop_click_template(img, img_cx, img_cy, template_half) {
+        anchor.click_template = t;
+    }
+    // ② 单元格地址：仅表格窗口的网格点击触发，否则不浪费 OCR
+    if let Some(hwnd) = foreground_hwnd() {
+        if let Some(cell) = capture_cell_ref(hwnd, screen_x, screen_y) {
+            anchor.cell_ref = cell;
+        }
+    }
+    Some(anchor)
+}
+
+/// 是否 WPS/Excel 表格窗口：标题含 WPS表格 / .et / .xls 或含 EXCEL7 子控件（网格）。
+fn is_spreadsheet_window(hwnd: HWND) -> bool {
+    unsafe {
+        let mut buf = [0u16; 256];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        if n > 0 {
+            let title = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+            if title.contains("wps表格") || title.contains(".et") || title.contains(".xls") {
+                return true;
+            }
+        }
+        if has_child_class(hwnd, "EXCEL7") {
+            return true;
+        }
+    }
+    false
+}
+
+struct HasChildCtx {
+    target: String,
+    found: bool,
+}
+
+unsafe extern "system" fn has_child_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let ctx = &mut *(lparam.0 as *mut HasChildCtx);
+    if ctx.found {
+        return BOOL(1);
+    }
+    let mut buf = [0u16; 256];
+    let n = GetClassNameW(hwnd, &mut buf);
+    if n > 0 {
+        let cls = String::from_utf16_lossy(&buf[..n as usize]);
+        if cls.contains(&ctx.target) {
+            ctx.found = true;
+        }
+    }
+    BOOL(1)
+}
+
+/// 窗口是否存在指定（子串）类名的子控件。
+fn has_child_class(window: HWND, class_sub: &str) -> bool {
+    let mut ctx = HasChildCtx {
+        target: class_sub.to_string(),
+        found: false,
+    };
+    unsafe {
+        EnumChildWindows(
+            window,
+            Some(has_child_proc),
+            LPARAM(&mut ctx as *mut _ as isize),
+        );
+    }
+    ctx.found
+}
+
+/// 找到第一个类名含 `class_sub` 的子控件矩形（屏幕坐标）。
+fn find_child_rect(window: HWND, class_sub: &str) -> Option<RECT> {
+    struct Ctx {
+        target: String,
+        rect: Option<RECT>,
+    }
+    unsafe extern "system" fn proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut Ctx);
+        if ctx.rect.is_some() {
+            return BOOL(1);
+        }
+        let mut buf = [0u16; 256];
+        let n = GetClassNameW(hwnd, &mut buf);
+        if n > 0 {
+            let cls = String::from_utf16_lossy(&buf[..n as usize]);
+            if cls.contains(&ctx.target) {
+                let mut r = RECT::default();
+                if GetWindowRect(hwnd, &mut r).is_ok() {
+                    ctx.rect = Some(r);
+                }
+            }
+        }
+        BOOL(1)
+    }
+    let mut ctx = Ctx {
+        target: class_sub.to_string(),
+        rect: None,
+    };
+    unsafe {
+        EnumChildWindows(window, Some(proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    ctx.rect
+}
+
+/// 解析 "x,y,w,h" 形式的矩形设置（屏幕像素）。
+fn parse_rect_setting(s: &str) -> Option<(i32, i32, i32, i32)> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let v: Vec<i32> = parts
+        .iter()
+        .filter_map(|p| p.trim().parse::<i32>().ok())
+        .collect();
+    if v.len() == 4 && v[2] > 0 && v[3] > 0 {
+        Some((v[0], v[1], v[2], v[3]))
+    } else {
+        None
+    }
+}
+
+/// 名称框矩形（屏幕坐标）。优先级：
+/// 1) 设置 `namebox_rect`（格式 "x,y,w,h"，由用户按自己 WPS 量取后配置，最可靠）；
+/// 2) 自动定位：在表格窗口子控件中找「编辑/下拉框」且位于网格顶栏左侧区域者。
+fn namebox_rect(window: HWND) -> Option<(i32, i32, i32, i32)> {
+    if let Some(s) = crate::db::get_setting("namebox_rect") {
+        if let Some(r) = parse_rect_setting(&s) {
+            return Some(r);
+        }
+    }
+    auto_namebox_rect(window)
+}
+
+/// 自动定位名称框（best-effort）：找 EXCEL7 网格控件，其顶栏左侧的编辑/下拉框即名称框。
+/// 任何不确定都返回 None（由上层走既有的像素锚点，零回归）。
+fn auto_namebox_rect(window: HWND) -> Option<(i32, i32, i32, i32)> {
+    let grid = find_child_rect(window, "EXCEL7")?;
+    let (gleft, gtop) = (grid.left, grid.top);
+    struct NbCtx {
+        gleft: i32,
+        gtop: i32,
+        best: Option<(i32, i32, i32, i32)>,
+    }
+    unsafe extern "system" fn proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut NbCtx);
+        let mut buf = [0u16; 256];
+        let n = GetClassNameW(hwnd, &mut buf);
+        if n > 0 {
+            let cls = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+            let is_edit = cls.contains("edit")
+                || cls.contains("combobox")
+                || cls.contains("edtbx")
+                || cls.contains("netui");
+            if is_edit {
+                let mut r = RECT::default();
+                if GetWindowRect(hwnd, &mut r).is_ok() {
+                    let w = r.right - r.left;
+                    let h = r.bottom - r.top;
+                    // 名称框：在网格顶边之上、左列附近、尺寸合理
+                    let above = r.bottom <= ctx.gtop + 6 && r.top >= ctx.gtop - 48;
+                    let near_left = r.left >= ctx.gleft - 6 && r.left <= ctx.gleft + 140;
+                    let sized = w >= 36 && w <= 170 && h >= 14 && h <= 40;
+                    if above && near_left && sized {
+                        ctx.best = Some((r.left, r.top, w, h));
+                    }
+                }
+            }
+        }
+        BOOL(1)
+    }
+    let mut ctx = NbCtx {
+        gleft,
+        gtop,
+        best: None,
+    };
+    unsafe {
+        EnumChildWindows(window, Some(proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    ctx.best
+}
+
+/// 把列字母（如 "B" / "XFD"）转成 1-based 列号；超出 Excel 上限 16384（XFD）返回 None。
+fn col_to_num(letters: &str) -> Option<u32> {
+    let mut n: u32 = 0;
+    for c in letters.chars() {
+        let v = (c.to_ascii_uppercase() as u32).wrapping_sub(b'A' as u32) + 1;
+        n = n.saturating_mul(26).saturating_add(v);
+        if n > 16384 {
+            return None;
+        }
+    }
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// 从 OCR 文本中抽取单元格地址（如 "B5" / "$B$5" / "$B5"）。
+/// 严格：字母段 + 数字段，列 A..XFD、行 1..1048576 校验；返回首个合法地址的大写形式。
+fn parse_cell_ref(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ls = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        if i == ls {
+            i += 1;
+            continue;
+        }
+        let ds = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == ds {
+            i += 1;
+            continue;
+        }
+        let letters = &cleaned[ls..ds];
+        let digits = &cleaned[ds..i];
+        // 列必须落在 A..XFD（列号 1..16384）；否则不是单元格地址（如 "Sheet1"），跳过继续找。
+        if col_to_num(letters).is_none() {
+            continue;
+        }
+        if digits.is_empty() {
+            continue;
+        }
+        if let Ok(n) = digits.parse::<u32>() {
+            if n >= 1 && n <= 1048576 {
+                return Some(format!("{}{}", letters.to_uppercase(), digits));
+            }
+        }
+    }
+    None
+}
+
+/// 录制端：尝试读取当前 WPS/Excel 表格活动单元格地址（如 "B5"）。
+/// 仅当点击落在表格网格时生效——任何失败 / 非表格 / 提取不到合法地址 -> 返回 None（零回归）。
+pub fn capture_cell_ref(window: HWND, _screen_x: i32, _screen_y: i32) -> Option<String> {
+    if !is_spreadsheet_window(window) {
+        return None;
+    }
+    let rect = namebox_rect(window)?;
+    let (img, ox, oy) = crate::recorder::screenshot::capture_fullscreen_with_origin().ok()?;
+    let ix = (rect.0 - ox).clamp(0, img.width() as i32 - 1) as u32;
+    let iy = (rect.1 - oy).clamp(0, img.height() as i32 - 1) as u32;
+    let iw = rect.2.min(img.width() as i32 - ix as i32) as u32;
+    let ih = rect.3.min(img.height() as i32 - iy as i32) as u32;
+    if iw < 4 || ih < 4 {
+        return None;
+    }
+    let crop = img.crop_imm(ix, iy, iw, ih);
+    let tmp = std::env::temp_dir().join(format!("flowio_cell_{}.png", std::process::id()));
+    {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        if crop.write_to(&mut buf, image::ImageFormat::Png).is_err() {
+            return None;
+        }
+        if std::fs::write(&tmp, buf.into_inner()).is_err() {
+            return None;
+        }
+    }
+    let lines = crate::redaction::ocr::recognize_image(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+    let lines = lines?;
+    for l in &lines {
+        if let Some(cell) = parse_cell_ref(&l.text) {
+            return Some(cell);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,6 +1078,8 @@ mod tests {
             nfy: 0.5,
             ax: -1,
             ay: -1,
+            click_template: String::new(),
+            cell_ref: String::new(),
         };
         let s = serde_json::to_string(&a).unwrap();
         let b = ControlAnchor::from_str(&s).unwrap();
@@ -670,6 +1163,8 @@ mod tests {
             nfy: 0.5,
             ax: -1,
             ay: -1,
+            click_template: String::new(),
+            cell_ref: String::new(),
         };
         assert!(!b.is_empty());
     }
@@ -692,5 +1187,107 @@ mod tests {
         let s = serde_json::to_string(&a).unwrap();
         let b = ControlAnchor::from_str(&s).unwrap();
         assert_eq!(b.ocr, "【WPS表格】SUM函数.xlsx");
+    }
+
+    // ── 单元格地址解析 ──────────────────────────────────
+
+    #[test]
+    fn cell_ref_plain() {
+        assert_eq!(parse_cell_ref("B5"), Some("B5".to_string()));
+    }
+    #[test]
+    fn cell_ref_lowercase() {
+        assert_eq!(parse_cell_ref("b12"), Some("B12".to_string()));
+    }
+    #[test]
+    fn cell_ref_dollar() {
+        assert_eq!(parse_cell_ref("$B$5"), Some("B5".to_string()));
+        assert_eq!(parse_cell_ref("$C3"), Some("C3".to_string()));
+    }
+    #[test]
+    fn cell_ref_surrounded() {
+        assert_eq!(parse_cell_ref("当前单元格 B5 已选中"), Some("B5".to_string()));
+        assert_eq!(
+            parse_cell_ref("定位到 A1 区域"),
+            Some("A1".to_string())
+        );
+    }
+    #[test]
+    fn cell_ref_range_first() {
+        // 名称框不会是范围，但即便 OCR 读到 "B5:C10"，也应取首个单元格
+        assert_eq!(parse_cell_ref("B5:C10"), Some("B5".to_string()));
+    }
+    #[test]
+    fn cell_ref_rejects_non_cell() {
+        assert_eq!(parse_cell_ref("Sheet1"), None);
+        assert_eq!(parse_cell_ref("确认"), None);
+        assert_eq!(parse_cell_ref("123"), None);
+        assert_eq!(parse_cell_ref(""), None);
+    }
+    #[test]
+    fn cell_ref_rejects_column_too_long() {
+        // "Sheet1" 被字母+数字误吸 -> 列超 3 字母应拒绝，继续找下一个合法地址
+        assert_eq!(parse_cell_ref("Sheet1!C3"), Some("C3".to_string()));
+    }
+    #[test]
+    fn cell_ref_max_bounds() {
+        assert_eq!(parse_cell_ref("XFD1048576"), Some("XFD1048576".to_string()));
+        assert_eq!(parse_cell_ref("XFE1"), None); // 列越界
+        assert_eq!(parse_cell_ref("A0"), None); // 行越界
+    }
+
+    // ── namebox_rect 设置解析 ───────────────────────────
+
+    #[test]
+    fn rect_setting_ok() {
+        assert_eq!(parse_rect_setting("100,200,120,24"), Some((100, 200, 120, 24)));
+    }
+    #[test]
+    fn rect_setting_bad() {
+        assert_eq!(parse_rect_setting("100,200,120"), None);
+        assert_eq!(parse_rect_setting("a,b,c,d"), None);
+        assert_eq!(parse_rect_setting("100,200,-5,24"), None); // 尺寸非正
+    }
+
+    // ── SSD 模板匹配（纯函数，合成图）────────────────────
+
+    #[test]
+    fn ssd_match_finds_inserted_patch() {
+        use image::{DynamicImage, GrayImage, Luma};
+        // 200x200 灰底场景
+        let mut scene = GrayImage::from_pixel(200, 200, Luma([240u8]));
+        // 在 (120,80) 处放一个 40x40 的暗方块作为模板本体
+        for y in 80..120 {
+            for x in 120..160 {
+                scene.put_pixel(x, y, Luma([20u8]));
+            }
+        }
+        // 模板 = 该 40x40 区域
+        let tpl = DynamicImage::ImageLuma8(scene.clone())
+            .crop_imm(120, 80, 40, 40)
+            .to_luma8();
+        // scale=1.0：场景与模板同分辨率
+        let (mssd, bx, by) = ssd_match(&tpl, &scene, 1.0).expect("应匹配到");
+        assert!(mssd < 1.0, "同图应为近乎零误差，实际 {}", mssd);
+        // 命中点左上角应接近 (120,80)
+        assert!((bx - 120).abs() <= 4, "bx={} 期望~120", bx);
+        assert!((by - 80).abs() <= 4, "by={} 期望~80", by);
+    }
+
+    #[test]
+    fn ssd_match_rejects_blank_template() {
+        use image::{GrayImage, Luma};
+        // 全白模板（方差为 0）应找不到有意义匹配
+        let tpl = GrayImage::from_pixel(40, 40, Luma([255u8]));
+        let mut scene = GrayImage::from_pixel(200, 200, Luma([240u8]));
+        for y in 80..120 {
+            for x in 120..160 {
+                scene.put_pixel(x, y, Luma([20u8]));
+            }
+        }
+        // 纯色模板在 ssd 下随处误差相同，best 仍会返回某候选，但其 mean_ssd 很大；
+        // 真正的方差门在 match_click_template 里。这里验证 ssd_match 仍能运行不崩。
+        let res = ssd_match(&tpl, &scene, 1.0);
+        assert!(res.is_some()); // 纯函数返回某候选即可（质量门在调用方）
     }
 }

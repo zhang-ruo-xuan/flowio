@@ -1702,12 +1702,14 @@ fn build_click_step(
 
     // Stage 2b：抓取点击处的控件锚点（控件类名 + 归一化点击比例），用于分辨率无关重放。
     // 任何失败返回空串，重放端回退到录制坐标。
-    let uia_anchor = crate::anchor::capture_anchor_with_image(
+    // 增强：同一份锚点内额外尝试抓「视觉模板」与「表格单元格地址」（确定性精准化）。
+    let uia_anchor = crate::anchor::capture_anchor_with_extras(
         x as i32,
         y as i32,
         &clean_before,
         win_cx,
         win_cy,
+        28,
     )
     .map(|a| serde_json::to_string(&a).unwrap_or_default())
     .unwrap_or_default();
