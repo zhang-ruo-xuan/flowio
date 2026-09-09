@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicerdicer/tauri-schema/main/tauri.conf.schema.json",
   "productName": "录步 Flowio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "com.flowio.app",
   "build": {
     "frontendDist": "../dist",
