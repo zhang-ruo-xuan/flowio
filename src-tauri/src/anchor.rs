@@ -913,9 +913,66 @@ fn namebox_rect(window: HWND) -> Option<(i32, i32, i32, i32)> {
     auto_namebox_rect(window)
 }
 
-/// 自动定位名称框（best-effort）：找 EXCEL7 网格控件，其顶栏左侧的编辑/下拉框即名称框。
-/// 任何不确定都返回 None（由上层走既有的像素锚点，零回归）。
+/// 自动定位名称框（best-effort）。
+/// 优先按「内容」定位：名称框显示的正是当前活动单元格地址（如 B5），故枚举窗口内
+/// edit/combobox 子控件，读出其 ValuePattern 值，能解析成合法单元格地址者即名称框。
+/// 此法跨 WPS/Excel 通用，不依赖 EXCEL7 相对几何与具体类名（WPS 自绘控件类名/布局
+/// 与 Excel 不同，几何法常失配 → 名称框识别不到 → cell_ref 全程为空 → Ctrl+G 精准化死掉）。
+/// 内容法不确定时回退「几何法」（EXCEL7 上方左列 edit/combobox），再不行返回 None
+/// （上层走像素锚点，零回归）。
 fn auto_namebox_rect(window: HWND) -> Option<(i32, i32, i32, i32)> {
+    if let Some(r) = auto_namebox_rect_by_content(window) {
+        return Some(r);
+    }
+    auto_namebox_rect_by_geometry(window)
+}
+
+/// 内容法：名称框的值即活动单元格地址（B5 等），用 UIA ValuePattern 读出比对。
+/// 公式栏等显示公式/文本、尺寸更宽的控件自然被排除，特异性高。
+fn auto_namebox_rect_by_content(window: HWND) -> Option<(i32, i32, i32, i32)> {
+    struct Ctx {
+        best: Option<(i32, i32, i32, i32)>,
+    }
+    unsafe extern "system" fn proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut Ctx);
+        if ctx.best.is_some() {
+            return BOOL(1);
+        }
+        let mut buf = [0u16; 256];
+        let n = GetClassNameW(hwnd, &mut buf);
+        if n > 0 {
+            let cls = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+            let is_edit = cls.contains("edit")
+                || cls.contains("combobox")
+                || cls.contains("edtbx")
+                || cls.contains("netui");
+            if is_edit {
+                let mut r = RECT::default();
+                if GetWindowRect(hwnd, &mut r).is_ok() {
+                    let w = r.right - r.left;
+                    let h = r.bottom - r.top;
+                    if w >= 24 && w <= 220 && h >= 14 && h <= 48 {
+                        let (cx, cy) = (r.left + w / 2, r.top + h / 2);
+                        if let Some(v) = crate::uia::value_at_point(cx, cy) {
+                            if parse_cell_ref(&v).is_some() {
+                                ctx.best = Some((r.left, r.top, w, h));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        BOOL(1)
+    }
+    let mut ctx = Ctx { best: None };
+    unsafe {
+        EnumChildWindows(window, Some(proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    ctx.best
+}
+
+/// 几何法（回退）：找 EXCEL7 网格控件，其顶栏左侧的编辑/下拉框即名称框。
+fn auto_namebox_rect_by_geometry(window: HWND) -> Option<(i32, i32, i32, i32)> {
     let grid = find_child_rect(window, "EXCEL7")?;
     let (gleft, gtop) = (grid.left, grid.top);
     struct NbCtx {
@@ -925,6 +982,9 @@ fn auto_namebox_rect(window: HWND) -> Option<(i32, i32, i32, i32)> {
     }
     unsafe extern "system" fn proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let ctx = &mut *(lparam.0 as *mut NbCtx);
+        if ctx.best.is_some() {
+            return BOOL(1);
+        }
         let mut buf = [0u16; 256];
         let n = GetClassNameW(hwnd, &mut buf);
         if n > 0 {
