@@ -1,0 +1,70 @@
+name: Release with SignPath signing
+
+# 触发：推送 v 开头的 tag（如 v0.2.1）或手动触发
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-sign-release:
+    runs-on: windows-latest
+    permissions:
+      contents: write # 创建 Release 需要写权限
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # 构建「网站直下版」NSIS 安装包（~7.6MB，无 offlineInstaller）——
+        # 这正是被 SmartScreen 拦的那个包，用 SignPath 签它
+      - name: Build Tauri app
+        run: npm run tauri build
+
+      # ---- SignPath 免费签名（Foundation 开源计划）----
+      # 前置条件（在 GitHub repo Settings → Secrets and variables → Actions 中配置）：
+      #   SIGNPATH_API_TOKEN     : SignPath API token（只勾提交签名请求权限）
+      #   SIGNPATH_ORGANIZATION_ID : SignPath 组织 ID（signpath.io 组织页可查）
+      - name: Submit signing request to SignPath
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: "${{ secrets.SIGNPATH_API_TOKEN }}"
+          organization-id: "${{ secrets.SIGNPATH_ORGANIZATION_ID }}"
+          project-slug: "flowio" # TODO: SignPath 项目建立后按实际 slug 修改
+          signing-policy-slug: "release-signing" # TODO: Foundation 批准后的策略 slug
+          artifact-configuration: "NSIS" # NSIS 安装包专用配置（含卸载器签名）
+          artifacts-path: "src-tauri/target/release/bundle/nsis/"
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+
+      # 签名后的产物由 action 输出到 signed/ 目录
+      - name: Collect signed artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path signed | Out-Null
+          Copy-Item "src-tauri/target/release/bundle/nsis/*.exe" signed/ -Force
+          Get-ChildItem signed
+
+      # 发 GitHub Release 并上传签名安装包
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: signed/*.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
