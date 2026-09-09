@@ -1030,6 +1030,14 @@ pub fn capture_cell_ref(window: HWND, _screen_x: i32, _screen_y: i32) -> Option<
         return None;
     }
     let rect = namebox_rect(window)?;
+    // 优先用 UIA 读取名称框的值（编辑控件的 ValuePattern.CurrentValue，最稳，
+    // 不受字体/缩放/抗锯齿干扰）；失败（控件不暴露 ValuePattern 等）回退下方 OCR。
+    let (cx, cy) = (rect.0 + rect.2 / 2, rect.1 + rect.3 / 2);
+    if let Some(v) = crate::uia::value_at_point(cx, cy) {
+        if let Some(cell) = parse_cell_ref(&v) {
+            return Some(cell);
+        }
+    }
     let (img, ox, oy) = crate::recorder::screenshot::capture_fullscreen_with_origin().ok()?;
     let ix = (rect.0 - ox).clamp(0, img.width() as i32 - 1) as u32;
     let iy = (rect.1 - oy).clamp(0, img.height() as i32 - 1) as u32;

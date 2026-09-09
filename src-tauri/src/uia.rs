@@ -15,16 +15,18 @@
 //! COM 初始化：线程内首次调用 CoInitializeEx(APARTMENTTHREADED)，之后复用；
 //! 若线程已按其他模式初始化（RPC_E_CHANGED_MODE），UIA 在 MTA 下同样可用，继续。
 
+use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Subtree, UIA_NamePropertyId,
+    CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
+    TreeScope_Subtree, UIA_NamePropertyId, UIA_ValuePatternId,
 };
 
 /// 获取（并按需初始化 COM 后创建）UIA 自动化对象。
-fn automation() -> Option<IUIAutomation> {
+pub fn automation() -> Option<IUIAutomation> {
     unsafe {
         // 已初始化（任何模式）或初始化失败都继续尝试：UIA 在 STA/MTA 下均可用。
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -184,5 +186,30 @@ fn to_name(b: &windows::core::BSTR) -> Option<String> {
         None
     } else {
         Some(t.to_string())
+    }
+}
+
+/// 取屏幕坐标处编辑控件的值（如 WPS 名称框当前显示的单元格地址 "B5"）。
+///
+/// 用于录制时高精度读取活动单元格：名称框是个编辑控件，其文本是 ValuePattern 的
+/// CurrentValue，比 OCR 更稳（不被字体/缩放/抗锯齿干扰）。先试落点元素自身、再试其
+/// 直接父（组合框的值常挂在父上）。任何失败返回 None —— 上层回退 OCR，零回归。
+pub fn value_at_point(x: i32, y: i32) -> Option<String> {
+    let auto = automation()?;
+    let el = unsafe { auto.ElementFromPoint(POINT { x, y }) }.ok()?;
+    element_value(&el)
+}
+
+/// 读一个 UIA 元素的 ValuePattern.CurrentValue（空值返回 None）。
+fn element_value(el: &IUIAutomationElement) -> Option<String> {
+    let iunk = unsafe { el.GetCurrentPattern(UIA_ValuePatternId) }.ok()?;
+    let pat: IUIAutomationValuePattern =
+        iunk.cast::<IUIAutomationValuePattern>().ok()?;
+    let v = unsafe { pat.CurrentValue() }.ok()?;
+    let s = v.to_string();
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
