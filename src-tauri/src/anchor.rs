@@ -924,7 +924,65 @@ fn auto_namebox_rect(window: HWND) -> Option<(i32, i32, i32, i32)> {
     if let Some(r) = auto_namebox_rect_by_content(window) {
         return Some(r);
     }
+    if let Some(r) = auto_namebox_rect_by_formula_row(window) {
+        return Some(r);
+    }
     auto_namebox_rect_by_geometry(window)
+}
+
+/// WPS 专用：名称框是 Qt 自绘控件（Prome 框架），既无 edit/combobox 类子控件，
+/// UIA 树里也没有 Edit 元素（2026-09-09 活体探测：整树 0 个 Edit/Combo，Name 全空）。
+/// 但它固定贴在 `EXCEL<`（公式栏容器）的**左侧相邻区域**：[名称框][EXCEL<: fx+输入区]。
+/// 故定位 = 找可见的 EXCEL< 子窗口，取其左侧同高条带（右缘留 6px 间隙，宽≤280px），
+/// 由上层 OCR 读地址并以 parse_cell_ref 严格校验。Excel 上 content 法先行命中，
+/// 本法不会被打到；WPS 上此法是唯一稳定定位途径。
+fn auto_namebox_rect_by_formula_row(window: HWND) -> Option<(i32, i32, i32, i32)> {
+    let mut wr = RECT::default();
+    unsafe { GetWindowRect(window, &mut wr).ok()? };
+    struct FRCtx {
+        row: Option<RECT>,
+    }
+    unsafe extern "system" fn proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut FRCtx);
+        if ctx.row.is_some() {
+            return BOOL(1);
+        }
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(hwnd, &mut buf);
+        if n > 0 {
+            let cls = String::from_utf16_lossy(&buf[..n as usize]);
+            if cls == "EXCEL<" {
+                let mut r = RECT::default();
+                if GetWindowRect(hwnd, &mut r).is_ok() {
+                    ctx.row = Some(r);
+                }
+            }
+        }
+        BOOL(1)
+    }
+    let mut ctx = FRCtx { row: None };
+    unsafe {
+        EnumChildWindows(window, Some(proc), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    let row = ctx.row?;
+    let h = row.bottom - row.top;
+    if h < 12 || h > 60 {
+        return None;
+    }
+    // 名称框条带：[窗口左缘+8 .. EXCEL< 左缘-6]
+    let right = row.left - 6;
+    let left_min = wr.left + 8;
+    if right <= left_min {
+        return None;
+    }
+    let w = (right - left_min).min(280);
+    if w < 40 {
+        return None;
+    }
+    Some((right - w, row.top, w, h))
 }
 
 /// 内容法：名称框的值即活动单元格地址（B5 等），用 UIA ValuePattern 读出比对。

@@ -221,8 +221,39 @@ pub fn delete_step(db: State<DbState>, step_id: String) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     // 删除前先压栈（此时还能反查 recording_id）
     push_edit_history_for_step(&conn, &step_id);
+    let recording_id: String = conn
+        .query_row(
+            "SELECT recording_id FROM steps WHERE id = ?1",
+            params![step_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM steps WHERE id = ?1", params![step_id])
         .map_err(|e| e.to_string())?;
+    // ── 删除后重排 order_index / step_number（与合并流程同口径）──
+    // 之前只 DELETE 不重排：DB 里序号留空洞（1,2,4,5…），前端仅本地重编号
+    // 未落库，一导出就露馅（2026-09-09 用户实测：删两步后导出文件序号全错）。
+    let mut re_stmt = conn
+        .prepare("SELECT id FROM steps WHERE recording_id = ?1 ORDER BY order_index")
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<String> = re_stmt
+        .query_map(params![recording_id], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(re_stmt);
+    for (i, id) in ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE steps SET order_index = ?1, step_number = ?2 WHERE id = ?3",
+            params![i as i32, i as i32 + 1, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "UPDATE recordings SET total_steps = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![ids.len() as i32, recording_id],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

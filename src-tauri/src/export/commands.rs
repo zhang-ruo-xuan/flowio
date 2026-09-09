@@ -321,6 +321,16 @@ fn load_export_data(
         steps.push(row.map_err(|e| e.to_string())?);
     }
 
+    // ── 导出侧兜底重编号 ─────────────────────────────────────────
+    // 历史删除只 DELETE 不重排，DB 里 step_number 可能留空洞（1,2,4,5…）。
+    // 导出按 order_index 升序已排好，这里就地重编为连续 1..N，保证任何旧
+    // 录制导出（SKILL.md/steps.json/HTML/PDF）序号都连续（2026-09-09 用户实测）。
+    // order_index 同步压实，保持两字段口径一致（与 editor 合并流程同款）。
+    for (i, s) in steps.iter_mut().enumerate() {
+        s.order_index = i as i32;
+        s.step_number = i as i32 + 1;
+    }
+
     Ok((recording, steps))
 }
 
@@ -730,15 +740,21 @@ fn gen_html_body(
                 build_screenshot_placeholder_html().to_string()
             } else {
                 let raw = std::fs::read(&s.screenshot_path).ok().unwrap_or_default();
-                let is_crop = crop_set.contains(s.id.as_str());
-                let data = if is_crop && !raw.is_empty() {
-                    maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type).0
+                if raw.is_empty() {
+                    // 路径非空但读取失败（临时截图被清理等）：显式占位。
+                    // 之前静默产出空 base64 的 <img>，整份 PDF 观感接近全空白。
+                    build_screenshot_placeholder_html().to_string()
                 } else {
-                    raw
-                };
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
-                let mime = mime_from_path(&s.screenshot_path);
-                build_screenshot_img_html(mime, &encoded, s.step_number)
+                    let is_crop = crop_set.contains(s.id.as_str());
+                    let data = if is_crop {
+                        maybe_crop_screenshot_bytes(raw, s.x, s.y, s.crop_w, s.crop_h, &s.action_type).0
+                    } else {
+                        raw
+                    };
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                    let mime = mime_from_path(&s.screenshot_path);
+                    build_screenshot_img_html(mime, &encoded, s.step_number)
+                }
             };
 
             // Step header: "Step N: [type] title"
@@ -762,7 +778,9 @@ fn gen_html_body(
         .collect::<Vec<_>>()
         .join("\n");
 
-    build_html_document(&recording.title, recording.total_steps, &recording.created_at, &step_cards)
+    // 页头「Steps: N」用实际卡数而非 DB 的 total_steps——历史删除不同步该字段，
+    // 会出现「共 18 步」但只有 16 张卡的错位（2026-09-09 用户实测）。
+    build_html_document(&recording.title, steps.len() as i32, &recording.created_at, &step_cards)
 }
 
 /// Generate standalone HTML with base64-embedded screenshots.
@@ -1122,8 +1140,13 @@ fn load_skill_machine(conn: &rusqlite::Connection, recording_id: &str) -> SkillM
         ))
     });
     let Ok(rows) = rows else { return map };
+    // 键与 load_export_data 的兜底重编号保持同一口径：按 order_index 顺序 1..N。
+    // DB 的 step_number 在历史删除后可能有空洞，直接用会与展示序号错位。
+    let mut seq = 0i32;
     for row in rows.filter_map(|r| r.ok()) {
-        let (n, action, title, window, x, y, sx, sy, ex, ey, scroll, hotkey, anchor, desc) = row;
+        let (_, action, title, window, x, y, sx, sy, ex, ey, scroll, hotkey, anchor, desc) = row;
+        seq += 1;
+        let n = seq;
         let is_text = matches!(action.as_str(), "type" | "paste");
         map.insert(
             n,
@@ -2035,6 +2058,74 @@ fn resolve_edge_path() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+/// 用指定 headless 模式跑一次 Edge 打印。返回 (退出状态, stderr)；超时返回 Err。
+fn run_edge_pdf(
+    edge_path: &std::path::Path,
+    headless_flag: &str,
+    profile_dir: &std::path::Path,
+    html_url: &str,
+    output_pdf: &str,
+) -> Result<(std::process::ExitStatus, String), String> {
+    // spawn + try_wait 轮询实现超时：Edge 无头渲染大 HTML 可能卡死，
+    // 进程必须能被回收而不是无限阻塞导出线程。
+    let mut child = std::process::Command::new(edge_path)
+        .args([
+            headless_flag,
+            "--disable-gpu",
+            "--no-sandbox",
+            "--no-first-run",
+            "--disable-extensions",
+            "--no-pdf-header-footer",
+            // 独立 profile：与用户正开着的 Edge 完全隔离，杜绝进程交接/配置锁冲突
+            &format!("--user-data-dir={}", profile_dir.to_string_lossy()),
+            &format!("--print-to-pdf={}", output_pdf),
+            html_url,
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to launch Edge: {}", e))?;
+
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() > EDGE_PDF_TIMEOUT {
+                    let _ = child.kill();
+                    timed_out = true;
+                    break child
+                        .wait()
+                        .map_err(|e| format!("Edge wait failed: {}", e))?;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("Edge wait failed: {}", e)),
+        }
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut handle) = child.stderr.take() {
+        use std::io::Read;
+        let _ = handle.read_to_string(&mut stderr);
+    }
+    if timed_out {
+        return Err(format!(
+            "PDF 导出超时：Microsoft Edge 未在 {} 秒内完成渲染，已终止",
+            EDGE_PDF_TIMEOUT.as_secs()
+        ));
+    }
+    Ok((status, stderr))
+}
+
+/// 产物有效性：文件存在且大于「纯空白页」阈值（空白 PDF 实测 ~1.6KB，
+/// 正常 PDF 必含页头文字 + 内嵌字体子集，远大于该值）。
+fn pdf_output_ok(output_path: &std::path::Path) -> bool {
+    std::fs::metadata(output_path)
+        .map(|m| m.len() > 2048)
+        .unwrap_or(false)
+}
+
 /// Generate a PDF by rendering the HTML export via Microsoft Edge headless.
 /// The HTML (with base64-embedded screenshots) is written to a temp file,
 /// then converted to a self-contained PDF. No printpdf, no external deps.
@@ -2060,67 +2151,54 @@ fn export_pdf(
     // 3. Convert to PDF using Microsoft Edge headless
     let edge_path = resolve_edge_path()
         .ok_or_else(|| "未找到 Microsoft Edge，无法导出 PDF".to_string())?;
-    let html_url = format!(
-        "file:///{}",
-        html_path.to_string_lossy().replace('\\', "/")
-    );
+    // file URL 必须走 percent-encoding：手拼 file:/// 遇中文/空格路径会加载失败，
+    // 且 Edge 加载失败仍返回成功码 → 静默产出空白 PDF（2026-09-09 加固）。
+    let html_url = url::Url::from_file_path(&html_path)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("file:///{}", html_path.to_string_lossy().replace('\\', "/")));
+    let profile_dir = temp_dir.join(format!("flowio_edge_profile_{}", std::process::id()));
 
-    // spawn + try_wait 轮询实现超时：Edge 无头渲染大 HTML 可能卡死，
-    // 进程必须能被回收而不是无限阻塞导出线程。
-    let mut child = std::process::Command::new(&edge_path)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--no-first-run",
-            "--disable-extensions",
-            "--no-pdf-header-footer",
-            &format!("--print-to-pdf={}", output_path.to_string_lossy()),
-            &html_url,
-        ])
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to launch Edge: {}", e))?;
+    let output = output_path.to_string_lossy().to_string();
+    let mut result = run_edge_pdf(&edge_path, "--headless=new", &profile_dir, &html_url, &output);
+    // 静默空白防护：进程正常退出但没产出有效 PDF → 换旧版 headless 开关重试一次
+    if result.is_ok() && !pdf_output_ok(output_path) {
+        result = run_edge_pdf(&edge_path, "--headless", &profile_dir, &html_url, &output);
+    }
 
-    let start = Instant::now();
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() > EDGE_PDF_TIMEOUT {
-                    let _ = child.kill();
-                    timed_out = true;
-                    break child
-                        .wait()
-                        .map_err(|e| format!("Edge wait failed: {}", e))?;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => return Err(format!("Edge wait failed: {}", e)),
+    match result {
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&profile_dir);
+            Err(format!(
+                "{}（临时 HTML 已保留供诊断：{}）",
+                e,
+                html_path.to_string_lossy()
+            ))
         }
-    };
-
-    // 4. Collect Edge stderr（渲染失败信息）+ Clean up temp HTML (best effort)
-    let mut stderr = String::new();
-    if let Some(mut handle) = child.stderr.take() {
-        use std::io::Read;
-        let _ = handle.read_to_string(&mut stderr);
+        Ok((status, stderr)) => {
+            if !status.success() {
+                let _ = std::fs::remove_dir_all(&profile_dir);
+                return Err(format!("Edge PDF conversion failed: {}", stderr.trim()));
+            }
+            if !pdf_output_ok(output_path) {
+                // 两次都没产出有效 PDF：报错并把原始 HTML 留给用户/开发者，
+                // 绝不再静默成功（「导出成功」+ 打开全空白最坑人）。
+                let _ = std::fs::remove_dir_all(&profile_dir);
+                return Err(format!(
+                    "PDF 导出异常：Edge 正常退出但未生成有效 PDF（产物缺失或为空白页）。\
+                     原始 HTML 已保留在 {}，请将该文件连同此提示反馈给开发者。{}",
+                    html_path.to_string_lossy(),
+                    if stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Edge 输出：{}", stderr.trim())
+                    }
+                ));
+            }
+            let _ = std::fs::remove_file(&html_path);
+            let _ = std::fs::remove_dir_all(&profile_dir);
+            Ok(())
+        }
     }
-    let _ = std::fs::remove_file(&html_path);
-
-    if timed_out {
-        return Err(format!(
-            "PDF 导出超时：Microsoft Edge 未在 {} 秒内完成渲染，已终止",
-            EDGE_PDF_TIMEOUT.as_secs()
-        ));
-    }
-
-    if !status.success() {
-        return Err(format!("Edge PDF conversion failed: {}", stderr.trim()));
-    }
-
-    Ok(())
 }
 
 // ── Extracted pure logic functions ────────────────────────────
