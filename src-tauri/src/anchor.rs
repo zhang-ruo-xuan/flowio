@@ -658,12 +658,12 @@ fn ssd_match(
             let mut s: u64 = 0u64;
             let mut n: u32 = 0;
             for j in (0..th).step_by(2) {
-                let tj = (j as f64 * scale) as i32;
+                let tj = (j as f64 / scale) as i32;
                 if tj >= th_s {
                     continue;
                 }
                 for i in (0..tw).step_by(2) {
-                    let ti = (i as f64 * scale) as i32;
+                    let ti = (i as f64 / scale) as i32;
                     if ti >= tw_s {
                         continue;
                     }
@@ -1289,5 +1289,32 @@ mod tests {
         // 真正的方差门在 match_click_template 里。这里验证 ssd_match 仍能运行不崩。
         let res = ssd_match(&tpl, &scene, 1.0);
         assert!(res.is_some()); // 纯函数返回某候选即可（质量门在调用方）
+    }
+
+    #[test]
+    fn ssd_match_finds_patch_at_scale() {
+        use image::{DynamicImage, GrayImage, Luma};
+        // 原始分辨率场景 400x400，含一个 40x40 暗块（与模板同源）
+        let mut orig = GrayImage::from_pixel(400, 400, Luma([240u8]));
+        for y in 160..200 {
+            for x in 240..280 {
+                orig.put_pixel(x, y, Luma([20u8]));
+            }
+        }
+        // 模板 = 暗块区域（40x40 原分辨率）
+        let tpl = DynamicImage::ImageLuma8(orig.clone())
+            .crop_imm(240, 160, 40, 40)
+            .to_luma8();
+        // 场景降采样到最长边 320（scale = 400/320 = 1.25，正是重放时的真实情形）
+        let scale = 400.0 / 320.0;
+        let scene = DynamicImage::ImageLuma8(orig.clone())
+            .resize(320, 320, image::imageops::FilterType::Triangle)
+            .to_luma8();
+        let (mssd, bx, by) = ssd_match(&tpl, &scene, scale).expect("应匹配到");
+        assert!(mssd < 60.0, "降采样下仍应近乎零误差，实际 {}", mssd);
+        let exp_x = (240.0 / scale).round() as i32;
+        let exp_y = (160.0 / scale).round() as i32;
+        assert!((bx - exp_x).abs() <= 6, "bx={} 期望~{}", bx, exp_x);
+        assert!((by - exp_y).abs() <= 6, "by={} 期望~{}", by, exp_y);
     }
 }
