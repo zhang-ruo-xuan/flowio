@@ -20,6 +20,67 @@ struct ChatRequest<'a> {
     messages: &'a [Message],
     max_tokens: u32,
     temperature: f32,
+    /// 🔴 r1030：智谱私有字段 —— 关掉思考型模型的 thinking。
+    ///
+    ///   背景：桌面默认模型 `glm-4.6v-flash` 是**思考型**模型，纯文本提问时
+    ///   会把 max_tokens 整份额度花在 reasoning_content 上，标准 content 回空串
+    ///   ⇒ 桌面端「AI 摘要 / 自动描述」拿到空内容（表现为"点了没反应"）。
+    ///   网站侧早在 2026-10-08 就实测过同一现象并用这个字段修掉：
+    ///   单次从 328 token / 11.5s 降到 58 token / 2.3s。
+    ///
+    ///   🔴 只对智谱端点发这个字段：它是智谱私有参数，千问 / DeepSeek 等
+    ///   标准 OpenAI 兼容端点收到未知参数可能直接 400（网站侧同款纪律）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingDisabled>,
+}
+
+/// 智谱 `thinking: {type:"disabled"}` 的序列化形态。
+#[derive(Serialize)]
+struct ThinkingDisabled {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl ChatRequest<'_> {
+    /// 按服务商决定要不要关掉思考。
+    ///
+    /// 判定依据是 **base_url 主机名**（不是模型名）：同一个模型名在不同端点下
+    /// 字段支持度不同，按 host 判最稳。
+    fn thinking_for(base_url: &str) -> Option<ThinkingDisabled> {
+        let host = base_url
+            .split("//")
+            .nth(1)
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("");
+        if host.eq_ignore_ascii_case("open.bigmodel.cn") || host.eq_ignore_ascii_case("api.z.ai") {
+            Some(ThinkingDisabled { kind: "disabled" })
+        } else {
+            None
+        }
+    }
+
+    /// 构造实际发出的请求体。
+    ///
+    /// 🔴 **单独抽成函数**（而不是内联在调用点）：这样测试能锁住「调用点真的
+    ///   带了 thinking」这件事 —— 只测 `thinking_for` 的锁是假绿（把调用点
+    ///   的 `thinking:` 改成 None 它照样绿，r1030 变异自证实测过）。
+    fn build<'a>(
+        model: &'a str,
+        messages: &'a [Message],
+        max_tokens: u32,
+        temperature: f32,
+        base_url: &str,
+    ) -> ChatRequest<'a> {
+        ChatRequest {
+            model,
+            messages,
+            max_tokens,
+            temperature,
+            thinking: ChatRequest::thinking_for(base_url),
+        }
+    }
 }
 
 /// Internal response shape — only extract what we need.
@@ -35,7 +96,14 @@ struct Choice {
 
 #[derive(serde::Deserialize)]
 struct ChoiceMessage {
+    /// 标准输出。**思考型模型**（如 glm-4.6v-flash）纯文本提问时可能把
+    /// max_tokens 预算全花在 thinking 上、content 留空 ⇒ 下面有回落逻辑。
+    #[serde(default)]
     content: String,
+    /// 思考型模型的思维链字段（智谱 GLM 系列 / DeepSeek reasoner）。
+    /// 仅当 content 为空时作为兜底内容使用。
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// Call the LLM API synchronously using `reqwest::blocking`.
@@ -70,12 +138,13 @@ pub fn call_llm_with_tokens(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let request_body = ChatRequest {
-        model: &cfg.provider.model,
-        messages: &messages,
+    let request_body = ChatRequest::build(
+        &cfg.provider.model,
+        &messages,
         max_tokens,
-        temperature: 0.3,
-    };
+        0.3,
+        &cfg.provider.base_url,
+    );
 
     const MAX_RETRIES: usize = 4;
     // 🔴 内置免费通道 Key 池轮换（2026-09-07）：智谱限流按账号计，单账号退避
@@ -145,11 +214,65 @@ pub fn call_llm_with_tokens(
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .map(|c| pick_response_text(&c.message))
             .ok_or_else(|| "LLM response contained no choices".to_string());
     }
 
     Err(format!("{}（已重试 {} 次仍失败）", last_err, MAX_RETRIES))
+}
+
+/// 从一条响应消息里挑出「给用户看」的正文。
+///
+/// 🔴 r1030：思考型模型（glm-4.6v-flash 等）纯文本提问时，max_tokens 预算被
+///   thinking 吃光 ⇒ 标准 `content` 回空串，而有用内容在 `reasoning_content`。
+///   旧逻辑只取 content ⇒ 桌面端「AI 摘要 / 自动描述」拿到空内容
+///   （实测：带图时 content 有值、纯文本时为空 ⇒ 表现为"点了没反应"）。
+///
+///   规则：content 非空 ⇒ 用 content（正常路径优先）；content 为空 ⇒ 回落
+///   reasoning_content（剥掉思维链标记）；两者都空 ⇒ 保持空串。
+///
+/// 🔴 **单独抽成函数**（而不是内联在调用点）：这样测试能直接锁住真实取值
+///   路径，删掉回落逻辑时锁必红（r1030 变异自证踩过这个坑：只测纯函数
+///   `strip_reasoning_markers` 的锁是假绿）。
+fn pick_response_text(message: &ChoiceMessage) -> String {
+    let primary = message.content.trim();
+    if !primary.is_empty() {
+        return message.content.clone();
+    }
+    let reasoning = message.reasoning_content.clone().unwrap_or_default();
+    let fallback = strip_reasoning_markers(&reasoning);
+    if fallback.trim().is_empty() {
+        message.content.clone()
+    } else {
+        fallback
+    }
+}
+
+/// 去掉思考型模型思维链里的标记行（如 `<think>…</think>`、`<reasoning>…</reasoning>`），
+/// 只留下真正给用户看的正文。
+fn strip_reasoning_markers(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    // 反复剥掉成对的标记块（有的模型会输出多段）
+    loop {
+        let mut found = false;
+        for (open, close) in [("<think>", "</think>"), ("<reasoning>", "</reasoning>")] {
+            if let Some(start) = rest.find(open) {
+                if let Some(end) = rest[start..].find(close) {
+                    let after = &rest[start + open.len()..start + end];
+                    out.push_str(after);
+                    rest = &rest[start + end + close.len()..];
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 /// Classify a non-2xx LLM API response into a user-friendly error,
@@ -383,5 +506,120 @@ mod http_tests {
         assert_eq!(out.len(), 200);
         let plain = extract_error_text("plain text error");
         assert_eq!(plain, "plain text error");
+    }
+
+    // ── r1030：思考型模型（glm-4.6v-flash）兼容 ────────────────────────
+
+    /// 🔴 智谱端点必须带 `thinking:{type:"disabled"}`。
+    ///
+    /// 原因（实测 2026-10-25）：`glm-4.6v-flash` 是思考型模型，纯文本提问时
+    /// 把 max_tokens 整份额度花在 reasoning_content 上、标准 content 回空串
+    /// ⇒ 桌面端「AI 摘要 / 自动描述」拿到空内容（表现为"点了没反应"）。
+    /// 网站侧 2026-10-08 已用同一字段修掉（328 token/11.5s → 58 token/2.3s）。
+    #[test]
+    fn thinking_disabled_only_for_zhipu_hosts() {
+        assert!(ChatRequest::thinking_for("https://open.bigmodel.cn/api/paas/v4/chat/completions").is_some());
+        assert!(ChatRequest::thinking_for("https://api.z.ai/api/paas/v4/chat/completions").is_some());
+        // 🔴 智谱私有字段，标准 OpenAI 兼容端点收到可能 400 ⇒ 不能发
+        assert!(ChatRequest::thinking_for("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions").is_none());
+        assert!(ChatRequest::thinking_for("https://api.deepseek.com/v1/chat/completions").is_none());
+        assert!(ChatRequest::thinking_for("https://api.openai.com/v1/chat/completions").is_none());
+    }
+
+    /// `thinking` 字段序列化形态必须是 `{"type":"disabled"}`。
+    #[test]
+    fn thinking_serializes_as_type_disabled() {
+        let v = serde_json::to_value(ChatRequest::thinking_for("https://open.bigmodel.cn").unwrap()).unwrap();
+        assert_eq!(v["type"], "disabled");
+    }
+
+    /// 🔴 智谱请求体里**必须真的带上** `thinking:{"type":"disabled"}`。
+    ///
+    /// ⚠ 走 `ChatRequest::build`（**真实构造路径**，与调用点同一份）——
+    ///   否则把调用点的 thinking 去掉它照样绿（r1030 变异自证实测的假绿）。
+    #[test]
+    fn zhipu_request_body_carries_thinking_disabled() {
+        let body = ChatRequest::build(
+            "glm-4.6v-flash",
+            &[],
+            1024,
+            0.3,
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        );
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["thinking"]["type"], "disabled");
+    }
+
+    /// 🔴 第三方请求体里**不许**出现 `thinking` 字段（智谱私有参数会 400）。
+    #[test]
+    fn third_party_request_body_has_no_thinking_field() {
+        for host in [
+            "https://api.openai.com/v1/chat/completions",
+            "https://api.deepseek.com/v1/chat/completions",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        ] {
+            let body = ChatRequest::build("m", &[], 1024, 0.3, host);
+            let v = serde_json::to_value(&body).unwrap();
+            assert!(
+                v.get("thinking").is_none(),
+                "{} 的请求体不该带 thinking 字段",
+                host
+            );
+        }
+    }
+
+    /// 🔴 思考型模型纯文本返回空 content 时，回落 reasoning_content。
+    ///
+    /// ⚠ 直接调**真实取值函数** `pick_response_text`（与调用点同一份）——
+    ///   早期版本只测 `strip_reasoning_markers` 纯函数 ⇒ 删掉调用点的回落
+    ///   逻辑它照样绿（r1030 变异自证实测到的假绿，已修）。
+    #[test]
+    fn falls_back_to_reasoning_content_when_content_empty() {
+        let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"用户要关闭个性化广告。先找设置入口。"}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = resp.choices.into_iter().next().unwrap().message;
+        assert!(m.content.trim().is_empty());
+        let picked = pick_response_text(&m);
+        assert_eq!(picked, "用户要关闭个性化广告。先找设置入口。");
+        // 🔴 反向自证锚点：删掉调用点的回落 ⇒ picked 变空串 ⇒ 本锁必红
+        assert!(!picked.trim().is_empty());
+    }
+
+    /// content 有值时**不该**被 reasoning 覆盖（正常路径优先）。
+    #[test]
+    fn does_not_override_non_empty_content_with_reasoning() {
+        let json = r#"{"choices":[{"message":{"content":"图片里是红色。","reasoning_content":"内部思考"}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = resp.choices.into_iter().next().unwrap().message;
+        assert_eq!(pick_response_text(&m), "图片里是红色。");
+    }
+
+    /// content 与 reasoning 都空 ⇒ 保持空串（不塞垃圾）。
+    #[test]
+    fn both_content_and_reasoning_empty_stays_empty() {
+        let json = r#"{"choices":[{"message":{"content":"","reasoning_content":""}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        let m = resp.choices.into_iter().next().unwrap().message;
+        assert_eq!(pick_response_text(&m).trim(), "");
+    }
+
+    /// 思维链标记块要被剥掉（`<think>…</think>`）。
+    ///
+    /// 注意语义：标记**块**被移除，但块**内部**的文字保留（思维过程本身
+    /// 也是有效信息，不能整段丢）。所以结果是"内部文字 + 标记外的正文"。
+    #[test]
+    fn strips_think_tags_from_reasoning() {
+        let raw = "<think>先分析图片颜色</think>图里是蓝色。";
+        let out = strip_reasoning_markers(raw);
+        assert!(!out.contains("<think>"));
+        assert!(!out.contains("</think>"));
+        assert!(out.contains("图里是蓝色。"));
+    }
+
+    /// content 与 reasoning 都空 ⇒ 不返回垃圾（保持空）。
+    #[test]
+    fn empty_reasoning_stays_empty() {
+        assert_eq!(strip_reasoning_markers("   "), "");
+        assert_eq!(strip_reasoning_markers(""), "");
     }
 }

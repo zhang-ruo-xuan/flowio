@@ -193,6 +193,7 @@ pub fn voice_finish(
             crate::job_notify::JobOp::Voice,
             false,
             &summary,
+            None,
         );
         return Ok(());
     }
@@ -238,6 +239,7 @@ pub fn voice_finish(
             crate::job_notify::JobOp::Voice,
             ok,
             &summary,
+            None,
         );
     });
 
@@ -247,28 +249,66 @@ pub fn voice_finish(
     Ok(())
 }
 
+/// 语音转写实际使用的供应商通道。
+///
+/// 🔴 r1030：新增百炼通道。原因是智谱 ASR 在生产上**恒 429/1113**
+/// （`glm-asr-2512` 需要付费资源包，免费账号没余额）⇒ 桌面端语音整体失效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrChannel {
+    /// 智谱 `open.bigmodel.cn` multipart 端点（认热词 + 上下文 prompt）。
+    Zhipu,
+    /// 百炼 `dashscope` chat/completions 端点（同步、快、不认热词）。
+    DashScope,
+}
+
+impl AsrChannel {
+    /// 通道名（写日志 / 用户提示用）。
+    pub fn label(self) -> &'static str {
+        match self {
+            AsrChannel::Zhipu => "智谱",
+            AsrChannel::DashScope => "百炼",
+        }
+    }
+}
+
+/// 解析语音转写要用的 `(供应商, Key, 通道名)`。
+///
+/// 策略（r1030 改）：
+/// - 当前配置是**智谱系**且 Key 非空 ⇒ 走智谱（用户自备付费资源包时最划算，
+///   而且只有这条链路支持热词 + 跨段上下文）；
+/// - 其它情况（第三方服务商 / 智谱 Key 为空）⇒ **走百炼**（内置 Key）。
+///   ⚠ 旧实现在这里回落智谱内置免费 Key，而那把 Key 的 ASR 配额已耗尽
+///   （实测两把 Key 全 429）⇒ 语音功能整体报废。
+pub fn resolve_asr_provider(
+    cfg: &crate::ai::types::AiConfig,
+) -> (AsrChannel, String, &'static str) {
+    if asr::asr_supported(&cfg.provider.id, &cfg.provider.base_url)
+        && !cfg.api_key.trim().is_empty()
+    {
+        return (AsrChannel::Zhipu, cfg.api_key.clone(), "用户配置");
+    }
+    // 🔴 r1030：回落**百炼**而不是智谱内置 Key（智谱 ASR 配额已尽）。
+    (
+        AsrChannel::DashScope,
+        asr::DASHSCOPE_ASR_BUILTIN_KEY.to_string(),
+        "内置免费通道",
+    )
+}
+
 /// 解析语音转写实际使用的 API Key，返回 `(key, 通道名)`。
 ///
 /// 🔴 **不能直接复用 `resolve_ai_config().api_key`**，两个原因：
 ///
-/// ① ASR 端点硬编码智谱（`asr::ASR_URL`），拿千问 / DeepSeek 的 Key 去打
-///    智谱必然 401 —— Key 必须与端点同族。
+/// ① ASR 端点与 Key 必须同族（智谱 Key 不能打百炼端点，反之亦然）。
 /// ② 用户把默认 AI 服务商设成第三方，通常只是为了换模型写步骤说明（省钱
 ///    / 效果更好），**不该顺带把语音功能整个废掉**。旧逻辑在这里直接拒绝
 ///    服务，是「配了第三方 AI 之后语音就再没效果」的隐藏原因。
 ///
-/// 策略：当前配置是智谱系且 Key 非空 → 用它的；否则一律回落内置免费通道
-/// Key（`glm-asr-2512` 在免费额度内可用，2026-09-03 实测中文转写准确）。
+/// 保留本函数是为了兼容既有调用方与测试锁；新代码请用
+/// [`resolve_asr_provider`]（它同时给出供应商）。
 pub fn resolve_asr_key(cfg: &crate::ai::types::AiConfig) -> (String, &'static str) {
-    if asr::asr_supported(&cfg.provider.id, &cfg.provider.base_url)
-        && !cfg.api_key.trim().is_empty()
-    {
-        return (cfg.api_key.clone(), "用户配置");
-    }
-    // 内置免费通道：2026-09-07 起主 Key 用新注册智谱账号（独立配额，避开
-    // 旧账号 LLM 扫描+ASR 互相挤兑的高峰 429）；旧 Key 降级进 asr.rs 的
-    // ASR_FALLBACK_KEYS，主 Key 429 时自动兜底（见 transcribe_wav）。
-    (asr::ASR_BUILTIN_PRIMARY_KEY.to_string(), "内置免费通道")
+    let (_channel, key, label) = resolve_asr_provider(cfg);
+    (key, label)
 }
 
 /// 用户自定义 ASR 热词的 settings 键（JSON 字符串数组）。
@@ -382,7 +422,7 @@ fn transcribe_and_apply(recording_id: &str, buffer: VoiceBuffer) -> Result<Voice
 
     // ── 2. 解析 ASR 通道与 Key ────────────────────────────────
     let config = crate::ai::commands::resolve_ai_config(&conn);
-    let (asr_key, asr_channel) = resolve_asr_key(&config);
+    let (asr_provider, asr_key, asr_channel) = resolve_asr_provider(&config);
     if asr_key.trim().is_empty() {
         return Ok(VoiceDoneEvent {
             recording_id: recording_id.to_string(),
@@ -482,12 +522,18 @@ fn transcribe_and_apply(recording_id: &str, buffer: VoiceBuffer) -> Result<Voice
         for chunk in chunks {
             attempted += 1;
             let wav = audio::pcm_to_wav(chunk, sample_rate);
-            match asr::transcribe_wav_auto(
-                &asr_key,
-                wav,
-                &hotwords,
-                asr::segment_prompt(last_text.as_deref()).as_deref(),
-            ) {
+            // 🔴 r1030：按供应商分派。百炼是**同步 chat/completions**、不认热词、
+            //   也不接受跨段 prompt（专用 ASR 任务混文本即 400）⇒ 这两样都不传。
+            let attempt = match asr_provider {
+                AsrChannel::DashScope => asr::transcribe_wav_dashscope(&asr_key, wav),
+                AsrChannel::Zhipu => asr::transcribe_wav_auto(
+                    &asr_key,
+                    wav,
+                    &hotwords,
+                    asr::segment_prompt(last_text.as_deref()).as_deref(),
+                ),
+            };
+            match attempt {
                 Ok(text) if !text.is_empty() => {
                     last_text = Some(text.clone());
                     texts.push(text);
@@ -765,9 +811,77 @@ mod voice_commands_tests {
         assert_eq!(channel, "内置免费通道");
         // 绝不能拿第三方的 key 去打智谱端点（必然 401）
         assert_ne!(key, "sk-third-party-key");
-        assert!(!key.trim().is_empty());
-        // 2026-09-07 起内置通道主 Key = 新账号 Key（独立配额），旧 Key 只做兜底
-        assert_eq!(key, asr::ASR_BUILTIN_PRIMARY_KEY);
+        // 🔴 r1030：Key 改成构建期注入 ⇒ 未注入时为空是预期（UI 提示用户自配）
+        if asr::DASHSCOPE_ASR_BUILTIN_KEY.trim().is_empty() {
+            assert!(key.trim().is_empty(), "未注入内置 Key 时回落必须给空（不许凭空造）");
+        } else {
+            assert!(!key.trim().is_empty(), "注入了内置 Key 就必须真的回落上去");
+        }
+        // 🔴 r1030 决策变更：回落供应商从「智谱内置免费 Key」改成「百炼」。
+        //   原因（实测 2026-10-25）：智谱 `glm-asr-2512` 需要**付费资源包**，
+        //   两把桌面内置智谱 Key 全部 429 / 1113「余额不足或无可用资源包」
+        //   ⇒ 回落智谱等于「语音功能整体报废」。百炼 qwen3-asr-flash 免费档
+        //   实测 200 + 中文逐字准确（7.6 秒音频 0.77 秒返回）。
+        // 🔴 Key 改成构建期注入 ⇒ 未注入时百炼 Key 为空（此时 UI 提示用户自配）。
+        assert_eq!(key, asr::DASHSCOPE_ASR_BUILTIN_KEY);
+        // 供应商也必须是百炼（Key 必须与端点同族）
+        let (provider, _key, _label) = resolve_asr_provider(&third_party);
+        assert_eq!(provider, AsrChannel::DashScope);
+    }
+
+    /// 🔴 r1030：第三方服务商 ⇒ 走百炼，且**绝不能**回落智谱内置 Key
+    /// （那把 Key 的 ASR 配额已耗尽，回落过去等于语音功能整体失效）。
+    #[test]
+    fn resolve_asr_provider_third_party_never_falls_back_to_zhipu() {
+        use crate::ai::types::{AiConfig, AiProvider};
+
+        let third_party = AiConfig {
+            provider: AiProvider {
+                id: "custom_x".into(),
+                name: "第三方".into(),
+                base_url: "https://example.com/v1".into(),
+                model: "some-model".into(),
+            },
+            api_key: "sk-third-party".into(),
+        };
+        let (provider, key, _label) = resolve_asr_provider(&third_party);
+        assert_eq!(provider, AsrChannel::DashScope);
+        // 🔴 绝不能回落智谱内置 Key（那把 Key 的 ASR 配额已耗尽）
+        //   （未注入时两边都是空串，assert_ne 无意义 ⇒ 只在有值时比）
+        if !asr::ASR_BUILTIN_PRIMARY_KEY.trim().is_empty() {
+            assert_ne!(key, asr::ASR_BUILTIN_PRIMARY_KEY);
+        }
+        // 也绝不能把第三方的 key 带去别的供应商端点
+        assert_ne!(key, "sk-third-party");
+        // 回落时用的是内置百炼 Key（免费档）
+        assert_eq!(key, asr::DASHSCOPE_ASR_BUILTIN_KEY);
+        // 🔴 Key 改成构建期注入 ⇒ 未注入时为空是预期（UI 会提示用户自配 Key）
+        if asr::DASHSCOPE_ASR_BUILTIN_KEY.trim().is_empty() {
+            assert!(key.trim().is_empty());
+        } else {
+            assert!(!key.trim().is_empty());
+        }
+    }
+
+    /// 🔴 r1030：用户自配**智谱**（有付费资源包）⇒ 仍走智谱，
+    /// 因为只有智谱链路支持热词 + 跨段上下文。
+    #[test]
+    fn resolve_asr_provider_keeps_zhipu_when_user_configured() {
+        use crate::ai::types::{AiConfig, AiProvider};
+
+        let mine = AiConfig {
+            provider: AiProvider {
+                id: "zhipu".into(),
+                name: "我的智谱".into(),
+                base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+                model: "glm-4.6v-flash".into(),
+            },
+            api_key: "sk-my-zhipu".into(),
+        };
+        let (provider, key, label) = resolve_asr_provider(&mine);
+        assert_eq!(provider, AsrChannel::Zhipu);
+        assert_eq!(key, "sk-my-zhipu");
+        assert_eq!(label, "用户配置");
     }
 
     /// 用户自配智谱时应当优先用他自己的 Key（省内置额度、也更可控）。
@@ -805,7 +919,12 @@ mod voice_commands_tests {
         };
         let (key, channel) = resolve_asr_key(&empty);
         assert_eq!(channel, "内置免费通道");
-        assert!(!key.trim().is_empty());
+        // 🔴 r1030：同上（未注入 ⇒ 空是预期；注入 ⇒ 必须非空）
+        if asr::DASHSCOPE_ASR_BUILTIN_KEY.trim().is_empty() {
+            assert!(key.trim().is_empty());
+        } else {
+            assert!(!key.trim().is_empty());
+        }
     }
 
     #[test]

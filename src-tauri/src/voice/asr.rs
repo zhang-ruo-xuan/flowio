@@ -16,12 +16,24 @@ pub const ASR_URL: &str = "https://open.bigmodel.cn/api/paas/v4/audio/transcript
 /// 智谱限流是**账号级**的：旧免费账号 Key 同时承担桌面 LLM 扫描（glm-4.6v-flash）
 /// 与 ASR，高峰期互相挤兑频繁 429。新账号 Key 与服务端 `/api/ai/asr` 主 Key
 /// 同账号同源，专供 ASR 后配额充裕。旧 Key 降级进 [`ASR_FALLBACK_KEYS`] 兜底。
-pub const ASR_BUILTIN_PRIMARY_KEY: &str = "054d0f9ec2f947a887b05e6ac45d7012.q3KSxvGcWLJAOMuD";
+///
+/// 🔴 r1030 安全修复：Key **不再硬编码**（本仓是 GitHub 公开仓）⇒ 改为构建期
+///   注入 `FLOWIO_BUILTIN_AI_KEY`（与桌面 LLM 通道共用同一把，见 ai/commands.rs）。
+///   ⚠ 但注意：`glm-asr-2512` 需要智谱**付费资源包**，免费账号恒 429/1113 ⇒
+///   这条链现在**只对自备付费资源包的用户**有效（`resolve_asr_provider` 走
+///   「用户配置」分支）；其它情况一律走百炼。
+pub const ASR_BUILTIN_PRIMARY_KEY: &str = match option_env!("FLOWIO_BUILTIN_AI_KEY") {
+    Some(k) => k,
+    None => "",
+};
 
 /// ASR 兜底 Key 池：主 Key 返回 429（限流或配额不可用）时依次尝试。
 /// 当前仅旧免费账号 Key（与 `ai::commands::get_builtin_free_config` 同一把，
 /// LLM 扫描通道继续用它，互不影响）。
-pub const ASR_FALLBACK_KEYS: &[&str] = &["874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U"];
+pub const ASR_FALLBACK_KEYS: &[&str] = &[match option_env!("FLOWIO_BUILTIN_AI_FALLBACK_KEY") {
+    Some(k) => k,
+    None => "",
+}];
 
 /// ASR 模型名。
 ///
@@ -36,6 +48,44 @@ pub const ASR_FALLBACK_KEYS: &[&str] = &["874191e5443c479f968aafd3a07f257c.6LksF
 /// 一律当限流退避重试 3 次（3s+6s+12s=21s），用户表现为「录了半天、
 /// 最后提示未检测到语音内容」。改模型名前请重新跑一遍真实语音回归。
 pub const ASR_MODEL: &str = "glm-asr-2512";
+
+// ===========================================================================
+// 🔴 r1030：百炼（阿里云 DashScope）ASR 通道 —— 智谱 ASR 在生产上恒 429/1113
+// ===========================================================================
+
+/// 百炼 ASR 端点（走标准 OpenAI 兼容 `chat/completions`，与网站 `/api/ai/asr`
+/// 的 `ASR_PROVIDER=dashscope` 同一条链、同一个模型）。
+///
+/// **为什么不用智谱**：`glm-asr-2512` 需要智谱的**付费资源包**，免费账号恒回
+/// 429 / 1113「余额不足或无可用资源包」——实测 2026-10-25 两把桌面内置智谱
+/// Key 全部 429 ⇒ 桌面端语音转写**整体失效**。
+///
+/// **为什么走 chat/completions 而不是百炼原生 ASR 端点**：原生端点是**异步**
+/// 的（要 file_urls + 轮询），慢 3~5 倍；而 `qwen3-asr-flash` 挂在
+/// chat/completions 上是**同步**的（实测 7.6 秒音频 0.77 秒返回），体验等价。
+///
+/// **音频怎么传**：`input_audio.data` 必须带 `data:audio/wav;base64,` 前缀
+/// （裸 base64 ⇒ 400「URL 无效」）。
+pub const DASHSCOPE_ASR_URL: &str =
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+
+/// 百炼 ASR 模型名（与网站侧 `DASHSCOPE_ASR_MODEL` 默认值同口径）。
+pub const DASHSCOPE_ASR_MODEL: &str = "qwen3-asr-flash";
+
+/// 百炼 ASR 内置 Key（与网站 `/api/ai/asr` 用的 `QWEN_API_KEY` 同源同源账号）。
+///
+/// 🔴 这把 Key **不是**桌面原有的智谱 Key，是另一家供应商的；桌面此前没有
+/// 任何百炼 Key，这里补上以恢复语音功能。
+///
+/// 🔴 r1030 安全修复：同样**不再硬编码**（本仓是 GitHub 公开仓）⇒ 构建期注入
+///   `FLOWIO_BUILTIN_DASHSCOPE_KEY`。
+pub const DASHSCOPE_ASR_BUILTIN_KEY: &str = match option_env!("FLOWIO_BUILTIN_DASHSCOPE_KEY") {
+    Some(k) => k,
+    None => "",
+};
+
+/// 百炼单段音频上限（对齐网站 `DASHSCOPE_ASR_MAX_BYTES`）。
+pub const DASHSCOPE_ASR_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// 当前 AI 配置是否属于「智谱系」通道。
 ///
@@ -332,6 +382,91 @@ pub fn transcribe_wav_auto(
     Ok(first)
 }
 
+// ===========================================================================
+// 🔴 r1030：百炼 ASR 实现
+// ===========================================================================
+
+/// 百炼（DashScope）语音转写：走标准 OpenAI 兼容 `chat/completions`。
+///
+/// **同步**（与百炼原生异步 ASR 端点不同）⇒ 体验等价、速度更快。
+/// 实测（2026-10-25）：7.6 秒中文语音 → 0.77 秒返回，逐字正确。
+///
+/// **能力边界（实测，别当热词表用）**：
+/// - ✅ 中文/英文转写准确；
+/// - ❌ **不认热词参数**：`context` / `hotwords` / `asr_options` / `vocabulary`
+///   全被静默忽略（输出与不传时逐字相同）；system 里带词表直接 400。
+///   ⇒ 热词能力由**网站侧 LLM 术语纠错**承担（`lib/asrHotwords.ts`），
+///   桌面端暂无等价机制（见 r1030 遗留项）。
+/// - ❌ **不能带 prompt / 上一段上下文**：百炼 ASR 是**专用任务**，混入文本即 400。
+///   ⇒ 跨段上下文（[`segment_prompt`]）在百炼链路上不可用。
+///
+/// # Errors
+/// HTTP 非 2xx 或响应缺 `choices[0].message.content` 时返回带原因的 String。
+pub fn transcribe_wav_dashscope(
+    api_key: &str,
+    wav_bytes: Vec<u8>,
+) -> Result<String, String> {
+    if wav_bytes.len() > DASHSCOPE_ASR_MAX_BYTES {
+        return Err(format!(
+            "音频过大（{} 字节），超过百炼 ASR 单段上限 {} 字节",
+            wav_bytes.len(),
+            DASHSCOPE_ASR_MAX_BYTES
+        ));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    // 🔴 `input_audio.data` 必须带 `data:audio/wav;base64,` 前缀（裸 base64 ⇒ 400「URL 无效」）
+    let b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&wav_bytes)
+    };
+    let audio_data = format!("data:audio/wav;base64,{}", b64);
+
+    let body = serde_json::json!({
+        "model": DASHSCOPE_ASR_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": { "data": audio_data }
+            }]
+        }],
+        "max_tokens": 512
+    });
+
+    let response = client
+        .post(DASHSCOPE_ASR_URL)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .unwrap_or_else(|_| "<unable to read body>".to_string());
+    if !status.is_success() {
+        return Err(format!("百炼 ASR 失败 HTTP {}: {}", status, text));
+    }
+
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析百炼 ASR 响应失败: {}", e))?;
+    let content = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if content.is_empty() {
+        return Err("百炼 ASR 返回空内容".to_string());
+    }
+    Ok(content)
+}
+
 /// 429 是否属于「重试也没用」的配额/账户类错误。
 ///
 /// 智谱实测错误码：`1113` = 余额不足或无可用资源包（不可恢复）；
@@ -393,19 +528,27 @@ mod asr_tests {
         assert_ne!(ASR_MODEL, "glm-asr", "glm-asr 需付费资源包，免费 Key 会返回 429/1113");
     }
 
-    /// 双 Key 池：主 Key（新账号）与兜底 Key（旧免费账号）必须不同且非空，
-    /// 兜底池必须含旧内置免费 Key（LLM 扫描同源 Key，账号级限流隔离）。
+    /// 双 Key 池：主 Key 与兜底 Key 必须不同且非空。
+    ///
+    /// 🔴 r1030：Key 改成**构建期注入**（`option_env!`）⇒ 编译时注入了才非空。
+    ///   · 注入时：主 ≠ 兜底，且都非空（兜底池不许出现空串占位）；
+    ///   · 未注入时（开发/CI 常见）：两把都为空是**预期**（此时内置通道判定为
+    ///     「未配置」，UI 明确提示用户自己填 Key，而不是拿空 Key 去请求 401）。
     #[test]
     fn builtin_key_pool_primary_and_fallback_are_distinct() {
-        assert!(!ASR_BUILTIN_PRIMARY_KEY.trim().is_empty());
+        if ASR_BUILTIN_PRIMARY_KEY.trim().is_empty() {
+            // 未注入：必须是「两把都空」，不许半把（半把 ⇒ 会拿着半把去打接口）
+            assert!(
+                ASR_FALLBACK_KEYS.iter().all(|k| k.trim().is_empty()),
+                "未注入主 Key 时兜底池也必须为空（不许半配置）"
+            );
+            return;
+        }
         assert!(!ASR_FALLBACK_KEYS.is_empty());
         for fb in ASR_FALLBACK_KEYS {
             assert_ne!(*fb, ASR_BUILTIN_PRIMARY_KEY, "兜底 Key 不得与主 Key 相同");
-            assert!(!fb.trim().is_empty());
+            assert!(!fb.trim().is_empty(), "兜底池里不许有空串占位");
         }
-        // 旧内置免费 Key 必须在兜底池里（降级不丢弃）
-        assert!(ASR_FALLBACK_KEYS
-            .contains(&"874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U"));
     }
 
     /// 仅 429 类错误（限流/配额）值得换兜底 Key；网络/4xx/5xx 换 Key 无意义。
@@ -542,5 +685,104 @@ mod asr_tests {
         assert_eq!(detect_lang("hello world"), "en");
         // 中文 → 不重转（直接返回首轮）
         assert_eq!(detect_lang("你好世界"), "zh");
+    }
+
+    // ── r1030：源码里不得再有明文 Key ────────────────────────────────
+
+    /// 🔴 **安全锁**：源码里不得再出现明文模型 Key。
+    ///
+    ///   背景：本仓是 GitHub **公开仓**（github.com/zhang-ruo-xuan/flowio），
+    ///   此前两把智谱 Key 是明文硬编码在 Rust 源码里的 ⇒ 任何人 clone 下来
+    ///   就能拿走并盗用你的免费额度（免费额度按**账号**计，撞了就是你的
+    ///   LLM 扫描 / 语音转写被限流）。
+    ///
+    ///   现在改成构建期注入（`option_env!` + build.rs 的 rerun-if-env-changed），
+    ///   这条锁保证它**不会被人顺手改回去**。
+    ///
+    ///   判据：扫描 src-tauri/src 下全部 .rs，命中「智谱 Key 形态」
+    ///   （32 位十六进制 + 点 + 16 位）或 `sk-` 开头的长串 ⇒ 必红。
+    ///   注释行不参与判定（文档里可以写形如 xxx 的示例）。
+    #[test]
+    fn source_contains_no_plaintext_model_keys() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits: Vec<String> = Vec::new();
+
+        fn looks_like_zhipu_key(line: &str) -> bool {
+            let bytes = line.as_bytes();
+            let mut seg_len = 0usize;
+            for (i, b) in bytes.iter().enumerate() {
+                let c = *b as char;
+                if c.is_ascii_hexdigit() {
+                    seg_len += 1;
+                } else {
+                    if seg_len == 32 && bytes.get(i) == Some(&b'.') {
+                        return true;
+                    }
+                    seg_len = 0;
+                }
+            }
+            false
+        }
+
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, hits);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let Ok(text) = std::fs::read_to_string(&p) else {
+                        continue;
+                    };
+                    for (i, line) in text.lines().enumerate() {
+                        let t = line.trim_start();
+                        if t.starts_with("//") || t.starts_with("///") || t.starts_with('*') {
+                            continue;
+                        }
+                        // 判据要准：只抓**真实形态**的 Key，不抓测试里的假串。
+                        // · 智谱：32 位十六进制 + 点 + 16 位（如 054d0f… .q3KSxvGcWLJAOMuD）
+                        // · 通用：sk- 后跟 ≥ 20 位（测试里的 "sk-user" / "sk-real" 这类短假串不算）
+                        // · `redaction` 模块除外：那是**脱敏功能自己的测试样本**
+                        //   （形如「sk- 加一串占位字母数字」），它就该把假 Key 写进源码。
+                        if p.to_string_lossy().replace('\\', "/").contains("/redaction/") {
+                            continue;
+                        }
+                        let looks_sk = {
+                            let mut hit = false;
+                            let mut rest = line;
+                            while let Some(idx) = rest.find("sk-") {
+                                let tail = &rest[idx + 3..];
+                                let token: String =
+                                    tail.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                                if token.len() >= 20 {
+                                    hit = true;
+                                    break;
+                                }
+                                rest = &rest[idx + 3..];
+                            }
+                            hit
+                        };
+                        if looks_like_zhipu_key(line) || looks_sk {
+                            hits.push(format!(
+                                "{}:{}: {}",
+                                p.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                                i + 1,
+                                line.trim().chars().take(60).collect::<String>()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        walk(&src_root, &mut hits);
+        assert!(
+            hits.is_empty(),
+            "源码里又出现了明文模型 Key（{} 处）—— 必须用 option_env! + 构建期注入：\n{}",
+            hits.len(),
+            hits.join("\n")
+        );
     }
 }

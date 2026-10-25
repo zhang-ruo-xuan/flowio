@@ -16,7 +16,7 @@ automation = []
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "custom-protocol"] }
+tauri = { version = "2", features = ["protocol-asset", "custom-protocol", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
@@ -63,6 +63,15 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
 url = "2"
 cpal = "0.15"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+qrcode = { version = "0.14", default-features = false }
 
 [patch.crates-io]
 rfd = { path = "../patches/rfd" }
+
+# 🔴 r1030：真机网络验证用的集成测试依赖（tests/live_ai_r1030.rs）。
+#   集成测试是**独立 crate**，不会继承 [dependencies] ⇒ 必须显式声明。
+[dev-dependencies]
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "http2"] }
+base64 = "0.22"

@@ -187,14 +187,29 @@ pub fn get_default_provider(db: State<DbState>) -> Result<String, String> {
 /// 智谱限流按账号计（1302 账户限流 / 1305 模型并发限流），单账号高峰期必撞 429。
 /// 主 Key = 新注册智谱账号；兜底 = 旧免费账号。与插件端 modelEnum.ts
 /// FLOWIO_FREE_KEY_POOL、服务端 /api/ai/asr ASR_KEYS、voice/asr.rs 同源同账号。
-pub(crate) const AI_BUILTIN_PRIMARY_KEY: &str = "054d0f9ec2f947a887b05e6ac45d7012.q3KSxvGcWLJAOMuD";
-pub(crate) const AI_BUILTIN_FALLBACK_KEY: &str = "874191e5443c479f968aafd3a07f257c.6LksFwbwhCrAfW8U";
+///
+/// 🔴 r1030 安全修复：这两把 Key **不再硬编码在源码里**（本仓是 GitHub 公开仓，
+///   明文 Key 会被任何人 clone 走）。改为**构建期注入**：
+///   `FLOWIO_BUILTIN_AI_KEY` / `FLOWIO_BUILTIN_AI_FALLBACK_KEY`。
+///   读不到（没注入）⇒ 空串 ⇒ 内置通道判定为「未配置」，UI 明确提示用户
+///   去设置里填自己的 Key，而不是拿空 Key 去请求（401）让人误以为自己配错了。
+pub(crate) const AI_BUILTIN_PRIMARY_KEY: &str = match option_env!("FLOWIO_BUILTIN_AI_KEY") {
+    Some(k) => k,
+    None => "",
+};
+pub(crate) const AI_BUILTIN_FALLBACK_KEY: &str = match option_env!("FLOWIO_BUILTIN_AI_FALLBACK_KEY") {
+    Some(k) => k,
+    None => "",
+};
 
 pub(crate) fn builtin_free_key_pool() -> Vec<String> {
     vec![
         AI_BUILTIN_PRIMARY_KEY.to_string(),
         AI_BUILTIN_FALLBACK_KEY.to_string(),
     ]
+    .into_iter()
+    .filter(|k| !k.trim().is_empty())
+    .collect()
 }
 
 /// Built-in free-tier AI configuration (Flowio free trial).
@@ -293,6 +308,16 @@ pub(crate) fn resolve_ai_config(conn: &rusqlite::Connection) -> AiConfig {
             cfg.api_key = get_builtin_free_config().api_key;
         }
         return cfg;
+    }
+
+    // 🔴 用户**显式**选了内置免费通道（`default_ai_provider = flowio-free`），但库里
+    // 没有 `ai_config_flowio-free` 这一行 —— 这是**正常状态**：内置通道不需要用户填
+    // key，所以永远不会被写进 settings。此时必须直接用内置配置收场，**不能**掉进下面
+    // 「扫任意可用配置」的兜底：那会把用户另外配过的付费 provider 顶上来，报出
+    // 「模型错误：xxx —— Access to model denied」这种与他所选服务商毫不相干的错。
+    // （2026-09-20 实测：默认是 flowio-free，AI 摘要却报 qwen3.8-max 无权限。）
+    if default_id.as_deref() == Some("flowio-free") {
+        return get_builtin_free_config();
     }
 
     match scan_first_usable_ai_config(conn) {
@@ -1058,6 +1083,52 @@ mod ai_commands_tests {
         assert_eq!(d, None, "缺省时无默认 provider 行（命令层回退 flowio-free）");
     }
 
+    /// 用户显式选了内置免费通道 → 即使他另外配过付费 provider，也不能被顶掉。
+    /// 回归：2026-09-20「AI 摘要失败：模型错误 qwen3.8-max —— Access to model denied」。
+    #[test]
+    fn explicit_free_tier_is_not_overridden_by_stored_configs() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn);
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('default_ai_provider', 'flowio-free')",
+            [],
+        )
+        .unwrap();
+        // 用户自配的付费 provider（rowid 更小，扫描兜底时会被先扫到）
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('ai_config_qwen-coding-plan', ?1)",
+            params![
+                r#"{"provider":{"id":"qwen-coding-plan","name":"千问 coding-plan (qwen3.8-max)","base_url":"https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions","model":"qwen3.8-max"},"api_key":"sk-user"}"#
+            ],
+        )
+        .unwrap();
+
+        let cfg = resolve_ai_config(&conn);
+        assert_eq!(cfg.provider.id, "flowio-free", "显式选免费通道时不能被自配 provider 顶掉");
+        assert_eq!(cfg.provider.model, "glm-4.6v-flash");
+        // 🔴 r1030：内置 Key 改成构建期注入 ⇒ 没注入时为空是预期（UI 会提示
+        //   用户自己配 Key）。注入时必须真的带上（否则请求会 401）。
+        if !crate::ai::commands::AI_BUILTIN_PRIMARY_KEY.trim().is_empty() {
+            assert!(!cfg.api_key.is_empty(), "注入了内置 key 就必须真的带上");
+        } else {
+            assert!(cfg.api_key.is_empty(), "没注入内置 key 时不许凭空造一个");
+        }
+
+        // 反向：**没有** default_ai_provider 时，扫描兜底仍按原样生效
+        let conn2 = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn2);
+        conn2
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('ai_config_qwen-coding-plan', ?1)",
+                params![
+                    r#"{"provider":{"id":"qwen-coding-plan","name":"qwen","base_url":"https://example.com/v1/chat/completions","model":"qwen3.8-max"},"api_key":"sk-user"}"#
+                ],
+            )
+            .unwrap();
+        let cfg2 = resolve_ai_config(&conn2);
+        assert_eq!(cfg2.provider.id, "qwen-coding-plan", "没设默认时应沿用扫描到的配置");
+    }
+
     #[test]
     fn ai_config_invalid_json_rejected() {
         let bad = "not-json{";
@@ -1147,7 +1218,12 @@ mod ai_commands_tests {
 
         let cfg = resolve_ai_config(&conn);
         assert_eq!(cfg.provider.id, "flowio-free", "全坏时应回退内置免费通道");
-        assert!(!cfg.api_key.is_empty(), "回退时必须带上内置 key");
+        // 🔴 r1030：同上（构建期注入 ⇒ 未注入时为空是预期）
+        if !crate::ai::commands::AI_BUILTIN_PRIMARY_KEY.trim().is_empty() {
+            assert!(!cfg.api_key.is_empty(), "注入了内置 key 就必须在回退时带上");
+        } else {
+            assert!(cfg.api_key.is_empty(), "没注入内置 key 时不许凭空造一个");
+        }
     }
 
     // ── read_file_base64 / row_to_step_input ─────────────────
