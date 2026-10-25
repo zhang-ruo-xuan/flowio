@@ -11,6 +11,8 @@ export default defineConfig({
     },
   },
   build: {
+    minify: false,
+    sourcemap: true,
     rollupOptions: {
       input: {
         main: resolve(__dirname, "index.html"),

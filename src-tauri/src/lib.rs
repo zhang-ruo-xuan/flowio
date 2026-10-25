@@ -1,4 +1,5 @@
 // StepSnap-style annotation
+mod paths;
 mod db;
 mod recorder;
 mod settings;
@@ -23,12 +24,15 @@ mod executor;
 mod executor;
 mod anchor;
 mod uia;
+// r740 录制入口：flowio:// 唤起路由 + 托盘常驻（关窗=隐藏，入口才在进程里活着）
+mod entry;
+mod tray;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use rusqlite::Connection;
 use recorder::Recorder;
-use tauri::{Manager, Emitter, AppHandle};
+use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_store;
 use tauri_plugin_notification;
@@ -113,58 +117,28 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // 第二实例被唤醒时（如 deep-link URL），deep-link 插件不会触发 on_open_url，
-            // URL 通过 argv 传入，需在此手动解析并转发事件
-            let mut handled = false;
-            for arg in &argv {
-                // 兼容三种格式：裸 URL（flowio://...）、--flowio-deeplink=flowio://...、
-                // Windows 协议处理器可能传 URL 作为唯一 argv
-                let url_str = arg.strip_prefix("--flowio-deeplink=").unwrap_or(arg);
-                if let Some(u) = try_parse_auth_url(url_str) {
-                    handled = true;
-                    // 持久化到 PendingDeepLink，防止前端监听器尚未就绪时事件丢失
-                    if let Some(pending) = app.try_state::<PendingDeepLink>() {
-                        *pending.0.lock().unwrap() = Some(u.clone());
-                    }
-                    let _ = app.emit("deep-link-auth", u);
-                    break;
-                }
-            }
-            // argv 为空时尝试从 argv[0] 裸 URL 解析（Windows 可能将 URL 作为程序路径传入）
-            if !handled && !argv.is_empty() {
-                if let Some(u) = try_parse_auth_url(&argv[0]) {
-                    handled = true;
-                    if let Some(pending) = app.try_state::<PendingDeepLink>() {
-                        *pending.0.lock().unwrap() = Some(u.clone());
-                    }
-                    let _ = app.emit("deep-link-auth", u);
-                }
-            }
-            // Windows 某些情况下 argv 是空或只包含程序路径，尝试从环境变量获取
-            if !handled {
-                if let Ok(env_url) = std::env::var("FLOWIO_DEEPLINK_URL") {
-                    if let Some(u) = try_parse_auth_url(&env_url) {
-                        handled = true;
-                        if let Some(pending) = app.try_state::<PendingDeepLink>() {
-                            *pending.0.lock().unwrap() = Some(u.clone());
-                        }
-                        let _ = app.emit("deep-link-auth", u);
-                    }
-                }
-            }
-            // 聚焦窗口
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.set_focus();
-            }
+            // URL 通过 argv 传入，需在此手动解析并转发事件（解析规则见 entry::handle_launch_args）
+            entry::handle_launch_args(app, &argv);
+            // r740：这里从 set_focus 改成 show_main_window——窗口被关进托盘时是**隐藏**状态，
+            // 只 set_focus 的话，从网站点「桌面录制」拉不起来窗口。
+            entry::show_main_window(app);
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        // r740：关窗 = 隐藏进托盘（入口继续在线）。注册在 builder 上而不是 setup 里，
+        // 因为 setup 拿到的 `&mut App` 没有 on_window_event；托盘缺席时该回调自己放行关闭。
+        .on_window_event(tray::hide_on_close)
         .setup(|app| {
             // 全局快捷键：Alt+Shift+S 录制 / Alt+Shift+P 暂停 / Alt+Shift+E 停止
             hotkey::init_hotkeys(app.handle());
 
             let app_data_dir = app.path().app_data_dir().expect("failed to get app data dir");
             std::fs::create_dir_all(&app_data_dir).ok();
+            // 注入统一路径工具（paths::screenshots_dir 等）：截图/媒体持久目录
+            // 与 DB 同属 app_data_dir，随 setup 一并初始化。
+            paths::set_app_data_dir(app_data_dir.clone());
+            paths::screenshots_dir(); // 提前创建持久截图目录
             let db_path = app_data_dir.join("flowio.db");
             // 启动即自动备份 DB（保留 5 份）：防数据目录被外部清空/损坏后全灭。
             // 失败静默，绝不阻塞启动。
@@ -179,7 +153,10 @@ pub fn run() {
             settings::commands::refresh_auto_redact_policy(&conn);
             app.manage(DbState(Mutex::new(conn)));
             app.manage(RecordingManager(Mutex::new(HashMap::new())));
+            // 「续录」目标（本次录制该插进哪份教程的哪个位置），停录时按会话 id 取用一次
+            app.manage(recorder::commands::AppendTargetState(Default::default()));
             app.manage(PendingDeepLink(Mutex::new(None)));
+            app.manage(entry::PendingAction::default());
             app.manage(voice::commands::VoiceCaptureState(Default::default()));
             app.manage(voice::capture::MicCaptureState(Default::default()));
 
@@ -188,27 +165,33 @@ pub fn run() {
             // 仅监听 127.0.0.1；扩展未安装时静默无影响，自动回落到 UIA。
             recorder::selection_bridge::start_server();
 
-            // Deep-link handler: flowio://auth?token=...&id=...&email=...
+            // Deep-link handler: flowio://auth?token=...（登录回调）
+            //                        flowio://record | flowio://stop（r740 录制入口）
             let handle = app.handle().clone();
             // Register the flowio:// scheme (Windows writes HKCU\Software\Classes\flowio)
             let _ = app.deep_link().register("flowio");
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
                     println!("[deep-link] 收到 URL: {}", url); // 调试日志
-                    if let Some(u) = try_parse_auth_url(url.as_str()) {
-                        // 先持久化，防止前端尚未就绪
-                        if let Some(pending) = handle.try_state::<PendingDeepLink>() {
-                            *pending.0.lock().unwrap() = Some(u.clone());
-                        }
-                        let _ = handle.emit("deep-link-auth", u);
+                    if entry::handle_url(&handle, url.as_str()) {
                         break;
                     }
                 }
-                // 聚焦窗口
-                if let Some(w) = handle.get_webview_window("main") {
-                    let _ = w.set_focus();
-                }
+                entry::show_main_window(&handle);
             });
+
+            // 冷启动补一刀：app 原本没运行时，`flowio://record` 直接拉起**第一个**实例，
+            // 既不走 single-instance 回调也不保证走 on_open_url，动作只能自己从 argv 里捞。
+            // 此刻 React 还没挂 listen，所以动作落在 PendingAction 槽里，由前端挂载后取走。
+            entry::handle_launch_args(app.handle(), &std::env::args().collect::<Vec<String>>());
+
+            // r740：托盘常驻入口。托盘要在 PendingAction 之后建，
+            // 菜单项点下去走的是 entry::store_and_emit_action，那个状态必须已经 manage 好。
+            // 构建失败不阻塞启动：托盘缺席时 hide_on_close 的闸门会放行正常关窗，
+            // 不至于「图标没出来 + 窗口又关不掉」把用户锁死。
+            if let Err(e) = tray::build(app.handle()) {
+                eprintln!("[startup] tray unavailable: {}", e);
+            }
 
             Ok(())
         })
@@ -222,6 +205,7 @@ pub fn run() {
             db::commands::duplicate_recording,
             db::commands::update_recording_app_name,
             recorder::commands::start_recording,
+            recorder::commands::start_append_recording,
             recorder::commands::list_target_windows,
             recorder::commands::pause_recording,
             recorder::commands::resume_recording,
@@ -261,12 +245,25 @@ pub fn run() {
             editor::commands::editor_view_get,
             editor::commands::editor_view_set,
             editor::commands::add_step,
+            editor::commands::add_block,
+            editor::commands::update_block_meta,
+            editor::commands::set_step_note_kind,
+            // 第十六轮：图片描述 + 流程摘要（录制结束后自动生成，随后 AI 润色）
+            editor::commands::set_step_caption,
+            editor::commands::summarize_recording_ai,
+            editor::commands::import_steps_from,
             editor::commands::update_recording_title,
             editor::commands::crop_step_screenshot,
             editor::commands::save_step_screenshot_full,
+            editor::commands::read_step_before_raw_base64,
             editor::commands::upload_step_screenshot,
+            /* 第二十轮：手传媒体（图片 / GIF 动图 / 视频） */
+            editor::commands::upload_step_media,
             editor::commands::delete_step_screenshot,
             export::commands::export_recording,
+            export::commands::batch_export_recordings,
+            export::commands::get_export_dir,
+            export::commands::open_export_dir,
             export::commands::load_skill_package,
             settings::commands::get_redaction_config,
             settings::commands::set_redaction_config,
@@ -297,9 +294,9 @@ pub fn run() {
             file_browser::get_known_folders,
             open_external_url,
             get_pending_deep_link,
+            entry::take_pending_action,
             executor::commands::execute_recording,
             executor::commands::preview_replay,
-            executor::commands::get_replay_audit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

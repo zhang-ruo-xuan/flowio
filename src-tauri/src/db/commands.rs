@@ -16,6 +16,42 @@ pub struct RecordingSummary {
     pub ai_generated: bool,
     pub text_redacted: bool,
     pub scan_redacted: bool,
+    /// 来源域名（对齐插件 history 的 source_domain）：取该录制首个非空步骤 url 的
+    /// 归一化主机；无来源返回空串。仅用于列表展示与搜索，不参与任何业务判定。
+    pub source_domain: String,
+}
+
+/// 归一化来源域名（对齐插件 site-sync-core.normalizeSourceDomain）：
+/// 去协议/路径/端口、小写、去 www.；认不出返回空串。
+pub fn normalize_source_domain(raw: &str) -> String {
+    let raw = raw.trim().to_lowercase();
+    if raw.is_empty() {
+        return String::new();
+    }
+    // 去协议（http:// https:// 等）
+    let after_scheme = match raw.find("://") {
+        Some(pos) => &raw[pos + 3..],
+        None => raw.as_str(),
+    };
+    // 去路径 / 查询 / 锚点
+    let host_port = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // 去端口
+    let host = host_port
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_port);
+    // 去 www.
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    // 粗校验：至少 x.y 形态（与插件正则语义对齐）
+    let valid = host.len() >= 3 && host.contains('.') && !host.contains(' ');
+    if valid {
+        host.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// 读取 settings 表中的当前登录账号标记；空值/缺失视为未登录。
@@ -35,8 +71,15 @@ fn get_current_user(conn: &rusqlite::Connection) -> Option<String> {
 /// 保证不重复、不漏。
 fn list_recordings_inner(conn: &rusqlite::Connection) -> Result<Vec<RecordingSummary>, String> {
     let filter = get_current_user(conn).unwrap_or_else(|| LOCAL_USER.to_string());
+    // 来源域名：取该录制首个非空步骤 url，归一化在 Rust 侧做（对齐插件 history）。
     let mut stmt = conn
-        .prepare("SELECT id, title, app_name, status, total_steps, created_at, ai_generated, text_redacted, scan_redacted FROM recordings WHERE user_id = ?1 ORDER BY created_at DESC")
+        .prepare(
+            "SELECT r.id, r.title, r.app_name, r.status, r.total_steps, r.created_at, \
+             r.ai_generated, r.text_redacted, r.scan_redacted, \
+             (SELECT s.url FROM steps s WHERE s.recording_id = r.id AND TRIM(s.url) <> '' \
+              ORDER BY s.order_index LIMIT 1) \
+             FROM recordings r WHERE r.user_id = ?1 ORDER BY r.created_at DESC",
+        )
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
@@ -51,6 +94,9 @@ fn list_recordings_inner(conn: &rusqlite::Connection) -> Result<Vec<RecordingSum
                 ai_generated: row.get::<_, i64>(6)? != 0,
                 text_redacted: row.get::<_, i64>(7)? != 0,
                 scan_redacted: row.get::<_, i64>(8)? != 0,
+                source_domain: normalize_source_domain(
+                    &row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                ),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -341,17 +387,25 @@ fn find_unique_title(conn: &rusqlite::Connection, base: &str) -> String {
 
 /// 复制一份教程为新录制（另存为）。
 /// - 生成全新的 recording id 与全新的 step id；
-/// - **截图文件连带拷贝**到 temp/flowio_screenshots 下的新文件名，避免删副本误删原图；
+/// - **截图文件连带拷贝**到持久截图目录（`%APPDATA%\com.flowio.app\screenshots`）
+///   下的新文件名，避免删副本误删原图；
 /// - 副本标题去重：先剥掉源标题结尾的「（副本）/（副本 N）」（含历史叠罗汉），
 ///   再依次尝试 base / base（副本）/ base（副本 2）…，并在 30 字符内封顶；
 /// - 副本沿用源教程的 user_id（归属同一账号），编辑历史/精简快照按新 id 天然隔离 → 改副本不伤原教程；
 /// - 编辑器视图偏好（全图/裁图，settings 表 `flowio_view::<rec_id>`）一并复制 → 副本打开时显示状态与源一致；
 /// - 译文副本（recordings.translations，按步骤序号键控）一并复制 → 副本无需重新翻译。
 /// 返回新录制 id，前端据此 navigate 到副本继续编辑。
+///
+/// 拆成「命令壳 + `duplicate_recording_conn(&Connection, id)`」两层：
+/// 后者可直接在内存库上做回归测试（第十六轮为「另存为后大标题变成步骤」补的用例）。
 #[tauri::command]
 pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    duplicate_recording_conn(&conn, &id)
+}
 
+/// `duplicate_recording` 的实际实现（见上方注释）。
+pub fn duplicate_recording_conn(conn: &Connection, id: &str) -> Result<String, String> {
     // 1) 读取源录制（含 user_id 隔离标记、步骤数、译文副本与内容标记）
     let src = conn
         .query_row(
@@ -376,14 +430,22 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
         .map_err(|e| format!("源教程不存在: {}", e))?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
-    let new_title = find_unique_title(&conn, &src.0);
+    let new_title = find_unique_title(conn, &src.0);
 
     // 2) 读取源步骤（按 order_index 稳定排序）
+    //    🔴 第十六轮修正：必须**连文档块字段一起搬**（block_kind / block_level /
+    //    note_kind / title_html）以及图片描述 image_caption。旧版只搬了 20 个
+    //    "步骤"列 ⇒ 另存为后大标题块落地成 block_kind='step' 的普通步骤：
+    //    目录里多了个「N 二恶烷服务」空截图步骤、total_steps 也多算一格
+    //    （用户报「我另存为后大标题变成步骤了」）。order_index 原样保留，
+    //    所以摘要块（order_index 最小）在副本里依旧排在正文最前。
     let mut stmt = conn
         .prepare(
             "SELECT id, order_index, step_number, action_type, title, description, tip, \
              screenshot_path, annotated_path, before_screenshot_path, x, y, crop_w, crop_h, \
-             after_screenshot_path, timestamp, window_title, is_variable, param_name, mouse_button \
+             after_screenshot_path, timestamp, window_title, is_variable, param_name, mouse_button, \
+             block_kind, block_level, note_kind, title_html, image_caption, \
+             COALESCE(media_kind, 'image'), COALESCE(media_poster_path, '') \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -406,10 +468,21 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
                 row.get::<_, Option<i32>>(13)?,
                 row.get::<_, Option<String>>(14)?,
                 row.get::<_, i64>(15)?,
-                row.get::<_, String>(16)?,
+                // window_title 是 TEXT（可空，无 DEFAULT）——老库里存在 NULL，
+                // 按 String 读会以 "Invalid column type Null" 直接让另存为失败，
+                // 这里一律按可空读（副本语义：原样搬，NULL → 空串）。
+                row.get::<_, Option<String>>(16)?.unwrap_or_default(),
                 row.get::<_, i64>(17)?,
                 row.get::<_, String>(18)?,
                 row.get::<_, Option<String>>(19)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(20)?.unwrap_or_else(|| "step".into()),
+                row.get::<_, Option<i32>>(21)?.unwrap_or(1),
+                row.get::<_, Option<String>>(22)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(23)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(24)?.unwrap_or_default(),
+                // 第二十轮：媒体类型 + 视频首帧（另存为必须一起搬，否则副本里的视频变回普通图片）
+                row.get::<_, Option<String>>(25)?.unwrap_or_else(|| "image".into()),
+                row.get::<_, Option<String>>(26)?.unwrap_or_default(),
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -418,6 +491,8 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
         String, i32, i32, String, String, String, String,
         String, String, String, Option<i32>, Option<i32>, Option<i32>, Option<i32>,
         Option<String>, i64, String, i64, String, String,
+        String, i32, String, String, String,
+        String, String,
     )> = Vec::new();
     for r in rows {
         steps.push(r.map_err(|e| e.to_string())?);
@@ -429,10 +504,15 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
     //    副本步骤 order_index/step_number 原样保留 → 序号对得上，无需改写。
     //    ai_generated/text_redacted/scan_redacted 是内容事实标记（副本内容与源相同），
     //    必须随内容走，否则副本在列表上丢失「ai/文/扫」徽标、脱敏状态失真。
+    //    total_steps 只数真步骤（文档块不占编号，见 renumber_recording_steps）。
+    let real_steps = steps
+        .iter()
+        .filter(|s| s.20.is_empty() || s.20.eq_ignore_ascii_case("step"))
+        .count() as i32;
     conn.execute(
         "INSERT INTO recordings (id, title, app_name, target_app, user_id, status, total_steps, translations, ai_generated, text_redacted, scan_redacted, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'completed', ?6, ?7, ?8, ?9, ?10, datetime('now'), datetime('now'))",
-        params![new_id, new_title, src.1, src.2, src.3, steps.len() as i32, src.5, src.6, src.7, src.8],
+        params![new_id, new_title, src.1, src.2, src.3, real_steps, src.5, src.6, src.7, src.8],
     )
     .map_err(|e| {
         let _ = conn.execute("ROLLBACK", []);
@@ -448,15 +528,21 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
         let new_ann = copy_screenshot_file(&st.8);
         let new_before = copy_screenshot_file(&st.9);
         let new_after = copy_screenshot_file(st.14.clone().unwrap_or_default().as_str());
+        // 视频首帧（.jpg 封面）与被搬的主媒体文件同样要复制到副本目录 —— 不然副本里
+        // 视频能播但缩略图/导出全空。
+        let new_poster = copy_screenshot_file(&st.26);
         conn.execute(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, description, tip, \
              screenshot_path, annotated_path, before_screenshot_path, x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, \
-             is_variable, param_name, mouse_button) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+             is_variable, param_name, mouse_button, block_kind, block_level, note_kind, title_html, image_caption, \
+             media_kind, media_poster_path) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
             params![
                 new_step_id, new_id, st.1, st.2, st.3, st.4, st.5, st.6,
                 new_ss, new_ann, new_before, st.10, st.11, st.12, st.13, new_after, st.15, st.16,
-                st.17, st.18, st.19
+                st.17, st.18, st.19,
+                st.20, st.21, st.22, st.23, st.24,
+                st.25, new_poster
             ],
         )
         .map_err(|e| {
@@ -470,7 +556,7 @@ pub fn duplicate_recording(db: State<DbState>, id: String) -> Result<String, Str
     //    并把逐步骤「裁图/全图」开关（stepViewCropped，按步骤 id 键控）从源 id 改键到副本 id
     //    → 副本打开时每步的裁图/全图显示与源完全一致（不会回退成全图）。
     //    源无记录则跳过（新教程默认全图）。best-effort：失败不影响另存为本身。
-    let _ = copy_view_preference(&conn, &id, &new_id, &step_remap);
+    let _ = copy_view_preference(conn, id, &new_id, &step_remap);
 
     conn.execute("COMMIT", []).map_err(|e| format!("COMMIT: {}", e))?;
     Ok(new_id)
@@ -530,8 +616,8 @@ fn remap_view_value(value: &str, step_remap: &[(String, String)]) -> Option<Stri
     serde_json::to_string(&v).ok()
 }
 
-/// 把一张截图文件拷贝到 temp/flowio_screenshots 下的新文件名，返回新路径；
-/// 源为空或不存在时返回空串（与现有 delete 逻辑一致：空路径跳过）。
+/// 把一张截图文件拷贝到持久截图目录（`%APPDATA%\com.flowio.app\screenshots`）下的
+/// 新文件名，返回新路径；源为空或不存在时返回空串（与现有 delete 逻辑一致：空路径跳过）。
 fn copy_screenshot_file(src: &str) -> String {
     if src.is_empty() {
         return String::new();
@@ -540,8 +626,7 @@ fn copy_screenshot_file(src: &str) -> String {
     if !src_path.exists() {
         return String::new();
     }
-    let dir = std::env::temp_dir().join("flowio_screenshots");
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = crate::paths::screenshots_dir();
     let dst = dir.join(format!("{}.jpg", uuid::Uuid::new_v4()));
     match std::fs::copy(src_path, &dst) {
         Ok(_) => dst.to_string_lossy().to_string(),
@@ -706,6 +791,7 @@ mod tests {
                     ai_generated: row.get::<_, i64>(6)? != 0,
                     text_redacted: row.get::<_, i64>(7)? != 0,
                     scan_redacted: row.get::<_, i64>(8)? != 0,
+                source_domain: String::new(),
                 })
             })
             .unwrap();
@@ -750,6 +836,7 @@ mod tests {
                     ai_generated: row.get::<_, i64>(6)? != 0,
                     text_redacted: row.get::<_, i64>(7)? != 0,
                     scan_redacted: row.get::<_, i64>(8)? != 0,
+                source_domain: String::new(),
                 })
             })
             .unwrap();

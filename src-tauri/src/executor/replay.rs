@@ -268,6 +268,19 @@ pub fn run_action(action: &ReplayAction, backend: &dyn ReplayBackend) {
         // 补聚焦一次再输入——否则文本会打进上一个控件，表现为「输入没生效」，
         // 后续步骤（如 Enter 触发确定）必然级联失败且极难排查。
         "type" | "input" => {
+            // 合并步骤（scroll→type）：录制端已把滚动段并入输入步骤，滚动量在
+            // scroll_delta、滚轮位置在 start_x/start_y（type 步骤原本恒为 None）。
+            // 先按录制时的滚轮位置滚动，再走聚焦+输入链路，滚动语义不丢失。
+            if let Some(d) = action.scroll_delta {
+                if d != 0 {
+                    let (sx, sy) = (
+                        action.start_x.unwrap_or(x),
+                        action.start_y.unwrap_or(y),
+                    );
+                    backend.scroll(sx, sy, d);
+                    std::thread::sleep(Duration::from_millis(80));
+                }
+            }
             if !focused && !action.window_title.trim().is_empty() {
                 crate::executor::backend::replay_log(&format!(
                     "[type-warn] 焦点未切到 '{}' → 补聚焦一次再输入（原窗口可能未打开）",

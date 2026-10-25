@@ -433,6 +433,7 @@ pub async fn scan_redact_screenshots(
         crate::job_notify::JobOp::ScanRedact,
         ok,
         &summary,
+        None,
     );
     Ok(result)
 }

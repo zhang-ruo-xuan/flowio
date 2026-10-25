@@ -1,5 +1,5 @@
 use base64::Engine;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -28,6 +28,10 @@ pub struct Step {
     pub step_number: i32,
     pub action_type: String,
     pub title: String,
+    /// 大标题的富文本正文（白名单内联 HTML 子集）；空串 = 无格式。
+    /// `title` 始终同步保存它的纯文本，供导出/SKILL.md/搜索使用。
+    #[serde(default)]
+    pub title_html: String,
     pub description: String,
     pub tip: String,
     pub screenshot_path: String,
@@ -53,6 +57,42 @@ pub struct Step {
     /// 鼠标按键（"left"/"right"，空=left）。右键步骤重放下发右键。
     #[serde(default)]
     pub mouse_button: String,
+    /// 文档块类型：'step' = 真步骤；heading / summary / flow / note / mark / warn = 文档块
+    /// （标题 / 流程摘要 / 流程 / 描述 / 标注 / 警告）。文档块不占步骤编号、不计入 total_steps。
+    #[serde(default = "default_block_kind")]
+    pub block_kind: String,
+    /// 标题块层级（1/2/3），仅 block_kind = 'heading' 有意义
+    #[serde(default = "default_block_level")]
+    pub block_level: i32,
+    /// 步骤「补充说明」的呈现类型：'' = 普通描述 / 'mark' 标注 / 'warn' 警告
+    #[serde(default)]
+    pub note_kind: String,
+    /// 图片描述：挂在**截图下面**的一句话说明（与 description「这一步做什么」分开）。
+    /// 空串 = 没写描述（编辑器不渲染这一行）。
+    #[serde(default)]
+    pub image_caption: String,
+    /// 这一步挂的是图片还是视频（第二十轮）：
+    /// `'image'` = png / jpg / webp / **gif 动图**（都走 `<img>`，动图浏览器自己会播）；
+    /// `'video'` = mp4 / webm（走 `<video>`，用 asset 协议播本地文件）。
+    /// 老数据/录制截图一律 `'image'`。
+    #[serde(default = "default_media_kind")]
+    pub media_kind: String,
+    /// 视频的**首帧静态图**路径（图片步骤恒为空串）。左栏缩略图 / 导出 / 发布封面都用它；
+    /// 视频本体不进 base64 负载（几十 MB 会把 payload 撑爆）。
+    #[serde(default)]
+    pub media_poster_path: String,
+}
+
+fn default_media_kind() -> String {
+    "image".to_string()
+}
+
+fn default_block_kind() -> String {
+    "step".to_string()
+}
+
+fn default_block_level() -> i32 {
+    1
 }
 
 #[derive(Debug, Serialize)]
@@ -109,7 +149,9 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
              title, description, tip, screenshot_path, annotated_path, \
              before_screenshot_path, created_at, \
              x, y, crop_w, crop_h, after_screenshot_path, timestamp, window_title, \
-             is_variable, param_name, mouse_button \
+             is_variable, param_name, mouse_button, block_kind, block_level, note_kind, \
+             title_html, image_caption, \
+             COALESCE(media_kind, 'image'), COALESCE(media_poster_path, '') \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index",
         )
         .map_err(|e| e.to_string())?;
@@ -142,6 +184,15 @@ pub fn load_recording(db: State<DbState>, id: String) -> Result<RecordingWithSte
                 is_variable: row.get::<_, i64>(19)? != 0,
                 param_name: row.get(20)?,
                 mouse_button: row.get::<_, Option<String>>(21)?.unwrap_or_default(),
+                block_kind: row.get::<_, Option<String>>(22)?.unwrap_or_else(|| "step".into()),
+                block_level: row.get::<_, Option<i32>>(23)?.unwrap_or(1),
+                note_kind: row.get::<_, Option<String>>(24)?.unwrap_or_default(),
+                title_html: row.get::<_, Option<String>>(25)?.unwrap_or_default(),
+                // 第十六轮：图片描述（挂在截图下面的一句话说明）
+                image_caption: row.get::<_, Option<String>>(26)?.unwrap_or_default(),
+                // 第二十轮：媒体类型 + 视频首帧
+                media_kind: row.get::<_, Option<String>>(27)?.unwrap_or_else(|| "image".into()),
+                media_poster_path: row.get::<_, Option<String>>(28)?.unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -173,14 +224,16 @@ pub fn update_step(
     tip: String,
     is_variable: Option<bool>,
     param_name: Option<String>,
+    title_html: Option<String>,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     push_edit_history_for_step(&conn, &step_id);
     conn.execute(
         "UPDATE steps SET title = ?1, description = ?2, action_type = ?3, tip = ?4, \
-         is_variable = COALESCE(?5, is_variable), param_name = COALESCE(?6, param_name) \
+         is_variable = COALESCE(?5, is_variable), param_name = COALESCE(?6, param_name), \
+         title_html = COALESCE(?8, title_html) \
          WHERE id = ?7",
-        params![title, description, action_type, tip, is_variable, param_name, step_id],
+        params![title, description, action_type, tip, is_variable, param_name, step_id, title_html],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -215,6 +268,55 @@ pub fn update_step_crop(
     Ok(())
 }
 
+/// 重排某录制的 order_index，并且**只给真步骤编 step_number**。
+///
+/// 文档块（标题 / 流程 / 描述 / 标注 / 警告）的 step_number 恒为 0：它们既不参与
+/// 「第 N 步」的编号，也不计入 total_steps —— 否则在两步之间插一个标题块之后，
+/// 整篇编号会跳号、导出文件序号也跟着错。
+///
+/// 返回该录制里真步骤的数量（调用方用它更新 recordings.total_steps）。
+pub(crate) fn renumber_recording_steps(
+    conn: &Connection,
+    recording_id: &str,
+) -> Result<usize, String> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, block_kind FROM steps WHERE recording_id = ?1 \
+                 ORDER BY order_index, rowid",
+            )
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map(params![recording_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?
+                        .unwrap_or_else(|| "step".to_string()),
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        mapped.filter_map(|r| r.ok()).collect()
+    };
+
+    let mut num: i32 = 0;
+    let mut real: usize = 0;
+    for (i, (id, kind)) in rows.iter().enumerate() {
+        let step_number = if kind == "step" {
+            num += 1;
+            real += 1;
+            num
+        } else {
+            0
+        };
+        conn.execute(
+            "UPDATE steps SET order_index = ?1, step_number = ?2 WHERE id = ?3",
+            params![i as i32, step_number, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(real)
+}
+
 /// Delete a single step by its ID.
 #[tauri::command]
 pub fn delete_step(db: State<DbState>, step_id: String) -> Result<(), String> {
@@ -233,25 +335,11 @@ pub fn delete_step(db: State<DbState>, step_id: String) -> Result<(), String> {
     // ── 删除后重排 order_index / step_number（与合并流程同口径）──
     // 之前只 DELETE 不重排：DB 里序号留空洞（1,2,4,5…），前端仅本地重编号
     // 未落库，一导出就露馅（2026-09-09 用户实测：删两步后导出文件序号全错）。
-    let mut re_stmt = conn
-        .prepare("SELECT id FROM steps WHERE recording_id = ?1 ORDER BY order_index")
-        .map_err(|e| e.to_string())?;
-    let ids: Vec<String> = re_stmt
-        .query_map(params![recording_id], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-    drop(re_stmt);
-    for (i, id) in ids.iter().enumerate() {
-        conn.execute(
-            "UPDATE steps SET order_index = ?1, step_number = ?2 WHERE id = ?3",
-            params![i as i32, i as i32 + 1, id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
+    // 2026-09-19 起改用 renumber_recording_steps：文档块（标题/警告…）不编号。
+    let real = renumber_recording_steps(&conn, &recording_id)?;
     conn.execute(
         "UPDATE recordings SET total_steps = ?1, updated_at = datetime('now') WHERE id = ?2",
-        params![ids.len() as i32, recording_id],
+        params![real as i32, recording_id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -388,13 +476,20 @@ pub fn reorder_steps(
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let _ = push_edit_history(&conn, &_recording_id);
+    // ── 与 delete_step / merge 同口径：order_index = i，step_number = i + 1 ──
+    // 之前只写 order_index：调序后列表按新顺序展示，但每行的 step_number 还是旧值，
+    // 界面编号与导出文件序号都会错乱（2026-09-19 用户实测：调换步骤后编号对不上）。
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     for (i, step_id) in id_order_updates(&step_ids) {
-        conn.execute(
+        tx.execute(
             "UPDATE steps SET order_index = ?1 WHERE id = ?2",
             params![i, step_id],
         )
         .map_err(|e| e.to_string())?;
     }
+    // step_number 交给统一重排：文档块（标题/流程/标注…）不占步骤编号
+    renumber_recording_steps(&tx, &_recording_id)?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -640,30 +735,23 @@ pub(crate) fn apply_merge_plan(
     }
 
     // ── 重排 order_index / step_number ─────────────────────────
-    let mut re_stmt = tx
-        .prepare("SELECT id FROM steps WHERE recording_id = ?1 ORDER BY order_index")
-        .map_err(|e| e.to_string())?;
-    let ids: Vec<String> = re_stmt
-        .query_map(params![recording_id], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-    drop(re_stmt);
-    for (i, id) in ids.iter().enumerate() {
-        tx.execute(
-            "UPDATE steps SET order_index = ?1, step_number = ?2 WHERE id = ?3",
-            params![i as i32, i as i32 + 1, id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
+    let real = renumber_recording_steps(&tx, &recording_id)?;
     tx.execute(
         "UPDATE recordings SET total_steps = ?1, updated_at = datetime('now') WHERE id = ?2",
-        params![ids.len() as i32, recording_id],
+        params![real as i32, recording_id],
     )
     .map_err(|e| e.to_string())?;
 
+    // 剩余的步骤行数（合并掉了几步 = 合并前 - 合并后）
+    let after: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM steps WHERE recording_id = ?1",
+            params![recording_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(before - ids.len())
+    Ok(before.saturating_sub(after.max(0) as usize))
 }
 
 /// 精简前把当前全部步骤序列化成快照（每个录制只留最近 3 条）。
@@ -1058,6 +1146,51 @@ struct EditorSnapshotStep {
     /// 鼠标按键（"left"/"right"，空=left）。旧快照 JSON 缺该字段 → serde default ''。
     #[serde(default)]
     mouse_button: String,
+    // ── 第十六轮补齐：文档块字段 ────────────────────────────────
+    // 之前快照只搬「步骤」列，而还原是「全删全插」⇒ 撤销一次就把大标题块降级成
+    // 普通步骤、说明类型/大标题富文本/图片描述全丢。全部加 `serde(default)`，
+    // 老快照（库里已存的 JSON）照样能反序列化。
+    /// 'step' 真步骤 / 'heading' 大标题 / 'summary' 流程摘要 / 'intro' 简介
+    #[serde(default = "default_snapshot_block_kind")]
+    block_kind: String,
+    /// 大标题层级 1..4（非大标题无意义）
+    #[serde(default = "default_snapshot_block_level")]
+    block_level: i32,
+    /// 补充说明类型：'' / 'mark' / 'warn'
+    #[serde(default)]
+    note_kind: String,
+    /// 大标题富文本正文
+    #[serde(default)]
+    title_html: String,
+    /// 图片描述（图注）
+    #[serde(default)]
+    image_caption: String,
+    // ── 第二十轮补齐：步骤媒体字段 ──────────────────────────────
+    // 同理（还原是「全删全插」）：快照没带这两列，撤销一次视频就被当成普通图片，
+    // 预览里再也播不出画面。老快照 JSON 缺字段 → serde default。
+    /// 'image'（png / jpg / webp / **gif 动图**） / 'video'（mp4 / webm）
+    #[serde(default = "default_snapshot_media_kind")]
+    media_kind: String,
+    /// 视频首帧（静态封面）路径；图片步骤恒为 ''
+    #[serde(default)]
+    media_poster_path: String,
+    // ── 第二十二轮补齐：步骤来源网址 ────────────────────────────
+    // 与插件 step.url 同语义（本机操作步骤恒为 ''，浏览器/导入场景有值）。
+    // 老快照 JSON 缺该字段 → serde default ''，撤销/重做不丢数据。
+    #[serde(default)]
+    url: String,
+}
+
+fn default_snapshot_media_kind() -> String {
+    "image".to_string()
+}
+
+fn default_snapshot_block_kind() -> String {
+    "step".to_string()
+}
+
+fn default_snapshot_block_level() -> i32 {
+    1
 }
 
 /// 一次快照 = 录制标题 + 全部步骤行。
@@ -1092,7 +1225,11 @@ fn capture_editor_snapshot(
         .prepare(
             "SELECT id, order_index, step_number, action_type, title, description, tip, \
              screenshot_path, annotated_path, before_screenshot_path, after_screenshot_path, \
-             x, y, crop_w, crop_h, timestamp, window_title, is_variable, param_name, mouse_button \
+             x, y, crop_w, crop_h, timestamp, window_title, is_variable, param_name, mouse_button, \
+             COALESCE(block_kind, 'step'), COALESCE(block_level, 1), COALESCE(note_kind, ''), \
+             COALESCE(title_html, ''), COALESCE(image_caption, ''), \
+             COALESCE(media_kind, 'image'), COALESCE(media_poster_path, ''),
+             COALESCE(url, '') \
              FROM steps WHERE recording_id = ?1 ORDER BY order_index ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -1119,6 +1256,14 @@ fn capture_editor_snapshot(
                 is_variable: r.get::<_, i64>(17)? != 0,
                 param_name: r.get(18)?,
                 mouse_button: r.get::<_, Option<String>>(19)?.unwrap_or_default(),
+                block_kind: r.get(20)?,
+                block_level: r.get(21)?,
+                note_kind: r.get(22)?,
+                title_html: r.get(23)?,
+                image_caption: r.get(24)?,
+                media_kind: r.get(25)?,
+                media_poster_path: r.get(26)?,
+                url: r.get(27)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -1204,25 +1349,35 @@ fn restore_editor_snapshot(
         let ann = if exists(&s.annotated_path) { &s.annotated_path } else { "" };
         let before = if exists(&s.before_screenshot_path) { &s.before_screenshot_path } else { "" };
         let after = s.after_screenshot_path.as_deref().filter(|p| exists(p));
+        // 第二十轮：视频的首帧同样要查在不在（首帧被删时留空串，前端按「视频可播但没封面」处理）
+        let poster = if exists(&s.media_poster_path) { &s.media_poster_path } else { "" };
+        // step_number 先占位 0，插完统一由 renumber_recording_steps 编（文档块不占号）
         tx.execute(
             "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
              description, tip, screenshot_path, annotated_path, before_screenshot_path, \
              after_screenshot_path, x, y, crop_w, crop_h, timestamp, window_title, \
-             is_variable, param_name, mouse_button) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+             is_variable, param_name, mouse_button, \
+             block_kind, block_level, note_kind, title_html, image_caption, \
+             media_kind, media_poster_path, url) \
+             VALUES (?1,?2,?3,0,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20, \
+             ?21,?22,?23,?24,?25,?26,?27,?28)",
             params![
-                s.id, recording_id, i as i32, i as i32 + 1, s.action_type, s.title,
+                s.id, recording_id, i as i32, s.action_type, s.title,
                 s.description, s.tip, shot, ann, before, after,
                 s.x, s.y, s.crop_w, s.crop_h, s.timestamp, s.window_title,
                 s.is_variable, s.param_name, s.mouse_button,
+                s.block_kind, s.block_level, s.note_kind, s.title_html, s.image_caption,
+                s.media_kind, poster, s.url,
             ],
         )
         .map_err(|e| e.to_string())?;
     }
+    // 还原后也走同一个编号器：真步骤 1..N、文档块 step_number=0，total_steps 只数真步骤
+    let total = renumber_recording_steps(&tx, recording_id)?;
     tx.execute(
         "UPDATE recordings SET title = ?1, total_steps = ?2, updated_at = datetime('now') \
          WHERE id = ?3",
-        params![snap.title, snap.steps.len() as i32, recording_id],
+        params![snap.title, total as i32, recording_id],
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -1309,7 +1464,7 @@ fn view_dbg_log(msg: &str) {
 }
 
 /// settings 表 key：`flowio_view::<recording_id>`
-fn view_setting_key(recording_id: &str) -> String {
+pub(crate) fn view_setting_key(recording_id: &str) -> String {
     format!("flowio_view::{}", recording_id)
 }
 
@@ -1387,17 +1542,11 @@ pub(crate) fn undo_last_merge_conn(
         )
         .map_err(|e| e.to_string())?;
     }
-    // 用快照里的原始顺序重排（快照按 order_index 升序存，行号即 order）
-    for (i, r) in rows.iter().enumerate() {
-        tx.execute(
-            "UPDATE steps SET order_index = ?1, step_number = ?2 WHERE id = ?3",
-            params![i as i32, i as i32 + 1, r.0],
-        )
-        .map_err(|e| e.to_string())?;
-    }
+    // 用快照里的原始顺序重排（快照按 order_index 升序存，插入顺序即 order）
+    let real = renumber_recording_steps(&tx, &recording_id)?;
     tx.execute(
         "UPDATE recordings SET total_steps = ?1, updated_at = datetime('now') WHERE id = ?2",
-        params![rows.len() as i32, recording_id],
+        params![real as i32, recording_id],
     )
     .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM step_snapshots WHERE id = ?1", params![snap_id])
@@ -1737,6 +1886,7 @@ pub async fn simplify_steps_ai(
                 crate::job_notify::JobOp::AiSimplify,
                 true,
                 &summary,
+                None,
             );
         }
         Err(e) => {
@@ -1747,6 +1897,7 @@ pub async fn simplify_steps_ai(
                 crate::job_notify::JobOp::AiSimplify,
                 false,
                 e,
+                None,
             );
         }
     }
@@ -1917,6 +2068,610 @@ pub fn add_step(
     ))
 }
 
+/// `add_block` 允许创建的块类型白名单。
+///
+/// 抽成独立函数是为了能被测试直接覆盖 —— 白名单写错的后果是「菜单点下去静默失败」
+/// （插不进块的典型症状），比任何样式问题都难查。
+fn is_known_block_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "heading" | "summary" | "intro" | "flow" | "note" | "mark" | "warn"
+    )
+}
+
+/// 在指定位置插入一个「文档块」（标题 / 流程摘要 / 简介 / 流程 / 描述 / 标注 / 警告）。
+///
+/// 与 `add_step` 的区别：文档块**不占步骤编号**（step_number = 0），也**不计入**
+/// `recordings.total_steps` —— 它只是正文里的排版块（对齐参考产品的
+/// 「+ 插入步骤 / 标题 / 流程」体验）。撤销栈同样会压一份快照。
+/// 编号只由 `renumber_recording_steps` 产生，它只给 `block_kind='step'` 的行编号。
+/// 第十九轮新增 `intro` —— 用户在正文里自己写的「简介」引子（正文存 description）。
+#[tauri::command]
+pub fn add_block(
+    db: State<DbState>,
+    recording_id: String,
+    block_kind: String,
+    order_index: i32,
+    block_level: Option<i32>,
+    title: Option<String>,
+) -> Result<String, String> {
+    if !is_known_block_kind(&block_kind) {
+        return Err(format!("未知的块类型: {}", block_kind));
+    }
+    let kind = block_kind;
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let _ = push_edit_history(&conn, &recording_id);
+
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE steps SET order_index = order_index + 1 \
+         WHERE recording_id = ?1 AND order_index >= ?2",
+        params![recording_id, order_index],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    tx.execute(
+        "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, \
+         title, description, tip, screenshot_path, created_at, timestamp, window_title, \
+         block_kind, block_level) \
+         VALUES (?1, ?2, ?3, 0, '', ?4, '', '', '', ?5, ?6, '', ?7, ?8)",
+        params![
+            id,
+            recording_id,
+            order_index,
+            title.unwrap_or_default(),
+            now,
+            now_ms,
+            kind,
+            block_level.unwrap_or(1).clamp(1, 4),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// 改文档块的类型 / 层级：标题块切 H1/H2/H3，提示块在描述 / 标注 / 警告之间切换。
+#[tauri::command]
+pub fn update_block_meta(
+    db: State<DbState>,
+    step_id: String,
+    block_kind: Option<String>,
+    block_level: Option<i32>,
+) -> Result<(), String> {
+    // 标题层级 1..4（对齐参考产品的 H1~H4）
+    let block_level = match block_level {
+        Some(l) if !(1..=4).contains(&l) => {
+            return Err(format!("标题层级必须是 1-4：{}", l))
+        }
+        other => other,
+    };
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
+    conn.execute(
+        "UPDATE steps SET block_kind = COALESCE(?1, block_kind), \
+         block_level = COALESCE(?2, block_level) WHERE id = ?3",
+        params![block_kind, block_level, step_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 改步骤「补充说明」的呈现类型：'' = 普通描述 / 'mark' 标注 / 'warn' 警告。
+#[tauri::command]
+pub fn set_step_note_kind(
+    db: State<DbState>,
+    step_id: String,
+    note_kind: String,
+) -> Result<(), String> {
+    let kind = match note_kind.as_str() {
+        "" | "note" | "mark" | "warn" => note_kind,
+        other => return Err(format!("未知的说明类型: {}", other)),
+    };
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
+    conn.execute(
+        "UPDATE steps SET note_kind = ?1 WHERE id = ?2",
+        params![kind, step_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 设「图片描述」：挂在**截图下面**的一句话说明（对齐参考产品的「编辑图片描述」弹窗）。
+///
+/// 与 `description`（补充说明）分开：description 讲「这一步做什么」，
+/// image_caption 只讲「这张图里能看到什么」，导出/预览紧贴图片下方渲染。
+/// 编辑器是弹窗 + 确定 → 一次性落库（不走 800ms 草稿防抖）；传空串即清掉描述。
+/// 压撤销快照，Ctrl+Z 可回退。
+#[tauri::command]
+pub fn set_step_caption(
+    db: State<DbState>,
+    step_id: String,
+    caption: String,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    push_edit_history_for_step(&conn, &step_id);
+    conn.execute(
+        "UPDATE steps SET image_caption = ?1 WHERE id = ?2",
+        params![caption.trim(), step_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── 流程摘要块（第十六轮）──────────────────────────────────────
+//
+// 参考产品（智写流程）的正文最前面有一块「本流程演示了…」+ 要点列表的摘要卡，
+// 录制结束由服务端生成、前端轮询 `/api/flow/autoStructure/status` 取回。
+// 我们照同一形态做，但落成本地：**录制结束先在本地用规则拼一版**（秒出、不联网、
+// 不花钱），随后由前端再调 `summarize_recording_ai` 让模型润色覆盖 —— 与「精简」
+// 的「先规则、再 AI」同一套路，AI 不可用时用户也已经有一版可读的摘要。
+//
+// 数据落点：`steps` 表复用为内容块表，`block_kind='summary'`；正文存 `description`
+// （首行总览 + 若干 `- **要点**：说明` 行），`title` 留空（标签由前端渲染）。
+// 铁律不变：摘要块不占步骤编号（step_number=0）、不计入 total_steps。
+
+/// 生成（或补齐）流程摘要块，固定排在正文最前。已存在则不动（用户可能已改过）。
+/// 返回 true = 本次新建了摘要块。
+pub fn ensure_summary_block_conn(conn: &Connection, recording_id: &str) -> Result<bool, String> {
+    let exists: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM steps WHERE recording_id = ?1 AND block_kind = 'summary'",
+            params![recording_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("查摘要块失败: {}", e))?;
+    if exists > 0 {
+        return Ok(false);
+    }
+    let text = build_rule_summary(conn, recording_id)?;
+    if text.trim().is_empty() {
+        // 没有步骤（或还没生成步骤）→ 不建空摘要块
+        return Ok(false);
+    }
+    let _ = push_edit_history(conn, recording_id);
+
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    // 整篇后移一格，摘要块占 order_index = 0
+    tx.execute(
+        "UPDATE steps SET order_index = order_index + 1 WHERE recording_id = ?1",
+        params![recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    tx.execute(
+        "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, \
+         title, description, tip, screenshot_path, created_at, timestamp, window_title, \
+         block_kind, block_level) \
+         VALUES (?1, ?2, 0, 0, '', '', ?3, '', '', ?4, ?5, '', 'summary', 1)",
+        params![id, recording_id, text, now, now_ms],
+    )
+    .map_err(|e| format!("写摘要块失败: {}", e))?;
+    tx.commit().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE recordings SET updated_at = datetime('now') WHERE id = ?1",
+        params![recording_id],
+    )
+    .ok();
+    Ok(true)
+}
+
+/// 规则版摘要文案：总览一句 + 要点若干（要点优先用大标题，其次用步骤标题）。
+/// 没有任何步骤时返回空串（调用方据此跳过建块）。
+fn build_rule_summary(conn: &Connection, recording_id: &str) -> Result<String, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT title, COALESCE(block_kind, 'step') FROM steps WHERE recording_id = ?1 \
+             AND COALESCE(block_kind, 'step') IN ('step', 'heading') \
+             ORDER BY order_index, rowid",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![recording_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let mut loose: Vec<String> = Vec::new();
+    let mut step_count = 0usize;
+    let mut cur: Option<usize> = None;
+    for (title, kind) in rows {
+        let t = title.trim().to_string();
+        if kind == "heading" {
+            sections.push((
+                if t.is_empty() { "未命名小节".to_string() } else { t },
+                Vec::new(),
+            ));
+            cur = Some(sections.len() - 1);
+        } else {
+            step_count += 1;
+            if t.is_empty() {
+                continue;
+            }
+            match cur {
+                Some(i) => sections[i].1.push(t),
+                None => loose.push(t),
+            }
+        }
+    }
+    if step_count == 0 {
+        return Ok(String::new());
+    }
+
+    let mut out = String::new();
+    if sections.is_empty() {
+        out.push_str(&format!(
+            "本流程共 {} 个步骤：{}。",
+            step_count,
+            loose.iter().take(4).cloned().collect::<Vec<_>>().join("、")
+        ));
+        for t in loose.iter().take(6) {
+            out.push_str(&format!("\n- {}", t));
+        }
+    } else {
+        out.push_str(&format!(
+            "本流程共 {} 个步骤，分为 {} 个部分：{}。",
+            step_count,
+            sections.len(),
+            sections
+                .iter()
+                .map(|s| s.0.clone())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+        for (name, steps) in &sections {
+            if steps.is_empty() {
+                out.push_str(&format!("\n- **{}**", name));
+            } else {
+                out.push_str(&format!(
+                    "\n- **{}**：{}",
+                    name,
+                    steps.iter().take(2).cloned().collect::<Vec<_>>().join("、")
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// AI 摘要结果（前端据此弹提示）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryResult {
+    pub kind: String,
+    pub chars: usize,
+}
+
+/// AI 润色流程摘要：把正文骨架交给模型，改写成「一段总览 + 3~6 条要点」，
+/// 覆盖摘要块的 description。外壳只负责取标题 + 派发完成通知，逻辑在 _inner。
+#[tauri::command]
+pub async fn summarize_recording_ai(
+    db: State<'_, DbState>,
+    app: AppHandle,
+    recording_id: String,
+) -> Result<SummaryResult, String> {
+    let title = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT title FROM recordings WHERE id = ?1",
+            params![recording_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default()
+    };
+    let result = summarize_recording_ai_inner(&db, &recording_id, &title).await;
+    match &result {
+        Ok(r) => crate::job_notify::emit_job_done(
+            &app,
+            &recording_id,
+            &title,
+            crate::job_notify::JobOp::AiSummary,
+            true,
+            &format!("已自动生成流程摘要（{} 字）", r.chars),
+            None,
+        ),
+        Err(e) => crate::job_notify::emit_job_done(
+            &app,
+            &recording_id,
+            &title,
+            crate::job_notify::JobOp::AiSummary,
+            false,
+            e,
+            None,
+        ),
+    }
+    result
+}
+
+async fn summarize_recording_ai_inner(
+    db: &State<'_, DbState>,
+    recording_id: &str,
+    title: &str,
+) -> Result<SummaryResult, String> {
+    let (config, outline) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        (
+            crate::ai::commands::resolve_ai_config(&conn),
+            load_summary_outline(&conn, recording_id)?,
+        )
+    };
+    if outline.is_empty() {
+        return Err("这份教程还没有步骤，跳过摘要生成".to_string());
+    }
+    let prompt = build_summary_prompt(title, &outline);
+
+    let raw = tauri::async_runtime::spawn_blocking(move || {
+        crate::ai::http::call_llm_with_tokens(
+            &config,
+            vec![crate::ai::http::Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(prompt),
+            }],
+            1200,
+        )
+    })
+    .await
+    .map_err(|e| format!("AI 摘要任务异常: {}", e))??;
+
+    let text = clean_summary_text(&raw);
+    if text.is_empty() {
+        return Err(format!(
+            "AI 没有返回可用的摘要（原始返回前 80 字：{}）",
+            raw.chars().take(80).collect::<String>()
+        ));
+    }
+
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 规则版可能没建过（比如老教程）→ 先补一个块，再覆盖内容
+    let _ = ensure_summary_block_conn(&conn, recording_id)?;
+    conn.execute(
+        "UPDATE steps SET description = ?1 WHERE recording_id = ?2 AND block_kind = 'summary'",
+        params![text, recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE recordings SET updated_at = datetime('now') WHERE id = ?1",
+        params![recording_id],
+    )
+    .ok();
+    Ok(SummaryResult {
+        kind: "ai".to_string(),
+        chars: text.chars().count(),
+    })
+}
+
+/// 正文骨架（摘要的输入）：大标题按 `#` 缩进、真步骤编号后的标题 + 一句说明。
+fn load_summary_outline(conn: &Connection, recording_id: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT title, description, COALESCE(block_kind, 'step'), block_level \
+             FROM steps WHERE recording_id = ?1 \
+             AND COALESCE(block_kind, 'step') IN ('step', 'heading') \
+             ORDER BY order_index, rowid",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String, String, i32)> = stmt
+        .query_map(params![recording_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i32>>(3)?.unwrap_or(1),
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut out = Vec::new();
+    let mut n = 0;
+    for (title, desc, kind, level) in rows {
+        let t = title.trim().to_string();
+        if kind == "heading" {
+            out.push(format!("{} {}", "#".repeat(level.clamp(1, 4) as usize), t));
+            continue;
+        }
+        n += 1;
+        let d: String = desc.trim().chars().take(60).collect();
+        if d.is_empty() {
+            out.push(format!("{}. {}", n, t));
+        } else {
+            out.push(format!("{}. {}（说明：{}）", n, t, d));
+        }
+    }
+    Ok(out)
+}
+
+fn build_summary_prompt(title: &str, outline: &[String]) -> String {
+    let body = outline.join("\n");
+    format!(
+        "你是教程编辑。下面是录屏自动生成的一份操作教程的正文骨架（# 开头是大标题，\
+         数字开头是步骤，括号里是该步的说明）。教程标题：{title}。\n\n{body}\n\n\
+         请写一段「流程摘要」，放在教程正文最前面，供读者 5 秒内了解这份教程在做什么：\n\
+         1) 第一行：一句话总览（40~80 字，说明这份流程做什么、大致分几个部分）；\n\
+         2) 之后 3~6 行要点，每行格式严格为 `- **要点名**：一句话说明`；\
+         要点名优先用上面的大标题，没有大标题时用步骤里的关键动作；\n\
+         3) 只用简体中文，不要输出标题行、不要解释、不要 markdown 代码块、不要空行。\n\
+         直接输出摘要正文。",
+        title = title,
+        body = body
+    )
+}
+
+/// 清洗模型返回：去掉代码块围栏、行首多余符号、空行，限制长度。
+fn clean_summary_text(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if s.starts_with("```") {
+        // 去掉 ```lang / ``` 围栏
+        if let Some(pos) = s.find('\n') {
+            s = s[pos + 1..].to_string();
+        }
+        if let Some(pos) = s.rfind("```") {
+            s = s[..pos].to_string();
+        }
+    }
+    let lines: Vec<String> = s
+        .lines()
+        .map(|l| l.trim().trim_start_matches('#').trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut out = lines.join("\n");
+    if out.chars().count() > 900 {
+        out = out.chars().take(900).collect();
+    }
+    out
+}
+
+/// 「导入已有教程」：把另一份教程里的**真步骤**搬进当前教程的 `insert_after` 之后。
+///
+/// - 只搬 `block_kind = 'step'` 的行 —— 文档块（大标题）带过来会把两份教程的
+///   标题层级搅在一起，且用户要的是"把那些操作搬过来"。
+/// - 截图是共享目录（`%APPDATA%\com.flowio.app\screenshots`，不按录制分子目录），
+///   行复制过去图片照样能显示，不必拷文件。
+/// - 原有后续步骤整体后移，最后统一重排（文档块不编号、不计入 total_steps）。
+/// - 返回真正插入的步骤数；源教程没有真步骤时为 0，此时不动目标。
+#[tauri::command]
+pub fn import_steps_from(
+    db: State<DbState>,
+    recording_id: String,
+    source_recording_id: String,
+    insert_after: i32,
+) -> Result<usize, String> {
+    if recording_id == source_recording_id {
+        return Err("不能把教程导入它自己".to_string());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM steps WHERE recording_id = ?1 AND block_kind = 'step'",
+            params![source_recording_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Ok(0);
+    }
+    // 插进正文要能撤销：先压一份快照（编辑器 Ctrl+Z 可回到导入前）
+    let _ = push_edit_history(&conn, &recording_id);
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE steps SET order_index = order_index + ?1 \
+         WHERE recording_id = ?2 AND order_index > ?3",
+        params![n, recording_id, insert_after],
+    )
+    .map_err(|e| e.to_string())?;
+    // id 用 SQLite 官方那套 uuid v4 写法（保持和别处 uuid::new_v4 的形态一致）
+    tx.execute(
+        "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
+         description, tip, screenshot_path, annotated_path, before_screenshot_path, created_at, \
+         timestamp, window_title, x, y, crop_w, crop_h, after_screenshot_path, is_variable, \
+         param_name, mouse_button, hotkey_combo, uia_anchor, start_x, start_y, end_x, end_y, \
+         scroll_delta, note_kind, block_kind, block_level, media_kind, media_poster_path) \
+         SELECT lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || \
+                substr(hex(randomblob(2)), 2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || \
+                substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))), \
+                ?1, ?2 + row_number() OVER (ORDER BY order_index, rowid), 0, \
+                action_type, title, description, tip, screenshot_path, annotated_path, \
+                before_screenshot_path, created_at, timestamp, window_title, x, y, crop_w, crop_h, \
+                after_screenshot_path, is_variable, param_name, mouse_button, hotkey_combo, \
+                uia_anchor, start_x, start_y, end_x, end_y, scroll_delta, note_kind, 'step', 1, \
+                COALESCE(media_kind, 'image'), COALESCE(media_poster_path, '') \
+         FROM steps WHERE recording_id = ?3 AND block_kind = 'step' ORDER BY order_index, rowid",
+        params![recording_id, insert_after, source_recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    let real = renumber_recording_steps(&tx, &recording_id)?;
+    tx.execute(
+        "UPDATE recordings SET total_steps = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![real as i32, recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(n as usize)
+}
+
+/// 「续录」的落库路径：把刚录到的一段步骤**插进已有教程的中间**。
+///
+/// 与 `save_recording_to_db` 的区别：不 INSERT `recordings` 行（教程已经存在），
+/// 只把 steps 插到 `insert_after` 之后、原有后续步骤整体后移，最后统一重排。
+/// 返回插入的步骤数。
+pub fn append_steps_to_recording_conn(
+    conn: &Connection,
+    recording_id: &str,
+    insert_after: i32,
+    steps: &[crate::db::StepSave],
+) -> Result<usize, String> {
+    if steps.is_empty() {
+        return Ok(0);
+    }
+    // 插进正文要能撤销：先压一份快照（编辑器 Ctrl+Z 可回到续录前）
+    let _ = push_edit_history(conn, recording_id);
+    let n = steps.len() as i64;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE steps SET order_index = order_index + ?1 \
+         WHERE recording_id = ?2 AND order_index > ?3",
+        params![n, recording_id, insert_after],
+    )
+    .map_err(|e| e.to_string())?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, \
+                 title, description, tip, screenshot_path, annotated_path, before_screenshot_path, \
+                 created_at, timestamp, window_title, x, y, crop_w, crop_h, after_screenshot_path, \
+                 is_variable, param_name, mouse_button, hotkey_combo, uia_anchor, \
+                 start_x, start_y, end_x, end_y, scroll_delta) \
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, '', ?9, datetime('now'), ?10, ?11, \
+                         ?12, ?13, ?14, ?15, ?16, 0, '', ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+            )
+            .map_err(|e| e.to_string())?;
+        for (i, s) in steps.iter().enumerate() {
+            stmt.execute(params![
+                uuid::Uuid::new_v4().to_string(),
+                recording_id,
+                insert_after + 1 + i as i32,
+                s.action_type,
+                s.title,
+                s.description,
+                s.tip,
+                s.screenshot_path,
+                s.before_screenshot_path,
+                s.timestamp,
+                s.window_title,
+                s.x,
+                s.y,
+                s.crop_w,
+                s.crop_h,
+                s.after_screenshot_path,
+                s.mouse_button,
+                s.hotkey_combo,
+                s.uia_anchor,
+                s.start_x,
+                s.start_y,
+                s.end_x,
+                s.end_y,
+                s.scroll_delta,
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    let real = renumber_recording_steps(&tx, recording_id)?;
+    tx.execute(
+        "UPDATE recordings SET total_steps = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![real as i32, recording_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(steps.len())
+}
+
 /// Update the recording title.
 /// Returns error if another recording (excluding self) already has this title.
 #[tauri::command]
@@ -2032,6 +2787,30 @@ pub fn save_step_screenshot_full(
     Ok(())
 }
 
+/// 读取步骤的 before 全屏原图（全尺寸 JPEG base64），供「统一改变截图大小」使用。
+///
+/// 桌面端烧录式模型下，主图可能已被降质内存 base64（downscale 到 1280 宽）或
+/// 上一轮裁切结果覆盖，而 before_screenshot_path 始终是录制时刻的原始全屏帧，
+/// 与主图同尺寸、坐标兼容。以它为基准裁切/还原，可避免嵌套越裁越小。
+#[tauri::command]
+pub fn read_step_before_raw_base64(
+    db: State<DbState>,
+    step_id: String,
+) -> Result<String, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let path: String = conn
+        .query_row(
+            "SELECT before_screenshot_path FROM steps WHERE id = ?1",
+            params![step_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Step not found: {}", e))?;
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(crate::ai::commands::read_file_base64(&path))
+}
+
 /// Upload a screenshot (base64 JPEG) for a step, save to disk and update DB.
 /// `is_after`: true = save as after_screenshot, false = save as main screenshot.
 /// `is_marked`: true = save as marked/annotated screenshot.
@@ -2071,6 +2850,102 @@ pub fn upload_step_screenshot(
     Ok(new_path_str)
 }
 
+/// ── 第二十轮：上传「这一步的媒体」（图片 / GIF 动图 / 视频）──────────────
+///
+/// 与 `upload_step_screenshot`（录制截图 / 标注图）分开，因为语义不同：
+/// - **原样落盘**：GIF 动图必须保持自己的字节。老命令把一切都存成 `.jpg`，浏览器按
+///   JPEG 去解 GIF 字节 ⇒ 动图根本显示不出来（这正是「能不能传动图」的症结）；
+/// - 视频要额外带一张**首帧**（前端用 `<video>` + canvas 抽的 JPEG base64），写进
+///   `media_poster_path` —— 左栏缩略图 / 导出长图与 Word / 发布封面都用它，
+///   视频本体只在编辑器预览里播；
+/// - `media_kind` 记 'image' / 'video'，前端据此决定用 `<img>` 还是 `<video>` 渲染。
+///
+/// 只作用于**主媒体**（`screenshot_path`）；after / marked 图仍走老命令。
+#[tauri::command]
+pub fn upload_step_media(
+    db: State<DbState>,
+    step_id: String,
+    base64_data: String,
+    ext: String,
+    poster_base64: Option<String>,
+) -> Result<String, String> {
+    let ext = normalize_media_ext(&ext)?;
+    let kind = if is_video_ext(&ext) { "video" } else { "image" };
+    let bytes = decode_jpeg_base64(strip_data_url(&base64_data))?;
+
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // 先确认步骤还在 —— 不然会留下一个没人引用的孤儿文件
+    let alive: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM steps WHERE id = ?1",
+            params![step_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if alive == 0 {
+        return Err("步骤不存在（可能已被删除）".to_string());
+    }
+    push_edit_history_for_step(&conn, &step_id);
+
+    let new_path = crate::recorder::screenshot::next_media_path("media", &ext);
+    std::fs::write(&new_path, &bytes).map_err(|e| format!("写入媒体文件失败: {}", e))?;
+    let new_path_str = new_path.to_string_lossy().to_string();
+
+    // 视频：首帧另存一张 jpg。抽帧失败/太短的视频前端会不传 ⇒ 留空串，
+    // 前端按「能播但没封面」处理（不阻断上传）。
+    let mut poster_path = String::new();
+    if kind == "video" {
+        if let Some(p) = poster_base64
+            .as_deref()
+            .map(strip_data_url)
+            .filter(|p| !p.is_empty())
+        {
+            let pb = decode_jpeg_base64(p)?;
+            let pp = crate::recorder::screenshot::next_screenshot_path("media_poster");
+            std::fs::write(&pp, &pb).map_err(|e| format!("写入视频首帧失败: {}", e))?;
+            poster_path = pp.to_string_lossy().to_string();
+        }
+    }
+
+    conn.execute(
+        "UPDATE steps SET screenshot_path = ?1, media_kind = ?2, media_poster_path = ?3 \
+         WHERE id = ?4",
+        params![new_path_str, kind, poster_path, step_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(new_path_str)
+}
+
+/// `upload_step_media` 的扩展名白名单（大小写不敏感，`.PNG` / `.jpeg` 都收）。
+/// 这是**唯一**的格式闸门 —— 返回的字符串会直接成为文件名后缀，别放开。
+fn normalize_media_ext(ext: &str) -> Result<String, String> {
+    let e = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    match e.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" => {
+            Ok(if e == "jpeg" { "jpg".to_string() } else { e })
+        }
+        "mp4" | "webm" => Ok(e),
+        _ => Err(format!("不支持的媒体格式: {}", ext)),
+    }
+}
+
+/// 视频类扩展名（决定 media_kind，以及前端用 `<video>` 还是 `<img>`）。
+fn is_video_ext(ext: &str) -> bool {
+    matches!(ext, "mp4" | "webm")
+}
+
+/// 前端可能直接把 data URL 丢过来（`data:image/png;base64,AAAA`），统一剥掉前缀；
+/// 已经是不带前缀的裸 base64 就原样返回。
+fn strip_data_url(s: &str) -> &str {
+    if s.starts_with("data:") {
+        if let Some(i) = s.find("base64,") {
+            return &s[i + 7..];
+        }
+    }
+    s
+}
+
 /// Delete a step's screenshot: remove files from disk and clear DB fields.
 #[tauri::command]
 pub fn delete_step_screenshot(
@@ -2098,6 +2973,25 @@ pub fn delete_step_screenshot(
 
         conn.execute(
             &clear_col_sql(col),
+            params![step_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        // 第二十轮：主媒体若是视频，把媒体标记与首帧一起清掉 —— 否则这一步删完还挂着
+        // media_kind='video'，编辑器会去播一个空路径，缩略图也留着已经没人用的首帧文件。
+        // （只有主图这一列需要，after/before 两列不会是视频。）
+        let poster: String = conn
+            .query_row(
+                "SELECT COALESCE(media_poster_path, '') FROM steps WHERE id = ?1",
+                params![step_id],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        if !poster.is_empty() {
+            std::fs::remove_file(&poster).ok();
+        }
+        conn.execute(
+            "UPDATE steps SET media_kind = 'image', media_poster_path = '' WHERE id = ?1",
             params![step_id],
         )
         .map_err(|e| e.to_string())?;
@@ -2226,6 +3120,15 @@ fn build_new_step(
         is_variable: false,
         param_name: String::new(),
         mouse_button: String::new(),
+        // add_step 插入的永远是「真步骤」
+        block_kind: "step".to_string(),
+        block_level: 1,
+        note_kind: String::new(),
+        title_html: String::new(),
+        image_caption: String::new(),
+        // 新建的步骤一律是普通图片（第二十轮：视频只能通过 upload_step_media 上传）
+        media_kind: "image".to_string(),
+        media_poster_path: String::new(),
     }
 }
 
@@ -2241,7 +3144,15 @@ fn maybe_read_base64(path: &str) -> Option<String> {
 
 /// 为步骤填充三个截图字段的 base64（load_recording 用，等价于原内联循环）。
 fn populate_step_screenshot_base64(step: &mut Step) {
-    step.screenshot_base64 = maybe_read_base64(&step.screenshot_path);
+    // 第二十轮：视频步骤的主图 base64 **取首帧**，绝不读视频本体 —— 视频动辄几十 MB，
+    // 而这份负载是「整份录制一次性返回」的，几个视频就能把编辑器卡死；
+    // 而 base64 这一路只服务缩略图 / 封面 / 发布 / 导出，本来就该是静态帧。
+    // 视频本体只在编辑器预览里用 asset 协议播（前端 stepMediaSrc）。
+    step.screenshot_base64 = if step.media_kind == "video" {
+        maybe_read_base64(&step.media_poster_path)
+    } else {
+        maybe_read_base64(&step.screenshot_path)
+    };
     step.before_screenshot_base64 = maybe_read_base64(&step.before_screenshot_path);
     step.after_screenshot_base64 = step
         .after_screenshot_path
@@ -2295,6 +3206,151 @@ mod editor_tests {
         let (out, n) = replace_ci("abc", "", "x");
         assert_eq!(n, 0);
         assert_eq!(out, "abc");
+    }
+
+    /// 摘要块：规则文案按「大标题 → 要点」出，块插在正文最前、不占编号（第十六轮）。
+    fn summary_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn);
+        conn.execute(
+            "INSERT INTO recordings (id, title, app_name, status, total_steps, created_at, updated_at) \
+             VALUES ('r', '教程', 'App', 'completed', 3, datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        let rows = [
+            ("上架前准备", "heading"),
+            ("打开控制台", "step"),
+            ("确认版本号", "step"),
+            ("发布", "heading"),
+            ("点击发布按钮", "step"),
+        ];
+        for (i, (title, kind)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
+                 block_kind, block_level) VALUES (?1, 'r', ?2, ?3, 'click', ?4, ?5, 1)",
+                params![
+                    format!("s{}", i),
+                    i as i32,
+                    if *kind == "step" { i as i32 } else { 0 },
+                    title,
+                    kind
+                ],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn rule_summary_uses_headings_as_bullets() {
+        let conn = summary_fixture();
+        let text = build_rule_summary(&conn, "r").unwrap();
+        assert!(text.starts_with("本流程共 3 个步骤，分为 2 个部分"), "文本：{}", text);
+        assert!(text.contains("- **上架前准备**：打开控制台、确认版本号"), "文本：{}", text);
+        assert!(text.contains("- **发布**：点击发布按钮"), "文本：{}", text);
+    }
+
+    #[test]
+    fn ensure_summary_block_prepends_without_taking_number() {
+        let conn = summary_fixture();
+        assert!(ensure_summary_block_conn(&conn, "r").unwrap(), "首次应新建");
+        // 幂等：第二次不再新建、也不覆盖用户改过的正文
+        assert!(!ensure_summary_block_conn(&conn, "r").unwrap());
+
+        let (kind, order, num, total): (String, i32, i32, i32) = conn
+            .query_row(
+                "SELECT s.block_kind, s.order_index, s.step_number, \
+                 (SELECT total_steps FROM recordings WHERE id = 'r') \
+                 FROM steps s WHERE s.recording_id = 'r' AND s.block_kind = 'summary'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "summary");
+        assert_eq!(order, 0, "摘要块排正文最前");
+        assert_eq!(num, 0, "摘要块不占步骤编号");
+        assert_eq!(total, 3, "摘要块不计入步骤数");
+
+        // 原步骤整体后移一格，且**编号不变**（后面不会被重新编号）
+        let (first_title, first_order, first_num): (String, i32, i32) = conn
+            .query_row(
+                "SELECT title, order_index, step_number FROM steps WHERE recording_id = 'r' \
+                 AND block_kind = 'heading' ORDER BY order_index LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(first_title, "上架前准备");
+        assert_eq!(first_order, 1);
+        assert_eq!(first_num, 0);
+    }
+
+    /* ── 第十九轮：简介块（左栏 ＋ 菜单的「添加简介」）───────────── */
+
+    #[test]
+    fn block_kind_whitelist_covers_insert_menu_entries() {
+        // 菜单里的每一种块都必须被接受 —— 漏一个的后果是「点了没反应」
+        for k in ["heading", "summary", "intro", "flow", "note", "mark", "warn"] {
+            assert!(is_known_block_kind(k), "{} 应当被接受", k);
+        }
+        assert!(is_known_block_kind("intro"), "第十九轮新增的简介块必须在白名单里");
+        assert!(!is_known_block_kind(""));
+        assert!(!is_known_block_kind("Intro"), "前端只传小写，别悄悄放宽");
+        assert!(!is_known_block_kind("step "), "前后空格不该被容忍");
+    }
+
+    #[test]
+    fn intro_block_inserted_by_add_block_does_not_take_number() {
+        let conn = summary_fixture();
+        // 与 add_block 的完整语义同款：先腾位（order_index >= 2 的后移），再插新块
+        conn.execute(
+            "UPDATE steps SET order_index = order_index + 1 \
+             WHERE recording_id = 'r' AND order_index >= 2",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
+             description, tip, screenshot_path, created_at, timestamp, window_title, \
+             block_kind, block_level) \
+             VALUES ('i1', 'r', 2, 0, '', '', '这份教程适合新手', '', '', '2026-09-19', 0, '', 'intro', 1)",
+            [],
+        )
+        .unwrap();
+
+        let real = renumber_recording_steps(&conn, "r").unwrap();
+        assert_eq!(real, 3, "简介块不该被算成步骤：真步骤仍是 3 个");
+
+        let (kind, num): (String, i32) = conn
+            .query_row(
+                "SELECT block_kind, step_number FROM steps WHERE id = 'i1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "intro");
+        assert_eq!(num, 0, "简介块不占步骤编号");
+
+        // order_index 被压实，正文顺序不变（简介插在第二个位子）
+        let order: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM steps WHERE recording_id = 'r' ORDER BY order_index, rowid")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        assert_eq!(order[2], "i1");
+        // 真步骤编号仍是连续 1..3
+        let mut stmt = conn
+            .prepare("SELECT step_number FROM steps WHERE recording_id = 'r' AND block_kind = 'step' ORDER BY order_index")
+            .unwrap();
+        let nums: Vec<i32> = stmt
+            .query_map([], |r| r.get::<_, i32>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(nums, vec![1, 2, 3]);
     }
 
     #[test]
@@ -2414,6 +3470,13 @@ mod editor_tests {
             is_variable: false,
             param_name: String::new(),
             mouse_button: String::new(),
+            block_kind: "step".into(),
+            block_level: 1,
+            note_kind: String::new(),
+            title_html: String::new(),
+            image_caption: String::new(),
+            media_kind: "image".into(),
+            media_poster_path: String::new(),
         };
         let json = serde_json::to_string(&s).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -2642,6 +3705,13 @@ mod editor_tests {
             is_variable: false,
             param_name: String::new(),
             mouse_button: String::new(),
+            block_kind: "step".into(),
+            block_level: 1,
+            note_kind: String::new(),
+            title_html: String::new(),
+            image_caption: String::new(),
+            media_kind: "image".into(),
+            media_poster_path: String::new(),
         };
         populate_step_screenshot_base64(&mut step);
         assert!(step.screenshot_base64.is_some());
@@ -2683,6 +3753,13 @@ mod editor_tests {
             is_variable: false,
             param_name: String::new(),
             mouse_button: String::new(),
+            block_kind: "step".into(),
+            block_level: 1,
+            note_kind: String::new(),
+            title_html: String::new(),
+            image_caption: String::new(),
+            media_kind: "image".into(),
+            media_poster_path: String::new(),
         };
         populate_step_screenshot_base64(&mut step);
         assert!(step.screenshot_base64.is_none());
@@ -3515,6 +4592,70 @@ mod editor_tests {
     // 测试用包装：直接吃连接（命令版本吃 Tauri State）
     fn edit_undo_conn_test(conn: &rusqlite::Connection, rid: &str) -> Result<usize, String> {
         super::pop_and_restore(conn, rid, "undo", "redo")
+    }
+
+    /// 第十六轮回归：撤销是「全删全插」，必须把**文档块字段**一起带回来
+    /// —— 否则撤销一次就把大标题降级成普通步骤、说明类型/富文本/图注全丢，
+    /// 编号也会被重新按「含文档块」的口径排错。修 bug 时顺带锁死。
+    #[test]
+    fn edit_undo_keeps_document_blocks_and_numbering() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
+             description, tip, screenshot_path, annotated_path, before_screenshot_path, \
+             title_html, block_kind, block_level) \
+             VALUES ('h1','r1',0,0,'','上架前准备','','','','','', '<b>上架前准备</b>','heading',2)",
+            [],
+        )
+        .unwrap();
+        insert_step(&conn, "s1", 1, "click", "打开控制台", "d1");
+        insert_step(&conn, "s2", 2, "click", "确认版本号", "d2");
+        conn.execute(
+            "UPDATE steps SET note_kind='mark', image_caption='红圈处是版本号' WHERE id='s2'",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE recordings SET total_steps=2 WHERE id='r1'", [])
+            .unwrap();
+
+        push_edit_history(&conn, "r1").unwrap();
+        conn.execute("DELETE FROM steps WHERE id='s1'", []).unwrap(); // 制造一次编辑
+        pop_and_restore(&conn, "r1", "undo", "redo").unwrap();
+
+        let (kind, lv, html): (String, i32, String) = conn
+            .query_row(
+                "SELECT COALESCE(block_kind,''), COALESCE(block_level,0), COALESCE(title_html,'') \
+                 FROM steps WHERE id='h1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "heading", "撤销后大标题块不该降级成普通步骤");
+        assert_eq!(lv, 2, "大标题层级丢了");
+        assert_eq!(html, "<b>上架前准备</b>", "大标题富文本丢了");
+
+        let (nk, cap, num): (String, String, i32) = conn
+            .query_row(
+                "SELECT COALESCE(note_kind,''), COALESCE(image_caption,''), step_number \
+                 FROM steps WHERE id='s2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(nk, "mark", "说明类型丢了");
+        assert_eq!(cap, "红圈处是版本号", "图片描述丢了");
+        assert_eq!(num, 2, "真步骤编号应只数真步骤");
+
+        let (hnum, total): (i32, i32) = conn
+            .query_row(
+                "SELECT (SELECT step_number FROM steps WHERE id='h1'), \
+                        (SELECT total_steps FROM recordings WHERE id='r1')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(hnum, 0, "文档块不占编号");
+        assert_eq!(total, 2, "total_steps 只数真步骤");
     }
 
     #[test]

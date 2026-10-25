@@ -94,9 +94,14 @@ impl FrameRing {
 /// record where in screen space the crop starts. If the target window is not
 /// visible/available, the frame is skipped entirely so the ring never holds
 /// unrelated desktop content.
+///
+/// `frame_tx` 为**有界** SyncSender：事件线程忙（正在同步生成点击/键盘步骤）
+/// 时最多积压 8 帧，满帧直接丢弃最旧。旧逻辑用无界 channel，事件线程一忙
+/// 帧就无限积压，恢复后 ring 会被几秒前的过期帧刷一遍，正好造成
+/// 「截图变化速度跟不上点击速度」。ring 本身容量 16（4 秒），8 帧缓冲足够。
 pub fn start_capture_thread(
     running: Arc<AtomicBool>,
-    frame_tx: mpsc::Sender<CapturedFrame>,
+    frame_tx: mpsc::SyncSender<CapturedFrame>,
     interval: Duration,
     target_window: Option<String>,
 ) {
@@ -105,6 +110,8 @@ pub fn start_capture_thread(
             "[CAPTURE] continuous capture thread started (interval: {:?}, target: {:?})",
             interval, target_window
         ));
+        // 满帧丢帧限频日志：避免事件线程持续繁忙时每 250ms 刷一行日志。
+        let mut last_drop_log = Instant::now();
         while running.load(Ordering::Relaxed) {
             let loop_start = Instant::now();
 
@@ -124,9 +131,16 @@ pub fn start_capture_thread(
                         origin_x: ox,
                         origin_y: oy,
                     };
-                    if frame_tx.send(frame).is_err() {
-                        super::recorder::capture_dbg_log("[CAPTURE] frame channel closed, exiting");
-                        break;
+                    // 有界发送：队列满则丢弃本帧（ring 只需要最近的帧）。
+                    // 事件线程每处理一个事件都会 drain 一次，最多落后几帧。
+                    if frame_tx.try_send(frame).is_err() {
+                        if last_drop_log.elapsed() >= Duration::from_secs(2) {
+                            super::recorder::capture_dbg_log(
+                                "[CAPTURE] frame queue full, dropping oldest (event thread busy)",
+                            );
+                            last_drop_log = Instant::now();
+                        }
+                        continue;
                     }
                 }
                 Err(e) => {

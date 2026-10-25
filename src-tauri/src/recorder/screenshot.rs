@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Screenshot storage directory under system temp.
+/// 截图/媒体持久目录（`%APPDATA%\com.flowio.app\screenshots`，见 paths::screenshots_dir）。
+///
+/// 🔴 历史坑（2026-10-04）：曾用 `%TEMP%\flowio_screenshots`，系统清理临时目录后
+/// 全部截图丢失。统一走 paths::screenshots_dir()，禁止再写系统临时目录。
 pub fn screenshot_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("flowio_screenshots");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    crate::paths::screenshots_dir()
 }
 
 /// Generate the next JPEG file path: `{prefix}_{timestamp_ms}_{counter}.jpg`
@@ -19,6 +20,18 @@ pub fn next_screenshot_path(prefix: &str) -> PathBuf {
         .as_millis();
     let c = COUNTER.fetch_add(1, Ordering::Relaxed);
     screenshot_dir().join(format!("{}_{}_{}.jpg", prefix, ts, c))
+}
+
+/// 第二十轮：带**显式扩展名**的媒体路径 `{prefix}_{timestamp_ms}_{counter}.{ext}`。
+/// 手传的图片 / GIF 动图 / 视频都落在这里（与录制截图同一个目录 —— 不按录制分目录，
+/// 所以复制 steps 行到别的录制不会失效）。扩展名由调用方按白名单给，不在这里校验。
+pub fn next_media_path(prefix: &str, ext: &str) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    screenshot_dir().join(format!("{}_{}_{}.{}", prefix, ts, c, ext))
 }
 
 /// Current mouse position in virtual-screen coordinates.
@@ -749,6 +762,42 @@ pub fn draw_click_marker_with_bounds(
 }
 
 // ── UIA text retrieval (StepSnap-style, for keyboard steps) ──────────
+
+/// UIA 高频调用节流缓存（事件线程专用）。
+///
+/// 背景：`get_focused_element_text` 是跨进程 COM/UIA 调用，单次可达
+/// 50–500ms；事件线程在**每次按键 / 退格 / nav flush** 时同步调用它，
+/// 快速连点时事件线程被 UIA RPC 拖死 → 后续点击事件在队列积压，
+/// 表现为「截图变化速度跟不上点击速度 / 快速点击几次后按钮失灵」。
+///
+/// 该缓存仅用于**事件线程的高频路径**（录制中实时读焦点文本），
+/// 200ms 时间窗内直接复用上一次结果。settle 等「动作之后才读」的
+/// 后台线程继续使用未缓存的原函数，保证「事后快照」语义不退化。
+struct UiaTextCache {
+    at: Option<std::time::Instant>,
+    value: Option<(String, bool)>,
+}
+
+static UIA_TEXT_CACHE: std::sync::Mutex<UiaTextCache> = std::sync::Mutex::new(UiaTextCache {
+    at: None,
+    value: None,
+});
+
+pub fn get_focused_element_text_cached() -> Option<(String, bool)> {
+    let mut guard = match UIA_TEXT_CACHE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(at) = guard.at {
+        if at.elapsed() < std::time::Duration::from_millis(200) {
+            return guard.value.clone();
+        }
+    }
+    let v = get_focused_element_text();
+    guard.at = Some(std::time::Instant::now());
+    guard.value = v.clone();
+    v
+}
 
 /// Read the current text value from the focused UIA element.
 ///
@@ -2097,8 +2146,8 @@ mod screenshot_tests {
         let path = next_screenshot_path("click");
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
 
-        // 位于 temp/flowio_screenshots 下
-        assert_eq!(path.parent().unwrap(), std::env::temp_dir().join("flowio_screenshots"));
+        // 位于持久截图目录下
+        assert_eq!(path.parent().unwrap(), crate::paths::screenshots_dir());
         // 格式：click_{ts}_{counter}.jpg
         assert!(file_name.starts_with("click_"), "unexpected name: {}", file_name);
         assert!(file_name.ends_with(".jpg"), "unexpected name: {}", file_name);

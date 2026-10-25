@@ -1,9 +1,10 @@
 import { BrowserRouter, Routes, Route, useNavigate, useLocation } from "react-router-dom";
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Settings, Minus, Square, Copy, X, Pause, Play, User, LayoutDashboard, Mic, MicOff } from "lucide-react";
+import { Settings, Minus, Square, Copy, X, Pause, Play, User, LayoutDashboard, Mic, MicOff, FolderOpen } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openPath } from "@tauri-apps/plugin-opener";
 import Dashboard from "./pages/Dashboard";
 import SettingsPage from "./pages/Settings";
 import StepEditor from "./pages/StepEditor";
@@ -54,7 +55,7 @@ function App() {
 
   // ── 长任务完成全局提醒（AI 精简/翻译/语音/扫描脱敏/导出，任意页面弹窗）──
   const [jobToasts, setJobToasts] = useState<{
-    id: number; recordingId: string; title: string; op: string; ok: boolean; summary: string;
+    id: number; recordingId: string; title: string; op: string; ok: boolean; summary: string; filePath?: string;
   }[]>([]);
   const jobIdRef = useRef(0);
 
@@ -108,14 +109,14 @@ function App() {
   // 带教程名，点击跳教程；AI 精简完成时清掉全局「进行中」标记。
   useEffect(() => {
     let unlisten: (() => void) | null = null;
-    listen<{ recording_id: string; title: string; op: string; ok: boolean; summary: string }>(
+    listen<{ recording_id: string; title: string; op: string; ok: boolean; summary: string; file_path?: string }>(
       "flowio://job-done",
       (ev) => {
         const p = ev.payload;
         const id = ++jobIdRef.current;
         setJobToasts((prev) => [
           ...prev,
-          { id, recordingId: p.recording_id, title: p.title, op: p.op, ok: p.ok, summary: p.summary },
+          { id, recordingId: p.recording_id, title: p.title, op: p.op, ok: p.ok, summary: p.summary, filePath: p.file_path },
         ]);
         if (p.ok) {
           // 成功卡片：9 秒后自动消失（纯信息性，无需用户操作）
@@ -443,6 +444,49 @@ function App() {
     }
   }, []);
 
+  /* 「续录」目标：本次录制结束后要回到哪份教程、插在第几步之后（null = 正常新建教程） */
+  const appendIntoRef = useRef<{ recordingId: string; insertAfter: number } | null>(null);
+
+  /**
+   * 「续录」：从编辑器里的某一步后面接着录。
+   *
+   * 与「开始录制」的区别只在落库位置：后端把这次录到的步骤插进已有教程的中间
+   * （`start_append_recording` + `finish_recording` 的 append 分支），不新建教程。
+   * 这里先回首页（编辑器卸载 → 停录跳回来时会重新拉一次步骤），再拉起录制。
+   */
+  const handleResumeInto = useCallback(
+    async (recordingId: string, insertAfter: number) => {
+      try {
+        const recordSelf = localStorage.getItem("flowio_record_self") === "1";
+        const recordTarget = localStorage.getItem("flowio_record_target") === "1";
+        const targetProcess = localStorage.getItem("flowio_record_target_process") || "";
+        const targetWindow = recordTarget && targetProcess ? targetProcess : null;
+        navigate("/");
+        const sessionId = await invoke<string>("start_append_recording", {
+          recordingId,
+          insertAfter,
+          recordSelf,
+          targetWindow,
+        });
+        appendIntoRef.current = { recordingId, insertAfter };
+        recordingIdRef.current = sessionId;
+        setRecordingId(sessionId);
+        setRecording(true);
+        setIsPaused(false);
+        isPausedRef.current = false;
+        setElapsed(0);
+        setStepCount(0);
+        await startVoiceIfEnabled(sessionId);
+        appWindow.minimize();
+      } catch (err) {
+        appendIntoRef.current = null;
+        console.error("Failed to start append recording:", err);
+        alert("续录启动失败: " + String(err));
+      }
+    },
+    [navigate, startVoiceIfEnabled]
+  );
+
   const handleResumeRecording = useCallback(async () => {
     const id = recordingIdRef.current;
     if (!id) return;
@@ -509,8 +553,27 @@ function App() {
       } catch (e) {
         console.error("Window restore failed (non-fatal):", e);
       }
+      // 续录：停录后回的是「被插入的那份教程」，不是本次录制会话 id
+      const appendInto = appendIntoRef.current;
+      appendIntoRef.current = null;
+
+      /* 流程摘要（第十六轮）：规则版已经在 finish_recording 里同步写好，
+         这里再让 AI 按要点润色一遍覆盖它。**非阻塞** —— 不 await，先跳编辑器；
+         没配 AI 服务商就整段跳过（否则会白弹一张失败卡片）。 */
+      const summaryInto = appendInto ? appendInto.recordingId : id;
+      void (async () => {
+        try {
+          const cfg = await invoke<unknown>("get_first_ai_config");
+          if (!cfg) return;
+          await invoke("summarize_recording_ai", { recordingId: summaryInto });
+        } catch {
+          /* AI 润色只是可选增强：失败就保留自动生成的规则版摘要，不影响跳转 */
+        }
+      })();
+
       try {
-        navigate(`/editor/${id}`);
+        // ★ v0.65.244 对齐：录制停止先进「成片预览」只读态，点编辑才进完整编辑器
+        navigate(appendInto ? `/editor/${appendInto.recordingId}?preview=1` : `/editor/${id}?preview=1`);
       } catch (navErr: any) {
         alert("跳转编辑页面失败: " + (navErr?.message || navErr));
         console.error("Navigate to editor failed:", navErr);
@@ -568,6 +631,33 @@ function App() {
     })();
     return () => { unlisteners.forEach((u) => u()); };
   }, [handleStartRecording, handlePauseRecording, handleResumeRecording, handleStopRecording]);
+
+  // r740：入口动作。托盘菜单、「结束录制」、`flowio://record|stop`、第二实例 argv
+  // 四条来源在 Rust 侧都收成 emit("flowio-action", action)，这里只认动作不认来源。
+  const runFlowioAction = useCallback((action: string) => {
+    if (action === "record") {
+      // 与 Alt+Shift+S 同一套三态：没在录才开拍，暂停中才恢复，录制中不重复触发
+      if (recordingIdRef.current === null) handleStartRecording();
+      else if (isPausedRef.current) handleResumeRecording();
+    } else if (action === "stop") {
+      if (recordingIdRef.current !== null) handleStopRecording();
+    }
+  }, [handleStartRecording, handleResumeRecording, handleStopRecording]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      unlisten = await listen("flowio-action", (event: any) => runFlowioAction(event.payload));
+      // 冷启动竞态：动作在 React 挂监听之前就到达了，只能靠 Rust 侧的挂起槽补取一次
+      try {
+        const pending = await invoke<string | null>("take_pending_action");
+        if (pending) runFlowioAction(pending);
+      } catch (err) {
+        console.warn("[flowio] take_pending_action 失败:", err);
+      }
+    })();
+    return () => { unlisten?.(); };
+  }, [runFlowioAction]);
   const formatTime = (sec: number) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 
   return (
@@ -592,6 +682,20 @@ function App() {
         </div>
         <div className="titlebar-right">
           {isEditor && <div id="titlebar-editor-actions" className="titlebar-editor-actions" />}
+          {/* 导出目录（第四十八轮）：所有导出都落到「文档\录步导出」，
+              在这里一键用资源管理器打开，导完不用再找路径 */}
+          {!isEditor && (
+            <button
+              className="titlebar-btn titlebar-btn-exportdir"
+              onClick={() => {
+                invoke<string>("open_export_dir").catch((err) => console.error("open_export_dir:", err));
+              }}
+              data-tip={"打开导出目录\n导出的 Word / PDF / 视频等都在这里（文档\\录步导出）"}
+            >
+              <FolderOpen size={14} />
+              <span className="titlebar-voice-text">导出目录</span>
+            </button>
+          )}
           {/* 语音输入开关（V1/V2/V13）：录制中=🎙指示灯；未录制=预设开关 */}
           {!isEditor && (
             <button
@@ -658,7 +762,7 @@ function App() {
           )}
           <button className="titlebar-win-btn" onClick={() => appWindow.minimize()}><Minus size={15} /></button>
           <button className="titlebar-win-btn" onClick={() => appWindow.toggleMaximize()}>{isMaximized ? <Copy size={13} /> : <Square size={13} />}</button>
-          <button className="titlebar-win-btn titlebar-close-btn" onClick={() => appWindow.close()}><X size={15} /></button>
+          <button className="titlebar-win-btn titlebar-close-btn" onClick={() => appWindow.close()} data-tip={"收起至托盘\n程序继续后台待命（Alt+Shift+S 开拍；托盘右键可退出）"}><X size={15} /></button>
         </div>
       </div>
 
@@ -668,7 +772,7 @@ function App() {
             <Route path="/" element={<Dashboard onEdit={handleEdit} onStartRecording={handleStartRecording} recording={recording} isPaused={isPaused} onPauseRecording={handlePauseRecording} onResumeRecording={handleResumeRecording} onStopRecording={handleStopRecording} locationKey={location.key} />} />
             <Route path="/settings" element={<SettingsPage darkMode={darkMode} onToggleDark={() => setDarkMode(!darkMode)} />} />
             <Route path="/profile" element={<ProfilePage />} />
-            <Route path="/editor/:id" element={<StepEditor siteToken={siteToken} siteUser={siteUser} voiceTranscribing={voiceTranscribing} />} />
+            <Route path="/editor/:id" element={<StepEditor siteToken={siteToken} siteUser={siteUser} voiceTranscribing={voiceTranscribing} onResumeInto={handleResumeInto} />} />
           </Routes>
         </div>
       </div>
@@ -726,7 +830,17 @@ function App() {
           {jobToasts.map((t) => (
             <div
               key={t.id}
-              onClick={() => navigate(`/editor/${t.recordingId}`)}
+              onClick={() => {
+                // 导出成功且带文件路径：点击直接打开已导出文件；其余场景跳回教程
+                if (t.op === "export" && t.ok && t.filePath) {
+                  openPath(t.filePath).catch((e) => {
+                    console.error("[flowio] 打开导出文件失败:", e);
+                    navigate(`/editor/${t.recordingId}`);
+                  });
+                } else {
+                  navigate(`/editor/${t.recordingId}`);
+                }
+              }}
               style={{
                 background: t.ok ? "#ffffff" : "#fff5f5",
                 border: `1px solid ${t.ok ? "#4caf50" : "#e57373"}`,
@@ -748,7 +862,9 @@ function App() {
                 《{t.title || "未命名教程"}》
               </div>
               <div style={{ fontSize: 12, color: "#555", marginTop: 2 }}>{t.summary}</div>
-              <div style={{ fontSize: 11, color: "#999", marginTop: 4 }}>点击查看教程</div>
+              <div style={{ fontSize: 11, color: "#999", marginTop: 4 }}>
+                {t.op === "export" && t.ok && t.filePath ? "点击打开文件" : "点击查看教程"}
+              </div>
             </div>
           ))}
         </div>

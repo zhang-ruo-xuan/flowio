@@ -44,7 +44,7 @@ ${StrLoc}
 !define UNINSTALLERICON ""
 !define UNINSTALLERHEADERIMAGE ""
 !define MAINBINARYNAME "flowio"
-!define MAINBINARYSRCPATH "D:\projects\flowio\src-tauri\target\release\flowio.exe"
+!define MAINBINARYSRCPATH "D:\projects\flowio-dev2\src-tauri\target\release\flowio.exe"
 !define BUNDLEID "com.flowio.app"
 !define COPYRIGHT ""
 !define OUTFILE "nsis-output.exe"
@@ -462,7 +462,7 @@ FunctionEnd
 ;Languages
 !insertmacro MUI_LANGUAGE "English"
 !insertmacro MUI_RESERVEFILE_LANGDLL
-  !include "D:\projects\flowio\src-tauri\target\release\nsis\x64\English.nsh"
+  !include "D:\projects\flowio-dev2\src-tauri\target\release\nsis\x64\English.nsh"
 
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode

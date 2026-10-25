@@ -69,3 +69,44 @@ export const UI_CROP_LINE = 1.5;
 /** 把「屏幕像素」换算成绘制时要用的图像像素。 */
 export const uiPx = (screenPx: number, displayScale?: number): number =>
   screenPx * uiScale(displayScale);
+
+/* ═══ 文字精确字体度量（对齐插件 annotate.tsx annoTextMetrics / annoTextBox）═══ */
+
+/** 标注文字字体（对齐插件 ANNO_FONT：600 加粗 + 系统字体栈）。 */
+export const ANNO_FONT = (fs: number): string =>
+  `600 ${fs}px -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif`;
+
+/** 文本度量缓存（同渲染字号只测一次）。 */
+const _metricCache = new Map<number, { asc: number; desc: number }>();
+
+/**
+ * 标注文字精确字体度量（对齐插件 annoTextMetrics）。
+ * 优先 fontBoundingBoxAscent/Descent（Chrome 83+），缺失回退 actualBoundingBox，
+ * 再兜底按 86%/20% 估算。绘制 / 命中 / 选中框共用同一基线，保证提交瞬间文字不跳。
+ */
+export function annoTextMetrics(fs: number): { asc: number; desc: number } {
+  const cached = _metricCache.get(fs);
+  if (cached) return cached;
+  let asc = fs * 0.86;
+  let desc = fs * 0.2;
+  try {
+    const c = document.createElement('canvas');
+    const ctx = c.getContext('2d');
+    if (ctx) {
+      ctx.font = ANNO_FONT(fs);
+      const m = ctx.measureText('Mg');
+      const ba = (m as unknown as TextMetrics).fontBoundingBoxAscent;
+      const bd = (m as unknown as TextMetrics).fontBoundingBoxDescent;
+      if (Number.isFinite(ba) && ba > 0) asc = ba;
+      if (Number.isFinite(bd) && bd > 0) desc = bd;
+    }
+  } catch {
+    // 兜底估算即可
+  }
+  const r = { asc, desc };
+  _metricCache.set(fs, r);
+  return r;
+}
+
+/** 文字框顶相对基线的偏移（y 为基线，框顶 = y - asc）。 */
+export const annoTextAscent = (fs: number): number => annoTextMetrics(fs).asc;

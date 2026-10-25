@@ -18,6 +18,8 @@ use tauri_plugin_notification::NotificationExt;
 #[derive(Debug, Clone, Copy)]
 pub enum JobOp {
     AiSimplify,
+    /// 录制结束后自动生成「流程摘要」（第十六轮）
+    AiSummary,
     Translate,
     Voice,
     ScanRedact,
@@ -28,6 +30,7 @@ impl JobOp {
     pub fn key(&self) -> &'static str {
         match self {
             JobOp::AiSimplify => "ai_simplify",
+            JobOp::AiSummary => "ai_summary",
             JobOp::Translate => "translate",
             JobOp::Voice => "voice",
             JobOp::ScanRedact => "scan_redact",
@@ -45,6 +48,8 @@ pub struct JobDoneEvent {
     pub op: String,
     pub ok: bool,
     pub summary: String,
+    /// 任务产出的文件绝对路径（如导出完成后的文件）；非文件类任务为 None。
+    pub file_path: Option<String>,
 }
 
 /// 统一完成回传：emit 前端事件 + 发 Windows 系统通知。
@@ -57,6 +62,7 @@ pub fn emit_job_done(
     op: JobOp,
     ok: bool,
     summary: &str,
+    file_path: Option<&str>,
 ) {
     let payload = JobDoneEvent {
         recording_id: recording_id.to_string(),
@@ -64,6 +70,7 @@ pub fn emit_job_done(
         op: op.key().to_string(),
         ok,
         summary: summary.to_string(),
+        file_path: file_path.map(|s| s.to_string()),
     };
 
     // 1) 前端全局卡片层（任何页面都接收）

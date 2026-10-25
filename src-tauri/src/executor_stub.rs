@@ -21,11 +21,9 @@ pub mod commands {
         _app: AppHandle,
         _db: tauri::State<'_, crate::DbState>,
         _recording_id: String,
-        _dry_run: bool,
         _step_delay_ms: Option<u64>,
         _approval_mode: Option<String>,
         _approved: Option<bool>,
-        _ai_fallback: Option<bool>,
     ) -> Result<Value, String> {
         Err(NOT_AVAILABLE.to_string())
     }
@@ -34,14 +32,6 @@ pub mod commands {
     pub fn preview_replay(
         _db: tauri::State<'_, crate::DbState>,
         _recording_id: String,
-    ) -> Result<Value, String> {
-        Err(NOT_AVAILABLE.to_string())
-    }
-
-    #[tauri::command]
-    pub fn get_replay_audit(
-        _db: tauri::State<'_, crate::DbState>,
-        _recording_id: Option<String>,
     ) -> Result<Value, String> {
         Err(NOT_AVAILABLE.to_string())
     }

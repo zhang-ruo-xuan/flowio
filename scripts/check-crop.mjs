@@ -3,10 +3,10 @@
  *
  *   npm run check:crop
  *
- * 覆盖三条历史 bug 的回归防线：
- *   1. 锚点 ↔ 矩形 round-trip 误差（v21）
- *   2. type 步骤左扩过冲、元素右边缘被切（v25）
- *   3. 手动框选拖拽的对角漂移 / 新建框越界放大（v26）
+ * 覆盖历史 bug 的回归防线：
+ *   1. 锚点 ↔ 矩形中心互逆 + 恒 50% 窗口（5b 对齐插件 computeCropRect）
+ *   2. 手动框选拖拽的对角漂移 / 新建框越界放大（v26）
+ *   3. 空白裁剪守卫阈值（三端同步 Δ=24）
  *
  * 用的是与运行时**完全相同的实现**（直接 import src/lib 下的真实代码），
  * 所以不存在"测试与实现各写一份、悄悄漂移"的问题。
@@ -18,7 +18,7 @@ const A = await import(new URL('../src/lib/cropAnchor.ts', import.meta.url).href
 const D = await import(new URL('../src/lib/cropDrag.ts', import.meta.url).href);
 const B = await import(new URL('../src/lib/cropBlank.ts', import.meta.url).href);
 
-const { cropBoxFromAnchor, rectToCropAnchor, CROP_PAD } = A;
+const { cropBoxFromAnchor, rectToCropAnchor } = A;
 const { resizeRect, newRect, moveRect, MIN_CROP_SIZE } = D;
 
 let failures = 0;
@@ -33,59 +33,54 @@ function makeRng(seed) {
   return () => ((s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
 }
 
-/* ═══ 1. 锚点 ↔ 矩形 round-trip ═══════════════════════ */
+/* ═══ 1. 锚点 ↔ 矩形：中心互逆 + 恒 50% 窗口 ═══════════════════════ */
 
-console.log('1. 锚点 ↔ 矩形 round-trip');
+console.log('1. 锚点 ↔ 矩形：中心互逆 + 恒 50% 窗口');
 {
   const rng = makeRng(20260902);
   const types = ['click', 'type', 'scroll', undefined];
-  let maxErr = 0, over2 = 0;
+  const [W, H] = [1920, 1080];
+  let maxErr = 0, over1 = 0;
   const N = 20000;
   for (let i = 0; i < N; i++) {
     const t = types[i % types.length];
     const rect = {
-      x: Math.floor(rng() * 1200),
-      y: Math.floor(rng() * 700),
-      width: 24 + Math.floor(rng() * 876),
-      height: 24 + Math.floor(rng() * 576),
+      x: Math.floor(rng() * W),
+      y: Math.floor(rng() * H),
+      width: 24 + Math.floor(rng() * (W - 24)),
+      height: 24 + Math.floor(rng() * (H - 24)),
     };
+    // 反解锚点 = 矩形中心（解析解，恒成立）
     const anchor = rectToCropAnchor(rect, t);
-    const back = cropBoxFromAnchor(anchor, t);
-    const err =
-      Math.abs(back.x - rect.x) +
-      Math.abs(back.y - rect.y) +
-      Math.abs(back.width - rect.width) +
-      Math.abs(back.height - rect.height);
-    if (err > maxErr) maxErr = err;
-    if (err > 2) {
-      over2++;
-      if (over2 <= 5) fail(`err=${err} t=${t} ${JSON.stringify(rect)} -> ${JSON.stringify(back)}`);
+    const cxErr =
+      Math.abs(anchor.x - (rect.x + rect.width / 2)) +
+      Math.abs(anchor.y - (rect.y + rect.height / 2));
+    if (cxErr > maxErr) maxErr = cxErr;
+    if (cxErr > 1) {
+      over1++;
+      if (over1 <= 5) fail(`中心偏差 err=${cxErr} t=${t} ${JSON.stringify(rect)}`);
     }
-  }
-  console.log(`   ${N} 例：maxErr=${maxErr}px，误差 >2px 的 ${over2} 例`);
-  if (over2 > 0) fail(`round-trip 有 ${over2} 例误差超过 2px`);
-}
 
-/* ═══ 2. 四边留白对称（v25 防线）═════════════════════ */
-
-console.log('2. 元素四边留白必须都 >= CROP_PAD');
-{
-  // 历史 bug：type 分支写成 `x - width/2 - extra`。框宽已含 extra，居中项
-  // x - width/2 天然在左右各分到 extra/2，再左移 extra 会过冲 extra/2，
-  // 使右侧留白变成 PAD - extra/2（元素宽 > 48px 即为负 → 右边缘被切）。
-  let bad = 0;
-  for (const cropW of [24, 48, 60, 120, 200, 300, 400, 600, 900]) {
-    for (const t of ['click', 'type']) {
-      const box = cropBoxFromAnchor({ x: 0, y: 0, cropW, cropH: 40 }, t);
-      const left = -cropW / 2 - box.x;             // 元素左边缘 − 框左边缘
-      const right = box.x + box.width - cropW / 2; // 框右边缘 − 元素右边缘
-      if (left < CROP_PAD - 0.01 || right < CROP_PAD - 0.01) {
-        bad++;
-        fail(`t=${t} cropW=${cropW} left=${left} right=${right}（应 >= ${CROP_PAD}）`);
-      }
-    }
+    // 正向恒为 50%×50% 窗口（Math.round 对齐 cropBoxFromAnchor）
+    const back = cropBoxFromAnchor(anchor, t, W, H);
+    const expW = Math.round(W * 0.5);
+    const expH = Math.round(H * 0.5);
+    if (back.width !== expW || back.height !== expH)
+      fail(`窗口尺寸 ${back.width}x${back.height}（应 ${expW}x${expH}）`);
+    // 窗口必须始终完整在图内
+    if (back.x < 0 || back.y < 0 || back.x + back.width > W || back.y + back.height > H)
+      fail(`窗口越界 ${JSON.stringify(back)} img=${W}x${H} anchor=${JSON.stringify(anchor)}`);
+    // 贴边语义逐轴独立：某轴未贴边 → 该轴中心必须对齐锚点；
+    // 某轴贴边（锚点靠近图边被平移夹回）→ 允许中心偏离，只需确认贴住图边。
+    const touchX = back.x === 0 || back.x + back.width === W;
+    const touchY = back.y === 0 || back.y + back.height === H;
+    const dx = Math.abs(back.x + back.width / 2 - anchor.x);
+    const dy = Math.abs(back.y + back.height / 2 - anchor.y);
+    if (!touchX && dx > 1) fail(`X 未贴边但中心偏离锚点 (dx=${dx})`);
+    if (!touchY && dy > 1) fail(`Y 未贴边但中心偏离锚点 (dy=${dy})`);
   }
-  if (!bad) console.log(`   18 例全部通过（四边留白 >= ${CROP_PAD}px）`);
+  console.log(`   ${N} 例：中心最大偏差=${maxErr}px，>1px 的 ${over1} 例`);
+  if (over1 > 0) fail(`锚点↔矩形中心有 ${over1} 例偏差超过 1px`);
 }
 
 /* ═══ 3. 手动框选拖拽几何 ═════════════════════════════ */
@@ -230,29 +225,35 @@ console.log('5. 手动框选：平移尺寸恒定 + 任意输入不越界');
   if (bad > 0) fail(`平移/安全不变式共 ${bad} 例违规`);
 }
 
-/* ═══ 6. 跨端黄金值（与 Rust 导出端共用同一组数）══════ */
+/* ═══ 6. 跨端黄金值（与 Rust crop_region_50 共用同一组数）══ */
 
 console.log('6. 跨端黄金值：编辑器与导出必须逐像素一致');
 {
-  // 同一套裁图算法在仓库里有 4 份实现（详见 src-tauri/src/export/commands.rs
-  // 的 export_crop_box 文档注释）。前端 2 份与导出端常量完全一致（PAD=8），
-  // 因此必须算出同样的矩形 —— 否则编辑器里看到的图和导出的图不是同一张。
+  // 同一套裁图几何在仓库里有 3 份实现（详见 src-tauri/src/export/commands.rs
+  // 的 export_crop_box 文档注释）：前端 cropBoxFromAnchor、导出端 crop_region_50、
+  // AI 端 ai_crop_region。几何已 5b 对齐插件 computeCropRect —— 恒 50% 窗口，
+  // 元素尺寸不影响框，type/click/drag 无差异。
   //
   // ⚠️ 下面每个数字都同时硬编码在 `src-tauri/src/export/commands.rs` 的
-  //    `export_crop_box_golden_*` 测试里。改任一端都必须同步改两处。
+  //    `export_crop_box_golden_*` 测试与 `src-tauri/src/ai/pipeline.rs` 的
+  //    `ai_crop_region_golden_*` 测试里。改任一端都必须同步改三处。
   //
-  // 场景：1920x1080 截图，元素矩形中心 (960,540)
-  //   type  300x40：extra = round(300/3) = 100，w = 300+16+100 = 416，x = 960-208-50 = 702
-  //   click 300x40：w = 316，x = 960-158 = 802
+  // 场景：1920x1080 截图，锚点中心 (960,540)
+  //   → 恒 50% 窗口：w = 960、h = 540，x = 960-480 = 480，y = 540-270 = 270
+  //   贴边：中心 (20,20) → x = clamp(20-480, 0, 960) = 0，y = clamp(20-270, 0, 540) = 0
+  //   4K：中心 (1920,1080) → (960, 540, 1920, 1080)
   const GOLDEN = [
-    ['type  300x40', { x: 960, y: 540, cropW: 300, cropH: 40 }, 'type', [702, 512, 416, 56]],
-    ['click 300x40', { x: 960, y: 540, cropW: 300, cropH: 40 }, 'click', [802, 512, 316, 56]],
-    ['type   24x40', { x: 960, y: 540, cropW: 24, cropH: 40 }, 'type', [932, 512, 48, 56]],
-    ['type  900x40', { x: 960, y: 540, cropW: 900, cropH: 40 }, 'type', [202, 512, 1216, 56]],
+    ['1920x1080 click 300x40', { x: 960, y: 540, cropW: 300, cropH: 40 }, 'click', 1920, 1080, [480, 270, 960, 540]],
+    ['1920x1080 type  300x40', { x: 960, y: 540, cropW: 300, cropH: 40 }, 'type', 1920, 1080, [480, 270, 960, 540]],
+    ['1920x1080 drag  300x40', { x: 960, y: 540, cropW: 300, cropH: 40 }, 'drag', 1920, 1080, [480, 270, 960, 540]],
+    ['1920x1080 贴边  20x20 ', { x: 20, y: 20, cropW: 300, cropH: 40 }, 'click', 1920, 1080, [0, 0, 960, 540]],
+    ['1920x1080 负中心 -5,10 ', { x: -5, y: 10, cropW: 2, cropH: 2 }, 'click', 1920, 1080, [0, 0, 960, 540]],
+    ['3840x2160 4K  中心', { x: 1920, y: 1080, cropW: 300, cropH: 40 }, 'click', 3840, 2160, [960, 540, 1920, 1080]],
+    ['1366x768  低分  中心', { x: 683, y: 384, cropW: 300, cropH: 40 }, 'click', 1366, 768, [341, 192, 683, 384]],
   ];
   let bad = 0;
-  for (const [name, anchor, t, [gx, gy, gw, gh]] of GOLDEN) {
-    const b = cropBoxFromAnchor(anchor, t);
+  for (const [name, anchor, t, W, H, [gx, gy, gw, gh]] of GOLDEN) {
+    const b = cropBoxFromAnchor(anchor, t, W, H);
     const got = [b.x, b.y, b.width, b.height];
     if (got.some((v, i) => v !== [gx, gy, gw, gh][i])) {
       bad++;
@@ -260,8 +261,8 @@ console.log('6. 跨端黄金值：编辑器与导出必须逐像素一致');
     }
   }
   if (!bad) {
-    console.log(`   ${GOLDEN.length} 组与 Rust 导出端一致`);
-    console.log('   （AI 管线 PAD=24/MIN=280，常量不同，黄金值另见其 cargo test）');
+    console.log(`   ${GOLDEN.length} 组与 Rust crop_region_50 一致`);
+    console.log('   （AI 端同用 crop_region_50 几何，黄金值见其 cargo test）');
   }
 }
 

@@ -105,10 +105,14 @@
   margin-top: 8px;
 }
 
+/* 第二十一轮：「共 N 条记录」从右端挪到「录制列表」后面（用户红框指的位置），
+   右端腾出来的位置留给常驻的「批量」按钮 / 批量操作条。
+   不再用 justify-content:space-between —— 靠 count 的 margin-right:auto 吃满剩余空间，
+   左侧自然紧贴、右侧元素贴右。 */
 .dashboard-table-bar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
   margin-bottom: 12px;
 }
 
@@ -121,6 +125,7 @@
 .dashboard-table-count {
   font-size: 13px;
   color: var(--text-muted);
+  margin-right: auto;
 }
 
 .dashboard-title-link {
@@ -169,6 +174,18 @@
   border: 1px solid transparent;
   transition: border-color 0.15s, background 0.15s;
   display: inline-block;
+}
+
+/* 来源域名小标（对齐插件 history 的 source_domain 展示） */
+.dashboard-source {
+  font-size: 11px;
+  color: var(--text-tertiary, #8b949e);
+  margin: 2px 6px 0;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
 }
 
 .dashboard-app-name:hover {
@@ -418,7 +435,12 @@
   right: 0;
   top: 100%;
   z-index: 100;
-  min-width: 160px;
+  /* 宽度跟着内容走：原先写死 min-width:160px，而三项（图标+两字）只占 ~72px，
+     右侧会空掉一大块。改成 max-content 后菜单贴合文字，留白只剩 12px 内边距。 */
+  min-width: 0;
+  width: max-content;
+  display: flex;
+  flex-direction: column;
   background: #fff;
   border: 1px solid #e0e0e0;
   border-radius: 8px;

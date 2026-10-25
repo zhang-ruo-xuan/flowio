@@ -21,6 +21,12 @@
     "deep-link:allow-register",
     "deep-link:allow-is-registered",
     "opener:default",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "**" }
+      ]
+    },
     "global-shortcut:default",
     "notification:default"
   ]

@@ -1,3 +1,5 @@
+import { annoFont, annoTextAscent, contentScale } from './annoScale';
+
 /**
  * 标注/裁剪框的命中检测几何。
  *
@@ -61,13 +63,18 @@ export interface AnnoLike {
   height?: number;
   endX?: number;
   endY?: number;
+  cx?: number;
+  cy?: number;
+  r?: number;
+  radius?: number;
+  fontSize?: number;
 }
 
 /**
  * 点是否命中标注重叠区（图像坐标）。
  * @param m 图像像素容差（由 `slopPx(HIT_SLOP.box, scale)` 得到）
  */
-export function hitAnnotation(a: AnnoLike, x: number, y: number, m: number): boolean {
+export function hitAnnotation(a: AnnoLike, x: number, y: number, m: number, imgH?: number): boolean {
   if (a.type === 'arrow') {
     const dx = (a.endX ?? 0) - a.x;
     const dy = (a.endY ?? 0) - a.y;
@@ -77,9 +84,36 @@ export function hitAnnotation(a: AnnoLike, x: number, y: number, m: number): boo
     const t = Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / (len * len)));
     return Math.hypot(x - (a.x + t * dx), y - (a.y + t * dy)) < m;
   }
+  if (a.type === 'magnifier') {
+    // 放大镜：点中透镜圆内（含圆周外扩 m 的容差）即可拖动
+    const dx = x - (a.cx ?? 0);
+    const dy = y - (a.cy ?? 0);
+    const rr = a.r ?? 0;
+    if (rr <= 0) return false;
+    return Math.hypot(dx, dy) <= rr + m;
+  }
+  if (a.type === 'badge') {
+    // 序号标注：点中实心圆内（含外扩 m 容差）即可命中；x/y 为圆心，radius 为半径
+    const dx = x - a.x;
+    const dy = y - a.y;
+    const rr = a.radius ?? 10;
+    if (rr <= 0) return false;
+    return Math.hypot(dx, dy) <= rr + m;
+  }
+  if (a.type === 'text') {
+    // 文字锚点是基线：命中框 = 框顶（a.y - asc）+ width/height（对齐插件 annoTextBox）。
+    // asc 用与绘制/选中框相同的精确字体度量，三处共用同一基线。
+    const k = contentScale(imgH);
+    const fs = annoFont(a.fontSize || 24, k);
+    const asc = annoTextAscent(fs);
+    const w = a.width || 0;
+    const h = a.height || 0;
+    const ty = a.y - asc;
+    return x >= a.x - m && x <= a.x + w + m && y >= ty - m && y <= ty + h + m;
+  }
   const w = a.width || 0;
   const h = a.height || 0;
-  // 高亮/模糊/文字的包围盒：外扩 m 后做矩形包含判断
+  // 高亮/模糊/矩形的包围盒：外扩 m 后做矩形包含判断
   return x >= a.x - m && x <= a.x + w + m && y >= a.y - m && y <= a.y + h + m;
 }
 

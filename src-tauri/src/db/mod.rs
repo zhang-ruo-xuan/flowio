@@ -253,22 +253,6 @@ pub fn init_db(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_edit_history_rec
             ON edit_history(recording_id, stack);
 
-        -- 重放审计表（Stage 3 精准可审计）：每次执行（含 dry-run / needs-approval）都留痕，
-        -- 供「审计历史」查询与信任层展示。run_id 为 uuid v4，report_json 为完整 ExecReport。
-        CREATE TABLE IF NOT EXISTS replay_audit (
-            run_id         TEXT PRIMARY KEY,
-            recording_id   TEXT NOT NULL,
-            started_at     TEXT NOT NULL,
-            finished_at    TEXT NOT NULL,
-            dry_run        INTEGER NOT NULL DEFAULT 0,
-            total_steps    INTEGER NOT NULL DEFAULT 0,
-            ok_steps       INTEGER NOT NULL DEFAULT 0,
-            failed_steps   INTEGER NOT NULL DEFAULT 0,
-            overall_status TEXT NOT NULL DEFAULT '',
-            target_app     TEXT NOT NULL DEFAULT '',
-            report_json    TEXT NOT NULL DEFAULT ''
-        );
-
         -- 撤销/重做历史只在本次运行内有效：启动即清空（用户要求退出软件后不保留，
         -- 避免重启后还能撤销到上一次会话的旧编辑状态）。
         DELETE FROM edit_history;
@@ -362,6 +346,57 @@ pub fn init_db(conn: &Connection) {
     for col in &["start_x", "start_y", "end_x", "end_y", "scroll_delta"] {
         let _ = conn.execute_batch(&format!("ALTER TABLE steps ADD COLUMN {} INTEGER", col));
     }
+
+    // ── Migrations: 正文「文档块」+ 步骤说明类型（2026-09-19 第十三轮）──
+    // block_kind：'step' = 真步骤（默认）；heading（大标题）为文档块 ——
+    //   不占步骤编号（step_number 恒为 0）、不计入 recordings.total_steps。
+    //   第十六轮再补一类 'summary'（流程摘要块）：录制结束时自动生成，固定在正文最前，
+    //   正文存 description（首行总览 + `- **要点**：说明` 若干行），同样不占编号。
+    // block_level：标题块层级（1/2/3），仅 heading 有意义。
+    // note_kind：步骤「补充说明」的呈现类型：'' = 普通描述 / 'mark' 标注 / 'warn' 警告。
+    for (col, ty) in [
+        ("block_kind", "TEXT NOT NULL DEFAULT 'step'"),
+        ("block_level", "INTEGER NOT NULL DEFAULT 1"),
+        ("note_kind", "TEXT NOT NULL DEFAULT ''"),
+        // title_html：大标题的富文本正文（白名单内联 HTML 子集）。
+        // 与 title 的关系：title 恒为该 HTML 的纯文本（导出/SKILL.md/搜索都用它），
+        // title_html 为空串时按「无格式」处理（旧库/旧块天然兼容）。
+        ("title_html", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        let _ = conn.execute_batch(&format!("ALTER TABLE steps ADD COLUMN {} {}", col, ty));
+    }
+
+    // ── Migrations: 图片描述（2026-09-19 第十六轮）──
+    // image_caption：挂在**截图下面**的一句话说明（对齐参考产品的「编辑图片描述」+
+    //   确定后显示在图片下方）。与 description「补充说明」是两件事：
+    //   description 讲「这一步做什么」，image_caption 只讲「这张图里能看到什么」，
+    //   导出/预览时紧贴图片下方渲染，位置固定在截图与补充说明之间。
+    //   旧库/存量步骤为 ''（不渲染，天然兼容）。
+    let _ = conn.execute_batch(
+        "ALTER TABLE steps ADD COLUMN image_caption TEXT NOT NULL DEFAULT ''",
+    );
+
+    // ── Migrations: 步骤媒体（2026-09-19 第二十轮）──
+    // media_kind：这一步挂的是图片还是视频。'image' = 默认（png / jpg / webp / **gif 动图**，
+    //   都走 <img>，浏览器自己会把动图播起来）；'video' = mp4 / webm，走 <video> 播。
+    // media_poster_path：视频的**首帧静态图**路径。左栏缩略图 / 导出（长图·Word·HTML·TXT）/
+    //   发布封面一律用它，视频本体只在编辑器预览里播 —— 这样导出链路是**零改动**的：
+    //   导出只认 `screenshot_path` 那一张图，加载时把视频步骤换成首帧即可。
+    // screenshot_path 的语义保持不变 = 「这一步的主媒体文件」（图片是它本人，视频是视频本体）。
+    // 旧库/存量步骤 = 'image' + ''（天然兼容）。
+    for (col, ty) in [
+        ("media_kind", "TEXT NOT NULL DEFAULT 'image'"),
+        ("media_poster_path", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        let _ = conn.execute_batch(&format!("ALTER TABLE steps ADD COLUMN {} {}", col, ty));
+    }
+
+    // ── Migrations: 步骤来源网址（对齐插件 step.url）──
+    // url：该步骤对应的页面地址。插件录制天然带页面 URL，桌面端为本机操作、
+    //   存量数据一律 ''（导出侧遇到空串就不渲染 🔗 行，天然兼容）。
+    let _ = conn.execute_batch(
+        "ALTER TABLE steps ADD COLUMN url TEXT NOT NULL DEFAULT ''",
+    );
 }
 
 /// 读取译文本来的 JSON 字符串（旧库/未翻译 → None；必须 Option 读，NULL 安全）。
@@ -939,5 +974,81 @@ mod db_tests {
         let conn = mem_db();
         let claimed = claim_recording_to_user(&conn, "ghost", "user-123").unwrap();
         assert!(!claimed);
+    }
+
+    /// 另存为必须**连文档块一起搬**（第十六轮回归）。
+    /// 用户报「我另存为后大标题变成步骤了」：旧实现只搬 20 个"步骤"列，block_kind /
+    /// block_level / note_kind / title_html 全丢 → 大标题落地成 block_kind='step'
+    /// 的空截图步骤，total_steps 也多算一格（含摘要块/标题块）。
+    #[test]
+    fn duplicate_recording_keeps_document_blocks() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO recordings (id, title, app_name, status, total_steps, created_at, updated_at) \
+             VALUES ('src', '源教程', 'App', 'completed', 2, datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        // 顺序：摘要块（order 0）→ 大标题（order 1）→ 步骤（order 2）→ 标注步骤（order 3）
+        let rows = [
+            ("summary", 1, "", "", ""),
+            ("heading", 2, "", "<b>装好 WPS</b>", ""),
+            ("step", 1, "", "", "单元格里能看到 2024 的版本号"),
+            ("step", 1, "mark", "", ""),
+        ];
+        for (i, (kind, level, note, th, cap)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO steps (id, recording_id, order_index, step_number, action_type, title, \
+                 block_kind, block_level, note_kind, title_html, image_caption) \
+                 VALUES (?1, 'src', ?2, ?3, 'click', ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    format!("s{}", i),
+                    i as i32,
+                    if *kind == "step" { (i as i32) - 1 } else { 0 },
+                    format!("标题 {}", i),
+                    kind,
+                    level,
+                    note,
+                    th,
+                    cap
+                ],
+            )
+            .unwrap();
+        }
+
+        let new_id = commands::duplicate_recording_conn(&conn, "src").unwrap();
+
+        // ① 块类型与层级逐条保留（顺序不变）
+        let mut stmt = conn
+            .prepare(
+                "SELECT block_kind, block_level, note_kind, title_html, image_caption \
+                 FROM steps WHERE recording_id = ?1 ORDER BY order_index",
+            )
+            .unwrap();
+        let got: Vec<(String, i32, String, String, String)> = stmt
+            .query_map(params![new_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].0, "summary");
+        assert_eq!(got[1].0, "heading");
+        assert_eq!(got[1].1, 2, "大标题层级要跟过来");
+        assert_eq!(got[1].3, "<b>装好 WPS</b>", "大标题富文本要跟过来");
+        assert_eq!(got[2].0, "step");
+        assert_eq!(got[3].2, "mark", "说明类型要跟过来");
+        assert_eq!(got[2].4, "单元格里能看到 2024 的版本号", "图片描述要跟过来");
+
+        // ② total_steps 只数真步骤（4 条里 2 条是块）
+        let total: i32 = conn
+            .query_row(
+                "SELECT total_steps FROM recordings WHERE id = ?1",
+                params![new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2, "文档块不占步骤数");
     }
 }

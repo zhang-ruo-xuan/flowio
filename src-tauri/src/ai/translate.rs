@@ -242,6 +242,7 @@ pub fn translate_recording(
             crate::job_notify::JobOp::Translate,
             ok,
             &summary,
+            None,
         );
     });
 

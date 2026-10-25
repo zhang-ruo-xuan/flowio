@@ -384,36 +384,11 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
     }
   };
 
-  /* ---- 重放 / 自动化 开关（设置页直接读写 settings 表，无需手动改库） ---- */
-  const [replayReplace, setReplayReplace] = useState(false);
-  const [aiAutoEnhance, setAiAutoEnhance] = useState(false);
-
-  useEffect(() => {
-    invoke<string | null>("get_setting", { key: "replay_type_mode" })
-      .then((v) => setReplayReplace(v === "replace"))
-      .catch(() => {});
-    invoke<string | null>("get_setting", { key: "ai_auto_enhance" })
-      .then((v) => setAiAutoEnhance(v === "true"))
-      .catch(() => {});
-  }, []);
-
-  const handleReplayReplaceToggle = async (value: boolean) => {
-    setReplayReplace(value);
-    try {
-      await invoke("set_setting", { key: "replay_type_mode", value: value ? "replace" : "append" });
-    } catch {
-      setReplayReplace(!value);
-    }
-  };
-
-  const handleAiEnhanceToggle = async (value: boolean) => {
-    setAiAutoEnhance(value);
-    try {
-      await invoke("set_setting", { key: "ai_auto_enhance", value: value ? "true" : "false" });
-    } catch {
-      setAiAutoEnhance(!value);
-    }
-  };
+  /* ---- 重放 / 自动化 开关（设置页直接读写 settings 表，无需手动改库） ----
+     第二十一轮：用户明确要求去掉设置里的「重放时先清空再输入（替换模式）」与
+     「录制后自动 AI 补写」两项 UI（红框截图），连同 state / effect / 两个 toggle 一起删。
+     🔴 Rust 侧读 `replay_type_mode` / `ai_auto_enhance` 的代码**保持不动** —— 读不到就是
+     默认（直接追加 / 不补写），老用户的旧值也不会让任何链路报错，只是不再有入口去改。 */
 
   /* ---- Record Target App（录制指定软件） ---- */
   const [recordTarget, setRecordTarget] = useState(() => localStorage.getItem("flowio_record_target") === "1");
@@ -1114,31 +1089,8 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
               <p className="hint">转写完成后，AI 会结合该步骤的屏幕截图校对识别文字，只修正明显的同音/近音错字，不会添加或改写内容（改不动就保留原文）。开着会更准确，但语音转写完成时间会略长；担心速度可关闭。</p>
             </div>
 
-            <div className="form-group">
-              <label>重放时先清空再输入（替换模式）</label>
-              <div className="toggle-switch" onClick={() => handleReplayReplaceToggle(!replayReplace)}>
-                <div className={`toggle-switch-track${replayReplace ? " active" : ""}`}>
-                  <div className="toggle-switch-thumb" />
-                </div>
-                <span className="toggle-switch-label">
-                  {replayReplace ? "开启" : "关闭"}
-                </span>
-              </div>
-              <p className="hint">开启后，重放「输入文字」步骤会先按 Ctrl+A 全选清空输入框原有内容再输入，避免旧内容串味；关闭则直接追加（默认）。适合往已填好内容的表单里重新录入。</p>
-            </div>
-
-            <div className="form-group">
-              <label>录制后自动 AI 补写</label>
-              <div className="toggle-switch" onClick={() => handleAiEnhanceToggle(!aiAutoEnhance)}>
-                <div className={`toggle-switch-track${aiAutoEnhance ? " active" : ""}`}>
-                  <div className="toggle-switch-thumb" />
-                </div>
-                <span className="toggle-switch-label">
-                  {aiAutoEnhance ? "开启" : "关闭"}
-                </span>
-              </div>
-              <p className="hint">开启后，每次录制结束自动调用一次 AI 把步骤标题/描述补写成更通顺的人话（消耗一次模型调用）。当前默认关闭，避免频繁录制触发 429 频限；需要更顺手的教程说明时再打开。</p>
-            </div>
+            {/* 第二十一轮：原「重放时先清空再输入（替换模式）」与「录制后自动 AI 补写」
+                两个开关按用户要求整体移除（见上方 state 处的说明）。 */}
           </div>
         )}
 

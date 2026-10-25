@@ -109,6 +109,17 @@ a:hover {
   -webkit-app-region: no-drag;
 }
 
+/* 标题栏左侧那块「logo + REC 计时」要排在一行。
+   ⚠️ .titlebar-logo 自身是 display:flex（块级），不加这条的话 REC 徽标会被
+   当成换行后的行内元素、掉到 logo 下面第二行去（用户 2026-09-19 报的
+   「这个放在图标文本的后面」就是这个）。 */
+.titlebar-drag {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
 .titlebar-logo {
   font-size: 16px;
   font-weight: 700;
@@ -203,6 +214,43 @@ a:hover {
 }
 .titlebar-btn-voice.on:hover {
   color: #ffa07c;
+}
+
+/* ── 编辑页「退回录制列表」：只留一枚 ← 箭头，不给文字占宽 ──────── */
+.titlebar-back-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: #e6edf3;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  -webkit-app-region: no-drag;
+}
+.titlebar-back-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+.titlebar-back-btn:active {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* ── 导出目录（titlebar）：深色顶栏上必须浅底 + 亮字才看得清 ── */
+.titlebar-btn-exportdir {
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: #ffffff;
+}
+.titlebar-btn-exportdir:hover {
+  background: rgba(255, 255, 255, 0.24);
+  border-color: #ff6b35;
+  color: #ffd9c9;
 }
 
 .titlebar-btn-login {
@@ -956,10 +1004,51 @@ select {
 .editor-sidebar {
   width: 40%;
   min-width: 300px;
-  border-right: 1px solid var(--border);
+  /* 第十八轮：分隔线改由 .editor-split 画（那条缝现在可拖拽），宽度也由内联 style 控制 */
+  flex: 0 0 auto;
   background: var(--bg-secondary);
   overflow-y: auto;
   padding: 0;
+}
+
+/* 整页缩放的承载层（第十九轮）。
+   把「目录栏 + 分隔条 + 正文」三兄弟包进来，CSS `zoom` 作用在它身上：
+   目录和正文一起放大/缩小（像 Word 的视图缩放），顶栏那排工具键不跟着动。
+   ⚠️ 只能包这三样 —— 弹窗/进度条这类 position:fixed 浮层必须留在外面，
+   否则 zoom 会把它们的 fixed 定位一起缩放，遮罩盖不满窗口。 */
+.editor-zoom {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+/* 两栏之间的可拖拽分隔条（第十八轮）。
+   平时就是原来那条 1px 灰分隔线（视觉不变），悬停/拖动时变主色 + 一圈淡光晕，
+   告诉用户「这里可以拖」。命中区 7px，纯为鼠标准备。 */
+.editor-split {
+  flex: 0 0 7px;
+  position: relative;
+  z-index: 6;
+  cursor: col-resize;
+  background: transparent;
+}
+
+.editor-split::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+  transition: background var(--transition), box-shadow var(--transition);
+}
+
+.editor-split:hover::before,
+.editor-split.is-dragging::before {
+  background: var(--green);
+  box-shadow: 0 0 0 2px rgba(255, 107, 53, 0.16);
 }
 
 .editor-preview {
@@ -967,7 +1056,7 @@ select {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--bg);
+  background: var(--bg-secondary);
 }
 
 /* Crop mode: allow internal scrolling */
@@ -992,6 +1081,91 @@ select {
   flex-direction: column;
   /* 缩小左右内边距（之前 40px 让主预览图左侧留下一条灰底"缝隙"）+ 收紧上内边距 */
   padding: 12px 16px 16px;
+}
+
+/* 第十八轮：撤销第十七轮的「正文列固定 900px 居中」。
+   那是在局部动刀 —— 窗口一宽，正文只剩中间一条、两侧全是留白（用户原话
+   「不要在局部变小，要在整体想办法」）。现在正文列铺满右栏，
+   想调宽度就拖 .editor-split：目录栏拖窄，右栏连同截图整体跟着变小。
+   编辑态与通篇预览态共用这一条（两边都是 .editor-preview-body 的唯一子元素 .sop-preview）。 */
+.editor-preview-body > .sop-preview {
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+/* ---- ★ v0.65.244 成片体检条（预览态悬浮条） ---- */
+.health-bar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  margin: 0 0 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+  backdrop-filter: blur(6px);
+  border: 1px solid;
+}
+.health-bar.is-ok {
+  background: rgba(240, 249, 240, 0.95);
+  border-color: #c8e6c9;
+  color: #2e7d32;
+}
+.health-bar.has-warns {
+  background: rgba(255, 250, 235, 0.96);
+  border-color: #ffe0b2;
+  color: #b26a00;
+}
+.health-bar.has-errors {
+  background: rgba(253, 240, 240, 0.97);
+  border-color: #f3c1c1;
+  color: #c62828;
+}
+.health-bar-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.health-bar-text {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+.health-bar-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: auto;
+}
+.health-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid;
+  font-size: 12px;
+  cursor: pointer;
+  background: transparent;
+  transition: background 0.15s;
+}
+.health-chip.is-error {
+  border-color: #e57373;
+  color: #c62828;
+}
+.health-chip.is-error:hover {
+  background: #ffebee;
+}
+.health-chip.is-warn {
+  border-color: #ffb74d;
+  color: #b26a00;
+}
+.health-chip.is-warn:hover {
+  background: #fff3e0;
 }
 
 /* ---- Editor topbar ---- */
@@ -1574,7 +1748,8 @@ select {
 .editor-sidebar {
   width: 320px;
   min-width: 280px;
-  border-right: 1px solid var(--border);
+  /* 第十八轮：分隔线统一由 .editor-split 画（原本这里也有一条 border-right，
+     会和可拖拽分隔条的线并排成两条，只删这一条会留下另一条 ⇒ 两处都得清掉） */
   display: flex;
   flex-direction: column;
   background: var(--bg-secondary);
@@ -1640,12 +1815,19 @@ select {
   width: 24px;
   height: 24px;
   border-radius: 50%;
-  background-color: #ff6b35;
-  color: #fff;
+  background-color: var(--bg);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
   font-size: 13px;
   font-weight: 600;
   line-height: 1;
   flex-shrink: 0;
+}
+
+.step-num-circle.is-sel {
+  background-color: #ff6b35;
+  border-color: #ff6b35;
+  color: #fff;
 }
 
 .sop-preview-step-type {
@@ -1730,6 +1912,772 @@ select {
   border: none;
   border-top: 1px solid var(--border);
   margin: 0;
+}
+
+/* ---- 通篇滚动编辑（编辑态右栏，2026-09-19）----
+   视觉沿用上面的 .sop-preview-*：同一套"圆徽 + 大标题 + 通栏截图"，
+   只把标题/描述换成"看着像正文、点进去才是输入框"的控件。 */
+
+.sop-edit {
+  padding-bottom: 56px;
+}
+
+/* 所有步骤一律带内边距 + 负外边距：几何统一，滚动时内容不会左右抖。
+   2026-09-19 起「当前是第几步」不再靠卡片换底色/加左竖条来表达 ——
+   通篇流里每一步长得一模一样，当前步只由左侧目录高亮体现。 */
+.sop-edit-step {
+  position: relative;
+  padding: 12px 14px 6px;
+  margin: 0 -14px;
+  border-radius: 10px;
+}
+
+/* 头部一行：① 圆徽 + 就地可编辑的标题 + 最右的删除键。
+   标题靠 flex:1 把 ✕ 顶到行尾，所以删除键永远贴在卡片右上角。 */
+.sop-edit-head {
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+/* 圆徽跟着标题第一行对齐（标题 22px/1.35，行高约 30px） */
+.sop-edit-head .step-num-circle {
+  margin-top: 4px;
+}
+
+/* 删除这一步：挂在「① 步骤」这一行的 ✕。
+   常驻会给通篇流添噪，鼠标进卡片才浮出（键盘聚焦同样可见）。 */
+.sop-step-del {
+  flex: none;
+  margin-left: 8px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.sop-edit-step:hover .sop-step-del,
+.sop-edit-step:focus-within .sop-step-del {
+  opacity: 1;
+}
+
+.sop-step-del:hover {
+  color: #f85149;
+  border-color: #f85149;
+}
+
+/* 标题 / 描述：平时就是正文的样子，悬停描边、聚焦才亮出来。 */
+.sop-edit-title,
+.sop-edit-desc {
+  display: block;
+  box-sizing: border-box;
+  font-family: 'Segoe UI', 'PingFang SC', system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 2px 6px;
+  resize: none;
+  overflow: hidden;
+  outline: none;
+  transition: background-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+/* 标题住在头部那一行：吃掉自己的左内边距（文字与圆徽的间距＝header 的 gap），
+   再靠 flex:1 撑满剩余宽度，把右边的 ✕ 顶到行尾。 */
+.sop-edit-title {
+  flex: 1 1 0;
+  min-width: 0;
+  width: auto;
+  margin: 0 0 0 -6px;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+/* 描述仍在图片下方：负 margin 抵消内边距 → 文字左缘与圆徽对齐。
+   高度只留一行（2026-09-19 按用户要求缩小），输入时自动长高。 */
+.sop-edit-desc {
+  width: calc(100% + 12px);
+  margin-left: -6px;
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
+.sop-edit-title:hover,
+.sop-edit-desc:hover {
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.sop-edit-title:focus,
+.sop-edit-desc:focus {
+  background: var(--bg-secondary);
+  box-shadow: inset 0 0 0 1px #ff6b35;
+}
+
+.sop-edit-title:focus { color: var(--text); }
+.sop-edit-desc:focus { color: var(--text); }
+
+.sop-edit-title::placeholder,
+.sop-edit-desc::placeholder {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+/* ── 补充说明的类型（第十三轮）：进框才浮出三个小图标 ───────────
+   平时是朴素输入框；鼠标进框（hover / 聚焦）右上角才出现 描述/标注/警告。
+   选了非「描述」的类型后整块上色 —— 通篇流里一眼能扫出标注与警告。
+   着色只动 background / color，不动 padding 与 box-shadow，
+   免得像选中态那样在滚动时把正文顶得左右抖。 */
+.sop-edit-note {
+  position: relative;
+}
+
+.sop-note-kinds {
+  position: absolute;
+  top: 1px;
+  right: 0;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.sop-edit-note:hover .sop-note-kinds,
+.sop-edit-note:focus-within .sop-note-kinds {
+  opacity: 1;
+}
+
+.sop-note-kind {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.12s ease, border-color 0.12s ease, background-color 0.12s ease;
+}
+
+.sop-note-kind:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.sop-note-kind.is-on {
+  background: #ff6b35;
+  border-color: #ff6b35;
+  color: #ffffff;
+}
+
+.sop-edit-note.is-mark .sop-edit-desc {
+  background: #e6f1fb;
+  color: #0c447c;
+}
+
+.sop-edit-note.is-mark .sop-edit-desc:hover {
+  box-shadow: inset 0 0 0 1px #b5d4f4;
+}
+
+.sop-edit-note.is-warn .sop-edit-desc {
+  background: #faeeda;
+  color: #633806;
+}
+
+.sop-edit-note.is-warn .sop-edit-desc:hover {
+  box-shadow: inset 0 0 0 1px #fac775;
+}
+
+/* 左侧类型色条：用 ::before 画，不占内边距（几何零位移） */
+.sop-edit-note.is-mark::before,
+.sop-edit-note.is-warn::before {
+  content: "";
+  position: absolute;
+  left: -6px;
+  top: 3px;
+  bottom: 13px;
+  width: 3px;
+  border-radius: 2px;
+}
+
+.sop-edit-note.is-mark::before { background: #378add; }
+.sop-edit-note.is-warn::before { background: #ba7517; }
+
+/* ── 大标题块（文档块）─────────────────────────────────────
+   只有一行：＃ 图标 + 可就地编辑的大标题；层级 H1/H2/H3 与删除键悬停才浮出。 */
+.sop-edit-heading {
+  padding-bottom: 12px;
+}
+
+.sop-heading-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sop-heading-hash {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+}
+
+.sop-heading-row .sop-edit-title {
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.sop-heading-t1 { font-size: 28px; }
+.sop-heading-t2 { font-size: 23px; }
+.sop-heading-t3 { font-size: 19px; }
+
+.sop-heading-ops {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.sop-edit-heading:hover .sop-heading-ops,
+.sop-edit-heading:focus-within .sop-heading-ops {
+  opacity: 1;
+}
+
+.sop-heading-lv {
+  height: 22px;
+  padding: 0 7px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.sop-heading-lv:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.sop-heading-lv.is-on {
+  background: var(--bg-tertiary);
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+/* 左栏里的大标题行：用 # 顶替数字编号 */
+.step-item-hash {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+}
+
+.step-item-title.is-heading {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ── 左栏「+」的插入菜单 ─────────────────────────────────── */
+.insert-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+
+.insert-menu {
+  position: fixed;
+  z-index: 61;
+  min-width: 178px;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg);
+}
+
+.insert-menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 9px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.insert-menu-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.insert-menu-item svg {
+  flex: none;
+  color: var(--text-muted);
+}
+
+.insert-menu-sep {
+  height: 1px;
+  margin: 5px 3px;
+  background: var(--border);
+}
+
+.insert-menu-label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.insert-menu-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* ── 导入已有教程选择器 ──────────────────────────────────── */
+.import-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(17, 24, 39, 0.28);
+}
+
+.import-modal {
+  width: 420px;
+  max-width: calc(100vw - 64px);
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 18px;
+  background: var(--bg);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+}
+
+.import-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+}
+
+.import-close {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.import-close:hover {
+  background: var(--bg-tertiary);
+  color: var(--text);
+}
+
+.import-sub {
+  margin: 6px 0 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.import-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.import-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.import-row:hover:not(:disabled) {
+  border-color: var(--text-muted);
+  background: var(--bg-secondary);
+}
+
+.import-row:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.import-row-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-row-meta {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.import-empty {
+  padding: 18px 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* 截图：铺满卡片宽度（别给 img 加 max-height，否则浏览器会反算宽度、两侧露白）。
+   overflow:hidden —— 「重点图」把图放大到 >100%，超出的边缘由这里裁掉。 */
+.sop-edit-shot {
+  position: relative;
+  overflow: hidden;
+}
+
+/* scale 只改显示倍率、不改布局尺寸 → 缩放不回流，通篇流的滚动位置不会跳。
+   transform-origin 由行内样式给（指向操作落点 = 重点图），这里的值只是兜底。 */
+.sop-edit-shot img {
+  width: 100%;
+  height: auto;
+  transform-origin: center center;
+  transition: transform 0.18s ease;
+}
+
+/* 图片上的功能键：沿用本区域既有那套（半透明黑底 + 白字/白图标），
+   鼠标移到图片上才浮现（键盘聚焦同样可见）。
+   横向顺序：「编辑图片」在左、删除截图的 ✕ 贴最右。 */
+.sop-shot-annotate {
+  position: absolute;
+  top: 8px;
+  right: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  /* 第十九轮：和右边那颗 ✕（24×24 圆）等高 —— 之前只有 19px（图标 13 + 上下各 3），
+     两个键顶对齐就变成「铅笔记中心偏高 2.5px」，用户要求两个功能中心水平对齐。 */
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+  line-height: 1;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, background 0.15s ease, visibility 0.15s ease;
+  z-index: 10;
+}
+
+.sop-shot-del {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, background 0.15s ease, visibility 0.15s ease;
+  z-index: 10;
+  line-height: 1;
+}
+
+.sop-shot-tools {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 10;
+  opacity: 0;
+  visibility: hidden;
+  /* 浮层隐藏时必须彻底不可命中：opacity:0 的元素仍会拦截点击，
+     曾导致「点图片右下角却点到别的卡片隐藏按钮、选中态漂移、按钮消失」。 */
+  transition: opacity 0.15s ease, visibility 0.15s ease;
+}
+
+.sop-edit-shot:hover .sop-shot-annotate,
+.sop-edit-shot:hover .sop-shot-del,
+.sop-edit-shot:hover .sop-shot-tools,
+.sop-edit-shot:focus-within .sop-shot-annotate,
+.sop-edit-shot:focus-within .sop-shot-del,
+.sop-edit-shot:focus-within .sop-shot-tools {
+  opacity: 1;
+  visibility: visible;
+}
+
+.sop-shot-annotate:hover,
+.sop-shot-del:hover {
+  background: rgba(0, 0, 0, 0.75);
+}
+
+/* −/+ 胶囊：与右侧定位圆钮同一套底色与圆角 */
+.sop-shot-zoom {
+  display: flex;
+  overflow: hidden;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.sop-shot-zoom .step-detail-view-segmented-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 10px;
+}
+
+/* 定位圆钮：准星 = 放大至点击位置（重点图），四角向内 = 还原原图。
+   与「删除截图」同一个 24px 黑底圆形，沿用本区域那套白图标语言。 */
+.sop-shot-zoomtoggle {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  cursor: pointer;
+  line-height: 1;
+  transition: background 0.15s ease;
+}
+
+.sop-shot-zoomtoggle:hover {
+  background: rgba(0, 0, 0, 0.75);
+}
+
+/* 这一排在图片里是普通 flex 项，别继承「右下角绝对定位」那套 */
+.sop-shot-tools .step-detail-view-segmented {
+  position: static;
+}
+
+.sop-edit-shot--empty {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 52px;
+  border: 1px dashed #d7dbe0;
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text-muted);
+  cursor: pointer;
+  margin-bottom: 16px;
+}
+
+.sop-edit-shot--empty:hover {
+  border-color: #b8c0c9;
+  color: var(--text-secondary);
+}
+
+/* 第二十轮：步骤里放视频 —— 外壳沿用截图那一套，但两处必须不一样：
+   ① 控制条不能被截图容器的 overflow:hidden 裁掉；
+   ② 不做「重点图」那套 scale 缩放（视频不需要、也没法裁）。 */
+.sop-preview-image.sop-shot-video {
+  overflow: visible;
+  background: #0b0d10;
+}
+
+.sop-shot-video video {
+  display: block;
+  width: 100%;
+  max-height: 620px;
+  border-radius: var(--radius);
+  background: #000;
+}
+
+/* 自绘视频控制条（替换原生 controls 的 −/+ 倍速，档位 0.5~2 可控） */
+.sop-video-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  margin-top: 6px;
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.92);
+  border: 1px solid #2b3340;
+}
+
+.sop-video-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #e6edf3;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.sop-video-btn:hover { background: rgba(255, 255, 255, 0.08); }
+
+.sop-video-rate {
+  min-width: 46px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: #e6edf3;
+  user-select: none;
+}
+
+.sop-video-seek {
+  flex: 1;
+  min-width: 60px;
+  height: 4px;
+  accent-color: #f0521a;
+  cursor: pointer;
+}
+
+.sop-video-time {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: #8b949e;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.sop-edit-shot-type {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.sop-edit-shot-hint {
+  font-size: 12px;
+}
+
+/* 变量 / 提示 */
+.sop-edit-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.sop-edit-var {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  border-radius: 999px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.sop-edit-var.is-on {
+  border-color: #f59e0b;
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.sop-edit-var-name {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text);
+  outline: none;
+}
+
+.sop-edit-var-name:focus {
+  border-color: #ff6b35;
+}
+
+.sop-edit-tip-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.sop-edit-tip-toggle:hover {
+  color: var(--text);
+}
+
+.sop-edit-foot {
+  min-height: 18px;
+}
+
+.sop-edit-saved {
+  font-size: 12px;
+  color: #22c55e;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 /* ---- Step list preview-active state ---- */
@@ -2814,7 +3762,8 @@ mark.find-hit {
   background: #24292E;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
+  gap: 10px;
   padding: 0 16px;
   flex-shrink: 0;
   border-bottom: 1px solid #333840;
@@ -3266,6 +4215,154 @@ mark.find-hit {
   border-color: #FF6B35;
 }
 
+.annotation-dashed-toggle {
+  min-width: 40px;
+  height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #828B94;
+  background: #333840;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.annotation-dashed-toggle:hover {
+  background: #3d444d;
+  color: #fff;
+}
+
+.annotation-dashed-toggle.active {
+  color: #fff;
+  background: #FF6B35;
+  border-color: #FF6B35;
+}
+
+.annotation-zoom-value {
+  min-width: 52px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: #e6edf3;
+  user-select: none;
+}
+
+/* 缩放控件（全局常驻顶栏，对齐插件 ed-anno-zoom） */
+.annotation-zoom {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: #333840;
+  border-radius: 8px;
+  padding: 4px;
+  flex-shrink: 0;
+}
+.annotation-zoom-btn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: #828B94;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.annotation-zoom-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+.annotation-zoom-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.annotation-zoom-pct {
+  min-width: 48px;
+  height: 28px;
+  padding: 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: #e6edf3;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.annotation-zoom-pct:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.annotation-toolbar-sep {
+  width: 1px;
+  height: 28px;
+  background: #333840;
+  margin: 0 2px;
+  flex-shrink: 0;
+}
+.annotation-toolbar-spacer {
+  flex: 1;
+}
+
+/* 线宽按钮组（对齐插件 ed-anno-thickness） */
+.annotation-thick {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.annotation-thick-btn {
+  min-width: 26px;
+  height: 28px;
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #828B94;
+  background: #333840;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.annotation-thick-btn:hover {
+  background: #3d444d;
+  color: #fff;
+}
+.annotation-thick-btn.active {
+  color: #fff;
+  background: #FF6B35;
+  border-color: #FF6B35;
+}
+
+/* 字号下拉（对齐插件 ed-anno-font select） */
+.annotation-font {
+  height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #e6edf3;
+  background: #333840;
+  border: 1px solid #3d444d;
+  border-radius: 6px;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.annotation-font:focus {
+  border-color: #FF6B35;
+}
+.annotation-font option {
+  background: #24292E;
+  color: #e6edf3;
+}
+
 /* ===== 文字浮层（桌面端：点击图片位置弹出，含字号+输入+确认/取消） ===== */
 .annotation-text-popover {
   position: absolute;
@@ -3376,7 +4473,9 @@ mark.find-hit {
   vertical-align: bottom;
 }
 
-/* ===== ★ 批量删除（Dashboard 多选） ===== */
+/* ===== ★ 批量删除 / 批量导出（Dashboard 多选） =====
+   第二十一轮：多选框列平时**不渲染**，点标题行右侧「批量」才出现；
+   下面这个按钮样式同时服务「批量」入口与批量操作条（视觉沿用同一套）。 */
 .dash-check {
   width: 15px;
   height: 15px;
@@ -3388,7 +4487,6 @@ mark.find-hit {
   background: rgba(255, 107, 53, 0.05);
 }
 .dash-batchbar {
-  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -3414,6 +4512,15 @@ mark.find-hit {
   border-color: #ff6b35;
   color: #ff6b35;
 }
+/* 未勾选任何一条 / 正在导出时：批量导出与批量删除不可点 */
+.dash-batchbar-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.dash-batchbar-btn:disabled:hover {
+  border-color: #e5e7eb;
+  color: #374151;
+}
 .dash-batchbar-del {
   background: #fef2f2;
   border-color: #fecaca;
@@ -3423,6 +4530,11 @@ mark.find-hit {
   background: #dc2626;
   border-color: #dc2626;
   color: #fff;
+}
+.dash-batchbar-del:disabled:hover {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #dc2626;
 }
 
 /* ── 步骤精简（自动合并 / AI 精简 / 撤销），2026-09-03 ──
@@ -3484,6 +4596,10 @@ mark.find-hit {
 .ui-tip {
   position: fixed;
   z-index: 100000;
+  /* width: max-content —— 缺了它，贴着右边缘的元素（图片右下角的定位圆钮、侧栏最右的
+     按钮）会按「left 到视口右沿还剩多少」被挤成一列竖排字，气泡变成一根黑条。
+     宽度交给内容决定，max-width 再兜底；定位仍由 JS 的贴边夹取负责。 */
+  width: max-content;
   max-width: 280px;
   padding: 6px 10px;
   border-radius: 6px;
@@ -3544,3 +4660,3382 @@ mark.find-hit {
   white-space: nowrap;
 }
 .voice-caption-panel .cap-line.last { color: #fff; }
+
+/* ============================================================
+   第十四轮（2026-09-19）：大标题富文本 / 目录栏 / 预览块渲染
+   ============================================================ */
+
+/* ── 大标题正文（contenteditable）────────────────────────────
+   与 .sop-edit-title 同一套「看着像正文、点进去才是输入框」的观感。 */
+.sop-edit-rich {
+  flex: 1 1 0;
+  min-width: 0;
+  box-sizing: border-box;
+  margin: 0 0 0 -6px;
+  font-family: 'Segoe UI', 'PingFang SC', system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 2px 6px;
+  outline: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  transition: background-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.sop-edit-rich:hover {
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.sop-edit-rich:focus {
+  background: var(--bg-secondary);
+  box-shadow: inset 0 0 0 1px #ff6b35;
+}
+
+.sop-edit-rich:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-muted);
+  font-weight: 400;
+  pointer-events: none;
+}
+
+.sop-heading-row .sop-edit-rich {
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+/* H4 补齐（原子号只到 H3）—— 与导出 HTML 的 .doc-heading.h4 同值 */
+.sop-heading-t4 { font-size: 17px; }
+
+/* ── 大标题工具条：聚焦才浮出，贴在标题上方 ──
+   斜体 / 下划线 / 删除线 ｜ A 字色 ｜ 高亮 ｜ H1~H4 */
+.sop-heading-bar {
+  position: absolute;
+  left: 0;
+  top: -42px;
+  z-index: 22;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 34px;
+  padding: 0 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+}
+
+/* 标题贴着滚动容器顶部时改挂到下方 */
+.sop-heading-bar.is-below {
+  top: auto;
+  bottom: -42px;
+}
+
+.sop-bar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 5px;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sop-bar-btn:hover { background: var(--bg-tertiary); }
+
+.sop-bar-btn.is-italic { font-style: italic; font-size: 13px; }
+.sop-bar-btn.is-underline { text-decoration: underline; font-size: 13px; }
+.sop-bar-btn.is-strike { text-decoration: line-through; font-size: 13px; }
+
+/* 当前层级：沿用本区域既有的「选中态」写法（.sop-heading-lv.is-on 同款），不另起配色 */
+.sop-bar-btn.is-lv { color: var(--text-secondary); letter-spacing: 0.03em; }
+.sop-bar-btn.is-lv.is-on {
+  background: var(--bg-tertiary);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.sop-bar-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--border);
+}
+
+.sop-bar-pop-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.sop-bar-pop {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  z-index: 23;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+}
+
+.sop-bar-swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+/* 「无高亮 / 默认色」：横线划掉的空色块 */
+.sop-bar-swatch.is-none {
+  background-color: var(--bg-tertiary);
+  background-image: linear-gradient(
+    45deg,
+    transparent 44%,
+    var(--text-muted) 44%,
+    var(--text-muted) 56%,
+    transparent 56%
+  );
+}
+
+/* ── 预览里的大标题（字号/字重/行高/外边距与导出 HTML 的 .doc-heading 逐值对齐）── */
+.sop-preview-heading {
+  margin: 28px 0 12px;
+  color: #1a1a2e;
+  font-family: 'Segoe UI', 'PingFang SC', system-ui, -apple-system, sans-serif;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.6;
+}
+
+.sop-preview-heading.h1 { font-size: 28px; }
+.sop-preview-heading.h2 { font-size: 23px; }
+.sop-preview-heading.h3 { font-size: 19px; }
+.sop-preview-heading.h4 { font-size: 17px; }
+
+.sop-preview-heading-wrap { padding-top: 4px; }
+
+/* ── 预览里的标注 / 警告（与导出 HTML 的 .step-desc.is-mark/.is-warn 同值）── */
+.sop-preview-desc.is-mark,
+.sop-preview-desc.is-warn {
+  border-left: 3px solid transparent;
+  border-radius: 0 6px 6px 0;
+  padding: 8px 12px;
+}
+
+.sop-preview-desc.is-mark {
+  background: #e6f1fb;
+  color: #0c447c;
+  border-left-color: #378add;
+}
+
+.sop-preview-desc.is-warn {
+  background: #faeeda;
+  color: #633806;
+  border-left-color: #ba7517;
+}
+
+/* ── 左栏「目录」：大标题当分组头，它下面的步骤缩进一级 ── */
+.dir-title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.step-item-caret {
+  flex: none;
+  width: 16px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: transform 0.15s ease, color 0.12s ease;
+}
+
+.step-item-caret.is-collapsed { transform: rotate(-90deg); }
+.step-item-caret:hover { color: var(--text); }
+
+/* 缩进到分组里的步骤：用一个点占掉箭头那一格，编号列才对得齐 */
+.step-item-dot {
+  flex: none;
+  width: 16px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.step-item-dot::before {
+  content: "";
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--border);
+}
+
+/* 第二十轮：目录行的拖拽把手 —— 挪到「步骤前面」（编号左侧那一列）。
+   平时透明，鼠标落到这一行才浮现（列表保持干净）；用负 margin 吃掉一半 gap，
+   整行只多占约 16px，别把标题挤窄。 */
+.step-item-grip {
+  flex: none;
+  width: 14px;
+  height: 24px;
+  margin-left: -4px;
+  margin-right: -4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  opacity: 0;
+  cursor: grab;
+  transition: opacity var(--transition);
+}
+
+.step-item:hover .step-item-grip {
+  opacity: 1;
+}
+
+.step-item-grip:active {
+  cursor: grabbing;
+}
+
+/* 第十七轮：目录里的「悬停浮出 H1~H4 切级键」（.step-item-lvops）已整块删除 ——
+   切级统一走正文里大标题自己的工具条，两处重复同一个操作容易被误认成两个功能。
+   .sop-heading-lv 仍是正文工具条上那排键的样式，保留。 */
+
+/* 拖拽排序的落点指示线 */
+.step-item.is-drop-before { box-shadow: inset 0 2px 0 #ff6b35; }
+.step-item.is-drop-after { box-shadow: inset 0 -2px 0 #ff6b35; }
+
+/* ============================================================
+   第十五轮（2026-09-19）：标题处对标参考产品 / 说明行改文字 chip / 目录压成一行
+   ============================================================ */
+
+/* ── 大标题的编辑槽：工具条不再浮到上一行去遮住别人的文字 ──────────
+   以前工具条 absolute 在 top:-42px，正好压在上一条步骤的说明行上（用户报「盖住文字」）。
+   现在大标题块自己在上方留出一条 38px 的槽位，工具条固定落在槽里，悬停/聚焦淡入：
+   既不遮挡内容，也不会因为聚焦插入节点而回流（布局高度恒定）。 */
+.sop-edit-heading {
+  padding-top: 44px;
+}
+
+.sop-heading-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 22;
+  height: 34px;
+  padding: 0 12px;
+  gap: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05), 0 4px 12px rgba(16, 24, 40, 0.06);
+  /* 常驻 DOM、靠透明度显隐 —— 聚焦瞬间插图会把下面的正文顶下去 */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.sop-edit-heading:hover .sop-heading-bar,
+.sop-edit-heading:focus-within .sop-heading-bar {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 工具条里的按钮：比原来更淡的灰、胶囊点击区（对齐参考产品的 I U S ／ H1-H4 排布） */
+.sop-bar-btn {
+  min-width: 28px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 999px;
+  color: #4b5563;
+  font-size: 13px;
+}
+
+.sop-bar-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text);
+}
+
+/* 当前层级：淡紫底 + 靛蓝字（参考产品同款，比原来的灰底一眼可见） */
+/* 层级 chip 比图标键宽一点、彼此拉开（参考产品里 H1~H4 是四个并列的胶囊） */
+.sop-bar-btn.is-lv {
+  min-width: 36px;
+  padding: 0 10px;
+  color: var(--text-muted);
+}
+
+.sop-bar-btn.is-lv.is-on {
+  background: #eceefe;
+  color: #4f46e5;
+  font-weight: 700;
+}
+
+.sop-bar-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 7px;
+  background: var(--border);
+}
+
+.sop-bar-pop { border-radius: 10px; }
+.sop-bar-swatch { border-radius: 5px; }
+
+/* ── 大标题的输入框：浅灰填充 + 细边框（参考产品同款），聚焦才亮橙圈 ── */
+.sop-edit-rich {
+  /* 圆角框留出与 # 图标之间的呼吸位（原来是 -6px，那是给裸文本对齐用的） */
+  margin: 0;
+  background: #f6f7f9;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px 12px;
+}
+
+.sop-edit-rich:hover {
+  border-color: #d8dce2;
+  box-shadow: none;
+}
+
+.sop-edit-rich:focus {
+  background: var(--bg);
+  border-color: #ff6b35;
+  box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.12);
+}
+
+/* 空标题的占位文字别因为灰就显得比正文小一号 */
+.sop-edit-rich:empty::before { color: #b6bcc6; }
+
+/* ── 左栏「目录」：条目压成一行（步骤不再挂 CLICK / TYPE 小字）────── */
+.step-item {
+  align-items: center;
+  padding: 7px 10px;
+}
+
+.step-item-body {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.step-item-title { flex: 1; min-width: 0; }
+
+/* 大标题那一行：加粗一点，与步骤区分开 */
+.step-item-title.is-heading { font-weight: 600; color: var(--text); }
+
+/* 大标题的层级徽标（取代原来那行「标题 H1」副标题） */
+.step-item-lv {
+  flex: none;
+  height: 16px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+/* ── 补充说明：「描述 / 标注 / 警告」文字 chip + 圆角输入框 ──────────
+   参考产品的写法 —— 类型是一行常显的文字标签，当前类型用同色描边；
+   正文是一圈浅边框的圆角框，选了标注/警告整框换色（与预览/导出同色）。 */
+.sop-edit-note {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 常显（原来是绝对定位在右上角、悬停才浮出） */
+.sop-note-kinds {
+  position: static;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 1;
+}
+
+.sop-note-kind {
+  width: auto;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+}
+
+.sop-note-kind:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.sop-note-kind.is-on {
+  background: var(--bg);
+  font-weight: 600;
+}
+
+/* 当前类型的描边取该类型自己的颜色 */
+.sop-edit-note.is-desc .sop-note-kind.is-on { border-color: #ff6b35; color: #d9501f; }
+.sop-edit-note.is-mark .sop-note-kind.is-on { border-color: #378add; color: #0c447c; }
+.sop-edit-note.is-warn .sop-note-kind.is-on { border-color: #ba7517; color: #8a520f; }
+
+/* 说明正文：圆角细边框的框（原来是通栏、没有边界的裸文本） */
+.sop-edit-note .sop-edit-desc {
+  width: 100%;
+  margin-left: 0;
+  margin-bottom: 0;
+  padding: 6px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.sop-edit-note .sop-edit-desc::placeholder { color: #b6bcc6; }
+
+.sop-edit-note .sop-edit-desc:hover {
+  border-color: #d8dce2;
+  box-shadow: none;
+}
+
+.sop-edit-note .sop-edit-desc:focus {
+  background: var(--bg);
+  border-color: #ff6b35;
+  box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.12);
+}
+
+/* 标注 / 警告：整框上色 + 左侧色条
+   （色值与预览 .sop-preview-desc.is-mark/.is-warn、导出 .step-desc 逐值一致） */
+.sop-edit-note.is-mark .sop-edit-desc,
+.sop-edit-note.is-warn .sop-edit-desc {
+  border-left-width: 3px;
+  border-radius: 0 8px 8px 0;
+}
+
+.sop-edit-note.is-mark .sop-edit-desc {
+  background: #e6f1fb;
+  color: #0c447c;
+  border-color: #cfe2f7;
+  border-left-color: #378add;
+}
+
+.sop-edit-note.is-mark .sop-edit-desc:hover {
+  border-color: #b5d4f4;
+  border-left-color: #378add;
+  box-shadow: none;
+}
+
+.sop-edit-note.is-warn .sop-edit-desc {
+  background: #faeeda;
+  color: #633806;
+  border-color: #f0dcbd;
+  border-left-color: #ba7517;
+}
+
+.sop-edit-note.is-warn .sop-edit-desc:hover {
+  border-color: #fac775;
+  border-left-color: #ba7517;
+  box-shadow: none;
+}
+
+/* 旧版那条绝对定位的左侧色条已由输入框自身的左边框取代 */
+.sop-edit-note.is-mark::before,
+.sop-edit-note.is-warn::before { content: none; }
+
+/* ════════════════════════════════════════════════════════════════
+   第十六轮（2026-09-19）
+   ① 补充说明的类型 chip 归位到输入框**同一行的右侧**
+   ② 截图浮层加「图片描述」图标 → 弹窗 → 确定后显示在图片下面
+   ③ 流程摘要块（录制结束自动生成，固定在正文最前）
+   ════════════════════════════════════════════════════════════════ */
+
+/* ── ① 类型 chip 排到行尾 ──────────────────────────────────────
+   原来 chip 独占一行压在输入框上面；现在输入框吃满剩余宽度、chip 贴行尾，
+   一行就装下「输入框 + 描述/标注/警告」。
+   DOM 顺序是「输入框 → chip」，所以视觉顺序和 Tab 顺序一致。 */
+.sop-edit-note {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.sop-edit-note .sop-edit-desc {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  margin-left: 0;
+}
+
+/* 与输入框第一行（6px 内边距 + 一行 15px 正文 ≈ 30px 高）视觉居中 */
+.sop-note-kinds {
+  flex: none;
+  padding-top: 5px;
+}
+
+/* ── ② 图片描述 ─────────────────────────────────────────────── */
+
+/* 图片描述图标键（`.sop-shot-caption`）第十九轮按用户要求**整体去掉**：
+   截图浮层上只留「编辑图片」与「删除截图」两颗。
+   图注本体（`.sop-edit-caption` / `.sop-preview-caption`）保留 —— 第十六轮存过的
+   图注仍要照常显示在图片下方，不能因为入口撤了就丢内容。 */
+
+/* 图注本体：显示在截图正下方（截图与补充说明之间）。
+   字号/颜色/行高与导出 HTML 的 .step-caption 逐值一致
+   （12.5px / #6b7280 / 1.6，改一处要同步 export/commands.rs）。 */
+.sop-edit-caption,
+.sop-preview-caption {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #6b7280;
+  white-space: pre-wrap;
+  margin-top: 6px;
+}
+
+/* 编辑态的图注不再是可点入口（第十九轮撤了编辑弹窗），去掉手型与悬停底色，
+   与预览态完全同观感。 */
+/* ── ③ 流程摘要块 ────────────────────────────────────────────
+   预览、编辑、导出三处同一版式：浅灰圆角卡 + 概述段 + 要点列表
+   （色值与导出 HTML 的 .doc-summary 逐值一致）。 */
+.sop-preview-summary,
+.sop-summary-card {
+  background: #f7f8fc;
+  border: 1px solid #e6e8f0;
+  border-radius: 12px;
+  padding: 14px 18px;
+}
+
+.sop-preview-summary { margin-bottom: 10px; }
+
+.sop-preview-summary p,
+.sop-summary-body p {
+  font-size: 14px;
+  line-height: 1.75;
+  color: #24292f;
+}
+
+.sop-preview-summary ul,
+.sop-summary-body ul {
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+
+.sop-preview-summary li,
+.sop-summary-body li {
+  font-size: 14px;
+  line-height: 1.75;
+  color: #24292f;
+  margin: 2px 0;
+}
+
+/* 编辑态的卡头：✨ + 「流程摘要」+「自动生成」徽标 + 右侧操作（悬停浮出） */
+.sop-summary-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.sop-summary-spark { color: #4f46e5; flex: none; }
+
+.sop-summary-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #24292f;
+}
+
+.sop-summary-badge {
+  height: 18px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  background: #eceefe;
+  color: #4f46e5;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.sop-summary-ops {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.sop-summary-card:hover .sop-summary-ops,
+.sop-summary-card:focus-within .sop-summary-ops { opacity: 1; }
+
+.sop-summary-op {
+  height: 22px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: inherit;
+  font-size: 11.5px;
+  color: #4b5563;
+  background: #fff;
+  border: 1px solid #dfe3e9;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.sop-summary-op:hover { color: #d9501f; border-color: #f0521a; }
+.sop-summary-op:disabled { opacity: 0.65; cursor: default; }
+
+.sop-summary-del {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.sop-summary-del:hover { background: #fee2e2; color: #dc2626; }
+
+/* 卡片主体：点一下切到原文编辑 */
+.sop-summary-body { cursor: text; }
+
+.sop-summary-empty {
+  color: #9aa3ad !important;
+  font-size: 13px !important;
+}
+
+/* 摘要原文编辑框：首行概述，下面每行一条 `- **要点**：说明` */
+.sop-summary-input {
+  width: 100%;
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: #24292f;
+  background: #fff;
+  border: 1px solid #d8dce4;
+  border-radius: 8px;
+  min-height: 88px;
+  resize: vertical;
+  overflow: auto;
+}
+
+.sop-summary-input:focus {
+  background: #fff;
+  border-color: #ff6b35;
+  box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.12);
+}
+
+/* 目录栏里那一条「流程摘要」 */
+.step-item-spark {
+  background: #eceefe;
+  color: #4f46e5;
+}
+
+.step-item-title.is-summary {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ── ④ 目录头部 + 整页缩放（2026-09-19 第十九轮）───────────────
+   头部一行：目录 · 16 个步骤                        － ＋ ｜ ⟲
+   步骤数从右端挪到「目录」后面（用户要求），右端腾出来放缩放三键。 */
+.dir-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 22px;
+}
+
+.dir-count {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.dir-zoom {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.dir-zoom-btn {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+
+.dir-zoom-btn:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  color: var(--text);
+}
+
+.dir-zoom-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* 「比例恢复原样」和 −/＋ 之间隔一道细线：它不是第四档，是复位键 */
+.dir-zoom-sep {
+  width: 1px;
+  height: 12px;
+  margin: 0 2px;
+  background: var(--border);
+  flex: none;
+}
+
+/* ── ⑤ 简介块（2026-09-19 第十九轮）─────────────────────────────
+   用户自己写的引子。编辑态 = 卡头（段落图标 + 「简介」+「自定」+ ✕）＋ 多行输入框；
+   预览/导出 = 一段正文（不占编号、不出「N 步骤」行）。
+   版式与导出 HTML 的 .doc-intro 逐值一致（14.5px / #3f4652 / 1.8）。 */
+.sop-edit-intro .sop-intro-card {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 16px 8px;
+}
+
+.sop-intro-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.sop-intro-mark { color: var(--text-muted); flex: none; }
+
+.sop-intro-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.sop-intro-badge {
+  height: 18px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  font-size: 11px;
+  flex: none;
+}
+
+.sop-intro-del {
+  margin-left: auto;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--transition), background var(--transition), color var(--transition);
+}
+
+.sop-edit-intro:hover .sop-intro-del,
+.sop-edit-intro:focus-within .sop-intro-del { opacity: 1; }
+
+.sop-intro-del:hover {
+  background: var(--bg-tertiary);
+  color: var(--red);
+}
+
+.sop-intro-input { width: 100%; }
+
+.sop-preview-intro {
+  font-size: 14.5px;
+  line-height: 1.8;
+  color: #3f4652;
+  white-space: pre-wrap;
+  margin-bottom: 16px;
+}
+/* ════════════════════════════════════════════════════════════════
+   第二十四轮（2026-09-20）：编辑器视觉改版 —— 第六轮设计稿落地
+   「纸面文档」：一张连续纸面 + 左侧大纲。刻意脱离前四轮的
+   「灰画布 + 白卡浮起 + 缩略图网格」那套（用户明确否掉）。
+
+     · 去卡片   步骤不再各自成白卡，靠 52px 大序号列 + 30px 留白分节
+     · 去网格   目录只保留大纲列表（缩略图网格整块移除）
+     · 去分栏   不再有「媒体左 + 300px 侧栏右」，宽度整体给内容
+     · 图上浮层 编辑 / 删除在图片右上，− / + 与放大定位在右下，26px 统一质感
+     · 说明行   浅边框输入框 + 右侧 描述 / 标注 / 警告 三颗胶囊（常驻可见）
+
+   实现：追加在文件末尾的覆盖层（同特异性压前面的旧值）。
+   文档块（大标题 / 摘要 / 简介）保持各自的版式，不进「序号列 + 内容列」栅格。
+   ════════════════════════════════════════════════════════════════ */
+
+:root {
+  --fio-paper: var(--bg);
+  --fio-nav: var(--bg-secondary);
+  --fio-ink: var(--text);
+  --fio-ink2: var(--text-secondary);
+  --fio-ink3: var(--text-muted);
+  --fio-ink4: #aeb6c2;
+  --fio-line: var(--border);
+  --fio-line2: var(--border);
+  --fio-num: #d3d9e1;
+  --fio-hover: rgba(125, 135, 150, 0.13);
+  --fio-nav-ink: var(--text-secondary);
+  --fio-nav-ink2: #8b93a1;
+  --fio-cur-ink: #b8420f;
+  --fio-accent: #ff6b35;
+  --fio-accent-soft: #fff2ec;
+  --fio-sbtn: rgba(24, 28, 34, 0.78);
+  --fio-sbtn-hover: rgba(24, 28, 34, 0.9);
+  /* 版式尺寸：正文列上限 / 左侧序号列宽 / 块间距 */
+  --fio-doc: 1240px;
+  --fio-gutter: 52px;
+  --fio-block: 30px;
+}
+
+.dark {
+  --fio-ink4: #5b636e;
+  --fio-num: #3d444d;
+  --fio-nav-ink2: #98a1af;
+  --fio-cur-ink: #ff8a5c;
+  --fio-hover: rgba(255, 255, 255, 0.07);
+  --fio-accent-soft: rgba(255, 107, 53, 0.16);
+  --fio-sbtn: rgba(0, 0, 0, 0.62);
+  --fio-sbtn-hover: rgba(0, 0, 0, 0.82);
+}
+
+/* ── 纸面 ────────────────────────────────────────────────────────
+   正文列随右栏宽度整体铺开（不再只给中段一小条），但封顶 1240px ——
+   再宽下去宽度就只是留白，不如不拉。两侧留白由 body 的 24px 内边距给。 */
+.editor-preview-body {
+  padding: 26px 24px 110px;
+}
+
+.editor-preview-body > .sop-preview {
+  width: 100%;
+  max-width: var(--fio-doc);
+  margin: 0 auto;
+}
+
+/* 块与块之间用外边距分节（原来是 flex gap + 通栏分隔线，现在都不要） */
+.sop-preview-body {
+  display: block;
+}
+
+.sop-preview-body .sop-step-divider {
+  display: none;
+}
+
+/* ── 一块 = 52px 序号列 + 内容列 ──────────────────────────────────
+   序号落进左栏、标题/截图/说明全在右栏同一条左缘上；无边框、无底色、无阴影。
+   文档块（大标题 / 摘要 / 简介）不进这套栅格 —— 它们自带版式，
+   通篇预览态也先不进（那边头部是「① 步骤」整体，拆不开）。 */
+.sop-edit-step:not(.sop-edit-heading):not(.sop-edit-summary):not(.sop-edit-intro) {
+  display: grid;
+  grid-template-columns: var(--fio-gutter) minmax(0, 1fr);
+  column-gap: 0;
+  row-gap: 10px;
+  align-items: start;
+  position: relative;
+  padding: 2px 0;
+  /* ⚠️ 千万别在这里写 margin 简写：本选择器带 3 个 :not()，特异性 (0,4,0)
+     高过下面那条分节留白规则 (0,3,0)，简写会把 margin-top 一并压回 0。 */
+  margin-left: 0;
+  margin-right: 0;
+  margin-bottom: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* 分节留白：30px。
+   ⚠️ 块与块之间还夹着一枚 <hr class="sop-step-divider">（它现在 display:none），
+   所以必须用「一般兄弟」~ 而不是「相邻兄弟」+ —— 用 + 一条都不会命中。 */
+.sop-preview-body > .sop-edit-step ~ .sop-edit-step,
+.sop-preview-body > .sop-preview-step ~ .sop-preview-step {
+  margin-top: var(--fio-block);
+}
+
+/* ── 头部一行在栅格里拆开：序号进左栏，标题与删除键留在右栏 ────── */
+.sop-edit-head {
+  display: contents;
+}
+
+.sop-edit-head > .step-num-circle {
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: start;
+  align-self: start;
+  width: auto;
+  height: auto;
+  min-width: 0;
+  margin: 0;
+  padding: 3px 0 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  font-size: 25px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: var(--fio-num);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 当前步：序号转橙（整屏橙色只有三处之一） */
+.sop-edit-head > .step-num-circle.is-sel {
+  background: none;
+  border-color: transparent;
+  color: var(--fio-accent);
+}
+
+/* 当前步的左侧 2px 标：画在纸面的留白里，不占正文宽度。
+   ⚠️ 第 30 轮用户圈掉的是「每一步都有的那道浅灰轨道」（第 29 轮加的），
+   不是这一道 —— 它是当前步的标识，从第二十四轮就在，保留。 */
+.sop-edit-step.is-sel::before {
+  content: "";
+  position: absolute;
+  /* ⚠️ 这个偏移量必须 < 纸面的左内边距（第三十轮收到 16px），否则橙标会
+     掉到 .editor-preview 外面被裁掉 —— 原来是 -22px，只有在 40px 内边距
+     下才成立。现在 -12px，离序号 12px。 */
+  left: -12px;
+  top: 2px;
+  bottom: 18px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--fio-accent);
+}
+
+/* 标题：正文级字号，悬停显底、聚焦描边。右侧留出删除键的位置 */
+.sop-edit-head > .sop-edit-title {
+  grid-column: 2;
+  grid-row: 1;
+  width: auto;
+  margin: 0 0 0 -5px;
+  padding: 1px 5px;
+  padding-right: 32px;
+  border-radius: 5px;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--fio-ink);
+}
+
+.sop-edit-head > .sop-edit-title:hover {
+  background: var(--fio-hover);
+  box-shadow: none;
+}
+
+.sop-edit-head > .sop-edit-title:focus {
+  background: var(--bg-tertiary);
+  box-shadow: inset 0 0 0 1px var(--fio-accent);
+}
+
+/* 删除这一步：贴在标题行最右。去掉原来那圈灰边框（通篇流里一个个方框很吵），
+   平时只是一枚淡灰 ✕，鼠标进块或它就是当前步时浮出，hover 转红。 */
+.sop-edit-head > .sop-step-del {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
+  align-self: start;
+  width: 22px;
+  height: 22px;
+  margin: 1px 0 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fio-ink4);
+}
+
+.sop-edit-head > .sop-step-del:hover {
+  background: #fdeceb;
+  color: #d92d20;
+  border: 0;
+}
+
+.dark .sop-edit-head > .sop-step-del:hover {
+  background: rgba(217, 45, 32, 0.2);
+  color: #ff7b72;
+}
+
+.sop-edit-step.is-sel .sop-step-del {
+  opacity: 1;
+}
+
+/* ── 内容列：截图 / 空放置区 / 图注 / 说明行，统一落右栏 ──────────
+   ⚠️ 必须连 .sop-edit-shot 一起列上：空步骤（.sop-edit-shot--empty）与视频
+   外壳只有这个类、没有 .sop-preview-image，漏掉它就自动排进第 1 列 ——
+   表现是放置区被挤成 52px 宽、里面那行提示竖着折成「传/图/视/频」，
+   而说明行跑到它右边。 */
+.sop-edit-step > .sop-preview-image,
+.sop-edit-step > .sop-edit-shot,
+.sop-edit-step > .sop-edit-caption,
+.sop-edit-step > .sop-edit-note,
+.sop-edit-step > .sop-edit-meta {
+  grid-column: 2;
+  margin-top: 0;
+}
+
+.sop-edit-step > .sop-preview-image {
+  margin-bottom: 0;
+}
+
+/* 截图自身成块：圆角 10 + 一圈浅边 + 1px 软阴影（不再套卡片） */
+.sop-preview-image img,
+.sop-edit-shot img {
+  border-radius: 10px;
+  border: 1px solid var(--fio-line2);
+  background: var(--fio-paper);
+}
+
+.sop-edit-shot {
+  border-radius: 10px;
+}
+
+/* 空步骤：常驻放置区。高度 88px（原来是 52px 的一条细缝，看着像出错了），
+   里面「+ 提示语」横向居中排一行；动作类型那个小标签（CLICK / INPUT）
+   在这个框里跟提示语语义重复，隐掉。 */
+.sop-edit-shot--empty {
+  height: 88px;
+  margin-bottom: 0;
+  border: 1px dashed var(--fio-line2);
+  border-radius: 10px;
+  background: var(--fio-paper);
+  color: var(--fio-ink4);
+}
+
+.sop-edit-shot--empty::before {
+  content: "+";
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--fio-line2);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--fio-ink3);
+}
+
+.sop-edit-shot--empty .sop-edit-shot-type {
+  display: none;
+}
+
+.sop-edit-shot--empty:hover {
+  border-color: var(--fio-accent);
+  background: var(--fio-accent-soft);
+  color: var(--fio-ink2);
+}
+
+.sop-edit-shot--empty:hover::before {
+  border-color: var(--fio-accent);
+  color: var(--fio-accent);
+}
+
+.sop-edit-shot-hint {
+  font-size: 12px;
+}
+
+/* ── 图片上的浮层键：26px 暗底 + 圆角 8（编辑/删除在右上，缩放在右下）── */
+.sop-shot-annotate,
+.sop-shot-del,
+.sop-shot-zoomtoggle {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--fio-sbtn);
+  color: #fff;
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+
+.sop-shot-annotate {
+  top: 10px;
+  right: 42px;
+  padding: 0;
+  justify-content: center;
+}
+
+.sop-shot-del {
+  top: 10px;
+  right: 10px;
+}
+
+.sop-shot-tools {
+  right: 10px;
+  bottom: 10px;
+  gap: 6px;
+}
+
+.sop-shot-zoom {
+  height: 26px;
+  border-radius: 8px;
+  background: var(--fio-sbtn);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+}
+
+.sop-shot-zoom .step-detail-view-segmented-btn {
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  justify-content: center;
+}
+
+.sop-shot-annotate:hover,
+.sop-shot-zoomtoggle:hover {
+  background: var(--fio-sbtn-hover);
+}
+
+.sop-shot-zoom .step-detail-view-segmented-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* 删除键 hover 转红（放在通用 hover 之后才压得住） */
+.sop-shot-del:hover {
+  background: #dc2626;
+}
+
+/* 当前步的图上浮层常驻 —— 设计稿口径：正在编辑的这一块不靠悬停也该看见
+   这几颗键（其余块仍然悬停才浮出）。这也是用户第二轮的原话：「这几个按钮
+   还是要做图片上」，等于说它们得随时够得着。 */
+.sop-edit-step.is-sel .sop-shot-annotate,
+.sop-edit-step.is-sel .sop-shot-del,
+.sop-edit-step.is-sel .sop-shot-tools {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* ── 说明行：浅边框输入框 + 右侧 描述 / 标注 / 警告 三颗胶囊 ──────
+   三颗胶囊常驻（原来藏在 hover 里），选中项描边染色，整框跟着换色。 */
+.sop-edit-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 0;
+}
+
+.sop-edit-note .sop-edit-desc {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+  margin: 0;
+  min-height: 34px;
+  padding: 8px 11px;
+  border: 1px solid var(--fio-line2);
+  border-radius: 9px;
+  background: var(--fio-paper);
+  font-size: 12.5px;
+  font-weight: 400;
+  line-height: 1.62;
+  color: var(--fio-ink2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.sop-edit-note .sop-edit-desc:hover {
+  border-color: var(--fio-ink4);
+  box-shadow: none;
+}
+
+.sop-edit-note .sop-edit-desc:focus {
+  background: var(--fio-paper);
+  border-color: var(--fio-accent);
+  box-shadow: none;
+}
+
+.sop-note-kinds {
+  position: static;
+  opacity: 1;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-top: 5px;
+}
+
+.sop-note-kind {
+  width: auto;
+  height: auto;
+  padding: 3px 9px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fio-ink3);
+  font-size: 11.5px;
+  line-height: 1.35;
+  font-family: inherit;
+}
+
+.sop-note-kind:hover {
+  color: var(--fio-ink2);
+  border-color: transparent;
+  background: var(--bg-tertiary);
+}
+
+.sop-note-kind.is-on {
+  border-color: var(--fio-accent);
+  color: var(--fio-accent);
+  background: var(--fio-paper);
+}
+
+/* 类型色只上「框 + 选中胶囊」，文字仍走三级灰（免得通篇流里太吵） */
+.sop-edit-note.is-mark .sop-edit-desc {
+  background: #f8fbff;
+  border-color: #bfdbfe;
+  color: var(--fio-ink2);
+}
+
+.sop-edit-note.is-mark .sop-edit-desc:hover {
+  border-color: #93c5fd;
+  box-shadow: none;
+}
+
+.sop-edit-note.is-mark .sop-note-kind.is-on {
+  border-color: #3b82f6;
+  color: #1d4ed8;
+}
+
+.sop-edit-note.is-warn .sop-edit-desc {
+  background: #fffdf3;
+  border-color: #fcd34d;
+  color: var(--fio-ink2);
+}
+
+.sop-edit-note.is-warn .sop-edit-desc:hover {
+  border-color: #fbbf24;
+  box-shadow: none;
+}
+
+.sop-edit-note.is-warn .sop-note-kind.is-on {
+  border-color: #f59e0b;
+  color: #b45309;
+}
+
+/* 左侧那条类型色条退役（现在由整框的边框色表达） */
+.sop-edit-note.is-mark::before,
+.sop-edit-note.is-warn::before {
+  display: none;
+}
+
+.dark .sop-edit-note.is-mark .sop-edit-desc {
+  background: rgba(59, 130, 246, 0.10);
+  border-color: rgba(59, 130, 246, 0.45);
+}
+
+.dark .sop-edit-note.is-warn .sop-edit-desc {
+  background: rgba(245, 158, 11, 0.10);
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.dark .sop-note-kind.is-on {
+  background: transparent;
+}
+
+/* ── 文档块：大标题 / 摘要 / 简介（各自的版式不动，只跟纸面对齐）──── */
+.sop-edit-step.sop-edit-heading,
+.sop-edit-step.sop-edit-summary,
+.sop-edit-step.sop-edit-intro {
+  margin-left: 0;
+  margin-right: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+/* 大标题块也回到「纸面」这一套：去掉灰底方框 + 边框，
+   平时就是一行大字，悬停显浅底、聚焦描一圈橙 —— 与步骤标题同一种交互语言。 */
+.sop-heading-hash {
+  width: 22px;
+  height: auto;
+  border-radius: 0;
+  background: none;
+  color: var(--fio-ink4);
+}
+
+.sop-heading-row .sop-edit-rich {
+  margin: 0;
+  padding: 1px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+}
+
+.sop-heading-row .sop-edit-rich:hover {
+  background: var(--fio-hover);
+  border: 0;
+  box-shadow: none;
+}
+
+.sop-heading-row .sop-edit-rich:focus {
+  background: var(--fio-hover);
+  border: 0;
+  box-shadow: inset 0 0 0 1px var(--fio-accent);
+}
+
+/* 层级 chip：当前层级改用强调色描边（原来是淡紫实底，跟纸面这一套不搭） */
+.sop-bar-btn.is-lv.is-on {
+  background: var(--fio-accent-soft);
+  color: var(--fio-accent);
+  font-weight: 700;
+}
+
+/* 大标题块也落进同一套「52px 序号列 + 内容列」：大标题的**文字左缘与步骤标题齐平**。
+   原来 # 贴在纸面最左、标题跟着它左移 18px，通篇读下来大标题比正文凸出去一截。 */
+.sop-edit-step.sop-edit-heading {
+  display: grid;
+  grid-template-columns: var(--fio-gutter) minmax(0, 1fr);
+  column-gap: 0;
+  align-items: start;
+  margin-top: 34px;
+}
+
+.sop-edit-heading .sop-heading-row {
+  display: contents;
+}
+
+.sop-edit-heading .sop-heading-hash {
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: start;
+  align-self: center;
+}
+
+.sop-edit-heading .sop-edit-rich {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.sop-preview-body > .sop-preview-step.sop-preview-heading-wrap {
+  margin-top: 34px;
+}
+
+/* ── 左栏：大纲列表（唯一一种形态，深色导航不是它的选项）───────── */
+.editor-sidebar {
+  background: var(--fio-nav);
+}
+
+.step-list {
+  padding: 0 8px 8px;
+}
+
+.step-item {
+  gap: 9px;
+  padding: 4px 8px;
+  margin-bottom: 1px;
+  background: transparent;
+  border-color: transparent;
+  border-radius: 8px;
+}
+
+.step-list .step-item:hover {
+  background: var(--fio-hover);
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.step-list .step-item.active {
+  background: var(--fio-accent-soft);
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* 当前步的左侧橙标画在列表的 8px 内边距里 */
+.step-item.active::before {
+  left: -8px;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+}
+
+/* 目录序号：不再是圆徽，就是一枚右对齐的等宽数字 */
+.step-item-number {
+  width: 22px;
+  height: auto;
+  justify-content: flex-end;
+  border-radius: 0;
+  background: none;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--fio-nav-ink2);
+  font-variant-numeric: tabular-nums;
+}
+
+.step-list .step-item.active .step-item-number {
+  background: none;
+  color: var(--fio-accent);
+  font-weight: 700;
+}
+
+.step-item-title {
+  font-size: 12.5px;
+  font-weight: 400;
+  line-height: 17px;
+  color: var(--fio-nav-ink);
+}
+
+.step-list .step-item.active .step-item-title {
+  color: var(--fio-cur-ink);
+  font-weight: 600;
+}
+
+/* 目录行末那枚 72×32 的小缩略图撤掉 —— 设计稿的目录是纯文字大纲，
+   缩略图既把标题挤成「点击在『WPS 表格 XLO...』中」，也在视觉上把
+   目录拖回「卡片/网格」那一套（用户明确否掉的方向）。
+   注：只是隐藏，数据与取图逻辑都还在，想恢复删掉这一段即可。 */
+.step-item-thumb,
+.step-item-thumb-empty {
+  display: none;
+}
+
+/* 文档块（摘要 / 大标题 / 简介）不占编号：在序号位放一枚右对齐的小字标签，
+   与步骤数字同一列对齐，不再额外挂徽标 */
+.step-item-slot {
+  flex: none;
+  width: 22px;
+  text-align: right;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: 0.02em;
+  color: var(--fio-nav-ink2);
+}
+
+/* ── 目录行的左缘统一（这一版目录最关键的一条）────────────────────
+   一行的左半其实是三段拼的：把手（悬停才显）+ 折叠箭头（只有大标题有）
+   + 序号位。三段都跟着行的缩进走，谁缺一段整行就往左跑 —— 实测改前
+   标题左缘有 6 种值（48/63/88/102/116/130），看着就是「没对齐的缩进」。
+   改法：把手与折叠箭头**脱离文档流**，锚在行左的 34px 净空里（不占位、
+   不用负偏移，免得把列表顶出横向滚动条）；序号位因此恒定落在
+   34px + 14px×缩进 上，标题跟着它走。缩进级别由行上的 --nav-indent 传进来。 */
+.step-item {
+  padding: 7px 8px 7px calc(34px + var(--nav-indent, 0) * 14px);
+}
+
+.step-item-grip,
+.step-item-caret,
+.step-item-dot,
+.step-list .selbox {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  margin: 0;
+  flex: none;
+}
+
+.step-item-grip {
+  left: 4px;
+  width: 14px;
+  height: 24px;
+}
+
+.step-item-caret,
+.step-item-dot {
+  left: 18px;
+  width: 16px;
+  height: 24px;
+}
+
+.step-item-caret.is-collapsed {
+  transform: translateY(-50%) rotate(-90deg);
+}
+
+/* 批量态的勾选框顶掉把手，占同一格 */
+.step-list .selbox {
+  left: 2px;
+}
+
+/* ── 目录头部那颗批量入口（沿用缩小键那套小图标语言）──────────── */
+.dir-tool-btn {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+
+.dir-tool-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text);
+}
+
+.dir-tool-btn.is-on {
+  color: var(--fio-accent);
+  background: var(--fio-accent-soft);
+}
+
+/* ── 批量态勾选框 ─────────────────────────────────────────────── */
+.selbox {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-left: -2px;
+  border-radius: 5px;
+  border: 1.5px solid var(--fio-line2);
+  background: var(--fio-paper);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  cursor: pointer;
+}
+
+.selbox.on {
+  background: var(--fio-accent);
+  border-color: var(--fio-accent);
+}
+
+/* ── 目录底部批量操作条（仅批量态渲染）────────────────────────── */
+.sb-batchbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--fio-line);
+  background: transparent;
+  font-size: 12px;
+}
+
+.sb-batchbar-n {
+  color: var(--fio-accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sb-batchbar-del {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--fio-accent);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: inherit;
+}
+
+.sb-batchbar-del:hover:not(:disabled) {
+  background: var(--green-hover);
+}
+
+.sb-batchbar-del:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sb-batchbar-cancel {
+  border: 0;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11.5px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  font-family: inherit;
+}
+
+.sb-batchbar-cancel:hover {
+  background: var(--bg-tertiary);
+  color: var(--text);
+}
+
+/* 目录栏里那一条「简介」 */
+.step-item-intro {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.step-item-title.is-intro {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第二十六轮 · 完整复刻设计稿
+   （原型：D:\tmp\flowio-editor-ux\proto6_template.html，截图 shots6/01~06）
+   ──────────────────────────────────────────────────────────────────────
+   这一轮不加新方向，只做一件事：把设计稿的每一个取值搬进产品、逐条对齐。
+     · 文档头   正文最前那一块：20px 大标题 + 元信息行（N 步 · M 图 · 自动生成）
+     · 标题行   标题（可编辑）+ 动作类型标 + 「易错」标 + 删除键，同一条 wrap
+     · 图注行   左：图注 / 窗口名；右：原图尺寸 · 点开看大图
+     · 文档块   摘要 = 左橙条 + 浅底（去白卡）；大标题/摘要/简介的序号位 = 边框小标
+     · 尺寸     正常档 正文列 760 / 截图 700；宽档 正文列 1240 / 截图 1128
+     · 间距     块内 截图 11 / 图注 7 / 说明 10；块间 30；大标题块 38 + 10
+   ⚠️ 所有新规则都带 .sop-edit 前缀（只作用编辑态）—— 通篇预览态与导出同一套
+      版式，这一轮一行都不动它。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── 版式尺寸：正文列**铺满**右栏（第二十八轮回到第十八轮的原则）──────
+   第 26 轮一度按设计稿把正文列固定成「正常档 760 / 宽档 1240」，
+   常规窗口（右栏约 1000）下左右各留 ~144px 白边 —— 用户圈出来说
+   「空白太多」。第十八轮用户的原话是「不要在局部变小，要在整体想办法」：
+   想去调宽度就拖分隔条，正文列本身该铺满。
+   现在两档合成一条：铺满，只有真的宽到 1240 才封顶（超宽屏行太长反而不适）。 */
+:root {
+  --fio-doc: min(1240px, 100%);
+  --fio-imgw: min(1128px, 100%);
+}
+
+/* 分档只给编辑态；通篇预览态维持 1240（它与导出用同一套版式）。 */
+.editor-preview-body > .sop-preview {
+  max-width: var(--fio-doc);
+}
+
+.editor-preview-body > .sop-preview:not(.sop-edit) {
+  max-width: 1240px;
+}
+
+/* ── ① 文档头（设计稿 .doc-head）────────────────────────────────────
+   一行大标题 + 一行元信息，底下一条分隔线。标题与顶栏那颗是同一个
+   recordings.title：就地改、失焦/回车落库，两处随时同步。 */
+.sop-edit .sop-doc-head {
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--fio-line2);
+  margin-bottom: 24px;
+}
+
+.sop-edit .sop-doc-h1 {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 0 0 -6px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font-family: inherit;
+  font-size: 20px;
+  font-weight: 650;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+  color: var(--fio-ink);
+  resize: none;
+  overflow: hidden;
+  outline: none;
+  transition: background-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.sop-edit .sop-doc-h1:hover {
+  background: var(--fio-hover);
+}
+
+.sop-edit .sop-doc-h1:focus {
+  background: var(--fio-hover);
+  box-shadow: inset 0 0 0 1px var(--fio-accent);
+}
+
+.sop-edit .sop-doc-h1::placeholder {
+  color: var(--fio-ink4);
+  font-weight: 500;
+}
+
+.sop-edit .sop-doc-meta {
+  margin-top: 7px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fio-ink3);
+}
+
+.sop-edit .sop-doc-dot {
+  flex: none;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: #cfd5de;
+}
+
+.dark .sop-edit .sop-doc-dot {
+  background: var(--fio-ink4);
+}
+
+.sop-edit .sop-doc-pill {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--fio-line2);
+  border-radius: 5px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--fio-ink3);
+}
+
+/* ── ② 步骤标题行：标题 + 动作类型 + 易错 + 删除（设计稿 .btitle 行）──
+   head 从「display:contents 拆进外层栅格」改成自己一条 flex：
+   左端是 52px 的序号位，右端一条 wrap 装「标题 → 动作标 → 易错 → ✕」。
+   （原先标题与删除键靠 grid 的 justify-self 定位，加不进中间那两枚标。） */
+.sop-edit-step > .sop-edit-head {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  min-width: 0;
+}
+
+/* 序号：25px 裸数字落在 52px 序号列里，自顶端对齐（设计稿 padding-top:1px） */
+.sop-edit-head > .step-num-circle {
+  flex: 0 0 var(--fio-gutter);
+  padding: 1px 0 0;
+}
+
+.sop-edit .sop-edit-titlewrap {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+/* 标题：15px/600 正文级字号。宽度**随内容**（field-sizing）——
+   设计稿里动作类型标是紧跟着标题文字后面的，不是飘在行尾，
+   所以标题不能撑满整行；旧版 WebView 不认 field-sizing 时退化成
+   20 列宽的默认 textarea，标签跟在它后面，也不会跑偏。 */
+.sop-edit .sop-edit-title {
+  flex: 0 1 auto;
+  min-width: 4ch;
+  max-width: 100%;
+  width: auto;
+  field-sizing: content;
+  margin: 0 0 0 -5px;
+  padding: 1px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--fio-ink);
+}
+
+.sop-edit .sop-edit-title:hover {
+  background: var(--fio-hover);
+  box-shadow: none;
+}
+
+.sop-edit .sop-edit-title:focus {
+  background: var(--bg-tertiary);
+  box-shadow: inset 0 0 0 1px var(--fio-accent);
+}
+
+/* 动作类型 / 易错：两枚 10px 小标，与标题同一基线（设计稿 .btitle 是 baseline 对齐） */
+.sop-edit .sop-act-tag,
+.sop-edit .sop-warn-chip {
+  flex: none;
+  align-self: baseline;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.sop-edit .sop-act-tag {
+  border: 1px solid var(--fio-line2);
+  color: var(--fio-ink3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.03em;
+}
+
+.sop-edit .sop-warn-chip {
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  color: #b45309;
+}
+
+.dark .sop-edit .sop-warn-chip {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+}
+
+/* 删除这一步：去掉那圈灰边框，平时一枚淡灰 ✕，鼠标进块 / 它是当前步时浮出 */
+.sop-edit .sop-step-del {
+  flex: none;
+  align-self: flex-start;
+  width: 22px;
+  height: 22px;
+  margin: 1px 0 0 auto;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fio-ink4);
+}
+
+.sop-edit .sop-step-del:hover {
+  border: 0;
+  background: #fdeceb;
+  color: #d92d20;
+}
+
+.dark .sop-edit .sop-step-del:hover {
+  background: rgba(217, 45, 32, 0.2);
+  color: #ff7b72;
+}
+
+/* ── ③ 内容列：截图 / 图注 / 说明行 的宽度上限与块内间距 ─────────────
+   设计稿：块内不用 gap，每个元素自带 margin-top（截图 11 / 图注 7 / 说明 10）；
+   宽度上截图、图注、说明行统一封顶 var(--fio-imgw)。 */
+.sop-edit-step:not(.sop-edit-heading):not(.sop-edit-summary):not(.sop-edit-intro) {
+  display: grid;
+  grid-template-columns: var(--fio-gutter) minmax(0, 1fr);
+  column-gap: 0;
+  row-gap: 0;
+  align-items: start;
+  position: relative;
+  padding: 2px 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.sop-edit-step > .sop-preview-image,
+.sop-edit-step > .sop-edit-shot {
+  grid-column: 2;
+  max-width: var(--fio-imgw);
+  margin-top: 11px;
+}
+
+.sop-edit-step > .sop-edit-caption {
+  grid-column: 2;
+  max-width: var(--fio-imgw);
+  margin-top: 7px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--fio-ink3);
+}
+
+.sop-edit .sop-cap-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sop-edit .sop-cap-dim {
+  flex: none;
+  margin-left: auto;
+  color: var(--fio-ink4);
+  font-variant-numeric: tabular-nums;
+}
+
+.sop-edit-step > .sop-edit-note {
+  grid-column: 2;
+  max-width: var(--fio-imgw);
+  margin-top: 10px;
+}
+
+.sop-edit-step > .sop-edit-meta {
+  grid-column: 2;
+  max-width: var(--fio-imgw);
+  margin-top: 8px;
+}
+
+/* 空步骤：放置区 74px（设计稿 .blk-empty），一枚无边框的 ＋ 与提示语横排 */
+.sop-edit-shot--empty {
+  height: 74px;
+  max-width: var(--fio-imgw);
+  gap: 8px;
+  border: 1px dashed #d8dde4;
+  border-radius: 10px;
+  background: #fcfcfd;
+  color: var(--fio-ink4);
+}
+
+.dark .sop-edit-shot--empty {
+  border-color: var(--fio-line2);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.sop-edit-shot--empty::before {
+  content: "+";
+  flex: none;
+  width: auto;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  font-size: 14px;
+  line-height: 1;
+  color: inherit;
+}
+
+.sop-edit-shot--empty:hover {
+  border-color: #c3cbd6;
+  background: #fafbfc;
+  color: var(--fio-ink3);
+}
+
+.sop-edit-shot--empty:hover::before {
+  border: 0;
+  color: inherit;
+}
+
+.dark .sop-edit-shot--empty:hover {
+  border-color: var(--fio-ink4);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* ── ④ 文档块：大标题 / 摘要 / 简介（设计稿 .blk.is-heading / .is-summary）──
+   三块都落进同一套「52px 序号列 + 内容列」，序号位是一枚带边框的小标
+   （H1~H4 / 摘 / 介）—— 与步骤的 25px 裸数字同一列左缘。 */
+.sop-edit-step.sop-edit-heading,
+.sop-edit-step.sop-edit-summary,
+.sop-edit-step.sop-edit-intro {
+  display: grid;
+  grid-template-columns: var(--fio-gutter) minmax(0, 1fr);
+  column-gap: 0;
+  align-items: start;
+  position: relative;
+  /* ⚠️ 不写 margin 简写（会吃掉下面那条分节留白规则） */
+  margin-left: 0;
+  margin-right: 0;
+  margin-bottom: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.sop-edit-step.sop-edit-heading::before,
+.sop-edit-step.sop-edit-summary::before,
+.sop-edit-step.sop-edit-intro::before {
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: start;
+  align-self: start;
+  box-sizing: border-box;
+  width: 24px;
+  margin-top: 3px;
+  border: 1px solid var(--fio-line2);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 15px;
+  text-align: center;
+  color: var(--fio-ink3);
+  white-space: nowrap;
+}
+
+.sop-edit-step.sop-edit-heading::before { content: "H" attr(data-lv); }
+.sop-edit-step.sop-edit-summary::before { content: "摘"; }
+.sop-edit-step.sop-edit-intro::before { content: "介"; }
+
+/* 大标题块：块间距 38 + 顶部 10（设计稿 .blk.is-heading.padding-top:10px）。
+   工具条浮到上方那 38px 留白里，既不遮上一块的说明行，也不占块内高度。 */
+.sop-preview-body > .sop-edit-step.sop-edit-heading {
+  margin-top: 38px;
+  padding-top: 10px;
+}
+
+.sop-edit-step.sop-edit-heading > .sop-heading-bar {
+  top: -36px;
+}
+
+/* 序号位由 ::before 那枚小标承担，原来那枚 `#` 方块退役 */
+.sop-edit-step.sop-edit-heading .sop-heading-hash {
+  display: none;
+}
+
+.sop-edit-step.sop-edit-heading .sop-edit-rich {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.sop-edit-step.sop-edit-heading .sop-heading-ops {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
+  align-self: start;
+}
+
+/* 大标题字号：19 / 16.5 / 15 / 13.5（设计稿 .h-h1~h-h4） */
+.sop-edit-heading .sop-heading-t1 { font-size: 19px; font-weight: 650; }
+.sop-edit-heading .sop-heading-t2 { font-size: 16.5px; }
+.sop-edit-heading .sop-heading-t3 { font-size: 15px; }
+.sop-edit-heading .sop-heading-t4 { font-size: 13.5px; color: var(--fio-ink2); }
+
+/* 摘要块：左边一道 2px 橙杆 + 极浅底（设计稿 .summary-box），不再是白卡 */
+.sop-edit-step.sop-edit-summary > .sop-summary-card {
+  grid-column: 2;
+  grid-row: 1;
+  padding: 11px 14px;
+  border: 0;
+  border-left: 2px solid var(--fio-accent);
+  border-radius: 0 8px 8px 0;
+  background: #fafbfc;
+  box-shadow: none;
+}
+
+.dark .sop-edit-step.sop-edit-summary > .sop-summary-card {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sop-edit-step.sop-edit-summary .sop-summary-head {
+  margin-bottom: 5px;
+}
+
+/* 设计稿的小标只有文字，没有图标 */
+.sop-edit-step.sop-edit-summary .sop-summary-spark {
+  display: none;
+}
+
+.sop-edit-step.sop-edit-summary .sop-summary-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--fio-accent);
+}
+
+.sop-edit-step.sop-edit-summary .sop-summary-badge {
+  height: auto;
+  padding: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--fio-ink3);
+  font-size: 10.5px;
+  font-weight: 400;
+}
+
+.sop-edit-step.sop-edit-summary .sop-summary-body p,
+.sop-edit-step.sop-edit-summary .sop-summary-body li {
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--fio-ink2);
+}
+
+.sop-edit-step.sop-edit-summary .sop-summary-body ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+/* 简介块：同样去白卡，只留一行小标 + 一段输入框 */
+.sop-edit-step.sop-edit-intro > .sop-intro-card {
+  grid-column: 2;
+  grid-row: 1;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+
+.sop-edit-step.sop-edit-intro .sop-intro-head {
+  margin-bottom: 6px;
+}
+
+.sop-edit-step.sop-edit-intro .sop-intro-mark {
+  color: var(--fio-accent);
+}
+
+.sop-edit-step.sop-edit-intro .sop-intro-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fio-ink);
+}
+
+.sop-edit-step.sop-edit-intro .sop-intro-badge {
+  height: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--fio-line2);
+  border-radius: 5px;
+  background: none;
+  color: var(--fio-ink3);
+  font-size: 10.5px;
+}
+
+/* 摘要 / 简介的输入框：与「补充说明」同一个浅边框圆角框（12.5px / 1.62） */
+.sop-edit-step.sop-edit-summary .sop-summary-input,
+.sop-edit-step.sop-edit-intro .sop-intro-input {
+  width: 100%;
+  max-width: var(--fio-imgw);
+  margin: 0;
+  padding: 8px 11px;
+  border: 1px solid var(--fio-line2);
+  border-radius: 9px;
+  background: var(--fio-paper);
+  font-size: 12.5px;
+  line-height: 1.62;
+  color: var(--fio-ink2);
+}
+
+.sop-edit-step.sop-edit-summary .sop-summary-input {
+  min-height: 56px;
+}
+
+.sop-edit-step.sop-edit-intro .sop-intro-input {
+  min-height: 40px;
+}
+
+/* ── ⑤ 左栏目录：回到设计稿的「22px 序号 + 标题」两列 ────────────────
+   序号左缘 8px、标题左缘 39px（8 + 22 + 9），层级不再靠缩进表达
+   （大标题用 H2 边框小标标示层级）。把手与折叠箭头改成 hover 才浮现的
+   浮层控件，锚在序号位上 —— 序号同时淡出，静态下这一行就是设计稿的样子。 */
+.step-list {
+  padding: 2px 8px 12px;
+}
+
+.step-list .step-item {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 7px 8px;
+  margin-bottom: 0;
+  border-radius: 8px;
+  position: relative;
+}
+
+.step-list .step-item > .step-item-number,
+.step-list .step-item > .step-item-slot {
+  grid-column: 1;
+  grid-row: 1;
+  width: 22px;
+}
+
+.step-list .step-item > .step-item-body {
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+}
+
+/* 把手（hover 浮现）与折叠箭头（hover 或已折起时浮现）都浮在序号位上 */
+.step-list .step-item-grip {
+  left: 8px;
+  width: 14px;
+}
+
+.step-list .step-item-caret {
+  left: 22px;
+  width: 16px;
+  opacity: 0;
+}
+
+.step-list .step-item:hover .step-item-caret,
+.step-list .step-item-caret.is-collapsed {
+  opacity: 1;
+}
+
+/* 控件浮出时序号退场（两者同一格，不退会叠在一起） */
+.step-list .step-item:hover .step-item-number,
+.step-list .step-item:hover .step-item-slot {
+  opacity: 0;
+}
+
+/* 缩进点退役：层级改由大标题的 H1~H4 小标表达，目录不再缩进 */
+.step-list .step-item-dot {
+  display: none;
+}
+
+/* 大标题行：序号位是一枚 H1~H4 的边框小标（设计稿 .nrow.is-h .nn） */
+.step-list .step-item-slot.is-h {
+  height: 17px;
+  margin-top: 1px;
+  border: 1px solid var(--fio-line2);
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 15px;
+  text-align: center;
+}
+
+/* 摘要 / 简介行：裸小字，与数字同一列右对齐 */
+.step-list .step-item-slot.is-doc {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--fio-nav-ink2);
+  text-align: right;
+}
+
+/* 批量态：勾选框 + 序号 + 标题三列（设计稿 .nrow.is-batchmode 的 15/20/1fr） */
+.step-list.is-batching .step-item {
+  grid-template-columns: 15px 20px minmax(0, 1fr);
+  gap: 7px;
+}
+
+.step-list.is-batching .step-item > .selbox {
+  position: static;
+  transform: none;
+  grid-column: 1;
+  grid-row: 1;
+  width: 15px;
+  height: 15px;
+  margin: 2px 0 0;
+  border-radius: 4px;
+}
+
+.step-list.is-batching .step-item > .step-item-number,
+.step-list.is-batching .step-item > .step-item-slot {
+  grid-column: 2;
+  width: 20px;
+}
+
+.step-list.is-batching .step-item > .step-item-body {
+  grid-column: 3;
+}
+
+/* ── ⑥ 收尾的三处小对齐 ───────────────────────────────────────────── */
+
+/* 1) 当前步的图上浮层：显隐不做过渡 —— 点哪一步，那一步的几颗键立刻到位。
+      （过渡只留给「悬停其它块」那一档，免得正在编辑的这步要等 0.15s 才出现） */
+.sop-edit .sop-edit-step.is-sel .sop-shot-annotate,
+.sop-edit .sop-edit-step.is-sel .sop-shot-del,
+.sop-edit .sop-edit-step.is-sel .sop-shot-tools {
+  opacity: 1;
+  visibility: visible;
+  transition: none;
+}
+
+/* 1.1) 悬浮条跟随图片、钉在图片右下角（absolute）：
+      编辑右栏 .editor-preview-body 本身 overflow-y:auto 可滚动，
+      把图片滚入视口后 −/+ 就在图片右下角，直接可点。
+      不再 fixed 到窗口右下角 —— fixed 会把按钮从「图片右下角」挪走，
+      用户按截图标注去找按钮时点到图片本体、误触灯箱，按钮又被遮罩盖住，
+      看起来就是「功能没实现 + 点图片按钮消失」。 */
+
+/* 1.1b) 非选中步骤的图上浮层彻底不可命中（visibility 由基础规则置 hidden），
+      防止隐藏按钮拦截点击、把选中态漂移到其它卡片。 */
+
+/* 2) 截图那圈 1px 软阴影（设计稿 .shotbox img 的 --sh-s） */
+.sop-edit .sop-preview-image img {
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+/* 3) 空标题的占位文字：淡一档 + 不加粗（设计稿 .bt.ph） */
+.sop-edit .sop-edit-title::placeholder {
+  color: var(--fio-ink4);
+  font-weight: 500;
+}
+
+/* 4) 目录标题允许折两行（设计稿 .nrow .nt 的 -webkit-line-clamp:2）——
+      长标题在窄目录里不再被截成「点击在『WPS 表格 XLO…』」 */
+.step-list .step-item-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 17px;
+}
+
+/* 5) 块的「插入」键（设计稿 .btool）：正文块头最右、鼠标进块或它是当前步时浮出 */
+.sop-edit .sop-block-insert {
+  flex: none;
+  align-self: center;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--fio-ink3);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background-color 0.12s ease, color 0.12s ease;
+}
+
+.sop-edit-step:hover .sop-block-insert,
+.sop-edit-step.is-sel .sop-block-insert {
+  opacity: 1;
+}
+
+.sop-edit .sop-block-insert:hover {
+  background: var(--bg-tertiary);
+  color: var(--fio-ink2);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第二十七轮 · 目录收口：「太大，像一段文本，不像目录」
+   ──────────────────────────────────────────────────────────────────────
+   量出来的症结不是字号（12.5/11.5 与设计稿一致），是**行距 43px 而
+   行高只有 33px** —— 每两行之间夹着一枚静态占位 10px 的
+   `.step-insert-point`。设计稿的插入线是 hover 才浮现的，静态不占高度；
+   产品这 10px × N 行把目录撑成了一段松散的文字。
+
+     · 插入槽：静态占位 10px → 0（2px 盒 + 上下各 −1px 负外边距抵消），
+       命中带改由 ::before 撑出来（上下各 4px，仍好点中）
+     · 行距：33 → 28px（内边距 7 → 5、行高 17 → 16）
+   ══════════════════════════════════════════════════════════════════════ */
+
+.step-list .step-insert-point {
+  height: 4px;
+  margin: -2px 0;
+  overflow: visible;
+}
+
+.step-list .step-insert-point::before {
+  content: "";
+  position: absolute;
+  left: -8px;
+  right: -8px;
+  top: -4px;
+  height: 12px;
+}
+
+.step-list .step-item {
+  padding: 5px 8px;
+}
+
+.step-list .step-item-number,
+.step-list .step-item-title {
+  line-height: 16px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第二十八轮 · 五处细节打磨（用户逐图圈出）
+   ──────────────────────────────────────────────────────────────────────
+   ① 正文列铺满右栏（见上面 :root 那段）
+   ② 目录层次：头部与列表之间一条浅分隔线；大标题行上方一点分组留白
+   ③ 分割条不亮：hover / 拖动都保持灰线，只靠 col-resize 光标表态
+   ④ 「插入」键从标题旁挪到行尾、紧挨 ✕
+   ⑤ 步骤标题：16px/650 + 字距收紧，与序号、正文拉开一档
+   ⑥ 步骤块：块内收紧、块间拉开（30 → 42），用留白分节、不加分割线
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── ② 目录层次 ─────────────────────────────────────────────────────
+   头部（目录 + 步数 + 缩放三键）与列表之间一条线，两者分开成「头部 / 正文」
+   两层；列表顶端再让出 6px，线不贴第一行。 */
+.editor-sidebar .dir-head {
+  padding: 0 16px 9px;
+  margin-bottom: 0;
+  border-bottom: 1px solid var(--fio-line2);
+}
+
+.step-list {
+  padding-top: 6px;
+}
+
+/* 大标题行：上方 7px 分组留白 —— 它领起下面一组步骤，和普通步骤行不是一个层级 */
+.step-list .step-item:has(.step-item-title.is-heading) {
+  margin-top: 7px;
+}
+
+/* ── ③ 分割条：hover 深一档、拖动显橙 ─────────────────────────────
+   第二十八轮曾按「不亮」全程压成灰线，但 #e5e7eb 在白底上几乎看不见
+   （用户反馈：鼠标变成能拉动的时候颜色深一点）。现改为：
+   hover = --fio-ink4（#aeb6c2，深两档的中灰，白底上清晰可见）；
+   拖动中 = 品牌橙实线（无光晕，不给「亮」的感觉，只给「我在动」的反馈）。 */
+.editor-split:hover::before {
+  background: var(--fio-ink4);
+  box-shadow: none;
+}
+
+.editor-split.is-dragging::before {
+  background: var(--green);
+  box-shadow: none;
+}
+
+/* ── ④ 「插入」挪到 ✕ 左边 ──────────────────────────────────────────
+   原来是「标题 → 动作标 → 插入 …… ✕」：插入挤在标题旁边、✕ 孤零零在行尾。
+   现在两个工具键成组靠右：标题/动作标 —— 插入、✕。 */
+.sop-edit .sop-block-insert {
+  margin-left: auto;
+}
+
+.sop-edit .sop-step-del {
+  margin: 1px 0 0 2px;
+}
+
+/* ── ⑤ 步骤标题：再厚一档，层级拉开 ───────────────────────────────
+   15 → 16px、600 → 650、字距微收；序号那一列保持 25px 裸数字压住左端，
+   整行看起来才像「这一块的小标题」而不是一行正文。 */
+.sop-edit .sop-edit-title {
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.006em;
+}
+
+/* ── ⑥ 步骤块：组内紧、组间松 ─────────────────────────────────────
+   不加分割线（用户：「不要强割裂感」），靠留白分节：
+   块距 30 → 42，块内 13 / 6 / 9（标题与截图之间也多让 2px）。 */
+:root {
+  --fio-block: 42px;
+}
+
+.sop-edit-step > .sop-preview-image,
+.sop-edit-step > .sop-edit-shot {
+  margin-top: 13px;
+}
+
+.sop-edit-step > .sop-edit-caption {
+  margin-top: 6px;
+}
+
+.sop-edit-step > .sop-edit-note {
+  margin-top: 9px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第二十九轮 · 三处（用户第三次逐图圈出）
+   ──────────────────────────────────────────────────────────────────────
+   ① 动作类型标也挪到「插入」左边 —— 行尾聚成 [动作标] [易错] 插入 ✕ 一组
+   ② 目录的层次感要**平常就有**（不是鼠标放上去才出来的）：
+      大标题领起的步骤缩进一级 + 大标题行上方分组留白 + 大标题行再实一档
+   ③ 步骤之间的层次感（仍然不要强割裂）：块距 42 → 56，并且每一步在纸面
+      留白里多一道极浅的 2px 竖轨，把「标题 / 截图 / 图注 / 说明」箍成一块
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── ① 动作标与工具键成组靠右 ─────────────────────────────────────
+   设计稿里动作标是紧跟标题文字的，用户要它挪到插入键左边（图上圈了两处：
+   动的是「click」那枚标，落到「插入」左边）。行里加一枚弹性空档撑开，
+   标题仍随内容（field-sizing），标签与工具键被顶到行尾。 */
+.sop-edit .sop-edit-spacer {
+  flex: 1 1 0;
+  min-width: 0;
+  align-self: stretch;
+}
+
+/* 撑开改由 spacer 承担，插入键原来那枚 margin-left:auto 退役 */
+.sop-edit .sop-block-insert {
+  margin-left: 0;
+}
+
+/* ── ② 目录：静态层次 ─────────────────────────────────────────────
+   设计稿只靠 H1~H4 小标表达层级，可 15 行齐头排下来仍像一段文字。
+   现在：大标题领起的步骤缩进一级（--nav-indent 由 TSX 下发，第 26 轮为了
+   复刻设计稿把它关掉了），大标题行上方留白 7 → 14px，行本身再实一档。 */
+.step-list .step-item {
+  padding-left: calc(8px + var(--nav-indent, 0) * 14px);
+}
+
+/* 把手 / 折叠箭头是绝对定位的（锚在行左），得跟着缩进一起走，
+   否则 hover 时它们留在原地、与序号错位。 */
+.step-list .step-item-grip {
+  left: calc(8px + var(--nav-indent, 0) * 14px);
+}
+
+.step-list .step-item-caret {
+  left: calc(22px + var(--nav-indent, 0) * 14px);
+}
+
+.step-list .step-item:has(.step-item-title.is-heading) {
+  margin-top: 14px;
+}
+
+/* 大标题行：12.5 → 13px，色再深一档（层级不靠缩进单独表达，还要靠字面重量） */
+.step-list .step-item .step-item-title.is-heading {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ── ③ 步骤之间：块距 + 序号色 ───────────────────────────────────
+   ⚠️ 第 29 轮在这里给每一步加过一道 2px 竖轨（画在纸面左留白里），
+   第 30 轮被用户圈掉：「不是这个，去掉这个，我是说上下方向的层次感」——
+   他要的层次感在**纵向留白**里，不是在左侧画线。竖轨（连同当前步那道
+   橙轨 .is-sel::before）一并撤销，块与块的分界重新只由「块距」承担，
+   见本文件末尾第三十轮覆盖层。 */
+:root {
+  --fio-block: 56px;
+  --fio-num: #b9c2cd;
+}
+
+.dark {
+  --fio-num: #4d555f;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第三十轮 · 三处（用户第四次逐图圈出）
+   ──────────────────────────────────────────────────────────────────────
+   ① 撤销「每一步一道 2px 竖轨」（用户圈的正是当前步那道橙轨）——
+      层次感不做在左侧的竖线上。见上一段与 .is-sel::before 处的说明。
+   ② 「上下方向的层次感」：靠纵向留白做，不靠线条。正文里是「组内紧、
+      组间松」的比值再拉开一档，并且把大标题块的位置摆正（标题要贴着它
+      领起的那一组，而不是贴着上一组）；目录里给大标题行上下都让出位置。
+   ③ 正文左侧那圈空白太宽（纸面原本给竖轨留的 40px 左内边距）→ 收到 16px，
+      正文列整体左移。竖轨撤掉后这处留白已无用途。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── ③ 正文列左移 ─────────────────────────────────────────────────
+   40 → 16px。序号列（--fio-gutter:52px）本身还要一点呼吸，所以不压到 0。
+   正文左缘到右栏左缘的距离：42px → 18px。 */
+.editor-preview-body {
+  padding-left: 16px;
+}
+
+/* ── ②a 正文：块间更松、块内更紧 ──────────────────────────────────
+   块距 56 → 76；块内 13/6/9 → 11/5/8。组间/组内的比值 4.3 → 6.9，
+   块与块之间「断开」的感觉才出得来（用户连说三轮「层次感没有」）。
+   ⚠️ 仍然不加任何横向分割线 —— 用户明确「不要强割裂感」。 */
+:root {
+  --fio-block: 76px;
+}
+
+.sop-edit-step > .sop-preview-image,
+.sop-edit-step > .sop-edit-shot {
+  margin-top: 11px;
+}
+
+.sop-edit-step > .sop-edit-caption {
+  margin-top: 5px;
+}
+
+.sop-edit-step > .sop-edit-note {
+  margin-top: 8px;
+}
+
+/* ── ②b 正文：大标题块的位置摆正 ──────────────────────────────────
+   原来上方 38px（比块距 56 还小）⇒ 标题离「上一组」比离「自己领起的
+   下一组」更近，层次是反的。现在上方 100px（> 块距 76），标题明确
+   归属下面那一组。工具条仍浮在上方留白里（top:-36px）。 */
+.sop-preview-body > .sop-edit-step.sop-edit-heading {
+  margin-top: 100px;
+}
+
+/* ── ②c 目录：大标题行是一个「分组头」，上下都要让位 ──────────────
+   行距是 28px，所以大标题行上方给 24px、自身再加 4px 上下内边距 ——
+   它在纵向占的高度明显大于普通步骤行，一组一组就分得清了。 */
+.step-list .step-item:has(.step-item-title.is-heading) {
+  margin-top: 24px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第三十一轮 · 收口（用户：「我没看到什么变化」）
+   ──────────────────────────────────────────────────────────────────────
+   先复盘：第三十轮那三处在包内**全部生效**，不是没编译进去。
+   探针实测（1375 档）：块距 76 / 分组头上方 100 / 纸面 padding-left 16 /
+   每步灰轨 content:none。exe 也确实是新的（内嵌 main-0cfDJYVj.js）。
+   所以「没看到」是**幅度与旋钮**的问题，病根有两个：
+
+   ① 「空白太多往左移动些」——第三十轮只把纸面内边距 24 → 16（8px），
+      而用户屏幕上那条空白根本不是它。实测（1920 屏 / 左栏 335）：
+        右栏左缘 x=342，正文列左缘 x=494 ⇒ 左侧空白 152px
+        正文列宽 1240，右栏宽 1552     ⇒ 右侧空白 160px
+      来源是 `.sop-preview{max-width:min(1240px,100%);margin:0 auto}`
+      —— 窗口一宽过 1240，正文列就被居中成中间一条窄栏、两边各空一片。
+      设计稿其实自带「宽版」：--docw 由 JS 切成 calc(100% - 48px)，
+      而图宽保持 min(100%,1128px)。照它做即可：正文铺满、图仍封顶 1128。
+
+   ② 左栏那个尺寸旋钮（SIDE_W_MAX 760 → 400）对这位用户是**空操作**：
+      真机 localStorage 里 flowio_editor_sidebar_w = 335，本来就在 400 以内，
+      clamp 前后都是 335。⇒ 以后要动左栏宽度，先读这个真值再定旋钮。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── ① 正文列铺满右栏（设计稿「宽版」）─────────────────────────────
+   min(1240px, 100%) → 100%：窗口再宽，正文也贴着右栏左缘铺开，
+   不再居中留白。一行会不会长到读不下去由 --fio-imgw 兜（仍封顶 1128）。
+   ⚠️ 只给编辑态（.sop-edit）。通篇预览态是 :not(.sop-edit)、max-width
+   硬编码 1240（它与导出共用一套版式），本轮不动它。 */
+:root {
+  --fio-doc: 100%;
+}
+
+.editor-preview-body > .sop-preview.sop-edit {
+  margin: 0;
+}
+
+/* ── ② 上下方向的层次感：块距再拉开一档 ────────────────────────────
+   正文铺满后画幅更宽，同样 76px 看上去更薄 ⇒ 96px。块内 11/5/8 不动，
+   「组间 / 组内」比值 76/24 → 96/24，纵向的断面更清楚。
+   仍然不加任何横向分割线（用户：「不要强割裂感」）。 */
+:root {
+  --fio-block: 96px;
+}
+
+/* 分组头（大标题块）上方留白必须大于块距，跟着抬到 120px */
+.sop-preview-body > .sop-edit-step.sop-edit-heading {
+  margin-top: 120px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第三十二轮 · 步骤之间靠「痕迹」而不是靠「距离」
+   ──────────────────────────────────────────────────────────────────────
+   用户贴了两张红框（裁图实测，物理 px；scale=1.255 ⇒ CSS = 物理/1.255；
+   真机左栏 380、窗口 1375 物理 = 1096 CSS）：
+
+     上框 x[491..1374] y[323..378] —— 「补充描述」行 … 「H1 大标题」行 之间的空白
+     下框 x[496..1360] y[549..659] —— 「H1 大标题」行 … 「02」步骤标题 之间的空白
+     另一张 x[458..494] y[49..899] —— 左栏右边界那条分隔条
+
+   原话：「我不是让你把他们弄的这么远，我是让你在他们之间做一点步骤间
+   隔离的痕迹」。⇒ 两件事：① 两处留白收回来；② 把「步骤间的痕迹」显出来。
+
+   回头看设计稿（proto6_template.html）——本来就两条都有：
+     .blk + .blk{margin-top:30px}                        ← 块距本来就只有 30
+     .insert{height:1px;margin:0 0 0 52px;background:transparent}
+     .blk:hover + .insert{background:var(--line2)}       ← 步骤之间本来就有 1px 细线，
+                                                           从「序号列之后」起，默认透明
+   我第二十八~三十一轮把块距做成 42 → 76 → 96，是拿「距离」去代替「线」，
+   方向就错了：距离一大就割裂，一小就没层次，怎么调都不对。现在两者都归位。
+   ══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  --fio-block: 48px;
+  --fio-trace: #eceef1;
+}
+
+/* 大标题（分组头）上方 64 > 块距 48：仍然明确「它领起的是下面那一组」，
+   但不再靠 120px 的空白去喊。 */
+.sop-preview-body > .sop-edit-step.sop-edit-heading {
+  margin-top: 64px;
+}
+
+/* ── 步骤之间的「痕迹」：设计稿 .insert 那条 1px 细线常显 ──────────────
+   设计稿里它 background:transparent、悬停才变 --line2；用户要「平常也有点
+   层次感」，所以平时就用设计稿更浅的那支 --line(#eceef1) 显示。
+   ⚠️ left:var(--fio-gutter)(52px) 与设计稿 .insert 的 margin-left:52px 一致：
+   线从序号列之后起、不横穿序号，所以是「痕迹」而不是「割裂」。
+
+   🔴 为什么不用那枚现成的 <hr class="sop-step-divider">（走了弯路，记下来）：
+   它**不是块与块之间的独立节点**，而是**每一块自己的最后一个子元素**
+   （在 .sop-edit-step 里面）。编辑态的块又是 display:grid
+   （52px 序号列 + 内容列），hr 作为 grid item 落进序号列、再被
+   margin-left:52px 吃光 ⇒ 探针实测 r32DivRect 宽度 = 0，屏幕上什么都没有。
+   所以改用块自身的 ::after 绝对定位画线（::before 被 .is-sel 橙标占用，
+   ::after 在第三十轮删掉灰轨后是空的）。
+
+   线挂在**上面那一块**的底部、落在块距的正中间（bottom = -块距/2）。
+   这样「上面是文档块 ⇒ 不画」可以直接用 :has(+ …) 从上面那块判掉，
+   反过来（下面那块判「我上面是不是文档块」）CSS 选不出来。 */
+.sop-preview-body > .sop-edit-step:where(:not(.sop-edit-heading):not(.sop-edit-summary):not(.sop-edit-intro)):not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: var(--fio-gutter);
+  right: 0;
+  bottom: calc(var(--fio-block) / -2);
+  height: 1px;
+  background: var(--fio-trace);
+  pointer-events: none;
+}
+
+/* 文档块（大标题 / 摘要 / 简介）自己就是分组的断面：紧挨着它的那一块
+   不画痕迹线（线在「上一块」身上，所以判据是「我后面是不是文档块」）。
+   ⚠️ 主规则里那串 :not() 必须裹在 :where() 里（贡献 0）——否则主规则会到
+   (0,7,0)，下面这条抑制规则的 (0,4,0) 压不过它，display:none 写了也白写。 */
+.sop-preview-body > .sop-edit-step:has(+ .sop-edit-step.sop-edit-heading)::after,
+.sop-preview-body > .sop-edit-step:has(+ .sop-edit-step.sop-edit-summary)::after,
+.sop-preview-body > .sop-edit-step:has(+ .sop-edit-step.sop-edit-intro)::after {
+  display: none;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第三十三轮 · 「再清晰一点、再紧一点」，目录也上「痕迹」
+   ──────────────────────────────────────────────────────────────────────
+   用户四张红框（裁图实测，物理 px；scale=1.255 ⇒ CSS = 物理 / 1.255；
+   真机窗口 1375 物理 = 1096 CSS、左栏 272 CSS = 344 物理）：
+
+     img1  y[452..509] h58  x[344..1374] —— 右栏：「补充描述」行 … 「05」标题行
+                                           之间的空白（= --fio-block 48px）
+     img2  y[ 97..201] h105 x[  7..337] —— 左栏目录：「01」行 … 「H1」行
+                                           之间的空白（= 分组头 margin-top 24px）
+     img4  y[318..831] h514 x[ 40..336] —— 左栏目录：「05」…「16」整段，
+                                           用户要「目录步骤间也要有隔离」
+
+   原话：「再清晰一点，上下步骤的距离再缩短一点」「距离不要这么大，正常距离」
+        「目录步骤间的隔离也弄到有隔离」。
+   ⇒ 三件事：① 块距 48 → 40；② 目录分组头上方 24 → 10；
+             ③ 目录连续步骤行之间补上与正文同源的「痕迹」线。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── ① 块距再收紧一档：48 → 40 ───────────────────────────────────
+   第三十二轮已经把「层次」交给那条 1px 线了，距离就不必再撑那么大。
+   分组头上方仍按 1.3 倍跟着降：64 → 52（必须 > 块距，否则标题离
+   「上一组」比离「它领起的下一组」更近，层次是反的）。
+   ⚠️ 那条痕迹线的落点写的是 bottom:calc(var(--fio-block) / -2)，跟着自动走。 */
+:root {
+  --fio-block: 40px;
+}
+
+.sop-preview-body > .sop-edit-step.sop-edit-heading {
+  margin-top: 52px;
+}
+
+/* ── ② 目录：分组头上方 24 → 10（「不要这么大，正常距离」）─────
+   普通步骤行之间是紧贴的（行盒相接），24px 的空档在这么窄的栏里会
+   像断了一截；10px 足以分组，其余层次交给下面那条线。
+   ⚠️ 这条规则带 :has()，特异性到 (0,4,0)，所以里面**只写分向属性**
+   （margin-top / padding-top / padding-bottom），绝不写简写。 */
+.step-list .step-item:has(.step-item-title.is-heading) {
+  margin-top: 10px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+
+/* ── ③ 目录也要「痕迹」：连续步骤行之间补一条 1px 细线 ─────────────
+   与正文那条同源（都出自设计稿的 --line 系）——但目录底色是 --nav
+   (#f7f8fa)、比纸面暗，所以在目录里用深一档的 --fio-line2，否则看不见。
+
+   线画在**本行的顶边**（top:0；两行紧贴 ⇒ 正好落在两行的交界上），
+   所以「最后一行不画」是天然的，不需要 :last-child。
+
+   🔴 目录里**每一行前面都夹着一个 `<div class="step-insert-point">`（插入槽）**，
+   实测 .step-list 的子节点是 `ip > item > ip > item > ip > …`（28 个孩子 /
+   13 行目录）。所以 `A + .step-item` 这种紧邻写法**一律不成立** —— 这正是
+   正文那边踩过的同一个坑（`.sop-step-divider` 也夹在块中间）。
+   正确写法是把插入槽一起写进 `+` 链：`ip + item`。
+
+   ⚠️ 为什么不给 .step-item 加 border-top：它带 border-radius:8px，
+   border 会顺着圆角弯成一条两端内收的短线；绝对定位的 ::after 不会弯。
+   ⚠️ .step-item::before 已被「当前步左侧橙标」占用（left:-8px），只能用 ::after。
+   ⚠️ left/right 都取 8px（＝ .step-item 的水平内边距）：线跟着内容栏走、
+   不顶到列表边缘，与正文那条「从序号列之后起」是同一个意思（缩进）。 */
+.step-list .step-insert-point + .step-item::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 0;
+  height: 1px;
+  background: var(--fio-line2);
+  pointer-events: none;
+}
+
+/* 不画线的三种情况 —— 与正文同一条规矩（文档行两侧 + 列表首行）。
+   ① 列表首行：它前面那个插入槽是 .step-list 的第一个孩子；
+   ② 本行是文档行（大标题 / 摘要 / 简介）；
+   ③ 上一行是文档行 —— 用 `ip + item(文档行) + ip + item` 这条 `+` 链
+      把「上一行」跨着插入槽锁死。
+   ⚠️ 特异性：主规则 (0,3,0)，②③ 都是 (0,5,0)，压得过。 */
+.step-list > .step-insert-point:first-child + .step-item::after,
+.step-list .step-insert-point + .step-item:has(.step-item-title.is-heading)::after,
+.step-list .step-insert-point + .step-item:has(.step-item-title.is-summary)::after,
+.step-list .step-insert-point + .step-item:has(.step-item-title.is-intro)::after,
+.step-list .step-insert-point + .step-item:has(.step-item-title.is-heading) + .step-insert-point + .step-item::after,
+.step-list .step-insert-point + .step-item:has(.step-item-title.is-summary) + .step-insert-point + .step-item::after,
+.step-list .step-insert-point + .step-item:has(.step-item-title.is-intro) + .step-insert-point + .step-item::after {
+  display: none;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第三十四轮 · 大标题上下收到底 + 目录「按键感」做回来
+   ──────────────────────────────────────────────────────────────────────
+   用户两张红框（图片真实像素 1375×974；scale=1.255 ⇒ CSS = 物理 / 1.255，
+   真机窗口 1096 CSS、左栏 272 CSS）：
+
+     img1  x[ 379..1374] y[435..489]   ┐两条横带**正好夹住「H1 大标题」
+           x[ 364..1344] y[564..597]   ┘那一行** → 要收它上下留白
+     img2  x[  28.. 341] y[138..730]    整个目录列表 → 要「按键感」
+
+   原话：「标题离上下步骤间再近一点」「（目录）又有点丑了，把那个之前的
+         那种按键的感觉做出来试下」。
+
+   ⇒ ① 分组头上方 52 → **38**、块距 40 → **30**：**回到设计稿原值**
+        （proto6 `.blk.is-heading{margin-top:38px}` / `.blk + .blk{margin-top:30px}`）。
+        前两轮我一路 96 → 48 → 40 地收，其实设计稿本来就是 30 —— 收到底才对。
+     ② 目录项恢复「按键」：白底 + 1px 边框 + 2px 间隙。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── ① 大标题上下都收到底（设计稿原值 38 / 30）──────────────────
+   ⚠️ 38 必须 > 30（分组头上方 > 块距），否则标题离「上一组」比离
+   「它领起的下一组」更近，层次是反的。 */
+:root {
+  --fio-block: 16px;
+}
+
+.sop-preview-body > .sop-edit-step.sop-edit-heading {
+  margin-top: 22px;
+}
+
+/* ── ② 目录项：「按键感」回来 ────────────────────────────────────
+   🔴 根因：第 26 轮为了治「像一段文本」，在 5738 那段把
+   `.step-item{background:transparent; border-color:transparent}` 写死了 ——
+   而它本来的样子（1318 行）是 `background: var(--bg)` +
+   `border: 1px solid var(--border)`，也就是用户说的「按键」。本轮把那两条
+   还回来，色值沿用项目自己的变量（white + #e5e7eb），不另造。
+   ⚠️ 特异性 (0,2,0)，与 6518 / 6707 那两条同级 ⇒ 靠**写在文件末尾**取胜，
+   所以这段必须留在 styles.css 的最后。 */
+.step-list .step-item {
+  margin-bottom: 1px;
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+/* hover / active 跟着回到「按键」的表达 —— 照抄 1331 / 1336 的原始写法
+   （原来 hover = 边框加深 + 阴影浮起；active = 边框高亮 + 同色 ring），
+   只把色值换成现在的 --fio- 系。
+   ⚠️ 第 26 轮把这两态也写成了 transparent + 取消阴影（5753 / 5759），
+   必须一起改回来，否则按键只在静态成立、一悬停就散架。 */
+.step-list .step-item:hover {
+  background: var(--bg);
+  border-color: var(--fio-ink4);
+  box-shadow: var(--shadow-sm);
+}
+
+.step-list .step-item.active,
+.step-list .step-item.active:hover {
+  background: var(--fio-accent-soft);
+  border-color: var(--fio-accent);
+  box-shadow: none;
+}
+
+/* ── ③ 目录那条「痕迹」线退场 ───────────────────────────────────
+   按键块之间已经有 1px 边框 + 2px 间隙，隔离比一条线更强；再叠一条线会
+   正好落在按键的间隙里、画出一道脏边（第三十三轮刚加的，本轮撤掉）。
+   ⚠️ 正文那条线（步骤块之间）**保留** —— 那边没有边框，仍需要它。
+   ⚠️ 只写这一条即可：它与第 33 轮主规则同为 (0,3,0)，写在后面就赢；
+   第 33 轮那堆抑制规则本身就是 display:none，不冲突。 */
+.step-list .step-insert-point + .step-item::after {
+  display: none;
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+   第三十五轮 · 痕迹线深一点 + 目录浅一点
+   ──────────────────────────────────────────────────────────────────────
+   用户两张柔红(#FA5151)标注（图片真实尺寸 1375×974；scale=1.255
+   ⇒ CSS = 物理 / 1.255；真机窗口 ≈1096 CSS、左栏 272 CSS）：
+
+     img1  x[363..1367] y[549..595]  正文里「补充描述 → 03 步骤」之间——
+                                      **痕迹线的实测位置 y=575（#ECEEF1）
+                                      正好落在框的正中**，框内除这条线外全空
+     img2  x[ 11.. 344] y[ 79..767]  整个目录列表（17 行，全项目扫描确认
+                                      行底色一致：普通行 #FFFFFF、当前行
+                                      #FFF2EC，描边 #E5E7EB / 当前 #FF6B35）
+     img3  = img2（逐像素完全一致，同一次截图重复粘贴）
+   原话：「深一点，浅一点」。
+
+   ⇒ ① 正文痕迹线：#ECEEF1 → **#DFE3E9**（对底 #F9FAFB 的对比 13 → 26，
+        翻一倍，仍是 1px 发丝线）。用户是**圈着现有这条线**说「深」的，
+        所以只调深浅、不加粗、不改长度（起点仍是内容列 52px 处）。
+      ② 目录按键描边：#E5E7EB → **#EEF1F5**（浅一档）。
+      ③ 目录当前项橙框：#FF6B35 → **#FFB694**（浅一档的橙）。
+
+   ⚠️ ② 只降描边的「重」，**不动白底 / 圆角 / 2px 间隙** ——「按键感」是上
+      一轮用户点名要的，这轮不是要撤掉它，而是把它调浅一档。
+   ⚠️ ③ 那条橙框是上一轮恢复 `border: 1px solid var(--border)` 时**顺带带
+      出来的**（第 26 轮把该 border 写成了 transparent，所以在此之前当前项
+      只有橙底 + 橙字、没有框）—— 它正是这轮目录里最「重」的元素。
+   ⚠️ 深色主题：描边改走 `--border-muted`(#21262D)，橙框改走 55% 橙 —— 都
+      沿用 `.dark` 自己的变量，不另造深色值。
+   ⚠️ 特异性：②(0,2,0) 与第 34 轮那条同级 ⇒ 靠**写在文件末尾**取胜，这段
+      必须留在 styles.css 的最后；③(0,3,0) 压得住第 34 轮的 `.active`。
+      悬停态(:hover, (0,3,0)) 故意不动 —— 悬停时边框变深是「可点」的反馈。
+   ══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  --fio-trace: #dfe3e9;
+  --fio-navline: #eef1f5;
+  --fio-accent-line: #ffb694;
+}
+
+.dark {
+  --fio-navline: var(--border-muted);
+  --fio-accent-line: rgba(255, 107, 53, 0.55);
+}
+
+.step-list .step-item {
+  border-color: var(--fio-navline);
+}
+
+.step-list .step-item.active,
+.step-list .step-item.active:hover {
+  border-color: var(--fio-accent-line);
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════
+   第三十八轮 · 大标题字号大一点 + 目录再浅一档
+   ──────────────────────────────────────────────────────────────────────
+   用户两张柔红(#FA5151)标注（图片真实尺寸 1375×974；scale = 1.255
+   ⇒ CSS = 物理 / 1.255；真机窗口 ≈ 1096 CSS）：
+
+     img1  x[373..1327] y[444..579]  H1 大标题块（正文工具条 + 「H1 大师傅似的」）
+                                     原话前半：「大标题字有点小」
+     img2  x[  8.. 359] y[ 97..802]  整个目录列表（16 行）
+                                     原话后半：「在浅一点」
+
+   ── ① 大标题（H1 块）字号 ─────────────────────────────────────────
+   实测 img1：H1 字面 x[439..559] = 120 物理 = 95.6 CSS ÷「大师傅似的」5 字
+   = **19.1 CSS/字** ⇒ 与 CSS 19px 完全吻合（字号 = CJK 全宽字宽）。
+   旁边步骤标题只有 16px，H1 仅高出 3px ⇒ 视觉上「大标题」不成其为大。
+   预览态 `.sop-preview-heading.h1` 本就是 **28px**，编辑态一直偏小半档。
+   ⇒ 编辑态 H1：19px → **22px**（+3，明显可辨；H2/H3/H4 阶梯 16.5/15/13.5
+     不动 —— 用户只点名「大标题」）。
+   ⚠️ 预览态 28px 不动；只覆盖编辑态这条 (0,2,0)，靠写在文件末尾取胜。
+
+   ── ②③ 目录再浅一档 ───────────────────────────────────────────────
+   本轮 img2 红框 x[8..359] y[97..802] 与**上一轮** img2（x[11..344]
+   y[79..767]）几乎重合 —— 同一对象、同一方向，说明上一轮那两处浅得不够：
+     · 目录按键描边：#EEF1F5 → **#F3F5F9**（对白底行仍有轮廓，落在
+       行间 #F9FAFB 缝隙里几乎隐身 ⇒「格栅感」被抹平）
+     · 目录当前项橙框：#FFB694 → **#FFC9B6**（再浅一档的橙；橙底
+       #FFF2EC 不动，仍能看出当前项）
+   ⚠️ 正文痕迹线 `--fio-trace` 保持 **#DFE3E9** —— 用户这轮没圈正文。
+   ⚠️ 白底 / 圆角 / 2px 间隙 / 悬停描边（--fio-ink4）全不动 ——
+      上一轮已确认「按键感」本身是要保留的，只是要更淡。
+   ⚠️ 深色主题变量不动（描边走 --border-muted、橙框走 55% 橙）。
+   ══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  --fio-navline: #f3f5f9;
+  --fio-accent-line: #ffc9b6;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   第三十九轮 · 标题整体升一档：H4 必须大过步骤标题
+   ──────────────────────────────────────────────────────────────────────
+   用户柔红(#FA5151)标注（图片真实尺寸 1375×974）落在 y[434..521] x[358..1334]，
+   圈的是正文块上那排 H1 H2 H3 H4 键 + 下面那行 H4 内容。
+   诉求两句：①「字还是小」（上轮 19→22 幅度不够）；②「H4 要比步骤标题大一点」。
+   实测参照物：编辑态步骤标题 .sop-preview-step-title = 16px，而 H4 只有 13.5px
+   ⇒ H4 是四档里**最小**的那一档，比正文步骤标题还小，方向反了。
+
+   新取值 28 / 24 / 21 / 18，逐级递减，H4(18) > 步骤标题(16) ✓。
+   ⚠️ 为什么 H2/H3 一起动：只抬 H4 会出现「H4 比 H3 还大」的倒挂，层级就废了，
+   四级是一组、必须同向抬。
+   ⚠️ 预览态 .sop-heading-t1~t4（2040 / 4390 行）**不动** —— 用户圈的是编辑器。
+   ⚠️ 特异性与 6393~6396 同为 (0,2,0)，靠写在文件末尾取胜，这段必须留在最后。
+   ⚠️ 宽版正文列可用宽 ≈696CSS，28px 那行标题实测仅占 ≈45% ⇒ 不会折行。
+   ══════════════════════════════════════════════════════════════════════ */
+.sop-edit-heading .sop-heading-t1 { font-size: 28px; }
+.sop-edit-heading .sop-heading-t2 { font-size: 24px; }
+.sop-edit-heading .sop-heading-t3 { font-size: 21px; }
+.sop-edit-heading .sop-heading-t4 { font-size: 18px; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   导出教程弹窗（复刻对标插件的网格布局：文档 / 演示 / 网页 + 底部选项）
+   从 flowio 旧线移植；深色面板与编辑器顶栏同族配色。
+   ══════════════════════════════════════════════════════════════════════ */
+.export-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: export-dialog-fade-in 0.18s ease;
+}
+
+.export-dialog {
+  background: #1f242c;
+  border: 1px solid #3a414b;
+  border-radius: 16px;
+  width: min(560px, 92vw);
+  max-height: 88vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+  animation: export-dialog-scale-in 0.18s ease;
+}
+
+@keyframes export-dialog-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes export-dialog-scale-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.export-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 22px;
+  border-bottom: 1px solid #2d333c;
+}
+
+.export-dialog-header h3 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: #f0f2f5;
+}
+
+.export-dialog-close {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  color: #9aa3ad;
+  font-size: 15px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.export-dialog-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.export-dialog-body {
+  padding: 20px 22px 8px;
+  overflow-y: auto;
+}
+
+.export-dialog-section {
+  margin-bottom: 18px;
+}
+
+.export-dialog-section-title {
+  margin: 0 0 10px 2px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #9aa3ad;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.export-dialog-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+.export-dialog-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 18px 8px;
+  background: #2b313a;
+  border: 1px solid #3a414b;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, transform 0.08s;
+}
+
+.export-dialog-card:hover {
+  background: #333a44;
+  border-color: #4a515b;
+}
+
+.export-dialog-card:active {
+  transform: scale(0.98);
+}
+
+.export-dialog-card-active {
+  background: #3a2a22;
+  border-color: #ff6b35;
+}
+
+.export-dialog-card-active:hover {
+  background: #422d24;
+}
+
+.export-dialog-card-icon {
+  font-size: 26px;
+  line-height: 1;
+}
+
+.export-dialog-card-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #e6e9ed;
+}
+
+.export-dialog-options {
+  padding: 14px 22px 20px;
+  border-top: 1px solid #2d333c;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.export-dialog-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  color: #e6e9ed;
+  font-size: 13px;
+}
+
+.export-dialog-option input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #ff6b35;
+  cursor: pointer;
+}
+
+.export-dialog-option-label {
+  font-weight: 500;
+  color: #f0f2f5;
+}
+
+.export-dialog-option-hint {
+  color: #828b94;
+  font-size: 12px;
+}
+
+.export-dialog-option-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.export-dialog-segmented {
+  display: flex;
+  background: #2b313a;
+  border: 1px solid #3a414b;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.export-dialog-segmented button {
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #b0b8c1;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.export-dialog-segmented button.active {
+  background: #ff6b35;
+  color: #fff;
+}
+
+.export-dialog-chip {
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #b0b8c1;
+  background: #2b313a;
+  border: 1px solid #3a414b;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  white-space: nowrap;
+}
+
+.export-dialog-chip:hover {
+  border-color: #ff6b35;
+  color: #f0f2f5;
+}
+
+.export-dialog-chip.active {
+  background: #ff6b35;
+  border-color: #ff6b35;
+  color: #fff;
+}
+
+/* 页脚二维码的公开链接输入框（挤在选项行里，收窄一点） */
+.export-dialog-public-url {
+  flex: 0 1 240px;
+  min-width: 140px;
+}
+
+.export-dialog-footer {
+  padding: 14px 22px 22px;
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid #2d333c;
+}
+
+.export-dialog-submit {
+  padding: 10px 28px;
+  background: #ff6b35;
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, opacity 0.12s;
+}
+
+.export-dialog-submit:hover:not(:disabled) {
+  background: #ff8155;
+}
+
+.export-dialog-submit:disabled {
+  background: #3a414b;
+  color: #9aa3ad;
+  cursor: not-allowed;
+}
+
+/* ── 视频「其他设置」（第四十八轮）────────────────────────── */
+/* 选到「速览视频 / 录屏视频」时弹窗加宽，正文里长出一块设置面板 */
+.export-dialog-wide {
+  width: min(720px, 94vw);
+}
+
+.export-dialog-advanced {
+  margin: 4px 0 2px;
+  padding: 14px 16px 16px;
+  border: 1px solid #333a44;
+  border-radius: 12px;
+  background: #191d24;
+}
+
+.export-dialog-advanced-title {
+  position: relative;
+  margin: 0 0 12px;
+  padding-left: 9px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #e6eaf0;
+}
+
+.export-dialog-advanced-title::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 13px;
+  border-radius: 2px;
+  background: #ff6b35;
+}
+
+.export-dialog-advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.export-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 30px;
+}
+
+.export-opt-wide {
+  grid-column: 1 / -1;
+}
+
+.export-opt-label {
+  font-size: 12.5px;
+  color: #aab3bd;
+  white-space: nowrap;
+}
+
+.export-opt-select,
+.export-opt-input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid #3a414b;
+  background: #232932;
+  color: #e6eaf0;
+  font-size: 12.5px;
+  outline: none;
+}
+
+.export-opt-input {
+  padding: 0 10px;
+}
+
+.export-opt-select {
+  cursor: pointer;
+}
+
+.export-opt-select:focus,
+.export-opt-input:focus {
+  border-color: #ff6b35;
+}
+
+.export-opt-toggle {
+  position: relative;
+  flex: none;
+  width: 38px;
+  height: 21px;
+  border-radius: 11px;
+  border: 1px solid #3a414b;
+  background: #2a313a;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.export-opt-toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #9aa3ad;
+  transition: transform 0.15s, background 0.15s;
+}
+
+.export-opt-toggle.on {
+  background: #ff6b35;
+  border-color: #ff6b35;
+}
+
+.export-opt-toggle.on .export-opt-toggle-knob {
+  transform: translateX(17px);
+  background: #fff;
+}
+
+@media (max-width: 640px) {
+  .export-dialog-advanced-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .export-dialog-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+

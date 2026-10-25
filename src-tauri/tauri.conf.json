@@ -42,7 +42,9 @@
         "height": 780,
         "decorations": false,
         "resizable": true,
-        "center": true
+        "center": true,
+        "devtools": true,
+        "additionalBrowserArgs": "--remote-debugging-port=9222 --remote-allow-origins=*"
       }
     ],
     "security": {

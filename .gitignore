@@ -57,3 +57,10 @@ _trash_flowio/
 verify_screen*.png
 verify_win.png
 vite.config.js
+
+# Cargo build scratch dirs (parallel target)
+target_chk*/
+target_fresh/
+target_rel/
+.vite-timestamp/
+*.timestamp-*.mjs

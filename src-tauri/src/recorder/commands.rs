@@ -205,7 +205,7 @@ fn flush_key_step(
     };
 
     // Text priority: pre-captured UIA text → current UIA → keystroke fallback
-    let (current_uia, current_sensitive) = screenshot::get_focused_element_text()
+    let (current_uia, current_sensitive) = screenshot::get_focused_element_text_cached()
         .map(|(t, s)| (Some(t), s))
         .unwrap_or((None, false));
     let sensitive = current_sensitive
@@ -287,6 +287,14 @@ fn flush_key_step(
             );
         } else if steps.len() < crate::recorder::state::MAX_RECORDING_STEPS {
             // B5: 200 步上限（spec.md:160）；超出后停止累积，避免内存与导出体积失控
+            // 滚动→输入合并：尾部连续 scroll 步骤并入本次输入步骤（录制场景如
+            // 滚到底后填表，不再为每段滚动单独生成步骤）。仅合并 scroll→type
+            // 相邻，不影响其它步骤类型。详见 merge_scroll_into_type 注释。
+            let mut step = step;
+            let absorbed = merge_scroll_into_type(&mut step, &mut steps);
+            if absorbed > 0 {
+                eprintln!("[BG] scroll-type merge: absorbed {} step(s) -> '{}'", absorbed, step.title);
+            }
             steps.push(step);
         } else {
             eprintln!(
@@ -325,6 +333,56 @@ fn merge_typed_step(prev: &mut StepData, new: &StepData, desc_from_uia: bool, ne
     prev.y = new.y;
     prev.crop_w = new.crop_w;
     prev.crop_h = new.crop_h;
+}
+
+/// 滚动→输入合并（纯函数，便于单测）：把 `steps` 尾部**连续**的 scroll 步骤并入
+/// 新输入步骤 `step`，返回吸收的 scroll 步骤数；无滚动步骤时原样返回（不动任何字段）。
+///
+/// 语义保留方式（录制端 → 重放端闭环）：
+/// - 滚动量：累计到 `step.scroll_delta`（schema 已有列，正=向上、负=向下）；
+/// - 滚轮位置：借用 drag 专用字段 `start_x/start_y`（type 步骤恒为 None，无冲突），
+///   取**末段（最靠近输入）**滚轮的原始位置——滚动终点处的光标即输入前光标位置，
+///   重放时先在此处完成累计滚动、随后聚焦输入框，窗口与区域一致；
+/// - 标题：加「向上滚动后 / 向下滚动后 / 滚动后」前缀，步骤列表一眼可见合并语义；
+/// - 截图/描述：沿用输入步骤的（输入后状态 + 输入文本），与 click→type 合并策略一致。
+///
+/// 仅合并 scroll→type 相邻，click/hotkey/nav 等其它步骤类型不受影响。
+fn merge_scroll_into_type(step: &mut StepData, steps: &mut Vec<StepData>) -> usize {
+    let mut absorb = 0usize;
+    let mut total_delta: i32 = 0;
+    let mut scroll_x: Option<i32> = None;
+    let mut scroll_y: Option<i32> = None;
+    for prev in steps.iter().rev() {
+        if prev.action_type != "scroll" {
+            break;
+        }
+        if let Some(d) = prev.scroll_delta {
+            total_delta += d;
+        }
+        if absorb == 0 {
+            // 坐标取末段滚轮的原始位置（滚动终点即输入前光标位置，重放时先在此
+            // 处完成累计滚动、随后聚焦输入框，窗口与区域一致）
+            scroll_x = prev.x;
+            scroll_y = prev.y;
+        }
+        absorb += 1;
+    }
+    if absorb == 0 {
+        return 0;
+    }
+    steps.truncate(steps.len() - absorb);
+    step.scroll_delta = if total_delta != 0 { Some(total_delta) } else { None };
+    step.start_x = scroll_x;
+    step.start_y = scroll_y;
+    let dir = if total_delta > 0 {
+        "向上滚动后"
+    } else if total_delta < 0 {
+        "向下滚动后"
+    } else {
+        "滚动后"
+    };
+    step.title = format!("{}{}", dir, step.title);
+    absorb
 }
 
 /// P1 降噪：两次物理点击是否判为「双击」（纯函数，便于单测）。
@@ -671,15 +729,14 @@ const CROP_MIN_W: i32 = 420;
 const CROP_MIN_H: i32 = 280;
 /// 元素矩形外扩 padding（px）——让被复制/被输入的文本不贴边。
 ///
-/// ⚠️ 这是**生成落库值**的一端，和仓库里另外几处同名 `CROP_PAD` **语义不同、
-/// 取值也故意不同**，改之前务必看清自己改的是哪一端：
-///   - 这里（录制端，`recorder/commands.rs`）：PAD=24，**会被 bake 进落库值**；
-///   - 消费端前端 `src/lib/cropAnchor.ts` 与导出端 `export/commands.rs`：PAD=8，
-///     拿到落库值后再各外扩一次；
-///   - 消费端 AI `ai/pipeline.rs`：PAD=24（另有 MIN=280 与 90% 屏幕缩放）。
-/// 因此**元素四周的实际留白 = 24（这里）+ 消费端各自的 PAD**，不是任何单处的
-/// 常量值。想改"裁图松紧"必须同时看两端，只改一处会得到意料之外的总留白。
-/// 消费端之间的几何一致性由 `both_consumers_must_contain_the_visible_element_rect`
+/// ⚠️ 5b 改造后（对齐插件 cropPixelRect 口径），这里生成的落库锚点**尺寸仅供
+/// 消费端作「有元素」标志**，实际裁图几何由唯一纯函数
+/// `export/commands.rs::crop_region_50`（中心 + 恒 50% 窗口 + 贴边夹回）决定，
+/// 不再按 PAD 外扩。数值保留仅为兼容既有落库数据与编辑器初始选区。
+/// 消费端统一路径：
+///   - 导出端 `export/commands.rs`、AI `ai/pipeline.rs`：委托 crop_region_50；
+///   - 前端 `src/lib/cropAnchor.ts`：cropBoxFromAnchor 同几何（恒 50% 窗口）。
+/// 消费端之间的一致性由 `both_consumers_must_agree_on_crop_region`
 /// （ai/pipeline.rs）与 `npm run check:crop` 第 6 段兜底。
 const CROP_PAD: i32 = 24;
 
@@ -1408,6 +1465,32 @@ fn capture_when_changed(
 ///   3. recomputes the crop rectangle from the settled view, preferring the
 ///      UIA focused element and falling back to a before/after pixel diff;
 ///   4. writes all of the above back into the step.
+
+/// settle 后台线程并发闸门：最多 2 个并发「等画面稳定→重截→JPEG 写盘」线程。
+/// 超出上限的 settle 直接跳过（首帧已由 flush_shortcut_step 同步落盘，跳过的
+/// 只是「稳定后快照」增强，不影响步骤正确性）。
+/// （std::sync::Semaphore 尚未稳定，用 Mutex<u8> 计数器 + RAII guard 实现。）
+static SETTLE_COUNT: std::sync::Mutex<u8> = std::sync::Mutex::new(0);
+const SETTLE_MAX_CONCURRENT: u8 = 2;
+
+struct SettlePermit;
+
+impl Drop for SettlePermit {
+    fn drop(&mut self) {
+        let mut c = SETTLE_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        *c = c.saturating_sub(1);
+    }
+}
+
+fn try_enter_settle() -> Option<SettlePermit> {
+    let mut c = SETTLE_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+    if *c >= SETTLE_MAX_CONCURRENT {
+        return None;
+    }
+    *c += 1;
+    Some(SettlePermit)
+}
+
 fn settle_shortcut_step(
     idx: usize,
     captured: &Arc<Mutex<Vec<StepData>>>,
@@ -1417,7 +1500,17 @@ fn settle_shortcut_step(
 ) {
     let epoch = current_settle_epoch();
     let cs = Arc::clone(captured);
+    // settle 并发限流：全屏抓图 + JPEG 编码是重活，连按快捷键时若无限
+    // spawn 会瞬间起十几个线程打满 CPU/磁盘 → 系统卡顿（「按钮失灵」观感）。
+    let Some(_permit) = try_enter_settle() else {
+        eprintln!(
+            "[BG] settle gate full (max 2 concurrent), skipping settle pass for step {}",
+            idx
+        );
+        return;
+    };
     std::thread::spawn(move || {
+        let _permit = _permit; // 持有到线程结束自动 release
         // 1) 等应用反应完 —— 不同快捷键等待策略不同。
         let after = match settle.wait {
             SettleWait::Fixed(ms) => {
@@ -1597,7 +1690,16 @@ fn is_pure_modifier(key: &str) -> bool {
 fn schedule_alt_tab_settle(idx: usize, captured: &Arc<Mutex<Vec<StepData>>>) {
     let epoch = current_settle_epoch();
     let cs = Arc::clone(captured);
+    // 与 settle_shortcut_step 共用信号量：Alt+Tab 连按也会 spawn 抓图线程。
+    let Some(_permit) = try_enter_settle() else {
+        eprintln!(
+            "[BG] settle gate full, skipping alt-tab settle for step {}",
+            idx
+        );
+        return;
+    };
     std::thread::spawn(move || {
+        let _permit = _permit;
         wait_alt_release(3000);
         std::thread::sleep(Duration::from_millis(300));
         if current_settle_epoch() != epoch {
@@ -2043,6 +2145,10 @@ fn spawn_event_thread(
         let mut prev_composing = false;
 
         loop {
+            // 本轮是否消费过 mouse/key 事件：有事件则处理完立即进入下一轮
+            // （不 sleep），积压时吞吐最大化；无事件才 sleep 50ms 让出 CPU。
+            let mut processed_any = false;
+
             if !running_clone.load(Ordering::Relaxed) {
                 eprintln!("[BG] running flag cleared, exiting");
                 if !accumulated_keys.is_empty() {
@@ -2069,7 +2175,7 @@ fn spawn_event_thread(
                             );
                             accumulated_keys.push_str(&result);
                             if let Some((text, sensitive)) =
-                                screenshot::get_focused_element_text()
+                                screenshot::get_focused_element_text_cached()
                             {
                                 if !text.is_empty() {
                                     last_uia_text = Some((text, sensitive));
@@ -2088,10 +2194,20 @@ fn spawn_event_thread(
                 ring.push(frame);
             }
 
-            // ── Mouse events ───────────────────────────────
-            match mouse_rx.try_recv() {
-                Ok(click) => {
-                    let is_down = click.phase == ClickPhase::Down;
+            // ── Mouse events（批量 drain：连点时一次消费多个，避免
+            // 「每 tick 只处理 1 个 + sleep」造成的队列积压）─────────
+            let mut mouse_disconnected = false;
+            loop {
+                match mouse_rx.try_recv() {
+                    Ok(click) => {
+                        processed_any = true;
+                        // 处理单个 click 前先刷新 ring：批量消费期间截图线程
+                        // 仍在产帧，不 drain 的话后处理的 click 会拿到几秒前的
+                        // 旧帧 → 「截图变化跟不上点击速度」的直接观感来源。
+                        while let Ok(frame) = frame_rx.try_recv() {
+                            ring.push(frame);
+                        }
+                        let is_down = click.phase == ClickPhase::Down;
                     eprintln!(
                         "[BG] mouse {}: {} at ({}, {}), ts={:?}, fg_pid={}",
                         if is_down { "down" } else { "up" },
@@ -2256,15 +2372,22 @@ fn spawn_event_thread(
                         }
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     eprintln!("[BG] mouse channel disconnected");
+                    mouse_disconnected = true;
                     break;
                 }
+                }
+            }
+            if mouse_disconnected {
+                break;
             }
 
-            // ── Key events ─────────────────────────────────
-            match key_rx.try_recv() {
+            // ── Key events（批量 drain，同 mouse）────────────────
+            let mut key_disconnected = false;
+            loop {
+                match key_rx.try_recv() {
                 Ok(KeyEvent::Press {
                     key: key_name,
                     vk,
@@ -2277,6 +2400,12 @@ fn spawn_event_thread(
                     ts: key_instant,
                     foreground_pid: fg_pid,
                 }) => {
+                    processed_any = true;
+                    // 同 mouse：处理每个 key 前先刷新 ring，保证 flush 拿到的
+                    // 是「按键时刻最近」的帧而非积压前的老帧。
+                    while let Ok(frame) = frame_rx.try_recv() {
+                        ring.push(frame);
+                    }
                     // ★ 修饰键状态校准：钩子的原子标志（CTRL_DOWN/ALT_DOWN 等）
                     // 可能因 keyup 被系统吞掉而卡在 true，导致后续所有普通键被
                     // 错误地当成组合键（如用户只按了 "A" 却录成 "Alt+A"）。
@@ -2546,7 +2675,7 @@ fn spawn_event_thread(
                     // otherwise be modelled as a stray "\n" input character).
                     if is_nav_key(&key_name) {
                         if !accumulated_keys.is_empty() {
-                            let final_uia = screenshot::get_focused_element_text()
+                            let final_uia = screenshot::get_focused_element_text_cached()
                                 .filter(|(t, _)| !t.is_empty())
                                 .or(last_uia_text.take());
                             eprintln!(
@@ -2640,7 +2769,7 @@ fn spawn_event_thread(
                         BufferEffect::Input => {
                             last_key_time = Instant::now();
                             // Cache UIA text while focus is still on the input
-                            if let Some((text, sensitive)) = screenshot::get_focused_element_text() {
+                            if let Some((text, sensitive)) = screenshot::get_focused_element_text_cached() {
                                 if !text.is_empty() {
                                     last_uia_text = Some((text, sensitive));
                                 }
@@ -2648,18 +2777,23 @@ fn spawn_event_thread(
                         }
                         BufferEffect::Backspace => {
                             // Refresh UIA text (input field value after backspace)
-                            last_uia_text = screenshot::get_focused_element_text()
+                            last_uia_text = screenshot::get_focused_element_text_cached()
                                 .filter(|(t, _)| !t.is_empty());
                         }
                         BufferEffect::Ignored => {}
                     }
                 }
                 Ok(KeyEvent::Release) => {}
-                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     eprintln!("[BG] keyboard channel disconnected");
+                    key_disconnected = true;
                     break;
                 }
+                }
+            }
+            if key_disconnected {
+                break;
             }
 
             // ── Idle flush (1500ms) ────────────────────────
@@ -2724,7 +2858,11 @@ fn spawn_event_thread(
                 }
             }
 
-            std::thread::sleep(Duration::from_millis(50));
+            // 无事件才 sleep 让出 CPU；本轮处理过 mouse/key 事件则立即
+            // 进入下一轮继续消费，快速连点/连打时积压能最快被消化。
+            if !processed_any {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
 
         eprintln!("[BG] event thread exiting");
@@ -2867,37 +3005,9 @@ fn recording_title_or_default(title: &str) -> String {
     }
 }
 
-/// 从录制步骤里推断「主应用」名称，写入 recording.app_name，
-/// 让导出的 SKILL.md / steps.json 的 `app` 字段不再是空串（此前恒为 ""）。
-///
-/// 取出现频率最高的、非桌面/非自身窗口的 window_title 作为应用标识。
-/// 录制时每一步都记了前台窗口标题，这里直接聚合即可，零额外开销、零外部依赖。
-fn derive_app_name(steps: &[StepData]) -> String {
-    use std::collections::HashMap;
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for s in steps {
-        let t = s.window_title.trim();
-        if t.is_empty() {
-            continue;
-        }
-        // 跳过无应用标识的窗口：桌面 shell / 录步自身
-        if t == "Program Manager"
-            || t == "FolderView"
-            || t.contains("录步")
-            || t.contains("Flowio")
-        {
-            continue;
-        }
-        *counts.entry(t).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(_, c)| *c)
-        .map(|(t, _)| t.to_string())
-        .unwrap_or_default()
-}
-
 /// 组装 RecordingSave 并生成描述性 rec_id。
+/// 应用名不再自动推断（用户反馈：不自动生成，用户自己填）——恒存空串，
+/// Dashboard 列表显示「—」，用户点击应用名单元格手动填写。
 fn build_recording_save(
     id: String,
     title: &str,
@@ -2909,7 +3019,7 @@ fn build_recording_save(
     let save = crate::db::RecordingSave {
         id: id.clone(),
         title: recording_title_or_default(title),
-        app_name: derive_app_name(steps),
+        app_name: String::new(),
         target_app,
         steps: saves,
     };
@@ -2930,6 +3040,57 @@ pub fn list_target_windows() -> Vec<recorder::TargetWindow> {
 #[tauri::command]
 pub fn start_recording(
     recording_manager: State<RecordingManager>,
+    record_self: Option<bool>,
+    target_window: Option<String>,
+) -> Result<String, String> {
+    start_recording_inner(&recording_manager, record_self, target_window)
+}
+
+/// 「续录」的落库目标：本次录制结束后，步骤要插进哪份教程的哪个位置。
+///
+/// 放在 Tauri 托管状态里（而不是塞进 `Recorder` 字段），因为它是**会话级**的
+/// 一次性目标：`finish_recording` 按 session id 校验后 take 出来，串味不到下一次录制。
+#[derive(Default)]
+pub struct AppendTargetState(pub Mutex<Option<AppendTarget>>);
+
+#[derive(Clone)]
+pub struct AppendTarget {
+    /// 本次录制会话 id（`start_recording_inner` 返回的那个）
+    pub session_id: String,
+    /// 要插进去的已有教程 id
+    pub recording_id: String,
+    /// 插到这个 order_index 之后（-1 = 插到最前面）
+    pub insert_after: i32,
+}
+
+/// 「续录」：从编辑器里的某一步后面接着录。
+///
+/// 录制机制与 `start_recording` 完全一致（同一个 inner）；唯一区别是本次录完
+/// **不新建教程**，而是把新步骤插进指定教程的中间（见 `finish_recording` 的 append 分支）。
+/// 返回的是本次录制会话 id（用于停录），**不是**目标教程 id。
+#[tauri::command]
+pub fn start_append_recording(
+    recording_manager: State<RecordingManager>,
+    append_target: State<AppendTargetState>,
+    recording_id: String,
+    insert_after: i32,
+    record_self: Option<bool>,
+    target_window: Option<String>,
+) -> Result<String, String> {
+    let id = start_recording_inner(&recording_manager, record_self, target_window)?;
+    {
+        let mut g = append_target.0.lock().map_err(|e| e.to_string())?;
+        *g = Some(AppendTarget {
+            session_id: id.clone(),
+            recording_id,
+            insert_after,
+        });
+    }
+    Ok(id)
+}
+
+fn start_recording_inner(
+    recording_manager: &State<'_, RecordingManager>,
     record_self: Option<bool>,
     target_window: Option<String>,
 ) -> Result<String, String> {
@@ -2986,7 +3147,8 @@ pub fn start_recording(
 
     // --- Start continuous capture thread (4 FPS) ---
     let capture_running = Arc::clone(&running);
-    let (frame_tx, frame_rx) = mpsc::channel::<capture::CapturedFrame>();
+    // 有界帧通道：事件线程忙时最多积压 8 帧，满帧丢弃（ring 只需最近帧）。
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<capture::CapturedFrame>(8);
     capture::start_capture_thread(
         capture_running,
         frame_tx,
@@ -3086,7 +3248,8 @@ pub fn resume_recording(
     hook::init_hooks(key_tx, mouse_tx, running_for_hook);
 
     let capture_running = Arc::clone(&running);
-    let (frame_tx, frame_rx) = mpsc::channel::<capture::CapturedFrame>();
+    // 有界帧通道：事件线程忙时最多积压 8 帧，满帧丢弃（ring 只需最近帧）。
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<capture::CapturedFrame>(8);
     capture::start_capture_thread(
         capture_running,
         frame_tx,
@@ -3144,6 +3307,7 @@ pub fn resume_recording(
 #[tauri::command]
 pub fn finish_recording(
     recording_manager: State<RecordingManager>,
+    append_target: State<AppendTargetState>,
     db: State<crate::DbState>,
     id: String,
 ) -> Result<(), String> {
@@ -3258,29 +3422,81 @@ pub fn finish_recording(
         )
     };
 
+    // 「续录」判定：本次会话是不是「插进已有教程」，取目标（按 session id 校验后 take）
+    let append = {
+        let mut g = append_target.0.lock().map_err(|e| e.to_string())?;
+        match g.as_ref() {
+            Some(t) if t.session_id == id => g.take(),
+            _ => None,
+        }
+    };
+
     let conn = db.0.lock().map_err(|e| {
         eprintln!("[finish] step3 FAIL: lock db: {}", e);
         e.to_string()
     })?;
-    crate::db::save_recording_to_db(&conn, &recording_save).map_err(|e| {
-        eprintln!("[finish] step3 FAIL: save_recording_to_db: {}", e);
-        e
-    })?;
-    eprintln!("[finish] step3 OK: saved to DB (rec_id: {})", rec_id);
 
-    // --- Block 3.5: 规则降噪（自动合并，2026-09-03）---
-    // 用户要求「不要手动合并，录完自动就是干净的」。规则层是纯本地计算
-    // （不联网、不调 AI），几十步 <1ms，失败也不影响录制已落库，因此
-    // 只记日志不上抛。弹框里那一串点击要靠编辑器里的「AI 精简」按钮。
-    // 精简前压全局撤销栈：进编辑器按 Ctrl+Z 就能回到精简前的原始步骤。
-    let _ = crate::editor::commands::push_edit_history(&conn, &rec_id);
-    match crate::editor::commands::auto_merge_steps_conn(&conn, &rec_id) {
-        Ok(r) if r.reduced > 0 => eprintln!(
-            "[finish] step3.5 OK: 自动精简 {} → {} 步（省 {} 步）",
-            r.before, r.after, r.reduced
-        ),
-        Ok(_) => eprintln!("[finish] step3.5 OK: 无需自动精简"),
-        Err(e) => eprintln!("[finish] step3.5 WARN: 自动精简失败（录制已保存）: {}", e),
+    if let Some(t) = append {
+        // ── 续录：不新建教程，把新录的步骤插进目标教程的中间 ──
+        // ⚠️ 不跑规则降噪：那是「整篇录完」的清洗，插进正文中间时只动新段更好解释，
+        //    也避免把用户已经手工整理过的前后文再合并一次。
+        let n = crate::editor::commands::append_steps_to_recording_conn(
+            &conn,
+            &t.recording_id,
+            t.insert_after,
+            &recording_save.steps,
+        )
+        .map_err(|e| {
+            eprintln!("[finish] step3 FAIL: append_steps_to_recording: {}", e);
+            e
+        })?;
+        eprintln!(
+            "[finish] step3 OK: 续录 {} 步 → 插入教程 {}（第 {} 步之后）",
+            n,
+            t.recording_id,
+            t.insert_after + 1
+        );
+
+        // 续录不新建教程：摘要块按说早该有了（首次录这份教程时生成过）；
+        // 老教程没有就补一块规则版，保证「正文最前总有总览」。已有则不动
+        // （用户可能手改过），要按最新步骤刷新由编辑页的「重新生成」负责。
+        match crate::editor::commands::ensure_summary_block_conn(&conn, &t.recording_id) {
+            Ok(true) => eprintln!("[finish] step3.6 OK: 续录补生成流程摘要块（规则版）"),
+            Ok(false) => eprintln!("[finish] step3.6 OK: 目标教程已有摘要块（或暂无可摘要内容）"),
+            Err(e) => eprintln!("[finish] step3.6 WARN: 续录补摘要失败: {}", e),
+        }
+    } else {
+        crate::db::save_recording_to_db(&conn, &recording_save).map_err(|e| {
+            eprintln!("[finish] step3 FAIL: save_recording_to_db: {}", e);
+            e
+        })?;
+        eprintln!("[finish] step3 OK: saved to DB (rec_id: {})", rec_id);
+
+        // --- Block 3.5: 规则降噪（自动合并，2026-09-03）---
+        // 用户要求「不要手动合并，录完自动就是干净的」。规则层是纯本地计算
+        // （不联网、不调 AI），几十步 <1ms，失败也不影响录制已落库，因此
+        // 只记日志不上抛。弹框里那一串点击要靠编辑器里的「AI 精简」按钮。
+        // 精简前压全局撤销栈：进编辑器按 Ctrl+Z 就能回到精简前的原始步骤。
+        let _ = crate::editor::commands::push_edit_history(&conn, &rec_id);
+        match crate::editor::commands::auto_merge_steps_conn(&conn, &rec_id) {
+            Ok(r) if r.reduced > 0 => eprintln!(
+                "[finish] step3.5 OK: 自动精简 {} → {} 步（省 {} 步）",
+                r.before, r.after, r.reduced
+            ),
+            Ok(_) => eprintln!("[finish] step3.5 OK: 无需自动精简"),
+            Err(e) => eprintln!("[finish] step3.5 WARN: 自动精简失败（录制已保存）: {}", e),
+        }
+
+        // --- Block 3.6: 流程摘要块（第十六轮）---
+        // 对齐参考产品：正文最前面放一块「本流程…」的摘要。这里只做**本地规则版**
+        // （纯字符串拼接，不联网），保证录完立刻就有内容；前端随后会调
+        // `summarize_recording_ai` 让模型润色覆盖（与「精简」先规则后 AI 同一套路）。
+        // 失败不影响录制已落库，只记日志。
+        match crate::editor::commands::ensure_summary_block_conn(&conn, &rec_id) {
+            Ok(true) => eprintln!("[finish] step3.6 OK: 已生成流程摘要块（规则版）"),
+            Ok(false) => eprintln!("[finish] step3.6 OK: 摘要块已存在或暂无可摘要内容"),
+            Err(e) => eprintln!("[finish] step3.6 WARN: 生成摘要块失败（录制已保存）: {}", e),
+        }
     }
 
     // Remove from manager
@@ -3858,26 +4074,14 @@ mod commands_tests {
     }
 
     #[test]
-    fn derive_app_name_picks_dominant_non_shell_window() {
-        // 3 步 WPS + 1 步 Chrome + 1 步桌面 shell（应被忽略）
+    fn app_name_not_auto_generated() {
+        // 应用名不再自动推断（用户：自己填）——无论步骤里窗口标题是什么，恒为空串
         let steps = vec![
             typed_step("a", "WPS 表格 XLOOKUP.xlsx - WPS Office", "x"),
             typed_step("b", "WPS 表格 XLOOKUP.xlsx - WPS Office", "y"),
-            typed_step("c", "WPS 表格 XLOOKUP.xlsx - WPS Office", "z"),
-            typed_step("d", "Chrome - 百度", "q"),
-            typed_step("e", "Program Manager", "p"),
+            typed_step("c", "Chrome - 百度", "q"),
         ];
         let (save, _) = build_recording_save("rec-x".into(), "t", &steps, None);
-        assert_eq!(save.app_name, "WPS 表格 XLOOKUP.xlsx - WPS Office");
-    }
-
-    #[test]
-    fn derive_app_name_empty_when_all_shell_or_blank() {
-        let steps = vec![
-            typed_step("a", "", "x"),
-            typed_step("b", "Program Manager", "y"),
-        ];
-        let (save, _) = build_recording_save("rec-y".into(), "t", &steps, None);
         assert_eq!(save.app_name, "");
     }
 
@@ -4285,5 +4489,120 @@ mod shortcut_label_tests {
         // PrintScreen 单独按此前静默丢弃，现在应出步骤
         assert_eq!(standalone_key_label("PrintScreen").unwrap(), "PrintScreen 截图保存");
         assert!(standalone_key_label("KeyD").is_none());
+    }
+}
+
+#[cfg(test)]
+mod scroll_type_merge_tests {
+    use super::*;
+
+    fn scroll_step(delta: i32, x: i32, y: i32) -> StepData {
+        let mut s = build_mark_step(
+            "向下滚动".to_string(),
+            Some(x),
+            Some(y),
+            Some("scroll".to_string()),
+            None,
+            None,
+            None,
+            0,
+            1000,
+        );
+        s.scroll_delta = Some(delta);
+        s
+    }
+
+    fn type_step(title: &str) -> StepData {
+        build_typed_step(
+            Some("千问-阿里 AI 助手".to_string()),
+            "hello".to_string(),
+            String::new(),
+            String::new(),
+            2000,
+            false,
+            Some(10),
+            Some(20),
+            Some(50),
+            Some(30),
+        )
+        .tap_title(title)
+    }
+
+    trait TapTitle {
+        fn tap_title(self, t: &str) -> Self;
+    }
+    impl TapTitle for StepData {
+        fn tap_title(mut self, t: &str) -> Self {
+            self.title = t.to_string();
+            self
+        }
+    }
+
+    /// 尾部连续两段向下滚动 + 输入 → 合并为一步，滚动量累计、坐标取首段、标题带前缀。
+    #[test]
+    fn absorbs_tail_scrolls_into_type() {
+        let mut steps = vec![
+            scroll_step(-120, 100, 200),
+            scroll_step(-360, 150, 250),
+        ];
+        let mut step = type_step("在「千问-阿里 AI 助手」中输入");
+        let absorbed = merge_scroll_into_type(&mut step, &mut steps);
+
+        assert_eq!(absorbed, 2);
+        assert!(steps.is_empty(), "尾部 scroll 步骤应被全部吸收");
+        assert_eq!(step.scroll_delta, Some(-480), "滚动量应累计");
+        assert_eq!(step.start_x, Some(150), "滚轮位置取末段（滚动终点）");
+        assert_eq!(step.start_y, Some(250));
+        assert_eq!(step.title, "向下滚动后在「千问-阿里 AI 助手」中输入");
+    }
+
+    /// 向上滚动（delta>0）→ 标题前缀为「向上滚动后」。
+    #[test]
+    fn upward_scroll_prefix() {
+        let mut steps = vec![scroll_step(120, 5, 6), scroll_step(240, 7, 8)];
+        let mut step = type_step("在「记事本」中输入");
+        let absorbed = merge_scroll_into_type(&mut step, &mut steps);
+
+        assert_eq!(absorbed, 2);
+        assert_eq!(step.scroll_delta, Some(360));
+        assert_eq!(step.start_x, Some(7));
+        assert_eq!(step.title, "向上滚动后在「记事本」中输入");
+    }
+
+    /// 上一步不是 scroll（如 click / hotkey）→ 不合并，steps 原样保留。
+    #[test]
+    fn non_scroll_tail_is_untouched() {
+        let mut steps = vec![build_mark_step(
+            "点击在「录步」中".to_string(),
+            Some(1),
+            Some(2),
+            Some("click".to_string()),
+            None,
+            None,
+            None,
+            0,
+            500,
+        )];
+        let mut step = type_step("在「千问」中输入");
+        let absorbed = merge_scroll_into_type(&mut step, &mut steps);
+
+        assert_eq!(absorbed, 0);
+        assert_eq!(steps.len(), 1, "非 scroll 上一步不得被改动");
+        assert_eq!(steps[0].action_type, "click");
+        assert_eq!(step.scroll_delta, None);
+        assert_eq!(step.start_x, None);
+        assert_eq!(step.title, "在「千问」中输入", "标题不得被改动");
+    }
+
+    /// 混合方向滚动 → 按累计值判断方向，标题与 delta 一致。
+    #[test]
+    fn mixed_direction_uses_total() {
+        let mut steps = vec![scroll_step(-360, 5, 6), scroll_step(120, 7, 8)];
+        let mut step = type_step("在「XX」中输入");
+        let absorbed = merge_scroll_into_type(&mut step, &mut steps);
+
+        assert_eq!(absorbed, 2);
+        assert_eq!(step.scroll_delta, Some(-240));
+        assert_eq!(step.title, "向下滚动后在「XX」中输入");
     }
 }

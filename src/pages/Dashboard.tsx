@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useState, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
-import { Circle, Search, MoreVertical, Play, Pencil, FileText, Code, FileType, CheckCircle2, XCircle, Trash2, Pause, Square } from "lucide-react";
+import { Circle, Search, MoreVertical, Play, Pencil, CheckCircle2, XCircle, Trash2, Pause, Square, ListChecks, Download, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import FileSaveDialog from "../components/FileSaveDialog";
+import ExportDialog, { type ExportFormat, type ExportOptions } from "../components/ExportDialog";
+import type { Step } from "../types";
 import { useAuthStore } from "../store/authStore";
 
 interface Recording {
@@ -16,6 +17,8 @@ interface Recording {
   ai_generated: boolean;
   text_redacted: boolean;
   scan_redacted: boolean;
+  /** 来源域名（对齐插件 history 的 source_domain），无来源为空串 */
+  source_domain: string;
 }
 
 function formatTime(dateStr: string): string {
@@ -85,11 +88,21 @@ export default function Dashboard({
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   // ★ 批量删除：选中 id 集合（跨页保留，删除后清空）
   const [selected, setSelected] = useState<string[]>([]);
+  // ★ 批量模式（第二十一轮）：平时**不渲染**多选框列，点「批量」才进入；退出即清空选中。
+  //   用户原话：「加一个批量的按钮，批量删除，批量导出什么的，平时的时候多选框不显示」
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchExportOpen, setBatchExportOpen] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(null);
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  const [exportDialog, setExportDialog] = useState<{ id: string; format: string } | null>(null);
+  // ★ 单条导出：菜单里只留一个「导出」按钮，点击后弹出 ExportDialog 选格式/选项，
+  //   确认后直接导出到固定导出目录（不再弹保存框）。
+  const [exportDialog, setExportDialog] = useState<{ id: string } | null>(null);
+  // ★ 单条导出：弹窗打开时异步拉 steps，供 ExportDialog 导出前跑成片体检
+  const [exportSteps, setExportSteps] = useState<Step[] | null>(null);
   const [editingAppId, setEditingAppId] = useState<string | null>(null);
   const [appNameDraft, setAppNameDraft] = useState("");
   const appNameInputRef = useRef<HTMLInputElement>(null);
@@ -98,6 +111,19 @@ export default function Dashboard({
   const menuAnchorRef = useRef<DOMRect | null>(null);
   const [menuPlaced, setMenuPlaced] = useState(false);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  // 表头「全选」框：本页部分选中时要显示 indeterminate（原生属性得手动设）
+  const headCheckRef = useRef<HTMLInputElement>(null);
+
+  // ★ 单条导出体检数据：弹窗打开时拉一次 steps（失败静默，退回不拦截）
+  useEffect(() => {
+    if (!exportDialog) {
+      setExportSteps(null);
+      return;
+    }
+    invoke<{ recording: unknown; steps: Step[] }>("load_recording", { id: exportDialog.id })
+      .then((d) => setExportSteps(d.steps))
+      .catch(() => setExportSteps(null));
+  }, [exportDialog]);
 
   // Auto-dismiss toast（★ 10s：错误文案长，2s 看不完会误以为功能坏了）
   useEffect(() => {
@@ -144,33 +170,48 @@ export default function Dashboard({
     return () => document.removeEventListener("mousedown", handler);
   }, [openMenuId]);
 
-  // ★ 菜单渲染后测量实际高度：底部放不下则改为向上弹出（菜单底边贴按钮顶边）
+  // ★ 菜单渲染后测量真实尺寸：宽度是 max-content（随内容变），所以靠右对齐的 left
+  //   必须量出来再定，不能再用写死的 160；高度则决定要不要翻到按钮上方弹出。
+  //   测量发生在 useLayoutEffect 里（绘制前），而菜单在此之前 visibility:hidden，故无跳动。
   useLayoutEffect(() => {
     const el = menuRef.current;
     const anchor = menuAnchorRef.current;
     if (!openMenuId || !el || !anchor) return;
+    const w = el.offsetWidth;
     const h = el.offsetHeight;
-    // 仅在仍处于「默认向下」位置时判断翻转，避免 setState 回路
-    if (menuPos.top === anchor.bottom + 4) {
-      if (anchor.bottom + 4 + h > window.innerHeight - 8) {
-        setMenuPos({ top: Math.max(8, anchor.top - h - 4), left: anchor.right - 160 });
-        return;
-      }
-    }
+    let top = anchor.bottom + 4;
+    if (top + h > window.innerHeight - 8) top = Math.max(8, anchor.top - h - 4);
+    // 右边缘对齐 ⋮ 按钮；万一菜单比可用空间还宽/贴左边，兜到 8px 安全边距
+    const left = Math.max(8, Math.min(anchor.right - w, window.innerWidth - w - 8));
+    setMenuPos({ top, left });
     setMenuPlaced(true);
-  }, [openMenuId, menuPos]);
+  }, [openMenuId]);
 
-  const handleExport = (id: string, format: string) => {
+  const handleExport = (id: string) => {
     setOpenMenuId(null);
-    setExportDialog({ id, format });
+    setExportDialog({ id });
   };
 
-  const handleSaveConfirm = async (savedPath: string) => {
-    const { id, format } = exportDialog!;
+  // ★ 固定导出目录（第四十八轮）：选完格式/选项直接导出到「文档\录步导出」，
+  //   不再弹保存框选位置（顶栏有「打开导出目录」按钮随时去看）。
+  const handleSingleFormatSelect = async (format: ExportFormat, options: ExportOptions) => {
+    if (!exportDialog) return;
+    const id = exportDialog.id;
     setExportDialog(null);
+    let backendFormat: string = format;
+    if (backendFormat === "images") {
+      backendFormat = options.imageMode === "long" ? "long" : "images";
+    } else if (backendFormat === "word") {
+      backendFormat = "docx";
+    }
+    setToast({ type: "success", message: "正在导出…" });
     try {
-      const path = await invoke<string>("export_recording", { id, format, outputPath: savedPath });
-      setToast({ type: "success", message: `导出成功: ${path}` });
+      const path = await invoke<string>("export_recording", {
+        id,
+        format: backendFormat,
+        options,
+      });
+      setToast({ type: "success", message: `已导出到 ${path}` });
     } catch (err) {
       console.error("Export failed:", err);
       setToast({ type: "error", message: "导出失败: " + String(err) });
@@ -223,6 +264,52 @@ export default function Dashboard({
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   };
 
+  // ★ 退出批量模式：多选框整列消失 + 清空选中 + 清掉进度残留
+  const exitBatchMode = () => {
+    setBatchMode(false);
+    setSelected([]);
+    setBatchProgress(null);
+  };
+
+  // ★ 批量导出（第四十八轮）：选完格式/选项直接导出 ZIP 到「文档\录步导出」。
+  //   后端为每个录制建一个文件夹，统一打包成 ZIP。
+  const handleBatchExportStart = () => {
+    if (selected.length === 0) return;
+    setBatchExportOpen(true);
+  };
+
+  const handleBatchExportFormat = async (format: ExportFormat, options: ExportOptions) => {
+    setBatchExportOpen(false);
+    const ids = [...selected];
+    if (ids.length === 0) return;
+
+    let actualFormat: string = format;
+    if (actualFormat === "images") {
+      actualFormat = options.imageMode === "long" ? "long" : "images";
+    } else if (actualFormat === "word") {
+      actualFormat = "docx";
+    }
+
+    setBatchBusy(true);
+    setBatchProgress({ done: 0, total: ids.length });
+    try {
+      const result = await invoke<string>("batch_export_recordings", {
+        ids,
+        format: actualFormat,
+        options,
+      });
+      setBatchBusy(false);
+      setBatchProgress(null);
+      setSelected([]);
+      setToast({ type: "success", message: `已批量导出：${result}` });
+    } catch (err) {
+      console.error("Batch export failed:", err);
+      setBatchBusy(false);
+      setBatchProgress(null);
+      setToast({ type: "error", message: "批量导出失败: " + String(err) });
+    }
+  };
+
   const handleRename = async () => {
     if (!renamingId || !renameDraft.trim()) {
       setRenamingId(null);
@@ -269,7 +356,8 @@ export default function Dashboard({
     return recordings.filter(
       (r) =>
         r.title.toLowerCase().includes(q) ||
-        r.app_name.toLowerCase().includes(q)
+        r.app_name.toLowerCase().includes(q) ||
+        (r.source_domain || "").toLowerCase().includes(q)
     );
   }, [recordings, search]);
 
@@ -299,6 +387,14 @@ export default function Dashboard({
   // ★ 全选/反选当前页（跨页选择保留；放在 paged 定义之后避免 TDZ）
   const pagedIds = paged.map((r) => r.id);
   const allPageSelected = pagedIds.length > 0 && pagedIds.every((id) => selected.includes(id));
+  // ★ 本页「部分选中」⇒ 表头要显示 indeterminate（原生 checkbox 的这个属性只能手动设，
+  //   否则勾了 5/6 时表头看起来和「一个都没选」完全一样）
+  const somePageSelected = pagedIds.some((id) => selected.includes(id));
+  useEffect(() => {
+    if (headCheckRef.current) {
+      headCheckRef.current.indeterminate = somePageSelected && !allPageSelected;
+    }
+  }, [somePageSelected, allPageSelected, batchMode]);
   const toggleSelectPage = () => {
     setSelected((prev) =>
       allPageSelected
@@ -397,18 +493,55 @@ export default function Dashboard({
           <span className="dashboard-table-count">
             共 {filtered.length} 条记录
           </span>
-          {/* ★ 批量操作栏：有选中项时显示 */}
-          {selected.length > 0 && (
+          {/* ★ 批量操作栏：点「批量」进入后才出现。平时多选框整列不渲染，列表保持干净。 */}
+          {batchMode ? (
             <div className="dash-batchbar">
-              <span className="dash-batchbar-count">已选 {selected.length} 条</span>
-              <button className="dash-batchbar-btn dash-batchbar-del" onClick={() => void handleBatchDelete()} data-tip={"删除选中的所有录制\n连同截图一起删除，无法恢复"}>
+              {batchProgress ? (
+                <span className="dash-batchbar-count">
+                  正在导出 {batchProgress.done}/{batchProgress.total}…
+                </span>
+              ) : (
+                <span className="dash-batchbar-count">
+                  {selected.length > 0 ? `已选 ${selected.length} 条` : "勾选要处理的录制"}
+                </span>
+              )}
+              <button
+                className="dash-batchbar-btn"
+                disabled={selected.length === 0 || batchBusy}
+                onClick={() => void handleBatchExportStart()}
+                data-tip={"批量导出\n选中的录制各导出一个文件夹，最后打包成 ZIP"}
+              >
+                <Download size={13} />
+                批量导出
+              </button>
+              <button
+                className="dash-batchbar-btn dash-batchbar-del"
+                disabled={selected.length === 0 || batchBusy}
+                onClick={() => void handleBatchDelete()}
+                data-tip={"删除选中的所有录制\n连同截图一起删除，无法恢复"}
+              >
                 <Trash2 size={13} />
                 批量删除
               </button>
-              <button className="dash-batchbar-btn" onClick={() => setSelected([])} data-tip="清空选中，不删除任何东西">
-                取消选择
+              <button
+                className="dash-batchbar-btn"
+                disabled={batchBusy}
+                onClick={exitBatchMode}
+                data-tip="退出批量，多选框收起"
+              >
+                <X size={13} />
+                取消
               </button>
             </div>
+          ) : (
+            <button
+              className="dash-batchbar-btn"
+              onClick={() => setBatchMode(true)}
+              data-tip={"批量处理\n进入后可以勾选多条录制，批量导出或批量删除"}
+            >
+              <ListChecks size={13} />
+              批量
+            </button>
           )}
         </div>
 
@@ -466,15 +599,18 @@ export default function Dashboard({
               <table className="table">
                 <thead>
                   <tr>
-                    <th style={{ width: 36 }}>
-                      <input
-                        type="checkbox"
-                        className="dash-check"
-                        checked={allPageSelected}
-                        onChange={toggleSelectPage}
-                        data-tip="全选/取消本页"
-                      />
-                    </th>
+                    {batchMode && (
+                      <th style={{ width: 36 }}>
+                        <input
+                          type="checkbox"
+                          className="dash-check"
+                          ref={headCheckRef}
+                          checked={allPageSelected}
+                          onChange={toggleSelectPage}
+                          data-tip="全选/取消本页"
+                        />
+                      </th>
+                    )}
                     <th>标题</th>
                     <th style={{ width: 120 }}>应用</th>
                     <th style={{ width: 100 }}>状态</th>
@@ -486,18 +622,21 @@ export default function Dashboard({
                   {paged.map((r) => (
                     <tr
                       key={r.id}
-                      onClick={() => onEdit(r.id)}
+                      /* 批量模式下行点击 = 切换勾选；平时 = 打开编辑器（选中列不存在时保持旧行为） */
+                      onClick={() => (batchMode ? toggleSelected(r.id) : onEdit(r.id))}
                       style={{ cursor: "pointer" }}
                       className={selected.includes(r.id) ? "dash-row-selected" : ""}
                     >
-                      <td onClick={(e) => e.stopPropagation()}>
-                        <input
-                          type="checkbox"
-                          className="dash-check"
-                          checked={selected.includes(r.id)}
-                          onChange={() => toggleSelected(r.id)}
-                        />
-                      </td>
+                      {batchMode && (
+                        <td onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            className="dash-check"
+                            checked={selected.includes(r.id)}
+                            onChange={() => toggleSelected(r.id)}
+                          />
+                        </td>
+                      )}
                       <td onClick={(e) => renamingId === r.id && e.stopPropagation()}>
                         {renamingId === r.id ? (
                           <input
@@ -543,6 +682,11 @@ export default function Dashboard({
                             {r.app_name || "—"}
                           </span>
                         )}
+                        {r.source_domain && (
+                          <div className="dashboard-source" data-tip="来源网站（步骤页面域名）">
+                            来自 {r.source_domain}
+                          </div>
+                        )}
                       </td>
                       <td>
                         <span
@@ -573,7 +717,8 @@ export default function Dashboard({
                               const rect = e.currentTarget.getBoundingClientRect();
                               menuAnchorRef.current = rect;
                               setMenuPlaced(false);
-                              setMenuPos({ top: rect.bottom + 4, left: rect.right - 160 });
+                              // 占位值，真实 left/top 由下面的 useLayoutEffect 按实测尺寸覆盖（绘制前完成）
+                              setMenuPos({ top: rect.bottom + 4, left: Math.max(8, rect.right - 96) });
                               setOpenMenuId(r.id);
                             }
                           }}
@@ -659,51 +804,33 @@ export default function Dashboard({
           <div className="dropdown-divider" />
           <button
             className="dropdown-item"
-            onClick={() => handleExport(openMenuId, "pdf")}
-            data-tip="导出成 PDF，适合直接发给别人看或打印"
+            onClick={() => handleExport(openMenuId)}
+            data-tip="导出为 PDF / Word / PPT / HTML / 视频 / 图片等"
           >
-            <FileText size={14} />
-            导出 PDF
-          </button>
-          <button
-            className="dropdown-item"
-            onClick={() => handleExport(openMenuId, "html")}
-            data-tip="导出成单个 HTML 文件，带目录，双击即可打开"
-          >
-            <Code size={14} />
-            导出 HTML
-          </button>
-          <button
-            className="dropdown-item"
-            onClick={() => handleExport(openMenuId, "docx")}
-            data-tip="导出成 Word 文档，方便交给同事继续编辑"
-          >
-            <FileType size={14} />
-            导出 Word 文档
+            <Download size={14} />
+            导出
           </button>
         </div>
       )}
 
-      {/* Custom Save Dialog */}
-      {exportDialog && (() => {
-        const formatLabels: Record<string, string> = { html: "HTML", markdown: "Markdown", pdf: "PDF" };
-        const formatExt: Record<string, string> = { html: "html", markdown: "md", pdf: "pdf" };
-        const fmt = exportDialog.format;
-        const rec = recordings.find((r) => r.id === exportDialog.id);
-        const defaultName = (rec?.title || "recording")
-          .replace(/[\\/:*?"<>|]/g, "_")
-          .substring(0, 120) + "." + (formatExt[fmt] || fmt);
-        return (
-          <FileSaveDialog
-            isOpen={true}
-            title={`导出为 ${formatLabels[fmt] || fmt}`}
-            defaultName={defaultName}
-            filters={[{ name: formatLabels[fmt] || fmt, extensions: [formatExt[fmt] || fmt] }]}
-            onClose={() => setExportDialog(null)}
-            onSave={handleSaveConfirm}
-          />
-        );
-      })()}
+      {/* 批量导出：选格式/选项后直接导出 ZIP 到固定导出目录 */}
+      {batchExportOpen && (
+        <ExportDialog
+          isOpen={true}
+          onClose={() => setBatchExportOpen(false)}
+          onSelect={(format, options) => void handleBatchExportFormat(format, options)}
+        />
+      )}
+
+      {/* 单条导出：选格式/选项后直接导出到固定导出目录 */}
+      {exportDialog && (
+        <ExportDialog
+          isOpen={true}
+          onClose={() => setExportDialog(null)}
+          onSelect={(format, options) => void handleSingleFormatSelect(format, options)}
+          steps={exportSteps ?? undefined}
+        />
+      )}
 
       {/* Toast notification */}
       {toast && createPortal(

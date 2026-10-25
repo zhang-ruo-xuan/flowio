@@ -1,5 +1,10 @@
 # 录步 Flowio · 桌面端
 
+> ⛔ **已退役（2026-10-12）**：这一代桌面端把编辑器做在了客户端里，与现行形态冲突——
+> 现行薄桌面是 `D:/projects/flowio-lite`（采集在桌面、编辑与存储在网站），
+> 公开下载入口已指向 `/download/Flowio-Lite-Setup-0.3.0.exe`。
+> 本目录仅作历史留盘：不再发版、不再修缺陷。
+
 > 软件操作教程，录一遍就好。
 
 [![Platform](https://img.shields.io/badge/platform-Windows_10+-blue?logo=windows)](https://gitee.com/zhangruoxuan/flowio)

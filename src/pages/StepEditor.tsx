@@ -13,6 +13,7 @@ import {
   Sparkles,
   Eye,
   Plus,
+  Minus,
   ChevronUp,
   Trash2,
   FileCode,
@@ -21,6 +22,8 @@ import {
   ImageIcon,
   ShieldCheck,
   ScanSearch,
+  Minimize2,
+  Maximize2,
   Settings as SettingsIcon,
   Wrench,
   Upload,
@@ -30,21 +33,165 @@ import {
   Wand2,
   Undo2,
   Redo2,
+  Hash,
+  Camera,
+  Lightbulb,
+  TriangleAlert,
+  FolderInput,
+  Highlighter,
+  /* 第十九轮：简介块图标 + 整页缩放三键 */
+  AlignLeft,
+  ZoomIn,
+  ZoomOut,
+  RotateCcw,
+  /* 第二十轮：目录行的拖拽把手 */
+  GripVertical,
+  /* 第二十四轮：目录批量删除入口（缩略图网格已按用户要求整块移除） */
+  ListChecks,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+  /* 视频步骤自绘控制条：替换原生 controls 的 −/+（原生倍速步进 0.21x 之类太怪，且不可控） */
+  Play,
+  Pause,
 } from "lucide-react";
-import { useNavigate, useParams } from "react-router-dom";
-import { invoke } from "@tauri-apps/api/core";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import FileSaveDialog from "../components/FileSaveDialog";
+import ExportDialog, { type ExportOptions } from "../components/ExportDialog";
 import { AUTOMATION_ENABLED } from "../config/automation";
 import AnnotationsOverlay from "../components/AnnotationsOverlay";
 import LoginSaveModal from "../components/LoginSaveModal";
 import type { Annotation } from "../lib/annotate";
-import { CROP_PAD, type CropAnchor } from "../lib/cropAnchor";
-import { isUniformCropPixels } from "../lib/cropBlank";
+import { type CropAnchor, cropBoxFromAnchorFrac } from "../lib/cropAnchor";
 import { previewBox, type PreviewBox } from "../lib/previewBox";
+// ★ v0.65.244 对齐：成片预览体检（静态校验纯函数，口径同插件 lib/preview.ts + verify.ts）
+import { healthSummaryOf, healthLabel, type HealthIssue } from "../lib/previewHealth";
+// ★ T9：团队库的过滤口径与措辞口径单点（纯函数）+ 网络层
+import {
+  TEAM_PUBLISH_LABEL,
+  TEAM_PUBLISH_NONE,
+  TEAM_PUBLISH_NONE_LABEL,
+  TEAM_PUBLISH_EMPTY_HINT,
+  teamWorkspaceLabel,
+  composePublishToast,
+  type TeamWorkspace,
+} from "../lib/teamPublish";
+import { listMyWorkspaces, attachTutorialToWorkspace } from "../lib/teamApi";
+// ★ r65「在网页编辑」（对齐 Scribe）：URL 形态与措辞的口径单点
+import { SITE_ORIGIN, webEditUrl, webSlugKey, WEB_EDIT_BUTTON, WEB_EDIT_HINT, WEB_EDIT_NEED_LOGIN, WEB_EDIT_OPEN_FAILED } from "../lib/webEdit";
 import type { Recording, Step } from "../types";
 import { useAppStore } from "../store/appStore";
+import {
+  normalizeInlineHtml,
+  sanitizeStoredHtml,
+  htmlToPlainText,
+  escapeText,
+  RICH_TEXT_COLORS,
+  RICH_HIGHLIGHTS,
+} from "../lib/richText";
+
+/* ── 文档块 / 补充说明类型（2026-09-19 第十三轮）────────────── */
+
+/** 大标题块：不占步骤编号、不计入步骤总数 */
+const isHeadingBlock = (s: Step) => (s.block_kind ?? "step") === "heading";
+
+/** 流程摘要块：录制结束时自动生成、固定在正文最前，同样不占编号（2026-09-19 第十六轮） */
+const isSummaryBlock = (s: Step) => (s.block_kind ?? "step") === "summary";
+
+/** 简介块：用户在正文里自己写的引子（第十九轮）。同样是文档块 —— 正文存 description */
+const isIntroBlock = (s: Step) => (s.block_kind ?? "step") === "intro";
+
+/** 文档块 = 大标题 / 流程摘要 / 简介：都不参与步骤编号，也不算进「N 个步骤」 */
+const isDocBlock = (s: Step) => isHeadingBlock(s) || isSummaryBlock(s) || isIntroBlock(s);
+
+/* ── 第二十轮：步骤媒体（图片 / GIF 动图 / 视频）──────────────────── */
+
+/** 这一步是视频吗（mp4 / webm）。录制截图与手传图片都返回 false。 */
+const isVideoStep = (s: Step) => (s.media_kind ?? "image") === "video";
+
+/** 视频的播放地址 —— 走 Tauri 的 asset 协议直接读本地文件（base64 那一份是首帧，不是视频）。 */
+const stepVideoSrc = (s: Step) =>
+  s.screenshot_path ? convertFileSrc(s.screenshot_path) : "";
+
+/** 允许手传的媒体扩展名（真正的闸门在 Rust 侧 `normalize_media_ext`，这里只管别选错文件）。 */
+const MEDIA_EXT_RE = /\.(png|jpe?g|webp|gif|mp4|webm)$/i;
+/** 单个媒体文件大小上限（MB）。视频为主 —— 再大 base64 走一遍 IPC 会明显卡。 */
+const MEDIA_MAX_MB = 64;
+
+/** 从文件名取小写扩展名（无扩展名返回空串）。 */
+const extOf = (name: string) => {
+  const m = /\.([A-Za-z0-9]+)$/.exec(name);
+  return m ? m[1].toLowerCase() : "";
+};
+
+/**
+ * 摘要正文 → 概述段 + 要点列表。
+ * 与 Rust 端 `export::commands::parse_summary` 是**同一套口径**（改一处要同步另一处）：
+ * 以 `-`/`•`/`*` 开头的行算要点，要点里第一对 `**…**` 是名字、其后到行尾是说明；
+ * 其余非空行拼成概述段。
+ */
+const parseSummary = (text: string): { intro: string; bullets: Array<{ name: string; detail: string }> } => {
+  const intro: string[] = [];
+  const bullets: Array<{ name: string; detail: string }> = [];
+  for (const raw of (text ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const head = line[0];
+    if (head === "-" || head === "•" || head === "*") {
+      const item = line.slice(1).trim();
+      const m = /\*\*(.+?)\*\*/.exec(item);
+      if (m && m.index !== undefined) {
+        const name = m[1].trim();
+        const detail = item.slice(m.index + m[0].length).trim().replace(/^[：:]\s*/, "").trim();
+        bullets.push({ name, detail });
+      } else {
+        bullets.push({ name: "", detail: item });
+      }
+    } else {
+      intro.push(line);
+    }
+  }
+  return { intro: intro.join(""), bullets };
+};
+
+/** 步骤「补充说明」的类型：'' 普通描述 / 'mark' 标注 / 'warn' 警告 */
+const noteKindOf = (s: Step): "" | "mark" | "warn" =>
+  s.note_kind === "mark" || s.note_kind === "warn" ? s.note_kind : "";
+
+/** 三种说明类型：进描述框才浮出的那三个小图标 */
+/** 补充说明的类型。第十五轮起用文字 chip（描述 / 标注 / 警告）替掉原来的三个图标方块：
+    文字比图标好认，标签常显也省掉了「悬停才敢点」的猜谜。 */
+const NOTE_KINDS: Array<{ id: "" | "mark" | "warn"; label: string; tip: string }> = [
+  { id: "", label: "描述", tip: "描述：普通补充说明" },
+  { id: "mark", label: "标注", tip: "标注：这一步要注意的点" },
+  { id: "warn", label: "警告", tip: "警告：做错了会出什么问题" },
+];
+
+const NOTE_PLACEHOLDER: Record<"" | "mark" | "warn", string> = {
+  "": "补充描述（可留空）",
+  mark: "标注：这一步要注意什么",
+  warn: "警告：做错了会怎样",
+};
+
+/** 大标题层级 1..4（与参考产品的 H1~H4、导出侧 heading_level 一致） */
+const HEADING_LEVELS = [1, 2, 3, 4] as const;
+
+/** 每步草稿：就地改过但还没落库的标题/描述/大标题富文本 */
+interface StepDraft {
+  title: string;
+  description: string;
+  /** 大标题富文本正文；undefined = 这次没动富文本（落库时 COALESCE 保留旧值） */
+  titleHtml?: string;
+}
+
+/** 大标题的初始 HTML：有富文本用富文本，否则是转义后的纯文本 */
+const headingInitialHtml = (s: Step): string => {
+  const rich = sanitizeStoredHtml(s.title_html ?? "");
+  if (rich.trim()) return rich;
+  return escapeText(s.title ?? "");
+};
 
 /* ── Export format options ─────────────────────────────────── */
 
@@ -111,126 +258,164 @@ const FALLBACK_CATEGORIES = [
   { id: "other", name: "其他", slug: "other" },
 ];
 
-/* ── Crop helper（Scribe-style 自适应裁剪）────────────── */
-
-// 元素矩形外扩 padding（px）—— 8px 让文本贴边但留呼吸。
-// 从 lib/cropAnchor 引入，与「手动框选裁图」的反算共用同一个取值，避免两处分叉。
-/** 无元素矩形时，以点击点为中心裁屏幕的此比例 */
-const CROP_FALLBACK_RATIO = 0.4;
+/* ── 左右两栏宽度（第十八轮） ─────────────────────────────── */
 
 /**
- * 将全图（screenshot_base64）按 Scribe 风格自适应裁剪：
- * - 整窗类型（scroll/nav/screenshot）：原样返回不裁剪；
- * - type：元素矩形左扩 1/3 宽，带出左侧 label（如"用户名/密码"）；
- * - 有元素矩形 (crop_w/crop_h，中心 x/y)：以矩形外扩 CROP_PAD 为基准，
- *   不足 CROP_MIN_SIZE 以中心外扩补足，超过屏幕 90% 等比缩放，保留宽高比；
- * - 无矩形但有点击坐标：以点击点为中心裁屏幕约 CROP_FALLBACK_RATIO 兜底；
- * - 其余情况回退原图。边界 clamp，输出 JPEG 质量 85 的 base64。
+ * 目录栏宽度可拖拽调节。
+ *
+ * 背景：第十七轮把正文列固定成 900px 居中，结果窗口一宽，正文就只剩中间一条、
+ * 两侧全是留白（用户原话「不要在局部变小，要在整体想办法」）。
+ * 现在改成**整体分配**：把两栏之间那条缝做成可拖的分隔条 —— 目录栏拖窄，
+ * 右栏连同里面的截图就整体跟着变小。
  */
-function cropAdaptiveBase64(
+const SIDE_W_KEY = "flowio_editor_sidebar_w";
+const SIDE_W_DEFAULT = 320;
+const SIDE_W_MIN = 200;
+/** 第三十二轮：400 → 272。用户圈着左栏右边界那条分隔条说「向左移动 10%」。
+   真机截图实测量化（物理 px，窗口 1375 / scale 1.255 ⇒ 窗口 1096 CSS）：
+     分隔条在物理 x=479 ⇒ 左栏占整窗 34.8%（CSS 值 380，与 localStorage 一致）
+     「向左移 10%」= 整窗宽度的 10% ⇒ 目标 24.8% ⇒ 380 × 0.713 ≈ 271。
+   ⚠️ 第三十轮把 760→400 是空操作：真机存的 380 本来就在 400 以内。
+   这次 272 < 380，clampSideWidth 初始化时就会把它收回来，用户不用手动拖。 */
+const SIDE_W_MAX = 272;
+/** 右栏至少留出这么宽，否则「拖到最左」会把正文挤没 */
+const SIDE_W_RESERVE = 420;
+
+const clampSideWidth = (w: number): number => {
+  const winW = typeof window === "undefined" ? 1440 : window.innerWidth;
+  const upper = Math.max(SIDE_W_MIN, Math.min(SIDE_W_MAX, winW - SIDE_W_RESERVE));
+  return Math.round(Math.min(Math.max(w, SIDE_W_MIN), upper));
+};
+
+/* ── 整页缩放（第十九轮） ───────────────────────────────────
+   目录标题右边那组「－ ＋ ⟲」调的是**整页比例**：目录栏与正文一起缩放，
+   像浏览器的 Ctrl+±（字号、内边距、控件都按比例走；顶栏那排工具键在外壳里，不动）。
+   实现用 CSS `zoom` 作用在包住两栏的 .editor-zoom 上（不是 webview 缩放）：
+   ① 布局会真的重排（transform: scale 不会）；② 无头实测台能量到真实几何。
+   ⚠️ zoom 会放大长度值 ⇒ 分隔条拖拽的鼠标位移必须除以 zoom，否则拖 100px 会跑 100*zoom。
+   档位收到 0.7~1.5：再往上目录栏会宽到把正文挤掉一块（正文是弹性宽度）。 */
+const ZOOM_KEY = "flowio_editor_zoom";
+const ZOOM_STEPS = [0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.5];
+const ZOOM_DEFAULT = 1;
+const ZOOM_MIN = ZOOM_STEPS[0];
+const ZOOM_MAX = ZOOM_STEPS[ZOOM_STEPS.length - 1];
+
+/** 收进合法区间，并吸附到最近的档位（历史值/手改 localStorage 都不会跑飞） */
+const normalizeZoom = (v: number): number => {
+  if (!Number.isFinite(v) || v <= 0) return ZOOM_DEFAULT;
+  let best = ZOOM_DEFAULT;
+  for (const s of ZOOM_STEPS) {
+    if (Math.abs(s - v) < Math.abs(best - v)) best = s;
+  }
+  return best;
+};
+
+/** 从任意当前值算「上一档 / 下一档」（值可能不在档位表里，先夹到区间内） */
+const stepZoom = (cur: number, dir: 1 | -1): number => {
+  const v = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, cur));
+  if (dir > 0) {
+    for (const s of ZOOM_STEPS) if (s > v + 1e-6) return s;
+    return ZOOM_MAX;
+  }
+  for (let i = ZOOM_STEPS.length - 1; i >= 0; i -= 1) {
+    if (ZOOM_STEPS[i] < v - 1e-6) return ZOOM_STEPS[i];
+  }
+  return ZOOM_MIN;
+};
+
+/* ── 重点图 helper ───────────────────────────────────────── */
+
+/** 默认显示倍率：1 = 图片完整填满截图框（100% 显示），超出画面的边缘被容器裁掉。
+    −/+ 以此为基准按 10% 档位缩放；用户主动放大（>1）时才进入「重点图」取景。 */
+const SHOT_ZOOM_DEFAULT = 1;
+
+/**
+ * 把整图裁成「重点图」—— 也就是前端 CSS `transform: scale(z)` +
+ * `transform-origin: 操作落点` 放大后读者真正看见的那块区域。
+ * 发布/封面上传走这条；导出由 Rust 端 `focus_shot_box` 等价实现（公式必须一致）。
+ *
+ * 推导：整图 W×H、倍率 z、落点 (cx, cy)。可见区域宽高 W/z、H/z；
+ * 落点在区域内的相对位置与其在整图内一致 ⇒ left = cx·(1 − 1/z)。
+ * 倍率 ≤ 1 或落点缺失 → 原样返回整图（不重编码、不丢信息）。
+ */
+function focusShotBase64(
   base64: string,
   x: number | null,
   y: number | null,
-  cropW: number | null,
-  cropH: number | null,
-  actionType?: string,
+  zoom: number,
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       try {
         const W = img.naturalWidth;
         const H = img.naturalHeight;
-        if (W <= 0 || H <= 0) {
-          resolve(base64);
-          return;
-        }
-
-        // Stage C: 整窗类型不裁剪，原样返回
-        if (actionType === "scroll" || actionType === "nav" || actionType === "screenshot") {
-          resolve(base64);
-          return;
-        }
-
-        let left: number;
-        let top: number;
-        let cw: number;
-        let ch: number;
-
-        if (cropW != null && cropH != null && cropW > 0 && cropH > 0 && x != null && y != null) {
-          // 严格按元素真实矩形裁切：尊重原宽高比，仅加 CROP_PAD 让文本贴边但不贴死。
-          // 不强制最小/最大尺寸，避免把 URL 地址栏这种长条拉成大方块把文字糊掉。
-          let rw = cropW + CROP_PAD * 2;
-          let rh = cropH + CROP_PAD * 2;
-          // Stage C: type 步骤左侧多留原始矩形宽的 1/3，把左侧 label 带进裁剪图。
-          // ⚠️ 是 - extra / 2 不是 - extra：rw 已含 extra，居中项 x - rw/2 已在左右
-          // 各分到 extra/2；再左移 extra 会过冲，使右侧留白变成 CROP_PAD - extra/2
-          // （元素宽 > 48px 即为负，右边缘被切掉）。与 lib/cropAnchor 保持一致。
-          if (actionType === "type") {
-            const extra = Math.round(cropW / 3);
-            rw += extra;
-            left = Math.round(x - rw / 2 - extra / 2);
-            top = Math.round(y - rh / 2);
-          } else if (actionType === "drag") {
-            // DRAG 步骤高度方向多留上下文：拖拽选区多为扁长（表格行 ~25px），
-            // 仅 +16px（CROP_PAD*2）看不出在拖哪里。额外至少 100px（约 4 行）、
-            // 并按选区高 0.6× 增长，让裁图带出周围行/列，用户能辨认拖拽位置与内容。
-            const extraH = Math.max(Math.round(cropH * 0.6), 100);
-            rh += extraH;
-            top = Math.round(y - rh / 2);
-            left = Math.round(x - rw / 2);
-          } else {
-            left = Math.round(x - rw / 2);
-            top = Math.round(y - rh / 2);
-          }
-          cw = rw;
-          ch = rh;
-        } else if (x != null && y != null && x >= 0 && y >= 0) {
-          // 无矩形兜底：以点击点为中心裁屏幕约 40%
-          cw = Math.max(1, Math.round(W * CROP_FALLBACK_RATIO));
-          ch = Math.max(1, Math.round(H * CROP_FALLBACK_RATIO));
-          left = Math.round(x - cw / 2);
-          top = Math.round(y - ch / 2);
-        } else {
-          resolve(base64);
-          return;
-        }
-
-        // 贴边时整体平移进图内，而不是缩小裁剪框 —— 缩小会把内容切掉一半，
-        // 且锚点被挤到一边（用户报：复制的地方不在裁图中间）。
-        cw = Math.min(cw, W);
-        ch = Math.min(ch, H);
-        left = Math.min(Math.max(0, left), Math.max(0, W - cw));
-        top = Math.min(Math.max(0, top), Math.max(0, H - ch));
-        if (cw <= 0 || ch <= 0) {
-          resolve(base64);
-          return;
-        }
-
+        if (W <= 0 || H <= 0 || !Number.isFinite(zoom) || zoom <= 1) { resolve(base64); return; }
+        if (x == null || y == null || x < 0 || y < 0 || x > W || y > H) { resolve(base64); return; }
+        const z = Math.min(zoom, 4);
+        const cw = Math.max(1, Math.min(W, Math.round(W / z)));
+        const ch = Math.max(1, Math.min(H, Math.round(H / z)));
+        const k = 1 - 1 / z;
+        const left = Math.min(Math.max(0, Math.round(x * k)), W - cw);
+        const top = Math.min(Math.max(0, Math.round(y * k)), H - ch);
         const canvas = document.createElement("canvas");
         canvas.width = cw;
         canvas.height = ch;
         const ctx = canvas.getContext("2d");
-        if (!ctx) {
-          resolve(base64);
-          return;
-        }
+        if (!ctx) { resolve(base64); return; }
         ctx.drawImage(img, left, top, cw, ch, 0, 0, cw, ch);
-        // 空白裁剪守卫：录制时 UIA 不可用会记到「Program Manager」宿主伪元素矩形，
-        // 裁出纯灰空白、毫无信息量 —— 回退整图（见 lib/cropBlank.ts 同步清单）。
-        const guard = ctx.getImageData(0, 0, cw, ch);
-        if (isUniformCropPixels(guard.data, cw, ch)) {
-          resolve(base64);
-          return;
-        }
         resolve(canvas.toDataURL("image/jpeg", 0.85).split(",")[1] || base64);
-      } catch (err) {
-        reject(err);
-      }
+      } catch { resolve(base64); }
     };
-    img.onerror = () => reject(new Error("截图解码失败"));
+    img.onerror = () => resolve(base64);
     img.src = `data:image/jpeg;base64,${base64}`;
   });
+}
+
+/**
+ * ★ 复刻插件「统一改变截图大小」：按锚点中心裁出 frac 比例的取景窗（JPEG base64）。
+ * 无锚点（scroll/navigate 整窗截图或已手动裁切）时以图中心兜底 —— 与插件
+ * 批量放宽到"所有有截图的步"同口径；裁切失败（载图失败等）返回 null，调用方跳过。
+ */
+function cropBase64ByAnchorFrac(
+  base64: string,
+  anchor: { x: number; y: number } | null,
+  frac: number,
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const W = img.naturalWidth;
+        const H = img.naturalHeight;
+        if (W <= 0 || H <= 0) { resolve(null); return; }
+        const center = anchor ?? { x: Math.round(W / 2), y: Math.round(H / 2) };
+        const r = cropBoxFromAnchorFrac(center, frac, W, H);
+        const canvas = document.createElement("canvas");
+        canvas.width = r.width;
+        canvas.height = r.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) { resolve(null); return; }
+        ctx.drawImage(img, r.x, r.y, r.width, r.height, 0, 0, r.width, r.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.9).split(",")[1] || null);
+      } catch { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = `data:image/jpeg;base64,${base64}`;
+  });
+}
+
+/** 读取某教程的重点图倍率偏好（localStorage 首屏同步缓存；SQLite 才是权威存储） */
+function readInitialZoom(recordingId: string | undefined): Record<string, number> {
+  if (!recordingId) return {};
+  try {
+    const raw = localStorage.getItem(`flowio_view_${recordingId}`);
+    if (raw) {
+      const z = JSON.parse(raw)?.shotZoom;
+      if (z && typeof z === "object" && !Array.isArray(z)) return z as Record<string, number>;
+    }
+  } catch { /* 坏数据忽略 → 全部走默认 125% */ }
+  return {};
 }
 
 /* ── Lightbox ──────────────────────────────────────────────── */
@@ -307,6 +492,7 @@ function Lightbox({
         {/* Footer bar */}
         <div className="lightbox-footer">
           <span>
+            {/* 这里收到的是已经滤掉文档块的列表（调用方传 realSteps） */}
             {step.step_number} / {steps.length}
           </span>
         </div>
@@ -321,6 +507,8 @@ interface StepEditorProps {
   siteToken?: string | null;
   siteUser?: { id: string; email?: string; display_name?: string; bio?: string; avatar?: string } | null;
   voiceTranscribing?: boolean;
+  /** 「续录」：从这个位置往后接着录（录制归 App 管，编辑器只负责发起） */
+  onResumeInto?: (recordingId: string, insertAfter: number) => void;
 }
 
 // 把 base64 截图压缩为更小的 JPEG，降低上传体积，避免“保存草稿/发布”因请求体过大而失败
@@ -398,7 +586,7 @@ async function downscaleBase64Image(dataUrl: string, maxWidth = 1280, quality = 
   });
 }
 
-export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: StepEditorProps) {
+export default function StepEditor({ siteToken, siteUser, voiceTranscribing, onResumeInto }: StepEditorProps) {
   const { id } = useParams<{ id: string }>();
   const recordingId = id!;
   const navigate = useNavigate();
@@ -411,13 +599,104 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
 
   /* UI state */
   const [selectedStepId, setSelectedStepId] = useState<string>("");
-  const [editTitle, setEditTitle] = useState("");
-  const [editDescription, setEditDescription] = useState("");
-  // 变量标记（SKILL.md 自动化导出用）：仅输入类步骤（type/paste）可标
-  const [editIsVar, setEditIsVar] = useState(false);
-  const [editParamName, setEditParamName] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [saveSuccess, setSaveSuccess] = useState(false);
+  /* ── 通篇滚动编辑（2026-09-19）───────────────────────────────
+     编辑态右栏把所有步骤排成一条可滚动的文档流，滑到哪改到哪。
+     每步一份未落库草稿 drafts：改动 800ms 防抖落库，落库成功后清掉草稿
+     （输入框随即回到"以 steps 为准"，值相同所以无感）。
+     防抖回调里用 stepsRef 取最新步骤，避免闭包拿到旧数组。 */
+  const [drafts, setDrafts] = useState<Record<string, StepDraft>>({});
+  const draftTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  /* 每步「提示」展开态（默认收起，别让 AI 说明把通篇流撑满） */
+  const [openTips, setOpenTips] = useState<Record<string, boolean>>({});
+  /* 左栏颗粒 ＋ 的插入菜单（第十三轮）：步骤 / 大标题 / 导入已有教程 / 续录 */
+  const [insertMenu, setInsertMenu] = useState<{ index: number; x: number; y: number } | null>(null);
+
+  /* ── 流程摘要（2026-09-19 第十六轮）─────────────────────────── */
+  /** 正在重新生成摘要的那一步（按钮转圈 + 防连点） */
+  const [summaryBusy, setSummaryBusy] = useState<string | null>(null);
+  /** 哪张摘要卡切到了「原文编辑」态（默认看排版好的卡片，点编辑才变输入框） */
+  const [summaryEditId, setSummaryEditId] = useState<string | null>(null);
+
+  /* ── 整页缩放（2026-09-19 第十九轮）───────────────────────────
+     用户点的是目录标题旁那组「－ ＋ ⟲」：比例恢复原样 = 回到 100%。 */
+  const [pageZoom, setPageZoom] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(ZOOM_KEY);
+      return raw == null ? ZOOM_DEFAULT : normalizeZoom(Number(raw));
+    } catch {
+      return ZOOM_DEFAULT;
+    }
+  });
+
+  /* ── 大标题富文本 + 目录栏（2026-09-19 第十四轮）────────────── */
+  /** 正在编辑哪个大标题（工具条跟着它走）；null = 没在编辑 */
+  const [activeHeadingId, setActiveHeadingId] = useState<string | null>(null);  /** 工具条里的取色下拉：null / 'text' 字色 / 'hl' 高亮 */
+  const [colorMenu, setColorMenu] = useState<null | "text" | "hl">(null);
+  /** 目录栏里折起来的大标题 id（只影响左栏，不动右侧文档流） */
+  const [collapsedHeadings, setCollapsedHeadings] = useState<Set<string>>(new Set());
+
+  /* ── 目录批量删除（2026-09-20 第二十三轮加，第二十四轮保留）──────
+     缩略图网格形态已按用户要求整块移除（2026-09-20），目录只保留大纲列表。
+     批量态：目录步骤项出勾选框（标题/摘要/简介块不参与）+ 目录底部操作条
+     「已选 N 步 · 删除 · 取消」，0 选中禁用删除。 */
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchChecked, setBatchChecked] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const toggleBatchMode = () => {
+    setBatchMode((b) => !b);
+    setBatchChecked(new Set());
+  };
+  const toggleBatchCheck = (id: string) =>
+    setBatchChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  /** 目录栏拖拽排序：正在拖谁 / 准备插到谁的前后 */
+  const [dragStepId, setDragStepId] = useState<string | null>(null);
+  const [dropAt, setDropAt] = useState<{ id: string; after: boolean } | null>(null);
+  /* 「导入已有教程」选择器 */
+  const [importFor, setImportFor] = useState<{ index: number } | null>(null);
+  const [importList, setImportList] = useState<
+    Array<{ id: string; title: string; total_steps: number; created_at: string }>
+  >([]);
+  const [importBusy, setImportBusy] = useState(false);
+  /* ── 重点图 · 图片显示倍率（2026-09-19 第十一轮，2026-10-06 更新口径）──
+     框显示图片的比例：100% = 整图全貌填满框（最小），+ 放大到 175%（最大），
+     每档 10%；以操作落点（点击坐标 x/y）为原点缩放，超出卡片的边缘由容器裁掉。
+     纯前端展示态，不落库、不影响导出。 */
+  /* 重点图倍率（按步）：默认 100%，用户用 −/+ 或圆钮调过之后必须记住 ——
+     否则刷新/重进又被默认 100% 吞掉，等于白调。落库见下方持久化 effect。 */
+  const [shotZoom, setShotZoom] = useState<Record<string, number>>(
+    () => readInitialZoom(recordingId)
+  );
+  /* 重点图缩放原点模式（按步）：true = 以截图中心为缩放中心（−/+ 放大镜微调）；
+     false = 以操作落点（点击坐标）为缩放中心（准星「放大至点击位置」）。
+     纯 UI 显示语义，不落库、不改烧录数据；刷新后回落默认的落点模式。 */
+  const [shotZoomCenter, setShotZoomCenter] = useState<Record<string, boolean>>({});
+  /* 单步「查看全图」开关（按步）：true = 显示 before 全图（100%，scale 1）；
+     false = 显示当前主截图（当前图片比例，含倍率与落点缩放）。
+     由图片右下角定位圆钮切换（当前比例 ↔ 100%），纯 UI 显示态，不落库。 */
+  const [showFullShot, setShowFullShot] = useState<Record<string, boolean>>({});
+  const isFullShot = (stepId: string) => !!showFullShot[stepId];
+  const exitFullShot = (stepId: string) =>
+    setShowFullShot((prev) => (prev[stepId] ? { ...prev, [stepId]: false } : prev));
+  /* 单步「顶栏全局比例态」开关（按步）：true = 显示当前主图（真实比例裁剪图，
+     如 50%）原样填满框（scale 100/disp，以操作落点为原点）；
+     false = 显示整图全貌 / 放大微调态。
+     由图片右下角右边按钮切换（100% 整图 ↔ 顶栏全局比例），纯 UI 显示态，
+     不落库；−/+ 不进入该区间，从顶栏态起步时先回到 [100,175] 体系。 */
+  const [shotAtGlobalPct, setShotAtGlobalPct] = useState<Record<string, boolean>>({});
+  /* ── 视频步骤自绘播放器（替换原生 controls）──────────────────
+     原生 controls 的 −/+ 是浏览器内部倍速控件，步进诡异（点几下变成 0.21x），
+     外观与档位都不可控。自绘控制条后：−/+ 走 VIDEO_RATE_STEPS 档位
+     （0.5/0.75/1/1.25/1.5/1.75/2），播放/暂停、进度条、时间、全屏一并接管。 */
+  const [videoRate, setVideoRate] = useState<Record<string, number>>({});
+  const [videoPlaying, setVideoPlaying] = useState<Record<string, boolean>>({});
+  const [videoTime, setVideoTime] = useState<Record<string, number>>({});
+  const [videoDur, setVideoDur] = useState<Record<string, number>>({});
+  const videoEls = useRef<Record<string, HTMLVideoElement | null>>({});
   const [exportOpen, setExportOpen] = useState(false);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [translateOpen, setTranslateOpen] = useState(false);
@@ -439,35 +718,37 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     drag: "拖拽", key: "按键", scroll: "滚动", select: "选择", nav: "导航",
     screenshot: "截图", other: "其它",
   };
-  // Stage 4：AI 兜底开关——确定性重放没打中时，让视觉模型判断「现在该点哪里」。
-  // 默认关闭（不联网、零成本、零延迟），用户显式勾选后才启用，并按本地偏好记住。
-  const [aiFallback, setAiFallback] = useState<boolean>(() => {
-    try { return localStorage.getItem("flowio.aiFallback") === "1"; } catch { return false; }
-  });
-  const toggleAiFallback = useCallback(() => {
-    setAiFallback((v) => {
-      const next = !v;
-      try { localStorage.setItem("flowio.aiFallback", next ? "1" : "0"); } catch { /* 忽略 */ }
-      return next;
-    });
-  }, []);
-  // Stage 3：执行审计历史面板（get_replay_audit）
-  const [showAudit, setShowAudit] = useState(false);
-  const [auditLoading, setAuditLoading] = useState(false);
-  const [auditRecords, setAuditRecords] = useState<{
-    runId: string; startedAt: string; finishedAt: string; dryRun: boolean;
-    totalSteps: number; okSteps: number; failedSteps: number;
-    overallStatus: string; targetApp: string;
-  }[]>([]);
   const [scanRedacting, setScanRedacting] = useState(false);
   const [scanProgress, setScanProgress] = useState<{ done: number; total: number; currentStepId: string }>({ done: 0, total: 0, currentStepId: "" });
   const [scanToast, setScanToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const scanToastTimerRef = useRef<number | null>(null);
-  const [showSaveDialog, setShowSaveDialog] = useState<string | null>(null);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [voiceBanner, setVoiceBanner] = useState(voiceTranscribing ?? false); // 录制跳编辑界面时，若语音未好则顶部常驻提示
   const [aiGenerating, setAiGenerating] = useState(false);
   const [domainMode, setDomainMode] = useState<"auto" | "spreadsheet" | "browser" | "code" | "terminal">("auto");
+
+  /* ── 编辑器双模式（简洁 / 复杂）─────────────────────────────
+     简洁（默认）：纯本地编辑/渲染，不调任何模型、不耗积分，零门槛零成本。
+     复杂：开放 AI 增强功能（AI 精简 / AI 生成 / 扫描脱敏 / 翻译 / 摘要重生成），按调用耗积分。
+     持久化在 localStorage（与 ZOOM_KEY/SIDE_W_KEY 同套路）；SQLite 落地留待 P1 之后。 */
+  const EDITOR_MODE_KEY = "flowio_editor_mode";
+  const [editorMode, setEditorMode] = useState<"simple" | "complex">(() => {
+    try {
+      const raw = localStorage.getItem(EDITOR_MODE_KEY);
+      return raw === "complex" ? "complex" : "simple";
+    } catch {
+      return "simple";
+    }
+  });
+  const isComplex = editorMode === "complex";
+  const switchEditorMode = (mode: "simple" | "complex") => {
+    if (mode === editorMode) return;
+    setEditorMode(mode);
+    try { localStorage.setItem(EDITOR_MODE_KEY, mode); } catch { /* 隐私模式等，忽略 */ }
+    if (mode === "complex") {
+      setToast({ type: "success", message: "已切换到复杂模式：AI 功能会调用模型，按用量消耗积分" });
+    }
+  };
 
   /* Translation state */
   const [translations, setTranslations] = useState<TranslationsMap>({});
@@ -535,6 +816,10 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   const [pubApplications, setPubApplications] = useState<string[]>([]);
   const [pubAppInput, setPubAppInput] = useState("");
   const [pubCategory, setPubCategory] = useState("");
+  // ★ T9：发布到团队库（可选）。
+  //   🔴 哪些空间算「可发布」不在这里判 —— 一律用服务端回传的 can_publish。
+  const [pubWorkspaceId, setPubWorkspaceId] = useState("");
+  const [pubWorkspaces, setPubWorkspaces] = useState<TeamWorkspace[]>([]);
   const [pubTags, setPubTags] = useState<string[]>([]);
   const [pubTagInput, setPubTagInput] = useState("");
   const [pubDownloadable, setPubDownloadable] = useState<"yes" | "no">("yes");
@@ -599,6 +884,97 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
 
   /* Preview mode */
   const [previewMode, setPreviewMode] = useState(false);
+  /* ★ v0.65.244 对齐：录制停止带 ?preview=1 进「成片预览」只读态（进预览 = 先看一遍成品）。
+     退出预览（点「编辑」）时清掉 URL 参数 —— 刷新/分享不会又落回预览态。 */
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [previewLanding, setPreviewLanding] = useState(() => searchParams.get("preview") === "1");
+  const exitPreviewLanding = () => {
+    setPreviewMode(false);
+    setPreviewLanding(false);
+    if (searchParams.has("preview")) {
+      const next = new URLSearchParams(searchParams);
+      next.delete("preview");
+      setSearchParams(next, { replace: true });
+    }
+  };
+
+  /* ── 左右两栏宽度：拖分隔条调节（第十八轮） ───────────────── */
+  const [sideWidth, setSideWidth] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(SIDE_W_KEY);
+      const v = raw == null ? NaN : Number(raw);
+      return Number.isFinite(v) && v > 0 ? clampSideWidth(v) : clampSideWidth(SIDE_W_DEFAULT);
+    } catch {
+      return SIDE_W_DEFAULT;
+    }
+  });
+  const [splitDragging, setSplitDragging] = useState(false);
+  /** startX/startW 固定拖拽基准，w 记最近一次的值（松手时才落库，免得每移动 1px 写一次）；
+   *  zoom 记按下那一刻的整页比例（拖拽位移要换算回未缩放的 CSS 像素） */
+  const splitDragRef = useRef<{ startX: number; startW: number; w: number; zoom: number } | null>(null);
+
+  useEffect(() => {
+    if (!splitDragging) return;
+    const onMove = (e: MouseEvent) => {
+      const d = splitDragRef.current;
+      if (!d) return;
+      // CSS zoom 会放大长度值：鼠标在视口里走 dx，栏宽只能加 dx/zoom，
+      // 否则缩放到 125% 时拖 100px 会跑 125px（手感像"越拖越快"）。
+      d.w = clampSideWidth(d.startW + (e.clientX - d.startX) / d.zoom);
+      setSideWidth(d.w);
+    };
+    const onUp = () => {
+      setSplitDragging(false);
+      const d = splitDragRef.current;
+      splitDragRef.current = null;
+      if (d) {
+        try { localStorage.setItem(SIDE_W_KEY, String(d.w)); } catch { /* 隐私模式等，忽略 */ }
+      }
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    // 拖动时鼠标可能移出 7px 命中区，全局兜住光标与选区
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [splitDragging]);
+
+  /* 窗口变窄时把已存的宽度收回到合法区间内（否则正文会被挤没） */
+  useEffect(() => {
+    const onResize = () => setSideWidth((w) => clampSideWidth(w));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  /* ── 第十八/十九轮：栏宽与整页比例的「恢复原样」────────────────
+     栏宽：双击分隔条 → 回到 SIDE_W_DEFAULT（拖动是隐式的，双击是它的复位键）。
+     比例：目录标题旁那组键里的 ⟲ → 回到 100%。两者都即刻落库。 */
+  const resetSideWidth = useCallback(() => {
+    setSideWidth(SIDE_W_DEFAULT);
+    try { localStorage.setItem(SIDE_W_KEY, String(SIDE_W_DEFAULT)); } catch { /* 忽略 */ }
+  }, []);
+
+  const applyPageZoom = useCallback((z: number) => {
+    setPageZoom(z);
+  }, []);
+
+  /** 按档位表放大/缩小一档。
+   *  🔴 必须走函数式更新：两个 setState 在同一个 tick 里读到的都是**闭包里的旧值**，
+   *     连点两次 ＋ 只会走一档（无头实测 PROBE62 抓到过：z1=1.1 而不是 1.25）。 */
+  const nudgePageZoom = useCallback((dir: 1 | -1) => {
+    setPageZoom((prev) => stepZoom(prev, dir));
+  }, []);
+
+  /* 比例落库：状态一变就写（首屏从 localStorage 读回来时写的是同一个值，无副作用） */
+  useEffect(() => {
+    try { localStorage.setItem(ZOOM_KEY, String(pageZoom)); } catch { /* 隐私模式等，忽略 */ }
+  }, [pageZoom]);
+
   /* ── 步骤精简：自动合并（规则）/ AI 精简（撤销上移为顶栏全局 ↶↷）── */
   const [simplifying, setSimplifying] = useState<null | "rules" | "ai">(null);
   const [simplifyOpen, setSimplifyOpen] = useState(false);
@@ -727,39 +1103,179 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [lightboxIndex, setLightboxIndex] = useState(0);
   const [lightboxMarked, setLightboxMarked] = useState(false);
-  /* 首屏同步读取已保存的裁图/全图偏好，避免先全图再闪跳到裁图 */
-  const readInitialView = (): { stepViewCropped: Record<string, boolean>; globalView: 'full' | 'crop' } => {
-    let stepViewCropped: Record<string, boolean> = {};
-    let globalView: 'full' | 'crop' = 'full';
-    try {
-      const savedView = localStorage.getItem(`flowio_view_${recordingId}`);
-      if (savedView) {
-        const parsed = JSON.parse(savedView);
-        stepViewCropped = parsed.stepViewCropped || {};
-        globalView = parsed.globalView || 'full';
-      }
-    } catch { /* ignore corrupt data */ }
-    return { stepViewCropped, globalView };
+  /* ── 重点图：以操作落点为原点的放大 ─────────────────────────
+     只改显示倍率（transform: scale），不改布局尺寸 —— 缩放不回流，
+     通篇流的滚动位置不会跳；超出卡片的部分由容器 overflow:hidden 裁掉。
+     transform-origin 指向操作落点（点击坐标），放大后画面仍然盯着用户
+     当时操作的那个部位 —— 这就是「重点图」。
+     口径（2026-10-06 用户定稿）：−/+ 改变的是「框显示图片的比例」——
+     相对完整整图的比例：100% = 整图全貌填满框（图片视觉最小，− 锁此下限），
+     + 放大到 175%（整图放大聚焦，+ 锁此上限），每档 10%，框始终被图片填满。
+     真实比例区间（disp<100，如 25/50/75%）不归 −/+ 管，只由右边按钮
+     从 100% 切入「顶栏全局比例态」（显示主图裁剪图原样填满框）。 */
+  const shotZoomOf = (stepId: string) => shotZoom[stepId] ?? SHOT_ZOOM_DEFAULT;
+  const isFocusShot = (stepId: string) => shotZoomOf(stepId) > 1;
+  /** 某步「框显示图片的比例」（相对完整整图）：
+      −/+ 口径（2026-10-06 用户定稿）：
+      100% = 整图全貌填满框（视觉最小，− 锁此下限）；+ 放大显示直到 175%
+      （整图放大聚焦，+ 锁此上限），每档 10%。
+      100 = 查看全图态（显示 before 整图 scale 1，居中）；
+      disp<100 = 顶栏全局比例态（显示主图裁剪图原样填满框，如 50%，
+      scale 100/disp，锚点原点）—— 仅由右边按钮从 100% 切入，−/+ 不进入；
+      disp>100 = 整图放大（倍率 × 100，如 1.5 → 150%）。 */
+  const shotDispOf = (stepId: string): number => {
+    if (isFullShot(stepId)) return 100;
+    if (shotAtGlobalPct[stepId]) return perShotPcts[stepId] ?? 100;
+    const z = shotZoomOf(stepId);
+    return Math.min(175, Math.max(100, Math.round(z * 100)));
   };
-  /* 主图视图：false=全图（默认，screenshot_base64），true=裁剪图（点击坐标 400×400 裁剪） */
-  const [stepViewCropped, setStepViewCropped] = useState<Record<string, boolean>>(
-    () => (recordingId ? readInitialView().stepViewCropped : {})
-  );
-  const getViewCropped = (stepId: string) => stepViewCropped[stepId] ?? false;
-  const setViewCropped = (stepId: string, value: boolean) => setStepViewCropped(prev => {
-    const next = { ...prev, [stepId]: value };
-    // 同步标题栏全局开关：若改动后所有步骤已一致，则让顶部高亮跟随，避免两处控件不同步
-    const allSame = steps.every((s) => (next[s.id] ?? false) === value);
-    if (allSame) setGlobalView(value ? 'crop' : 'full');
-    return next;
-  });
-  /* 裁剪图是否已被用户删除（true=该步骤裁剪图视为不存在，仅影响裁图视图，全图不受影响） */
-  const [deletedCrop, setDeletedCrop] = useState<Record<string, boolean>>({});
-  const isCropDeleted = (stepId: string) => !!deletedCrop[stepId];
-  /* 全局视图风格：'full'=全图，'crop'=裁剪图（顶部统一切换按钮高亮当前教程主要风格） */
-  const [globalView, setGlobalView] = useState<'full' | 'crop'>(
-    () => (recordingId ? readInitialView().globalView : 'full')
-  );
+  /** 设置某步显示：参数 dispPct 是期望的「框显示图片的比例」（相对完整整图）。
+      clamp 到 [100, 175]：100 = 整图全貌填满框（视觉最小，− 锁此下限），
+      175 = 整图放大 175%（+ 锁此上限）；倍率 = disp / 100。 */
+  /** 视觉整图态判定：显示为整图 100%（before 整图 scale 1，填满框）即视为
+      「整图 100%」—— 含显式 full 态（isFullShot）与初始默认态（shotZoom 1）。
+      右边按钮「100% ↔ 顶栏全局比例」切换以此为准，避免初始默认态
+      （isFullShot=false 但显示整图）第一次点击被吞。 */
+  const isShotVisFull = (stepId: string) =>
+    Math.abs(shotDispOf(stepId) - 100) < 0.001;
+
+  const setShotZoomFor = (stepId: string, dispPct: number) => {
+    const disp = Math.min(175, Math.max(100, Math.round(dispPct * 100) / 100));
+    const v = Math.round((disp / 100) * 100) / 100;
+    setShotZoom((prev) => ({ ...prev, [stepId]: v }));
+  };
+  /** −/+ 微调：围绕操作落点缩放（transform-origin 取点击坐标 x/y）。
+       口径 = 「框显示图片的比例」（相对整图，每档 10%，区间 [100%, 175%]）：
+       − 缩小显示直到 100%（整图全貌填满框，视觉最小，锁 100）；
+       + 放大显示直到 175%（整图放大聚焦，最大，锁 175）。
+       顶栏全局比例态（disp<100）起步时：−/+ 不进入该区间，
+       − 直接缩到 100% 整图全貌，+ 从 100% 放大一档（110%）。 */
+  const nudgeShotZoom = (stepId: string, dir: -1 | 1) => {
+    if (shotAtGlobalPct[stepId]) {
+      setShotAtGlobalPct((prev) =>
+        prev[stepId] ? { ...prev, [stepId]: false } : prev,
+      );
+      if (dir === -1) {
+        // 顶栏全局比例态点 −：缩到 100% 整图全貌（锁 100）
+        setShowFullShot((prev) => ({ ...prev, [stepId]: true }));
+        setShotZoom((prev) => ({ ...prev, [stepId]: 1 }));
+        setShotZoomCenter((prev) => ({ ...prev, [stepId]: false }));
+      } else {
+        // 顶栏全局比例态点 +：从 100% 起步放大一档（110%）
+        exitFullShot(stepId);
+        setShotZoomCenter((prev) => ({ ...prev, [stepId]: false }));
+        setShotZoomFor(stepId, 110);
+      }
+      return;
+    }
+    const cur = isFullShot(stepId)
+      ? 100
+      : Math.min(175, Math.max(100, Math.round(shotZoomOf(stepId) * 100)));
+    const next = Math.min(175, Math.max(100, cur + dir * 10));
+    if (Math.abs(next - cur) < 0.001) return; // 已在边界，−/+ 无可进
+    if (next <= 100.001) {
+      // 到 100% = 整图全貌：走「查看全图」态（before 整图 scale 1，居中）
+      setShowFullShot((prev) => ({ ...prev, [stepId]: true }));
+      setShotZoom((prev) => ({ ...prev, [stepId]: 1 }));
+      setShotZoomCenter((prev) => ({ ...prev, [stepId]: false }));
+      return;
+    }
+    exitFullShot(stepId);
+    setShotZoomCenter((prev) => ({ ...prev, [stepId]: false }));
+    setShotZoomFor(stepId, next);
+  };
+
+  /* ── 视频倍速与播放控制（自绘播放器用）────────────────── */
+  const VIDEO_RATE_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
+  const videoRateOf = (stepId: string) => videoRate[stepId] ?? 1;
+  const setVideoRateFor = (stepId: string, r: number) => {
+    const v = Math.min(2, Math.max(0.5, Math.round(r * 100) / 100));
+    setVideoRate((prev) => ({ ...prev, [stepId]: v }));
+    const el = videoEls.current[stepId];
+    if (el) el.playbackRate = v;
+  };
+  /** 倍速 −/+：按 VIDEO_RATE_STEPS 档位步进（与图片 −/+ 档位口径一致，每档 25%）。 */
+  const nudgeVideoRate = (stepId: string, dir: -1 | 1) => {
+    const cur = videoRateOf(stepId);
+    let next = cur;
+    if (dir === -1) {
+      for (let i = VIDEO_RATE_STEPS.length - 1; i >= 0; i--) {
+        if (VIDEO_RATE_STEPS[i] < cur - 0.001) { next = VIDEO_RATE_STEPS[i]; break; }
+      }
+    } else {
+      for (let i = 0; i < VIDEO_RATE_STEPS.length; i++) {
+        if (VIDEO_RATE_STEPS[i] > cur + 0.001) { next = VIDEO_RATE_STEPS[i]; break; }
+      }
+    }
+    if (Math.abs(next - cur) < 0.001) return; // 已在边界档
+    setVideoRateFor(stepId, next);
+  };
+  const toggleVideoPlay = (stepId: string) => {
+    const el = videoEls.current[stepId];
+    if (!el) return;
+    if (el.paused) { void el.play().catch(() => { /* 用户未交互前 autoplay 限制 */ }); }
+    else el.pause();
+  };
+  const seekVideoTo = (stepId: string, t: number) => {
+    const el = videoEls.current[stepId];
+    if (!el) return;
+    el.currentTime = t;
+    setVideoTime((prev) => ({ ...prev, [stepId]: t }));
+  };
+  const fmtTime = (t: number) => {
+    if (!Number.isFinite(t) || t < 0) return "00:00";
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  };
+
+  /* 每步截图的原始像素尺寸：算 transform-origin 的百分比要用它
+     （origin 取的是元素自身盒子的比例，而图是 width:100% 缩放显示的）。 */
+  const [shotNat, setShotNat] = useState<Record<string, { w: number; h: number }>>({});
+  const rememberShotNat = (stepId: string, el: HTMLImageElement | null) => {
+    if (!el || !el.naturalWidth || !el.naturalHeight) return;
+    const w = el.naturalWidth;
+    const h = el.naturalHeight;
+    setShotNat((prev) => {
+      const cur = prev[stepId];
+      return cur && cur.w === w && cur.h === h ? prev : { ...prev, [stepId]: { w, h } };
+    });
+  };
+  /** 缩放原点：中心模式下固定 50% 50%（放大镜 −/+ 微调）；落点模式下取操作落点
+      （点击坐标）在当前显示图里的位置；坐标缺失或越界退回居中。
+      主图是裁剪图（真实比例 <100%）时：落点坐标在 before 整图坐标系里，
+      当前图 = before 按 frac 以落点为中心裁出（cropBoxFromAnchorFrac 贴边夹回），
+      必须用同一几何反算落点在图内的相对位置，缩放中心才能咬住操作点 ——
+      旧实现直接拿 before 坐标 ÷ 裁剪后尺寸，百分比全偏（还经常因 x>nat.w 退回居中）。 */
+  const shotOriginOf = (step: Step): string => {
+    if (shotZoomCenter[step.id]) return "50% 50%";
+    const nat = shotNat[step.id];
+    if (!nat || step.x == null || step.y == null) return "50% 50%";
+    if (step.x < 0 || step.y < 0) return "50% 50%";
+    const fracPct = perShotPcts[step.id];
+    if (fracPct != null && fracPct > 0 && fracPct < 100) {
+      const frac = fracPct / 100;
+      const beforeW = nat.w / frac;
+      const beforeH = nat.h / frac;
+      const rect = cropBoxFromAnchorFrac({ x: step.x, y: step.y }, frac, beforeW, beforeH);
+      const ox = Math.min(100, Math.max(0, ((step.x - rect.x) / rect.width) * 100));
+      const oy = Math.min(100, Math.max(0, ((step.y - rect.y) / rect.height) * 100));
+      return `${ox.toFixed(2)}% ${oy.toFixed(2)}%`;
+    }
+    if (step.x > nat.w || step.y > nat.h) return "50% 50%";
+    return `${((step.x / nat.w) * 100).toFixed(2)}% ${((step.y / nat.h) * 100).toFixed(2)}%`;
+  };
+
+  /** 中间态（显示 before 整图放大到 disp 区域）的缩放原点：落点在整图内的相对位置。
+      中间态 <img> 的 naturalWidth/Height 已是 before 尺寸（onLoad 后）；
+      首次切换的一帧 nat 仍是裁剪图尺寸，落点越界会退回居中，onLoad 后即修正。 */
+  const shotBeforeOriginOf = (step: Step): string => {
+    if (shotZoomCenter[step.id]) return "50% 50%";
+    const nat = shotNat[step.id];
+    if (!nat || step.x == null || step.y == null) return "50% 50%";
+    if (step.x < 0 || step.y < 0 || step.x > nat.w || step.y > nat.h) return "50% 50%";
+    return `${((step.x / nat.w) * 100).toFixed(2)}% ${((step.y / nat.h) * 100).toFixed(2)}%`;
+  };
 
   /* Tip expand */
   const [tipExpanded, setTipExpanded] = useState(false);
@@ -791,16 +1307,12 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     setDetailImgBox((prev) => (prev.box ? prev : { ...prev, box }));
   }, [detailImgBox]);
 
-  /* 裁剪图（400×400 @点击坐标）缓存：key=step.id，为所有步骤异步预生成，避免预览/缩略图重复计算 */
-  const [cropCache, setCropCache] = useState<Record<string, string>>({});
   // 首屏视图恢复完成后才允许持久化，避免挂载瞬间用默认值 {} / 'full' 覆盖已保存的偏好
   const viewLoadedRef = useRef(false);
 
   /* Annotation (手动标注编辑器) */
   const [annotateOpen, setAnnotateOpen] = useState(false);
   const [annotateStepId, setAnnotateStepId] = useState<string>("");
-  /** 打开标注时的当前视图：'full'=全图，'crop'=裁图。决定裁切结果落到哪个槽位 */
-  const [annotateMode, setAnnotateMode] = useState<'full' | 'crop'>('full');
 
   // ⚠️ 这里**不要**再给主预览容器写死高度。
   // v24 之前的遗留代码曾写 `height = clamp(w*9/16, 200, 520)`，把盒子锁成 16:9，
@@ -822,32 +1334,6 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     }
     return data.steps;
   }, [recordingId, selectedStepId]);
-
-  /**
-   * 重建裁图缓存。
-   *
-   * 🔴 精简/撤销后**必须**调用：合并会把末步的主图写到承载步上，但 step.id 不变，
-   * 缓存里的还是合并前那张旧图 → 界面会显示「张冠李戴」的截图。
-   * 与首次加载共用同一套预生成逻辑（先算完再一次提交，避免逐帧跳变）。
-   */
-  const rebuildCropCache = useCallback(async (list: Step[]) => {
-    const cache: Record<string, string> = {};
-    await Promise.all(
-      list
-        .filter((s) => s.screenshot_base64)
-        .map(async (s) => {
-          try {
-            cache[s.id] = await cropAdaptiveBase64(
-              s.screenshot_base64 as string,
-              s.x, s.y, s.crop_w, s.crop_h, s.action_type,
-            );
-          } catch {
-            cache[s.id] = "";
-          }
-        }),
-    );
-    setCropCache(cache);
-  }, []);
 
   /** 将某张步骤截图设为封面（预览用原图，上传用压缩图） */
   const selectStepCover = async (s: { id: string; screenshot_base64?: string | null }) => {
@@ -914,7 +1400,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       cancelled = true;
       unlisten?.();
     };
-  }, [recordingId, reloadRecording, rebuildCropCache]);
+  }, [recordingId, reloadRecording]);
 
   /* ── ★ 步骤自动精简（规则层 / AI 层 / 撤销），定义在 reloadRecording 之后避免 deps TDZ ── */
   const handleAutoMerge = useCallback(async () => {
@@ -925,8 +1411,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         "auto_merge_steps",
         { recordingId }
       );
-      const list = await reloadRecording();
-      await rebuildCropCache(list);
+      await reloadRecording();
       refreshHist();
       setToast({
         type: "success",
@@ -940,7 +1425,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     } finally {
       setSimplifying(null);
     }
-  }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
+  }, [recordingId, reloadRecording, refreshHist]);
 
   const handleAiSimplify = useCallback(async () => {
     if (!recordingId) return;
@@ -966,6 +1451,14 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       "flowio://job-done",
       async (ev) => {
         if (ev.payload.recording_id !== recordingId) return;
+        /* 流程摘要（AI 润色完成）→ 重载一次把新文案显示出来；失败就静默留着规则版 */
+        if (ev.payload.op === "ai_summary") {
+          if (ev.payload.ok) {
+            await reloadRecording();
+            refreshHist();
+          }
+          return;
+        }
         if (ev.payload.op !== "ai_simplify") return;
         setSimplifying(null);
         useAppStore.getState().setSimplifyingId(null);
@@ -975,16 +1468,15 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
           return;
         }
         if (ev.payload.ok) {
-          const list = await reloadRecording();
-          await rebuildCropCache(list);
+          await reloadRecording();
           refreshHist();
         }
       }
     ).then((fn) => { if (cancelled) fn(); else unlisten = fn; });
     return () => { cancelled = true; unlisten?.(); };
-  }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
+  }, [recordingId, reloadRecording, refreshHist]);
 
-  /* ── ★ 全局撤销/重做：还原后必须 rebuildCropCache（理由同精简）── */
+  /* ── ★ 全局撤销/重做 ───────────────────────────────────── */
   const applyHist = useCallback(async (cmd: "edit_undo" | "edit_redo") => {
     if (histBusy) return;
     setHistBusy(true);
@@ -993,8 +1485,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     if (autoSaveRef.current) { clearTimeout(autoSaveRef.current); autoSaveRef.current = null; }
     try {
       const n = await invoke<number>(cmd, { recordingId });
-      const list = await reloadRecording();
-      await rebuildCropCache(list);
+      await reloadRecording();
       setToast({
         type: "success",
         message: cmd === "edit_undo" ? `已撤销，恢复到 ${n} 个步骤` : `已恢复，${n} 个步骤`,
@@ -1005,7 +1496,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       setHistBusy(false);
       refreshHist();
     }
-  }, [histBusy, recordingId, reloadRecording, rebuildCropCache, refreshHist]);
+  }, [histBusy, recordingId, reloadRecording, refreshHist]);
 
   /* Ctrl+Z / Ctrl+Y（Ctrl+Shift+Z = 重做）；输入框内让位给原生文本撤销 */
   useEffect(() => {
@@ -1189,49 +1680,37 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         if (cancelled) return;
 
         // ── 视图偏好恢复（在 setSteps 之前，首屏即最终视图，无闪跳）──
-        let viewJson: string | null = dbView;
-        let needMigrate = false;
-        if (!viewJson) {
-          try { viewJson = localStorage.getItem(`flowio_view_${recordingId}`); } catch { /* ignore */ }
-          needMigrate = !!viewJson;
+        // SQLite 与 localStorage 各存一份带 ts 的 JSON；恢复取 ts 较新者。
+        // 背景：曾出现 WebView 存储丢失（→ SQLite 权威），又出现 DB 写入偶发失败
+        // （fire-and-forget 静默）→ 若无条件 DB 优先，用户刚调好的倍率会被旧值覆盖
+        // （"退出再进变回去"）。带 ts 对比后，无论哪端滞后/失败都能取到最新。
+        let dbParsed: { shotZoom?: unknown; ts?: number } | null = null;
+        if (dbView) {
+          try { dbParsed = JSON.parse(dbView); } catch { dbParsed = null; }
         }
-        if (viewJson) {
-          try {
-            const parsed = JSON.parse(viewJson);
-            setStepViewCropped(parsed.stepViewCropped || {});
-            setGlobalView(parsed.globalView === "crop" ? "crop" : "full");
-            if (needMigrate) {
-              void invoke("editor_view_set", { recordingId, value: viewJson }).catch(() => { /* best-effort */ });
-            }
-          } catch { /* 坏数据忽略，用默认全图 */ }
+        let lsParsed: { shotZoom?: unknown; ts?: number } | null = null;
+        let lsRaw: string | null = null;
+        try { lsRaw = localStorage.getItem(`flowio_view_${recordingId}`); } catch { /* ignore */ }
+        if (lsRaw) {
+          try { lsParsed = JSON.parse(lsRaw); } catch { lsParsed = null; }
+        }
+        const useDb = !lsParsed || (dbParsed != null && (dbParsed.ts ?? 0) >= (lsParsed.ts ?? 0));
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const chosen: any = useDb ? dbParsed : lsParsed;
+        if (chosen) {
+          const z = chosen.shotZoom;
+          setShotZoom(z && typeof z === "object" && !Array.isArray(z) ? z : {});
+          // 选了 localStorage（DB 缺失或更旧）→ 把较新的值迁回 DB，保证下次 DB 权威
+          if (!useDb && lsRaw) {
+            void invoke("editor_view_set", { recordingId, value: lsRaw }).catch(() => { /* best-effort */ });
+          }
         } else {
-          setStepViewCropped({});
-          setGlobalView("full");
+          setShotZoom({});
         }
         viewLoadedRef.current = true;
 
-        // 关键：在 setSteps 之前预生成**所有步骤**的裁剪图缓存，然后单次提交。
-        // 这样首次渲染就是最终状态（spinner → 裁图/全图），不存在
-        // "灰框→裁图"或"全图→裁图"的任何中间帧。
-        // （此前是 setSteps 先渲染、cropCache 异步逐个填充 → 每步都跳一次。）
-        const cache: Record<string, string> = {};
-        await Promise.all(
-          data.steps
-            .filter((s) => s.screenshot_base64)
-            .map(async (s) => {
-              try {
-                cache[s.id] = await cropAdaptiveBase64(
-                  s.screenshot_base64 as string,
-                  s.x, s.y, s.crop_w, s.crop_h, s.action_type,
-                );
-              } catch {
-                cache[s.id] = "";
-              }
-            }),
-        );
         if (cancelled) return;
 
-        setCropCache(cache);
         setRecording(data.recording);
         setSteps(data.steps);
         if (data.steps.length > 0) {
@@ -1265,7 +1744,11 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       } catch (err) {
         if (!cancelled) setError(String(err));
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          // ★ v0.65.244：带 ?preview=1 进来 = 录制刚停，直接落在「成片预览」只读态
+          if (searchParams.get("preview") === "1") setPreviewMode(true);
+        }
       }
     })();
     return () => {
@@ -1295,190 +1778,133 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
 
   const selectedStep = steps.find((s) => s.id === selectedStepId);
 
-  /* 裁剪图缓存：为所有有截图的步骤异步预生成（key=step.id），steps/坐标变化时重算 */
-  useEffect(() => {
-    let cancelled = false;
-    const stepsWithImg = steps.filter((s) => s.screenshot_base64);
-    // 清理已无截图步骤的残留缓存
-    setCropCache((prev) => {
-      const next: Record<string, string> = {};
-      Object.keys(prev).forEach((k) => {
-        const st = steps.find((s) => s.id === k);
-        if (st && st.screenshot_base64) next[k] = prev[k];
-      });
-      return next;
-    });
-    stepsWithImg.forEach((step) => {
-      cropAdaptiveBase64(step.screenshot_base64 as string, step.x, step.y, step.crop_w, step.crop_h, step.action_type)
-        .then((b64) => { if (!cancelled) setCropCache((prev) => ({ ...prev, [step.id]: b64 })); })
-        .catch(() => { if (!cancelled) setCropCache((prev) => ({ ...prev, [step.id]: "" })); });
-    });
-    return () => { cancelled = true; };
-  }, [steps.map((s) => `${s.id}|${s.screenshot_base64}|${s.x}|${s.y}|${s.crop_w}|${s.crop_h}|${s.action_type}`).join("||")]);
-
-  /* 持久化裁图/全图视图偏好：localStorage（首屏同步缓存）+ SQLite（权威存储，
-     WebView 存储曾出现丢失 → 退出重进回全图；DB 写入 fire-and-forget，失败不阻塞 UI） */
+  /* 持久化重点图倍率：localStorage（首屏同步缓存）+ SQLite（权威存储，
+     WebView 存储曾出现丢失 → 退出重进又变回默认值；DB 写入 fire-and-forget，失败不阻塞 UI） */
   useEffect(() => {
     if (!recordingId) return;
-    // 首屏视图恢复前不写，防止挂载瞬间用默认值覆盖已保存偏好
+    // 首屏恢复前不写，防止挂载瞬间用默认值覆盖已保存偏好
     if (!viewLoadedRef.current) return;
-    const json = JSON.stringify({ stepViewCropped, globalView });
+    // 带 ts 写入：恢复端用 ts 对比 DB/localStorage 取最新，DB 偶发写入失败
+    // 时也不会被旧值覆盖（问题1：退出编辑再进变回去）。
+    const json = JSON.stringify({ shotZoom, ts: Date.now() });
     try {
       localStorage.setItem(`flowio_view_${recordingId}`, json);
     } catch { /* storage full / unavailable */ }
-    void invoke("editor_view_set", { recordingId, value: json }).catch(() => { /* best-effort */ });
-  }, [recordingId, stepViewCropped, globalView]);
+    // DB 写入 debounce 300ms：连点 −/+ 只落最后一次，减少 SQLite 并发争用；
+    // 卸载（退出编辑）时清理定时器 —— localStorage 已同步写入，恢复端仍能取到。
+    const t = window.setTimeout(() => {
+      void invoke("editor_view_set", { recordingId, value: json }).catch((e) => {
+        console.warn("[flowio] editor_view_set 写入失败:", e);
+      });
+    }, 300);
+    return () => window.clearTimeout(t);
+  }, [recordingId, shotZoom]);
 
   const selectedIndex = steps.findIndex((s) => s.id === selectedStepId);
 
-  /* 主截图解析：全图（screenshot_base64）或裁剪图（缓存）；裁剪图已删或全图缺失时返回 null */
-  const getStepMainSrc = (step: Step): string | null => {
-    const base = step.screenshot_base64;
-    if (!base) return null;
-    const useCrop = getViewCropped(step.id);
-    if (useCrop && isCropDeleted(step.id)) return null;
-    if (useCrop) {
-      const cropped = cropCache[step.id];
-      // 裁图缓存已就绪：返回裁剪结果（空字符串=裁剪失败→返回null隐藏）
-      if (cropped !== undefined) return cropped || null;
-      // 裁图缓存尚未就绪（首次加载/cold start）：返回null而非全图，
-      // 避免"全图→裁图"闪跳。用户会看到短暂空白后裁图出现。
-      return null;
-    }
-    return base;
-  };
+  /* 主截图：就是步骤截图本体。「重点图」是显示层的倍率（CSS transform），
+     不改动数据 —— 预览/导出在渲染时才按倍率裁出可见区域。 */
+  const getStepMainSrc = (step: Step): string | null => step.screenshot_base64 || null;
+  /** Lightbox「查看图片」统一显示全图（before 原图），对**所有步骤**生效；
+      无 before 图时退回主截图兜底。 */
+  const lightboxSrcOf = (step: Step): string | null =>
+    step.before_screenshot_base64 || step.screenshot_base64 || null;
 
-  /* 顶部统一切换：一键将所有步骤的主截图设为全图或裁剪图（教程主要风格） */
-  const applyGlobalView = (mode: 'full' | 'crop') => {
-    setGlobalView(mode);
-    setStepViewCropped((prev) => {
-      const next: Record<string, boolean> = {};
-      steps.forEach((s) => { next[s.id] = mode === 'crop'; });
-      return next;
-    });
-  };
-
-  /* ── Sync edits when selection changes ──────────────────── */
-
+  /* 兜底：img 的 onLoad 在内存缓存图上偶尔不触发（React 已知问题），
+     这里直接 new Image() 预载一次，保证每步都能拿到原图像素尺寸，
+     重点图的缩放原点才不会悄悄退回居中。 */
   useEffect(() => {
-    if (selectedStep) {
-      setEditTitle(selectedStep.title);
-      setEditDescription(selectedStep.description);
-      setEditIsVar(!!selectedStep.is_variable);
-      setEditParamName(selectedStep.param_name || "");
-      setTipExpanded(false);
-    }
-  }, [selectedStepId, steps]);
+    steps.forEach((s) => {
+      if (shotNat[s.id]) return;
+      const b64 = getStepMainSrc(s);
+      if (!b64) return;
+      const im = new Image();
+      im.onload = () => {
+        if (!im.naturalWidth || !im.naturalHeight) return;
+        const w = im.naturalWidth;
+        const h = im.naturalHeight;
+        setShotNat((prev) => (prev[s.id] ? prev : { ...prev, [s.id]: { w, h } }));
+      };
+      im.src = `data:image/jpeg;base64,${b64}`;
+    });
+  }, [steps.map((s) => `${s.id}|${s.screenshot_base64 ? s.screenshot_base64.length : 0}`).join("||")]);
 
-  /* ── Save step ───────────────────────────────────────────── */
+  /* ── 通篇滚动编辑：草稿 · 落库 · 就地操作 ────────────────── */
 
-  const handleSaveStep = useCallback(async () => {
-    if (!selectedStep) return;
-    setSaving(true);
-    setSaveSuccess(false);
+  /* 防抖回调里取最新 steps，避免闭包拿到旧数组 */
+  const stepsRef = useRef<Step[]>([]);
+  stepsRef.current = steps;
+
+  /* 每步草稿：没编辑过就回落到步骤当前值 */
+  const draftOf = (s: Step) =>
+    drafts[s.id] ?? { title: s.title ?? "", description: s.description ?? "" };
+
+  /* 大标题的 contenteditable 是不受控的：按 step.id 记一份 DOM 引用，
+     敲完/点工具条时从 DOM 现读 HTML（读 DOM 而不是读 state，光标才不会被顶回去） */
+  const headingEls = useRef<Record<string, HTMLDivElement | null>>({});
+
+  /* textarea 随内容长高（标题/描述都是一行起步、随输入撑开） */
+  const autoGrow = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+  };
+
+  /* ── 第二十六轮：正文最前面那条「文档头」────────────────────────
+     就是设计稿的 .doc-head：一行大标题（20px）+ 一行元信息
+     （N 个步骤 · M 张截图 · 自动生成 · 可编辑）。
+     标题与顶栏那颗是**同一个字段**（recordings.title），走同一条命令，
+     就地改、失焦或回车落库，两处随时同步。 */
+  const [docTitleDraft, setDocTitleDraft] = useState<string | null>(null);
+  const docTitle = docTitleDraft ?? recording?.title ?? "";
+  const commitDocTitle = async () => {
+    const raw = (docTitleDraft ?? "").trim();
+    setDocTitleDraft(null);
+    if (!raw || raw === recording?.title) return;
     try {
-      await invoke("update_step", {
-        stepId: selectedStep.id,
-        title: editTitle,
-        description: editDescription,
-        actionType: selectedStep.action_type,
-        tip: selectedStep.tip || "",
-      });
-      setSteps((prev) =>
-        prev.map((s) =>
-          s.id === selectedStep.id
-            ? { ...s, title: editTitle, description: editDescription }
-            : s
-        )
-      );
-      setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 2000);
+      await invoke("update_recording_title", { id: recordingId, title: raw });
+      setRecording((prev) => (prev ? { ...prev, title: raw } : prev));
       refreshHist();
     } catch (err) {
-      console.error("Save step failed:", err);
-    } finally {
-      setSaving(false);
+      setToast({ type: "error", message: String(err) });
     }
-  }, [selectedStep, editTitle, editDescription, refreshHist]);
+  };
 
-  /* ── 变量标记（SKILL.md 自动化导出用）──────────────────────
-     独立于标题/描述自动保存：切换立即落库，参数名失焦时落库，
-     避免与 800ms 自动保存互相覆盖。老调用方不传变量字段，
-     Rust 端 COALESCE 保留现值。 */
-
-  const persistVariable = useCallback(
-    async (isVar: boolean, paramName: string) => {
-      if (!selectedStep) return;
+  const scheduleDraftSave = (id: string, d: StepDraft) => {
+    if (draftTimers.current[id]) clearTimeout(draftTimers.current[id]);
+    draftTimers.current[id] = setTimeout(async () => {
+      delete draftTimers.current[id];
+      const s0 = stepsRef.current.find((x) => x.id === id);
+      if (!s0) return;
       try {
         await invoke("update_step", {
-          stepId: selectedStep.id,
-          title: editTitle,
-          description: editDescription,
-          actionType: selectedStep.action_type,
-          tip: selectedStep.tip || "",
-          isVariable: isVar,
-          paramName,
+          stepId: id,
+          title: d.title,
+          description: d.description,
+          actionType: s0.action_type,
+          tip: s0.tip || "",
+          // 只有真的改过富文本才带上：undefined 会被 JSON.stringify 丢掉，
+          // 后端走 COALESCE(?8, title_html) 保留原值（老调用方不用改）
+          titleHtml: d.titleHtml,
         });
         setSteps((prev) =>
-          prev.map((s) =>
-            s.id === selectedStep.id
-              ? { ...s, is_variable: isVar, param_name: paramName }
-              : s
+          prev.map((x) =>
+            x.id === id
+              ? {
+                  ...x,
+                  title: d.title,
+                  description: d.description,
+                  ...(d.titleHtml === undefined ? {} : { title_html: d.titleHtml }),
+                }
+              : x
           )
         );
-      } catch (err) {
-        console.error("Save variable mark failed:", err);
-      }
-    },
-    [selectedStep, editTitle, editDescription]
-  );
-
-  const toggleVariable = useCallback(() => {
-    if (!selectedStep) return;
-    const next = !editIsVar;
-    setEditIsVar(next);
-    let name = editParamName.trim();
-    if (next && !name) {
-      // 默认参数名：param_1 / param_2 …（避开本教程已有的变量名）
-      const used = new Set(
-        steps.filter((s) => s.is_variable && s.param_name).map((s) => s.param_name)
-      );
-      let i = 1;
-      while (used.has(`param_${i}`)) i += 1;
-      name = `param_${i}`;
-      setEditParamName(name);
-    }
-    void persistVariable(next, name);
-  }, [selectedStep, editIsVar, editParamName, steps, persistVariable]);
-
-  /* ── Auto-save (debounce 800ms) ─────────────────────────── */
-  const [autoSaved, setAutoSaved] = useState(false);
-
-  useEffect(() => {
-    if (!selectedStep) return;
-    // 仅当值与原始步骤不同时才触发自动保存
-    const titleChanged = editTitle !== selectedStep.title;
-    const descChanged = editDescription !== selectedStep.description;
-    if (!titleChanged && !descChanged) return;
-
-    setAutoSaved(false);
-    if (autoSaveRef.current) clearTimeout(autoSaveRef.current);
-    autoSaveRef.current = setTimeout(async () => {
-      try {
-        await invoke("update_step", {
-          stepId: selectedStep.id,
-          title: editTitle,
-          description: editDescription,
-          actionType: selectedStep.action_type,
-          tip: selectedStep.tip || "",
+        setDrafts((prev) => {
+          if (!(id in prev)) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
         });
-        setSteps((prev) =>
-          prev.map((s) =>
-            s.id === selectedStep.id
-              ? { ...s, title: editTitle, description: editDescription }
-              : s
-          )
-        );
         setAutoSaved(true);
         setTimeout(() => setAutoSaved(false), 1500);
         refreshHist();
@@ -1486,8 +1912,465 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         console.error("Auto-save failed:", err);
       }
     }, 800);
-    return () => { if (autoSaveRef.current) clearTimeout(autoSaveRef.current); };
-  }, [editTitle, editDescription, selectedStep, refreshHist]);
+  };
+
+  const setDraftField = (id: string, field: "title" | "description", value: string) => {
+    const s0 = stepsRef.current.find((x) => x.id === id);
+    const base: StepDraft =
+      drafts[id] ?? { title: s0?.title ?? "", description: s0?.description ?? "" };
+    const next = { ...base, [field]: value };
+    setDrafts((prev) => ({ ...prev, [id]: next }));
+    scheduleDraftSave(id, next);
+  };
+
+  /** 大标题富文本：contenteditable 里敲完，把归一化 HTML + 纯文本一起落草稿 */
+  const setDraftHeadingHtml = (id: string, html: string, plain: string) => {
+    const s0 = stepsRef.current.find((x) => x.id === id);
+    const base: StepDraft =
+      drafts[id] ?? { title: s0?.title ?? "", description: s0?.description ?? "" };
+    const next: StepDraft = { ...base, title: plain, titleHtml: html };
+    setDrafts((prev) => ({ ...prev, [id]: next }));
+    scheduleDraftSave(id, next);
+  };
+
+  const [autoSaved, setAutoSaved] = useState(false);
+
+  /* ── 文档块 / 插入菜单（2026-09-19 第十三轮）──────────────────
+     1) 左栏颗粒 ＋ 不再直接插一个空步骤，而是弹菜单：步骤 / 大标题 /
+        导入已有教程 / 续录 —— 对标参考产品那条「+ 插入」工具条。
+     2) 「大标题」是文档块（block_kind='heading'）：不占步骤编号、
+        不计入步骤总数，编号只在真步骤之间连续。
+     3) 「续录」由 App 负责（拉起录制 → 停录后把新步骤插到这个位置之后）。 */
+
+  /** 真步骤（不含大标题 / 流程摘要等文档块）：用来算「N 个步骤」、大图预览翻页、编号回退 */
+  const realSteps = useMemo(
+    () => steps.filter((s) => !isDocBlock(s)),
+    [steps]
+  );
+
+  /** 文档流块序列：真步骤按 1..N 连续编号（文档块不占号），大标题带上自己的层级；
+   *  indent = 这一条应该缩进几级（步骤跟着最近的那个大标题走）。 */
+  const previewBlocks = useMemo(() => {
+    let num = 0;
+    let level = 0;
+    return steps.map((s) => {
+      if (isSummaryBlock(s)) {
+        return { step: s, isHeading: false, isSummary: true, isIntro: false, level: 0, num: 0, indent: 0 };
+      }
+      if (isHeadingBlock(s)) {
+        level = Math.min(4, Math.max(1, s.block_level || 1));
+        return { step: s, isHeading: true, isSummary: false, isIntro: false, level, num: 0, indent: level - 1 };
+      }
+      if (isIntroBlock(s)) {
+        // 简介块跟着最近的大标题缩进（和步骤一样），但自己不占编号
+        return { step: s, isHeading: false, isSummary: false, isIntro: true, level: 0, num: 0, indent: Math.min(3, level) };
+      }
+      num += 1;
+      return { step: s, isHeading: false, isSummary: false, isIntro: false, level: 0, num, indent: Math.min(3, level) };
+    });
+  }, [steps]);
+
+  /** 左栏「目录」的树：大标题是分组头，它下面的步骤缩进一级；折起来的分支不下发 */
+  const dirEntries = useMemo(() => {
+    let hiddenBelow: number | null = null; // 非 null 时，层级比它深的条目全藏起来
+    return previewBlocks.map((b) => {
+      if (b.isHeading) {
+        if (hiddenBelow !== null && b.level > hiddenBelow) {
+          return { ...b, hidden: true, collapsed: false };
+        }
+        hiddenBelow = null;
+        const collapsed = collapsedHeadings.has(b.step.id);
+        if (collapsed) hiddenBelow = b.level;
+        return { ...b, hidden: false, collapsed };
+      }
+      return { ...b, hidden: hiddenBelow !== null, collapsed: false };
+    });
+  }, [previewBlocks, collapsedHeadings]);
+
+  /** 改这一步「补充说明」的类型：描述 / 标注 / 警告 */
+  const setNoteKindFor = useCallback(
+    async (step: Step, kind: "" | "mark" | "warn") => {
+      if (noteKindOf(step) === kind) return;
+      try {
+        await invoke("set_step_note_kind", { stepId: step.id, noteKind: kind });
+        setSteps((prev) => prev.map((s) => (s.id === step.id ? { ...s, note_kind: kind } : s)));
+        refreshHist();
+      } catch (err) {
+        console.error("Set note kind failed:", err);
+      }
+    },
+    [refreshHist]
+  );
+
+  /** 在 insertPos 处插入一个「大标题」块（insertPos = 数组下标，即插在被点那行之后） */
+  const handleAddHeading = useCallback(
+    async (insertPos: number) => {
+      try {
+        await invoke("add_block", {
+          recordingId,
+          blockKind: "heading",
+          orderIndex: insertPos,
+          blockLevel: 2,
+          title: "",
+        });
+        await reloadRecording();
+        refreshHist();
+      } catch (err) {
+        console.error("Add heading failed:", err);
+      }
+    },
+    [recordingId, reloadRecording, refreshHist]
+  );
+
+  /** 切换标题块层级 H1/H2/H3 */
+  const handleSetBlockLevel = useCallback(async (stepId: string, level: number) => {
+    try {
+      await invoke("update_block_meta", { stepId, blockKind: "heading", blockLevel: level });
+      setSteps((prev) => prev.map((s) => (s.id === stepId ? { ...s, block_level: level } : s)));
+    } catch (err) {
+      console.error("Set block level failed:", err);
+    }
+  }, []);
+
+  /* ── 简介块（2026-09-19 第十九轮）─────────────────────────────
+     用户在正文里自己写的引子（"这份教程适合谁、读完能学会什么"）。
+     入口在左栏颗粒 ＋ 的插入菜单里（与「添加大标题」同一排）；
+     正文存 description，走和其它就地可编辑控件同一套 800ms 防抖落库。
+     图标键（截图浮层那颗「图片描述」）第十九轮按用户要求去掉 ——
+     已有图注仍照常渲染在图片下方，不影响老数据。 */
+
+  /** 在 insertPos 处插入一个「简介」块 */
+  const handleAddIntro = useCallback(
+    async (insertPos: number) => {
+      try {
+        await invoke("add_block", {
+          recordingId,
+          blockKind: "intro",
+          orderIndex: insertPos,
+          blockLevel: 1,
+          title: "",
+        });
+        await reloadRecording();
+        refreshHist();
+      } catch (err) {
+        console.error("Add intro failed:", err);
+      }
+    },
+    [recordingId, reloadRecording, refreshHist]
+  );
+
+  /* ── 流程摘要（2026-09-19 第十六轮）────────────────────────────
+     录制结束时后端已经同步写了「规则版」摘要（不联网、秒出），这里负责
+     手动「重新生成」：让 AI 按规则版那份要点润色覆盖（不可用就保留规则版）。 */
+  const regenerateSummary = useCallback(
+    async (stepId: string) => {
+      if (!recordingId || summaryBusy) return;
+      setSummaryBusy(stepId);
+      try {
+        await invoke("summarize_recording_ai", { recordingId });
+        await reloadRecording();
+        refreshHist();
+      } catch (err) {
+        console.error("Summarize failed:", err);
+        setToast({
+          type: "error",
+          message: "AI 摘要没生成成功，已保留自动生成的版本：" + String(err),
+        });
+      } finally {
+        setSummaryBusy(null);
+      }
+    },
+    [recordingId, summaryBusy, reloadRecording, refreshHist, setToast]
+  );
+
+  /** 大标题工具条上的富文本命令（WebView2 即 Chromium，execCommand 可用） */
+  const execRich = (cmd: string, value?: string) => {
+    const id = activeHeadingId;
+    if (!id) return;
+    try {
+      // styleWithCSS：让 foreColor / hiliteColor 产出 <span style>，而不是废弃的 <font color>
+      document.execCommand("styleWithCSS", false, "true");
+      document.execCommand(cmd, false, value);
+    } catch {
+      /* 命令不被支持时静默忽略，别把编辑流程打断 */
+    }
+    const el = headingEls.current[id];
+    if (el) {
+      const html = normalizeInlineHtml(el);
+      setDraftHeadingHtml(id, html, htmlToPlainText(html));
+    }
+    setColorMenu(null);
+  };
+
+  /** 目录栏：折起 / 展开某个大标题下面的这一节 */
+  const toggleHeadingCollapse = (id: string) => {
+    setCollapsedHeadings((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  /** 目录栏拖拽落库：整份 id 顺序交给 reorder_steps（它按文档块口径重排编号） */
+  const applyReorder = async () => {
+    const from = dragStepId;
+    const target = dropAt;
+    setDragStepId(null);
+    setDropAt(null);
+    if (!from || !target || from === target.id) return;
+    const ids = steps.map((s) => s.id);
+    const at = ids.indexOf(from);
+    if (at < 0) return;
+    ids.splice(at, 1);
+    const to = ids.indexOf(target.id);
+    if (to < 0) return;
+    ids.splice(target.after ? to + 1 : to, 0, from);
+    // 乐观更新：本地先动，失败就整体重载兜回来
+    const byId = new Map(steps.map((s) => [s.id, s]));
+    setSteps(ids.map((i) => byId.get(i)!).filter(Boolean));
+    try {
+      await invoke("reorder_steps", { recordingId, stepIds: ids });
+      await reloadRecording();
+      refreshHist();
+    } catch (err) {
+      console.error("Reorder failed:", err);
+      await reloadRecording();
+    }
+  };
+
+  /** 打开「+」插入菜单，菜单贴着加号右下方浮出 */
+  const openInsertMenu = (e: React.MouseEvent, index: number) => {
+    e.stopPropagation();
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setInsertMenu({
+      index,
+      x: r.right + 8,
+      y: Math.min(r.top - 8, Math.max(12, window.innerHeight - 260)),
+    });
+  };
+
+  /** 打开「导入已有教程」选择器 */
+  const openImportPicker = useCallback(
+    async (insertAfter: number) => {
+      setImportFor({ index: insertAfter });
+      setImportList([]);
+      try {
+        const list = await invoke<
+          Array<{ id: string; title: string; total_steps: number; created_at: string }>
+        >("list_recordings");
+        setImportList(list.filter((r) => r.id !== recordingId));
+      } catch (err) {
+        console.error("List recordings failed:", err);
+      }
+    },
+    [recordingId]
+  );
+
+  /** 真导入：把源教程的真步骤搬到当前位置之后 */
+  const doImport = useCallback(
+    async (sourceId: string) => {
+      if (!importFor || importBusy) return;
+      setImportBusy(true);
+      try {
+        const n = await invoke<number>("import_steps_from", {
+          recordingId,
+          sourceRecordingId: sourceId,
+          insertAfter: importFor.index,
+        });
+        await reloadRecording();
+        refreshHist();
+        setImportFor(null);
+        setToast({ type: "success", message: `已导入 ${n} 个步骤，Ctrl+Z 可整体撤销` });
+      } catch (err: any) {
+        setToast({ type: "error", message: "导入失败：" + String(err?.message || err) });
+      } finally {
+        setImportBusy(false);
+      }
+    },
+    [importFor, importBusy, recordingId, reloadRecording, refreshHist]
+  );
+
+  /* ── 截图就地操作（按步）─────────────────────────────────── */
+
+  /* ── 这一步的媒体（图片 / GIF 动图 / 视频）─────────────────────
+     老链路（upload_step_screenshot）把一切都当 JPEG 存成 `.jpg`：GIF 传上去就成
+     一张不会动的图，视频存了也放不出来。第二十轮改走 upload_step_media ——
+     按扩展名**原样落盘**，视频额外抽一张首帧当封面（缩略图 / 导出 / 发布都用它）。 */
+
+  /** 视频抽首帧：`<video>` 读对象 URL → seek 到 0.1s → canvas → JPEG base64。
+      抽不到（编码特别、0 时长）就返回空串，**不阻断上传** —— 视频照样能播，
+      只是没有封面。 */
+  const grabVideoPoster = (file: File): Promise<string> =>
+    new Promise((resolve) => {
+      const url = URL.createObjectURL(file);
+      const v = document.createElement("video");
+      let done = false;
+      const finish = (out: string) => {
+        if (done) return;
+        done = true;
+        window.clearTimeout(timer);
+        URL.revokeObjectURL(url);
+        resolve(out);
+      };
+      const timer = window.setTimeout(() => finish(""), 6000);
+      v.muted = true;
+      v.playsInline = true;
+      v.preload = "auto";
+      v.onloadeddata = () => {
+        // 往后挪一点点：某些编码的首帧是全黑
+        try {
+          v.currentTime = Math.min(0.1, (v.duration || 0.2) / 2);
+        } catch { /* 有些容器不给 seek，直接用当前帧 */ }
+      };
+      v.onseeked = () => {
+        try {
+          const c = document.createElement("canvas");
+          c.width = v.videoWidth || 1280;
+          c.height = v.videoHeight || 720;
+          const ctx = c.getContext("2d");
+          if (!ctx) return finish("");
+          ctx.drawImage(v, 0, 0, c.width, c.height);
+          finish(c.toDataURL("image/jpeg", 0.85).split(",")[1] || "");
+        } catch {
+          finish("");
+        }
+      };
+      v.onerror = () => finish("");
+      v.src = url;
+    });
+
+  /** 读成 data URL（Rust 侧会剥掉前缀，两边都容错）。 */
+  const mediaToBase64 = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ""));
+      r.onerror = () => reject(new Error("读取文件失败"));
+      r.readAsDataURL(file);
+    });
+
+  /** 上传一个媒体文件到指定步骤。类型与大小在这里先挡一道，Rust 侧还有一道白名单。 */
+  const uploadMediaForStep = useCallback(
+    async (stepId: string, file: File) => {
+      if (!MEDIA_EXT_RE.test(file.name)) {
+        setToast({ type: "error", message: "只支持 图片 / GIF / MP4：png、jpg、webp、gif、mp4、webm" });
+        return;
+      }
+      const mb = file.size / 1024 / 1024;
+      if (mb > MEDIA_MAX_MB) {
+        setToast({ type: "error", message: `文件太大（${mb.toFixed(1)}MB），单个上限 ${MEDIA_MAX_MB}MB` });
+        return;
+      }
+      const ext = extOf(file.name);
+      const isVideo = ext === "mp4" || ext === "webm";
+      try {
+        const data = await mediaToBase64(file);
+        const poster = isVideo ? await grabVideoPoster(file) : "";
+        await invoke("upload_step_media", {
+          stepId,
+          base64Data: data,
+          ext,
+          posterBase64: poster || null,
+        });
+        setSelectedStepId(stepId);
+        await reloadRecording();
+        setToast({ type: "success", message: isVideo ? "视频已插入 · 按播放键预览" : "已插入" });
+      } catch (err) {
+        setToast({ type: "error", message: "上传失败：" + String(err) });
+      }
+    },
+    [reloadRecording]
+  );
+
+  const pickMediaForStep = (stepId: string) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*,video/mp4,video/webm";
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (file) void uploadMediaForStep(stepId, file);
+    };
+    input.click();
+  };
+
+  /** 拖拽进来 —— 兼容「文件」和「从网页拖来的图片」。 */
+  const dropMediaForStep = (stepId: string, dt: DataTransfer) => {
+    const fromList = dt.files && dt.files.length ? dt.files[0] : null;
+    const fromItems = Array.from(dt.items || [])
+      .map((i) => (i.kind === "file" ? i.getAsFile() : null))
+      .find(Boolean);
+    const file = fromList || fromItems;
+    if (file) void uploadMediaForStep(stepId, file);
+  };
+
+  const pasteForStep = (e: React.MouseEvent, stepId: string) => {
+    e.preventDefault();
+    navigator.clipboard
+      .read()
+      .then((items) => {
+        for (const item of items) {
+          const hit = item.types.find((t) => t.startsWith("image/") || t.startsWith("video/"));
+          if (!hit) continue;
+          item.getType(hit).then((blob) => {
+            const sub = (hit.split("/")[1] || "png").replace("jpeg", "jpg");
+            // ⚠️ 这里不能用裸 `File`：本文件从 lucide-react 引入过同名的图标组件，会被遮蔽
+            void uploadMediaForStep(stepId, new window.File([blob], `粘贴.${sub}`, { type: hit }));
+          });
+          return;
+        }
+      })
+      .catch(() => console.log("Clipboard read failed or no media"));
+  };
+
+  const deleteScreenshotFor = (step: Step) => {
+    if (!confirm("确定删除截图？")) return;
+    invoke("delete_step_screenshot", { stepId: step.id, isAfter: true });
+    setSteps((prev) => prev.map((s) => (s.id === step.id ? { ...s, screenshot_base64: null } : s)));
+  };
+
+  /* ── 滚动联动：滑到哪，左目录高亮跟到哪 ────────────────────
+     编辑态与通篇预览态共用（预览态此前漏了两处：块上没有 data-step-id、
+     下面 onScroll 又被 previewMode 关掉 ⇒ 右边怎么滑左边都不动）。 */
+
+  const sopBodyRef = useRef<HTMLDivElement>(null);
+  const sopScrollLock = useRef(0);
+
+  const onSopScroll = useCallback(() => {
+    if (Date.now() < sopScrollLock.current) return;
+    const box = sopBodyRef.current;
+    if (!box) return;
+    // 参考线：容器顶部往下 28px。判据 = 「完全落在参考线之上的最后一块」，
+    // 而不是「离参考线最近的那一块」—— 一块截图占满整屏时，屏幕外刚露头的
+    // 下一块反而离参考线更近，会把高亮提前抢走（预览态块特别高，这个坑必踩）。
+    const ref = box.getBoundingClientRect().top + 28;
+    let bestId = "";
+    box.querySelectorAll<HTMLElement>("[data-step-id]").forEach((el) => {
+      if (el.getBoundingClientRect().top <= ref) bestId = el.dataset.stepId || "";
+    });
+    // 还没滚过第一块（或首块是文档行）时，兜底取第一个候选
+    if (!bestId) bestId = box.querySelector<HTMLElement>("[data-step-id]")?.dataset.stepId || "";
+    if (bestId && bestId !== selectedStepId) setSelectedStepId(bestId);
+  }, [selectedStepId]);
+
+  /* 目录跟随：高亮换了行，就把那一行滚进左栏可视区。
+     用 block:"nearest" —— 行本来就在视野里时是空操作，所以「点目录跳转 / 查找
+     定位 / 新增步骤」这些路径共用这一条也不会打架。 */
+  useEffect(() => {
+    if (!selectedStepId) return;
+    document
+      .getElementById(`step-item-${selectedStepId}`)
+      ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [selectedStepId]);
+
+  /* 标题/描述都是「自动长高」的 textarea：rows 只保证一行的高度，长标题会被
+     overflow:hidden 裁掉。步骤数据一变就统一量一次 scrollHeight 顶开。 */
+  useEffect(() => {
+    const box = sopBodyRef.current;
+    if (!box) return;
+    box.querySelectorAll<HTMLTextAreaElement>(".sop-edit-title, .sop-edit-desc")
+      .forEach((el) => autoGrow(el));
+  }, [steps]);
+
 
   /* ── Upload screenshot ─────────────────────────────────── */
 
@@ -1540,9 +2423,6 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
                 screenshot_base64: base64
               }
             ));
-            // 上传新图后恢复裁图可用并切回全图视图，让用户看到上传的图
-            setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: false }));
-            setViewCropped(selectedStep.id, false);
             refreshHist();
           });
       };
@@ -1578,9 +2458,6 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
                             screenshot_base64: base64
                           }
                         ));
-                        // 上传新图后恢复裁图可用并切回全图视图
-                        setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: false }));
-                        setViewCropped(selectedStep.id, false);
                         refreshHist();
                       });
                   };
@@ -1621,6 +2498,41 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
       }
     },
     [selectedStepId, steps, refreshHist]
+  );
+
+  /* ── 批量删除（2026-09-20 第二十三轮：入口在目录）──────────────
+     逐条 await delete_step（后端每删一条自己重排编号），本地一次性过滤
+     勾选步骤再整表重排；全空 / 忙碌时按钮禁用，删完退出批量态。 */
+  const handleBatchDelete = useCallback(
+    async () => {
+      const ids = Array.from(batchChecked);
+      if (ids.length === 0 || batchBusy) return;
+      setBatchBusy(true);
+      try {
+        for (const id of ids) {
+          await invoke("delete_step", { stepId: id });
+        }
+        const killed = new Set(ids);
+        setSteps((prev) =>
+          prev
+            .filter((s) => !killed.has(s.id))
+            .map((s, i) => ({ ...s, step_number: i + 1, order_index: i }))
+        );
+        if (selectedStepId && killed.has(selectedStepId)) {
+          const remaining = steps.filter((s) => !killed.has(s.id));
+          setSelectedStepId(remaining.length > 0 ? remaining[0].id : "");
+        }
+        setBatchChecked(new Set());
+        setBatchMode(false);
+        refreshHist();
+        setToast({ type: "success", message: `已删除 ${ids.length} 个步骤` });
+      } catch (err) {
+        setToast({ type: "error", message: "批量删除失败: " + String(err) });
+      } finally {
+        setBatchBusy(false);
+      }
+    },
+    [batchChecked, batchBusy, steps, selectedStepId, refreshHist]
   );
 
   /* ── Insert step ────────────────────────────────────────── */
@@ -1688,7 +2600,8 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
 
   useEffect(() => {
     const closeDropdowns = () => {
-      setExportOpen(false);
+      // 不关导出弹窗：ExportDialog 的遮罩 onClick 负责（仅点击遮罩空白关闭），
+      // 全局 mousedown 若一并 setExportOpen(false)，弹窗内任意点击都会先被关掉。
       setToolsOpen(false);
       setSimplifyOpen(false);
       setTranslateOpen(false);
@@ -1700,17 +2613,17 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
   /* ── Export ───────────────────────────────────────────────── */
 
   const handleExport = useCallback(
-    (format: string) => {
+    async (format: string, options: ExportOptions) => {
+      if (!recordingId) return;
       setExportOpen(false);
-      setShowSaveDialog(format);
-    },
-    []
-  );
-
-  const handleSaveConfirm = useCallback(
-    async (savedPath: string) => {
-      const format = showSaveDialog!;
-      setShowSaveDialog(null);
+      // 图片格式按「图片方式」映射到后端格式：长截图 = long，逐张文件 = images
+      let backendFormat = format;
+      if (format === 'images') {
+        backendFormat = options.imageMode === 'long' ? 'long' : 'images';
+      } else if (format === 'word') {
+        backendFormat = 'docx';
+      }
+      // ★ 第四十八轮：不再弹保存框，直接导出到固定目录「文档\录步导出」
       setExporting(true);
       setExportProgress(null);
       // 监听 Rust 侧 OCR 脱敏进度（导出前自动脱敏时上报 export://progress）
@@ -1722,11 +2635,10 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         }
       );
       try {
-        const path = await invoke<string>("export_recording", {
+        await invoke<string>("export_recording", {
           id: recordingId,
-          format,
-          outputPath: savedPath,
-          cropStepIds: Object.keys(stepViewCropped).filter(id => stepViewCropped[id]),
+          format: backendFormat,
+          options,
         });
         // 完成提醒统一走全局 flowio://job-done 卡片（任意页面弹窗，带教程名）
       } catch (err) {
@@ -1737,7 +2649,7 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         unlisten();
       }
     },
-    [recordingId, showSaveDialog, stepViewCropped]
+    [recordingId]
   );
 
 /* ── Stage 2a：精准执行器（坐标确定性重放，非 LLM/视觉）── */
@@ -1755,15 +2667,13 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         // 给 OS 一点时间把目标应用顶到前台，再下发动作
         await new Promise((r) => setTimeout(r, 300));
         const report = await invoke<any>("execute_recording", {
-          recordingId, dryRun: false, stepDelayMs: 300, approvalMode, approved: true,
-          aiFallback,
+          recordingId, stepDelayMs: 300, approvalMode, approved: true,
         });
-        const rescued = (report.outcomes || []).filter((o: any) => o.status === "ai-recovered").length;
         const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
         const panics = (report.outcomes || []).filter((o: any) => o.status === "step-panic").length;
         setToast({
           type: fails > 0 || panics > 0 ? "error" : "success",
-          message: `执行完成：${report.total} 步，校验异常 ${fails} 步${rescued > 0 ? `，AI 兜底救回 ${rescued} 步` : ""}${panics > 0 ? `，异常步 ${panics} 步` : ""}`,
+          message: `执行完成：${report.total} 步，校验异常 ${fails} 步${panics > 0 ? `，异常步 ${panics} 步` : ""}`,
         });
       } catch (err) {
         setToast({ type: "error", message: `执行失败：${String(err)}` });
@@ -1773,31 +2683,13 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
         try { await win.setFocus(); } catch { /* 忽略 */ }
       }
     },
-    [recordingId, aiFallback]
+    [recordingId]
   );
 
   const handleExecute = useCallback(
-    async (dryRun: boolean) => {
+    async () => {
       if (!recordingId) { setToast({ type: "error", message: "未找到当前录制" }); return; }
-      // 演练（dry-run）只生成动作序列、不操作桌面，无需最小化、无需审批
-      if (dryRun) {
-        setExecuting(true);
-        setToast({ type: "success", message: "开始演练（dry-run，不操作桌面）…" });
-        try {
-          const report = await invoke<any>("execute_recording", { recordingId, dryRun: true, stepDelayMs: 300 });
-          const fails = (report.outcomes || []).filter((o: any) => o.status === "verify-fail").length;
-          setToast({
-            type: fails > 0 ? "error" : "success",
-            message: `执行完成：${report.total} 步，校验异常 ${fails} 步（演练）`,
-          });
-        } catch (err) {
-          setToast({ type: "error", message: `演练失败：${String(err)}` });
-        } finally {
-          setExecuting(false);
-        }
-        return;
-      }
-      // 真实执行：先预览计划；含敏感步骤（快捷键/复制/粘贴/拖拽）则弹审批闸门，
+      // 先预览计划；含敏感步骤（快捷键/复制/粘贴/拖拽）则弹审批闸门，
       // 此时**不下发任何桌面动作**，等用户点「批准并执行」后再用 approved=true 重放
       setExecuting(true);
       try {
@@ -1823,21 +2715,6 @@ export default function StepEditor({ siteToken, siteUser, voiceTranscribing }: S
     await realExecute("check");
   }, [recordingId, approvalPlan, realExecute]);
 
-  // Stage 3：打开执行历史面板时拉取审计记录
-  const loadAudit = useCallback(async () => {
-    if (!recordingId) { setAuditRecords([]); return; }
-    setAuditLoading(true);
-    try {
-      const rows = await invoke<any[]>("get_replay_audit", { recordingId });
-      setAuditRecords(Array.isArray(rows) ? rows : []);
-    } catch (err) {
-      setToast({ type: "error", message: `读取执行历史失败：${String(err)}` });
-      setAuditRecords([]);
-    } finally {
-      setAuditLoading(false);
-    }
-  }, [recordingId]);
-
 /* ── Publish to website ──────────────────────────────────── */
 
 // SHA-256 hex（与网站后端 content_hash 同口径），用于发布前按内容兜底查已存在教程
@@ -1846,7 +2723,42 @@ async function sha256Hex(s: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "published") => {
+/** ★ 端云一体化 v247：发布 / 静默草稿共用的「上传步骤载荷」组装。
+ *   发布=所见即所得：把重点图（按该步倍率裁出「放大后仍可见」的区域）传上去，
+ *   与编辑器显示、导出用的是同一套公式。落点缺失或倍率=1 时原样返回整图；
+ *   任何失败都回退全图，不阻塞上传。
+ *   压缩每张截图，显著降低上传体积（修复"保存草稿/发布失败"：完整截图会导致请求体过大/超时）。 */
+async function buildUploadSteps(
+  steps: Step[],
+  getZoom: (stepId: string) => number
+): Promise<unknown[]> {
+  return Promise.all(
+    steps.map(async (s) => {
+      let shotB64: string | undefined = s.screenshot_base64 || undefined;
+      if (shotB64) {
+        try {
+          shotB64 = await focusShotBase64(shotB64, s.x, s.y, getZoom(s.id));
+        } catch { /* 裁剪失败 → 回退全图 */ }
+      }
+      return {
+        order_index: s.order_index,
+        step_number: s.step_number,
+        action_type: s.action_type,
+        title: s.title,
+        description: s.description,
+        tip: s.tip,
+        x: s.x,
+        y: s.y,
+        window_title: s.window_title,
+        screenshot_base64: shotB64 ? await downscaleBase64Image(shotB64) : undefined,
+        before_screenshot_base64: s.before_screenshot_base64 ? await downscaleBase64Image(s.before_screenshot_base64) : undefined,
+        after_screenshot_base64: s.after_screenshot_base64 ? await downscaleBase64Image(s.after_screenshot_base64) : undefined,
+      };
+    })
+  );
+}
+
+const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "published", openWeb = false) => {
     if (!siteToken) { setToast({ type: "error", message: "请先登录后再发布" }); return; }
     if (!recordingId) { setToast({ type: "error", message: "未找到当前录制，请重试" }); return; }
     setPublishing(true);
@@ -1859,7 +2771,8 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       const isDraft = targetStatus === "draft";
       const title = pubTitle.trim() || (isDraft ? (recording?.title || "未命名教程") : "");
       const applications = pubApplications.map((s) => s.trim()).filter(Boolean);
-      const app_name = applications[0] || (isDraft ? (recording?.app_name || "网页应用") : "");
+      // 应用名不自动生成（用户：自己填）——只用表单里手填的第一个应用，没有就空串
+      const app_name = applications[0] || "";
       // 发布（表单路径）需校验必填；草稿放宽，用录制信息兜底
       if (!isDraft && !title) { setToast({ type: "error", message: "请填写标题" }); return; }
       if (!isDraft && applications.length === 0) { setToast({ type: "error", message: "请至少填写一个涉及应用" }); return; }
@@ -1868,34 +2781,8 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       // 标签直接发送（不再合并场景名称——场景下拉已移除，改为自由文本「场景描述」）
       const tagsToSend = pubTags;
 
-      // 发布=所见即所得：步骤视图为「裁图」时上传裁剪结果（与编辑器显示、导出 cropStepIds 同一视图偏好），
-      // 整窗类型（scroll/nav/screenshot）cropAdaptiveBase64 内部自动原样返回；裁剪失败回退全图，不阻塞发布。
-      // 压缩每张截图，显著降低上传体积（修复"保存草稿/发布失败"：完整截图会导致请求体过大/超时）
-      const steps = await Promise.all(
-        data.steps.map(async (s) => {
-          const useCrop = getViewCropped(s.id) && !isCropDeleted(s.id) && !!s.screenshot_base64;
-          let shotB64: string | undefined = s.screenshot_base64 || undefined;
-          if (useCrop && shotB64) {
-            try {
-              shotB64 = await cropAdaptiveBase64(shotB64, s.x, s.y, s.crop_w, s.crop_h, s.action_type);
-            } catch { /* 裁剪失败 → 回退全图 */ }
-          }
-          return {
-            order_index: s.order_index,
-            step_number: s.step_number,
-            action_type: s.action_type,
-            title: s.title,
-            description: s.description,
-            tip: s.tip,
-            x: s.x,
-            y: s.y,
-            window_title: s.window_title,
-            screenshot_base64: shotB64 ? await downscaleBase64Image(shotB64) : undefined,
-            before_screenshot_base64: s.before_screenshot_base64 ? await downscaleBase64Image(s.before_screenshot_base64) : undefined,
-            after_screenshot_base64: s.after_screenshot_base64 ? await downscaleBase64Image(s.after_screenshot_base64) : undefined,
-          };
-        })
-      );
+      // 发布=所见即所得：重点图/压缩逻辑统一走 buildUploadSteps（与静默草稿同一份口径）
+      const steps = await buildUploadSteps(data.steps, (id) => shotZoomOf(id));
 
       // 覆盖发布：同一录制曾发布过（本地映射记录 guide id）→ 带 guide_id 让网站覆盖更新而非新建
       let prevGuideId: string | null = null;
@@ -1943,14 +2830,14 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       if (pubCoverBase64) {
         uploadData.cover_base64 = pubCoverBase64;
       } else {
-        // 封面=所见即所得（与步骤截图同一视图逻辑）：未手动选封面时，取首个有主图的步骤按其视图偏好解析
-        // ——该步视图为「裁图」传裁剪图，「全图」传全图；整窗类型自动保持全图；
-        // 该步无主图但有 after 图时回退 after（不裁）。任何失败回退全图，不阻塞发布。
+        // 封面=所见即所得（与步骤截图同一套重点图公式）：未手动选封面时，
+        // 取首个有主图的步骤按其倍率裁重点图；该步无主图但有 after 图时回退 after（不裁）。
+        // 任何失败回退全图，不阻塞发布。
         const firstImg = data.steps.find((s) => s.screenshot_base64);
         let coverSrc: string | undefined = firstImg?.screenshot_base64 || undefined;
-        if (coverSrc && firstImg && getViewCropped(firstImg.id) && !isCropDeleted(firstImg.id)) {
+        if (coverSrc && firstImg) {
           try {
-            coverSrc = await cropAdaptiveBase64(coverSrc, firstImg.x, firstImg.y, firstImg.crop_w, firstImg.crop_h, firstImg.action_type);
+            coverSrc = await focusShotBase64(coverSrc, firstImg.x, firstImg.y, shotZoomOf(firstImg.id));
           } catch { /* 裁剪失败 → 回退全图 */ }
         }
         if (!coverSrc && firstImg?.after_screenshot_base64) coverSrc = firstImg.after_screenshot_base64;
@@ -1992,14 +2879,32 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       }
 
       setPublishedGuide(result.guide || null);
+      // ★ T9：附挂团队库。🔴 **永不阻断发布** —— 教程已经在网站上了（用户手上有链接），
+      //   这一步失败只是「没进团队库」。措辞由 lib/teamPublish 统一 —— 绝不许说成
+      //   「发布失败」，那会让人重发一遍、制造重复教程。
+      const attach = pubWorkspaceId && result.guide?.id
+        ? await attachTutorialToWorkspace(siteToken, pubWorkspaceId, String(result.guide.id))
+        : null;
       // 记录「录制 → 已发布教程」映射：下次发布同一录制时覆盖更新而非新建
       if (result.guide?.id) {
         try { localStorage.setItem(`flowio_pub_${recordingId}`, String(result.guide.id)); } catch { /* ignore */ }
+      }
+      // ★ r65：记下云端 slug —— 再点「在网页编辑」时秒跳，不必重传整篇截图
+      const gRes = result.guide as { slug?: string; edit_url?: string } | undefined;
+      const gResUrl = gRes?.edit_url ? `${SITE_ORIGIN}${gRes.edit_url}` : webEditUrl(gRes?.slug || "");
+      if (gRes?.slug) {
+        try { localStorage.setItem(webSlugKey(recordingId), gRes.slug); } catch { /* 配额忽略 */ }
       }
       // ★ 保存发布表单快照：下次重发同一录制时自动恢复填写内容，免重复输入
       try {
         const formSnap = {
           guideId: result.guide?.id || "",
+          // ★ T9：记住这次选的团队空间，重发同一录制时自动恢复
+          workspaceId: pubWorkspaceId || "",
+          // ★ 端云一体化 v247：把公开链接与 slug 一起存下来（对齐插件二维码快照），
+          //   重传是覆盖式 PATCH 同一篇（slug 不变），存下的地址长期有效。
+          url: gResUrl || "",
+          slug: gRes?.slug || "",
           title: pubTitle,
           applications: pubApplications,
           category: pubCategory,
@@ -2012,17 +2917,122 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       } catch { /* 配额不足等忽略 */ }
       setShowPublishDialog(false);
       setPubStep("pick");
+      // ★ r65「在网页编辑」（对齐 Scribe）：存完草稿直接把人送到网页编辑器。
+      //   🔴 打开失败**绝不回滚已完成的保存** —— 草稿已经在云端了，只是这次没跳过去；
+      //      措辞更不许说「发布失败」（那会让人重发一遍、制造重复教程）。
+      if (openWeb) {
+        const url = gRes?.edit_url ? `${SITE_ORIGIN}${gRes.edit_url}` : webEditUrl(gRes?.slug || "");
+        if (url) {
+          try { await invoke("open_external_url", { url }); }
+          catch (e) { console.warn("[flowio] [r65] 打开网页编辑失败:", e); }
+        } else {
+          setToast({ type: "error", message: WEB_EDIT_OPEN_FAILED });
+        }
+      }
       const okMsg = isDraft
         ? (isUpdateMode ? "草稿已更新！" : "草稿已保存！")
         : (isUpdateMode ? "教程已更新，点赞/评论/收藏已保留" : "发布成功！教程已上传到网站");
-      setToast({ type: "success", message: okMsg });
+      // ★ T9：把附挂团队库的结果并进同一条提示（没选空间 ⇒ 原样返回 okMsg）
+      setToast({
+        type: "success",
+        message: composePublishToast({ base: okMsg, target: pubWorkspaceId, list: pubWorkspaces, attach }),
+      });
     } catch (err) {
       const isAbort = (err as { name?: string })?.name === "AbortError";
       setToast({ type: "error", message: isAbort ? "发布超时（90秒），请检查网络后重试" : "发布失败: " + String(err) });
     } finally {
       setPublishing(false);
     }
-  }, [siteToken, siteUser, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSummary, translations, stepViewCropped, deletedCrop]);
+  }, [siteToken, siteUser, recording, recordingId, categories, pubTitle, pubApplications, pubCategory, pubTags, pubDownloadable, pubCoverBase64, pubSummary, translations, shotZoom, pubWorkspaceId, pubWorkspaces]);
+
+  /** ★ 端云一体化 v247 对齐（对标插件 maybeAutoSaveDraft）：录制停止且已登录时，
+   *   静默把教程存为网站草稿（status=draft，fire-and-forget）。
+   *   去重：本地已记 `flowio_pub_<rid>`（发过/存过）或 `flowio_webslug_<rid>`（已有云端实体）⇒ 不动，
+   *   避免把已发布的教程降级成草稿、或重复建草稿。
+   *   失败（未登录 / 网络 / 校验）一律静默吞掉，绝不影响用户编辑。 */
+  const autoSaveDraftQuiet = useCallback(async () => {
+    if (!siteToken || !recordingId) return;
+    try {
+      if (localStorage.getItem(`flowio_pub_${recordingId}`)) return;
+      if (localStorage.getItem(webSlugKey(recordingId))) return;
+      const data = await invoke<RecordingWithSteps>("load_recording", { id: recordingId });
+      if (!data || !data.steps?.length) return;
+      const title = (recording?.title || data.recording.title || "未命名教程").trim();
+      const app_name = (recording?.app_name || data.recording.app_name || "").trim();
+      const steps = await buildUploadSteps(data.steps, (id) => shotZoomOf(id));
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 90000);
+      let res: Response;
+      try {
+        res = await fetch("https://flowio.cn/api/guides/upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${siteToken}` },
+          body: JSON.stringify({
+            title,
+            summary: "",
+            app_name,
+            category: "other",
+            tags: [],
+            software: [],
+            description: "",
+            visibility: "public",
+            status: "draft",
+            downloadable: "no",
+            steps,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      const result = await res.json().catch(() => ({}) as Record<string, unknown>);
+      if (!res.ok || !result.ok || !result.guide) return; // 静默
+      const g = result.guide as { id?: string; slug?: string };
+      if (g.id) {
+        try { localStorage.setItem(`flowio_pub_${recordingId}`, String(g.id)); } catch { /* 配额忽略 */ }
+        if (g.slug) {
+          try { localStorage.setItem(webSlugKey(recordingId), g.slug); } catch { /* 配额忽略 */ }
+        }
+      }
+    } catch { /* 自动存草稿失败不阻塞用户 */ }
+  }, [siteToken, recordingId, recording, shotZoom]);
+
+  /* ★ 端云一体化 v247 对齐：录制停止进「成片预览」着陆且已登录 ⇒ 自动静默存草稿。
+     fire-and-forget —— 上传在后台上，不阻塞预览/编辑；同一录制只触发一次。 */
+  const autoDraftFiredRef = useRef(false);
+  useEffect(() => {
+    if (!previewLanding || !siteToken) return;
+    if (autoDraftFiredRef.current) return;
+    autoDraftFiredRef.current = true;
+    void autoSaveDraftQuiet();
+  }, [previewLanding, siteToken, autoSaveDraftQuiet]);
+
+  /** ★ r65「在网页编辑」（对齐 Scribe）：把这篇录制交给 flowio.cn 的网页编辑器。
+   *
+   *  路线：本地记过云端 slug ⇒ 直接开（秒跳，不重传）；
+   *        没记过 ⇒ 走 `handlePublish("draft", true)` 存一份草稿再开。
+   *
+   *  🔴 与扩展端 `src/shared/webEdit.ts` 同口径；三条纪律也同源：
+   *    ① 绝不丢数据（端内编辑照旧）② 不说「发布失败」③ 未登录给下一步而不是报错。
+   */
+  const openInWebEditor = useCallback(async () => {
+    if (!recordingId || publishing) return;
+    if (!siteToken) { setToast({ type: "error", message: WEB_EDIT_NEED_LOGIN }); return; }
+    let slug = "";
+    try { slug = localStorage.getItem(webSlugKey(recordingId)) || ""; } catch { /* ignore */ }
+    if (!slug) {
+      // 还没往云端存过 ⇒ 存一份草稿，upload 成功后由 openWeb 分支接管跳转
+      await handlePublish("draft", true);
+      return;
+    }
+    const url = webEditUrl(slug);
+    if (!url) { setToast({ type: "error", message: WEB_EDIT_OPEN_FAILED }); return; }
+    try { await invoke("open_external_url", { url }); }
+    catch (e) {
+      console.warn("[flowio] [r65] 打开网页编辑失败:", e);
+      setToast({ type: "error", message: WEB_EDIT_OPEN_FAILED });
+    }
+  }, [recordingId, siteToken, publishing, handlePublish]);
 
   /* ── 另存为副本 ──────────────────────────────────────────── */
   // 复制整篇教程为一份独立的新副本（标题加「 (副本)」后缀），
@@ -2057,7 +3067,6 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
         { recordingId },
       );
       const list = await reloadRecording();
-      await rebuildCropCache(list);
       refreshHist();
       if (res.changed > 0) {
         // ★ v310: 持久弹窗列出被处理的步骤（toast 几秒就没了，用户不知道改了哪些）
@@ -2080,7 +3089,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
     } finally {
       setRedacting(false);
     }
-  }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
+  }, [recordingId, reloadRecording, refreshHist]);
 
   // 扫描全部截图中的敏感文字区域并自动脱敏（OCR）
   const showScanToast = useCallback((toast: { type: "success" | "error"; message: string }) => {
@@ -2138,7 +3147,6 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
         setScanRedacting(false);
         setScanProgress({ done: 0, total: 0, currentStepId: "" });
         const list2 = await reloadRecording().catch(() => null);
-        if (list2) await rebuildCropCache(list2).catch(() => {});
         if (r.cancelled) {
           showScanToast({ type: "success", message: "扫描已取消" });
         } else if (r.total === 0) {
@@ -2166,7 +3174,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       }
     ).then((fn) => { if (cancelled) fn(); else unlisten = fn; });
     return () => { cancelled = true; unlisten?.(); };
-  }, [recordingId, reloadRecording, rebuildCropCache, showScanToast]);
+  }, [recordingId, reloadRecording, showScanToast]);
 
   const handleCancelScanRedact = useCallback(async () => {
     try {
@@ -2193,8 +3201,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
         domainMode: domainMode === "auto" ? null : domainMode,
       });
       alert(result);
-      const list = await reloadRecording();
-      await rebuildCropCache(list);
+      await reloadRecording();
       refreshHist();
     } catch (err) {
       const msg = String(err);
@@ -2214,7 +3221,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
     } finally {
       setAiGenerating(false);
     }
-  }, [recordingId, reloadRecording, rebuildCropCache, refreshHist]);
+  }, [recordingId, reloadRecording, refreshHist]);
 
   /* ── Lightbox helpers ────────────────────────────────────── */
 
@@ -2227,7 +3234,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
   const lightboxPrev = () =>
     setLightboxIndex((i) => Math.max(0, i - 1));
   const lightboxNext = () =>
-    setLightboxIndex((i) => Math.min(steps.length - 1, i + 1));
+    setLightboxIndex((i) => Math.min(realSteps.length - 1, i + 1));
 
   /* ── Annotation (手动标注) ───────────────────────────────── */
 
@@ -2240,19 +3247,15 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       setToast({ type: "error", message: "该步骤没有可标注的截图" });
       return;
     }
-    // 记录当前视图：从「裁图」视图打开 → 此后裁切顶替裁图；从「全图」打开 → 顶替全图
-    setAnnotateMode(getViewCropped(stepId) ? 'crop' : 'full');
     setAnnotateStepId(stepId);
     setAnnotateOpen(true);
   };
 
   /**
-   * 标注完成——按打开标注时的视图（annotateMode）决定裁切结果落到哪个槽位：
-   * - 全图视图裁剪（hasCrop && mode==='full'）：
-   *     把「注释+裁切」的结果直接覆盖全图（screenshot_path），并清空裁图锚点。
-   *     原全图不保留（应用内可撤销）。
-   * - 裁图视图重裁（hasCrop && mode==='crop'）：
-   *     注释烧回全图（save_step_screenshot_full，原全图不动）+ 更新裁图锚点（顶替之前的裁图）。
+   * 标注完成：
+   * - 有圈选裁切（hasCrop）：「注释 + 裁切」的结果顶替全图（screenshot_path），
+   *   并清空裁图锚点 —— 已经没有独立的「裁图」槽位了，用户圈的就是新的主图。
+   *   原全图不保留（应用内可撤销）。
    * - 仅标注无裁切：注释烧回全图。
    */
   const handleAnnotateSave = async (
@@ -2269,28 +3272,17 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
     }
     const stepId = annotateStepId;
     try {
-      if (hasCrop && annotateMode === 'full') {
-        // 全图视图裁剪 → 裁切结果顶替全图，并清空裁图锚点
+      if (hasCrop) {
+        // 圈选裁切 → 裁切结果顶替全图，并清空裁图锚点。
+        // 5b 对齐（插件「手调框落 cropRect 不改锚点」）：手调框的 cropRect 直接
+        // 按像素烧录为最终裁切结果（cropped 固化进 full 槽位），锚点被清空而
+        // 不是被手调框反算覆盖 —— 「重置为自动」仅存在于编辑器内
+        // （AnnotationsOverlay 持 initialAnchor 时回到 cropBoxFromAnchor 50% 窗口）。
         const base64 = cropped!.split(",")[1] || "";
         if (base64) {
           await invoke("save_step_screenshot_full", { stepId, base64Data: base64 });
         }
         await invoke("update_step_crop", { stepId, x: null, y: null, cropW: null, cropH: null });
-      } else if (hasCrop && annotateMode === 'crop') {
-        // 裁图视图重裁 → 注释烧回全图（原全图不动）+ 更新裁图锚点（顶替之前的裁图）
-        if (full) {
-          const base64 = full.split(",")[1] || "";
-          if (base64) {
-            await invoke("save_step_screenshot_full", { stepId, base64Data: base64 });
-          }
-        }
-        await invoke("update_step_crop", {
-          stepId,
-          x: anchor!.x,
-          y: anchor!.y,
-          cropW: anchor!.cropW,
-          cropH: anchor!.cropH,
-        });
       } else if (full) {
         // 仅标注（无裁切）→ 注释烧回全图
         const base64 = full.split(",")[1] || "";
@@ -2298,9 +3290,8 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
           await invoke("save_step_screenshot_full", { stepId, base64Data: base64 });
         }
       }
-      // 重新从库加载步骤 + 重建裁图缓存（screenshot_base64 与锚点可能都变了）
-      const list = await reloadRecording();
-      await rebuildCropCache(list);
+      // 重新从库加载步骤（screenshot_base64 与锚点可能都变了）
+      await reloadRecording();
       setToast({ type: "success", message: "标注已保存" });
       refreshHist();
     } catch (err) {
@@ -2310,38 +3301,257 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
     setAnnotateOpen(false);
   };
 
-  /* ── Loading / Error ─────────────────────────────────────── */
+  /* ── 复刻插件「统一改变截图大小」：顶栏「图片 X%」按钮 ──────────
+      插件口径（editor.tsx r489）：50% = 重点部位占整张图的一半（cropRect 归一化边长），
+      顶栏按钮循环档位 100/75/50/25，落点是每步截图本身（桌面端烧录模型，
+      批量按锚点中心裁切后顶替主图；save_step_screenshot_full 自带 hist 快照可撤销）。 */
 
-  if (loading) {
-    return (
-      <div className="editor-loading">
-        <Loader2 size={32} className="spinner" />
-        <p>加载录制数据...</p>
-      </div>
-    );
-  }
+  const SHOT_SCALE_STEPS = [100, 75, 50, 25] as const;
 
-  if (error) {
-    return (
-      <div className="editor-loading">
-        <p className="text-red">加载失败：{error}</p>
-        <button className="btn mt-3" onClick={() => navigate("/")} data-tip="返回录制列表">
-          <ArrowLeft size={14} /> 返回 Dashboard
-        </button>
-      </div>
+  const nextShotScalePct = (cur: number | null): number => {
+    if (cur == null) return 75;
+    const idx = SHOT_SCALE_STEPS.indexOf(cur as (typeof SHOT_SCALE_STEPS)[number]);
+    return SHOT_SCALE_STEPS[(idx < 0 ? 0 : idx + 1) % SHOT_SCALE_STEPS.length];
+  };
+
+  const [shotScalePctNow, setShotScalePctNow] = useState<number | null>(null);
+  const [shotScaleBusy, setShotScaleBusy] = useState(false);
+  // ★ 防并发重入：state 更新是异步的，快速连点会在同一帧穿过 busy 检查，
+  //   并发执行多轮「8 步 invoke + reloadRecording」→ SQLite 争用 / 内存暴涨 → 界面假死。
+  //   用 ref 同步加锁，点击瞬间即可挡住后续重入。
+  const shotScaleBusyRef = useRef(false);
+
+  /** 读取 base64 图片真实像素尺寸（screenshot_base64 为无前缀裸 base64）。 */
+  const readImageSize = (b64: string): Promise<{ width: number; height: number } | null> =>
+    new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      img.onerror = () => resolve(null);
+      img.src = b64.startsWith("data:") ? b64 : `data:image/jpeg;base64,${b64}`;
+    });
+
+  /**
+   * 实时统计整篇共同比例：以真实主图尺寸 / before 整图尺寸为准。
+   * 统一比例烧录 / 手动标注裁剪后 x/y 锚点不代表真实比例（x/y 恒在、尺寸已变），
+   * 只有实际像素能反映 —— 全部一致返回该百分比，不一致返回 null（顶栏显示「混合」）。
+   */
+  const [liveShotScalePct, setLiveShotScalePct] = useState<number | null>(null);
+  // 每步「真实比例」（主图像素 / before 整图像素，无 before 时回退锚点口径）。
+  // 与显示倍率解耦：真实比例只依赖数据（steps），读图尺寸较慢，单独缓存。
+  const [perShotPcts, setPerShotPcts] = useState<Record<string, number | null>>({});
+  useEffect(() => {
+    let cancelled = false;
+    const targets = steps.filter(
+      (s) => !isDocBlock(s) && !!s.screenshot_base64,
     );
-  }
+    if (targets.length === 0) {
+      setPerShotPcts({});
+      return;
+    }
+    (async () => {
+      const map: Record<string, number | null> = {};
+      for (const s of targets) {
+        const main = await readImageSize(s.screenshot_base64 as string);
+        if (!main || main.width <= 0) { map[s.id] = null; continue; }
+        if (s.before_screenshot_base64) {
+          const base = await readImageSize(s.before_screenshot_base64);
+          if (base && base.width > 0) {
+            // 等比裁剪宽高同比例，取宽度比四舍五入到整数百分比
+            map[s.id] = Math.round((main.width / base.width) * 100);
+            continue;
+          }
+        }
+        // 无 before 整图（老数据 / 上传图）：回退锚点口径
+        map[s.id] = s.x != null && s.y != null ? 50 : 100;
+      }
+      if (cancelled) return;
+      setPerShotPcts(map);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [steps]);
+
+  // 显示口径 = 真实比例 × 显示倍率（−/+ 微调也算「图片大小」，
+  // 某步倍率被改后各步显示大小不一致 → 顶栏同样显示「混合」）。
+  // 全部一致时优先展示真实比例（与顶栏统一比例档位 100/75/50/25 语义一致）。
+  useEffect(() => {
+    const targets = steps.filter(
+      (s) => !isDocBlock(s) && !!s.screenshot_base64,
+    );
+    if (targets.length === 0) {
+      setLiveShotScalePct(null);
+      return;
+    }
+    const shown: (number | null)[] = targets.map((s) => shotDispOf(s.id));
+    const validShown = shown.filter((p): p is number => p != null);
+    if (validShown.length === 0) { setLiveShotScalePct(null); return; }
+    const firstShown = validShown[0];
+    if (!validShown.every((p) => p === firstShown)) {
+      setLiveShotScalePct(null);
+      return;
+    }
+    // 显示一致：优先展示真实比例（未动 −/+ 时按钮显示的就是真实比例）
+    const realVals = targets.map((s) => perShotPcts[s.id]).filter((p): p is number => p != null);
+    if (realVals.length > 0 && realVals.every((p) => p === realVals[0])) {
+      setLiveShotScalePct(realVals[0]);
+    } else {
+      setLiveShotScalePct(firstShown);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [perShotPcts, shotZoom, showFullShot, shotAtGlobalPct]);
+
+  // 只在未初始化时用统计值兜底；用户点过档位后保持用户选择，刷新页面回统计值
+  useEffect(() => {
+    if (shotScalePctNow == null) setShotScalePctNow(liveShotScalePct);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveShotScalePct]);
+
+  const onShotScaleAll = async (pct: number) => {
+    if (shotScaleBusyRef.current) return;
+    shotScaleBusyRef.current = true;
+    setShotScaleBusy(true);
+    // 统一大小：100% 档还原整图并清空锚点（导出端据此判定整图），只处理有锚点步；
+    // 75/50/25 档处理所有有截图步 —— 有锚点按落点裁剪，无锚点（整窗截图 / 刚还原整图）
+    // 由 cropBase64ByAnchorFrac 以截图中心兜底，保证 100→75→50→25→100 循环可重入，
+    // 不被「100% 清锚点」破坏（修复：连点多下后提示"已经是 X%"不再推进档位）。
+    const fullPct = pct === 100;
+    // ★ 100% 档 targets 与 75/50/25 档一致：所有有截图步（不再要求有锚点）。
+    //   之前 100% 只筛「有锚点步」：100% 清锚点后（或 100→75→50→25 循环后
+    //   锚点已空）再点 100% ⇒ targets 为空，主图文件不被还原，仅按钮推进到
+    //   "100%" —— 用户看到「图片 100% 但主图仍是 25% 尺寸」。
+    //   现在 100% 对所有有截图步写回 before 整图并清锚点，25→100 循环必然还原。
+    const targets = steps.filter(
+      (s) => !isDocBlock(s) && !!s.id && !!s.screenshot_base64,
+    );
+    const centerCount = targets.filter((s) => s.x == null || s.y == null).length;
+    let done = 0;
+    let skipped = 0;
+    try {
+      const frac = pct / 100;
+      for (const s of targets) {
+        // 以录制时刻 before 全屏原图为基准（与主图同尺寸、坐标兼容），
+        // 不再用降质内存 base64（downscale 到 1280 宽），避免越裁越小。
+        const raw = await invoke<string>("read_step_before_raw_base64", {
+          stepId: s.id,
+        });
+        if (!raw) { skipped += 1; continue; }
+        if (frac >= 1) {
+          // 100% = 全图：把 before 原图写回主图（走 hist 快照，路径不变），
+          // 并清空 x/y/crop 锚点 —— 插件端等价 viewMode=full；
+          // 桌面端导出/AI 消费端 crop_region_50 只要见到 x/y 锚点就恒裁 50%
+          // 重点图特写，只写回整图不清锚点 ⇒ 导出的还是"非100%的重点图"。
+          await invoke("save_step_screenshot_full", {
+            stepId: s.id,
+            base64Data: raw,
+          });
+          await invoke("update_step_crop", {
+            stepId: s.id,
+            x: null,
+            y: null,
+            cropW: null,
+            cropH: null,
+          });
+        } else {
+          // 有锚点按落点裁剪；无锚点（整图）传 null → cropBase64ByAnchorFrac 以截图中心兜底
+          const out = await cropBase64ByAnchorFrac(
+            raw,
+            s.x != null && s.y != null ? { x: s.x, y: s.y } : null,
+            frac,
+          );
+          if (!out) { skipped += 1; continue; }
+          await invoke("save_step_screenshot_full", {
+            stepId: s.id,
+            base64Data: out,
+          });
+        }
+        done += 1;
+      }
+      await reloadRecording();
+      refreshHist();
+      // ★ 统一比例后把参与步的显示倍率一并复位：数据层已写回统一尺寸的截图，
+      //   但显示倍率 shotZoom（localStorage flowio_view_<recordingId>）仍是旧放大值，
+      //   主图 <img> 按 transform: scale(zoom) 渲染 ⇒ 各步画面大小仍不一致，
+      //   顶栏统计（真实比例 × 显示倍率）仍显示「混合」，用户困惑"统一了怎么还混合"。
+      //   所有档位统一后显示倍率复位为 1（图片完整填满截图框 = 框显示 100%），
+      //   让数据与显示两层都一致；100% 档同时保证「图片 100% 且主图是整图」。
+      setShotZoom((prev) => {
+        const next: Record<string, number> = {};
+        const z = 1;
+        for (const s of targets) next[s.id] = z;
+        return { ...prev, ...next };
+      });
+      // ★ 一并退出参与步的「查看全图」态并清掉中心缩放模式：
+      //   showFullShot 的步显示 before 整图（scale 1）、shotZoomCenter 的步以
+      //   截图中心为缩放原点，二者都会让该步显示大小/取景与其他步不一致，
+      //   只复位 shotZoom 时用户仍会看到「某步还放大着/对不上」。统一后
+      //   所有参与步回落到统一的当前比例 × 统一倍率，取景原点也归一。
+      setShowFullShot((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const s of targets) if (next[s.id]) { next[s.id] = false; changed = true; }
+        return changed ? next : prev;
+      });
+      setShotZoomCenter((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const s of targets) if (next[s.id]) { next[s.id] = false; changed = true; }
+        return changed ? next : prev;
+      });
+      // ★ 一并退出参与步的「顶栏全局比例态」：顶栏态显示主图裁剪图原样填满框，
+      //   统一后数据层已写回新的统一尺寸，若仍停留在顶栏态会让各步显示大小不一致，
+      //   统一后所有参与步回落到统一的当前比例 × 统一倍率，取景原点也归一。
+      setShotAtGlobalPct((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const s of targets) if (next[s.id]) { next[s.id] = false; changed = true; }
+        return changed ? next : prev;
+      });
+      setShotScalePctNow(pct);
+      const suffix = centerCount > 0 ? `（其中 ${centerCount} 张无锚点整图按中心取景）` : "";
+      if (pct === 100) {
+        setToast({
+          type: "success",
+          message:
+            done > 0
+              ? `已把 ${done} 张图还原为整图（100%）${suffix}`
+              : skipped > 0
+                ? `没有可还原的截图（${skipped} 张读取失败）`
+                : "所有截图已经是整图了",
+        });
+      } else if (done > 0) {
+        setToast({
+          type: "success",
+          message: `已把 ${done} 张图统一成 ${pct}%${suffix}`,
+        });
+      } else {
+        setToast({
+          type: "success",
+          message:
+            skipped > 0
+              ? `没有可统一的截图（${skipped} 张读取失败或保持原样）`
+              : "没有可统一的截图",
+        });
+      }
+    } catch (err) {
+      console.error("统一截图大小失败:", err);
+      setToast({ type: "error", message: "统一截图大小失败，请重试" });
+    } finally {
+      shotScaleBusyRef.current = false;
+      setShotScaleBusy(false);
+    }
+  };
 
   /* ── Portal toolbar into titlebar ─────────────────────── */
 
   const titlebarLeft = (
     <div style={{ display: "flex", alignItems: "center", gap: 8, height: "100%", overflow: "hidden" }}>
+      {/* 退回录制列表：一枚 ← 箭头，不再占文字宽度（顶栏左侧留给撤销/重做与标题） */}
       <button
+        className="titlebar-back-btn"
         onClick={() => navigate("/")}
         data-tip={"返回录制列表\n改动已自动保存"}
-        style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px 4px 2px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
       >
-        <ArrowLeft size={14} /> 返回
+        <ArrowLeft size={16} />
       </button>
       {/* 全局撤销/重做（WPS 式）：可撤销标题/描述编辑、删步、精简、合并、改图等一切编辑 */}
       <div style={{ display: "flex", alignItems: "center", gap: 2 }} onMouseDown={(e) => e.stopPropagation()}>
@@ -2405,43 +3615,111 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
 
   const titlebarActions = (
     <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      {/* 编辑器双模式切换：简洁（默认，不调模型）/ 复杂（开放 AI 功能） */}
+      <div
+        className="ed-mode-switch"
+        style={{ display: "flex", alignItems: "center", borderRadius: 6, border: "1px solid #2b3340", overflow: "hidden", fontSize: 12 }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={() => switchEditorMode("simple")}
+          data-tip={"简洁模式\n纯本地编辑，不调模型、不耗积分（默认）"}
+          style={{ border: "none", cursor: "pointer", padding: "3px 9px", fontSize: 12, background: !isComplex ? "#ff6b35" : "transparent", color: !isComplex ? "#fff" : "#9aa4b2" }}
+        >
+          简洁
+        </button>
+        <button
+          onClick={() => switchEditorMode("complex")}
+          data-tip={"复杂模式\n开放 AI 功能（AI 精简 / 生成 / 扫描脱敏 / 翻译 / 摘要重生成），按调用消耗积分"}
+          style={{ border: "none", borderLeft: "1px solid #2b3340", cursor: "pointer", padding: "3px 9px", fontSize: 12, background: isComplex ? "#ff6b35" : "transparent", color: isComplex ? "#fff" : "#9aa4b2" }}
+        >
+          复杂
+        </button>
+      </div>
+      {/* ★ 复刻插件「统一改变截图大小」：图片 X% —— 一条按钮循环档位 100/75/50/25，
+          一键把所有步骤的重点图统一成同一比例（Ctrl+Z 可整篇撤销）。 */}
+      {!previewMode && steps.length > 0 && (
+        <button
+          onClick={() => void onShotScaleAll(nextShotScalePct(shotScalePctNow))}
+          disabled={shotScaleBusy}
+          data-tip={"统一改变截图大小\n整篇所有步骤的重点图占整张图的比例（100% 整图 / 75% / 50% / 25%，点一下进下一档；重点部位会占满显示区域）；各步比例不一致时显示『混合』"}
+          style={{
+            background: "transparent", border: "none",
+            color: liveShotScalePct != null ? "#ff6b35" : "#e6edf3",
+            cursor: shotScaleBusy ? "default" : "pointer", padding: "3px 8px",
+            borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4,
+            opacity: shotScaleBusy ? 0.6 : 1,
+          }}
+        >
+          {shotScaleBusy ? "处理中…" : `图片 ${liveShotScalePct != null ? `${liveShotScalePct}%` : "混合"}`}
+        </button>
+      )}
+      {/* 精简 / 执行：第十五轮从左侧目录栏搬上来（顶栏本来就只有它俩是「对整篇动手」的
+          重度操作，跟导出/发布同一层）。文字按钮，不带图标，与顶栏其余按钮一致。 */}
+      {!previewMode && steps.length > 0 && (
+        <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+          <button
+            onClick={() => { setSimplifyOpen(!simplifyOpen); setExportOpen(false); setToolsOpen(false); setTranslateOpen(false); }}
+            disabled={simplifying !== null || aiBusy}
+            data-tip={"把啰嗦的步骤合并掉\n录完会自动跑一遍；这里也可以手动重跑或换用 AI"}
+            style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: simplifying !== null || aiBusy ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4, opacity: simplifying !== null || aiBusy ? 0.6 : 1 }}
+          >
+            {aiBusy ? "AI 精简中…" : simplifying === "rules" ? "规则合并中…" : "精简"} <ChevronDown size={12} />
+          </button>
+          {simplifyOpen && (
+            <div className="export-dropdown step-simplify-menu">
+              {isComplex && (
+              <button
+                className="export-dropdown-item"
+                onClick={() => { setSimplifyOpen(false); void handleAiSimplify(); }}
+                disabled={simplifying !== null || aiBusy}
+                data-tip={"AI 精简（推荐）\n先跑本地规则，再让 AI 按语义把重复步骤压成一步\n能处理规则看不懂的情况（比如弹框里坐标各异的一串点击），需要几秒到十几秒"}
+              >
+                {aiBusy ? <Loader2 size={14} className="spinner" /> : <Sparkles size={14} className="export-dropdown-item-icon" />}
+                <span className="export-dropdown-item-label">AI 精简（推荐）</span>
+              </button>
+              )}
+              <button
+                className="export-dropdown-item"
+                data-tip={"仅规则合并\n只跑本地规则：重复点击→双击、连续输入合并、删掉误点到自己窗口的末步\n不联网、瞬间完成，但看不懂语义上的重复"}
+                onClick={() => { setSimplifyOpen(false); void handleAutoMerge(); }}
+                disabled={simplifying !== null}
+              >
+                {simplifying === "rules" ? <Loader2 size={14} className="spinner" /> : <Wand2 size={14} className="export-dropdown-item-icon" />}
+                <span className="export-dropdown-item-label">仅规则合并</span>
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+      {!previewMode && AUTOMATION_ENABLED && steps.length > 0 && (
+        <button
+          onClick={() => handleExecute()}
+          disabled={executing}
+          data-tip={"精准执行\n按录制时的屏幕坐标确定性重放（非 AI 猜点），在目标窗口自动点选；每步后截图校验"}
+          style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+        >
+          执行{executing ? "中…" : ""}
+        </button>
+      )}
       {!previewMode && (
         <button
           onClick={() => void handleSaveAs()}
           data-tip="另存为副本：复制一份完全相同的教程（含截图），改副本不会破坏原教程"
-          style={{ background: "transparent", border: "1px solid #8b5cf6", color: "#a78bfa", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+          style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
         >
-          <Copy size={14} /> 另存为
+          另存为
         </button>
       )}
-      <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+      <div style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
         <button
-          onClick={() => { setExportOpen(!exportOpen); setToolsOpen(false); setTranslateOpen(false); setSimplifyOpen(false); }}
+          onClick={() => { setExportOpen(true); setToolsOpen(false); setTranslateOpen(false); setSimplifyOpen(false); }}
           disabled={exporting}
-          data-tip={"导出教程\n导出为 Word / PDF / HTML / Markdown 等；要用译文导出，先在「翻译」里选好导出语言"}
+          data-tip={"导出教程\n导出为 Word / PDF / PPT / 视频 / 图片等；要用译文导出，先在「翻译」里选好导出语言"}
           style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
         >
-          <Download size={14} /> {exportProgress ? exportProgress : exporting ? "导出中..." : "导出"} <ChevronDown size={12} />
+          {exportProgress ? exportProgress : exporting ? "导出中..." : "导出"}
         </button>
-        {exportOpen && (
-          <div className="export-dropdown" style={{ right: 0 }}>
-            {/* 导出语言已迁到「翻译」下拉，这里只保留格式 */}
-            {EXPORT_FORMATS.map((fmt) => {
-              const Icon = fmt.icon;
-              return (
-                <button
-                  key={fmt.value}
-                  className="export-dropdown-item"
-                  onClick={() => handleExport(fmt.value)}
-                  data-tip={EXPORT_TIPS[fmt.value]}
-                >
-                  <Icon size={14} className="export-dropdown-item-icon" />
-                  <span className="export-dropdown-item-label">{fmt.label}</span>
-                </button>
-              );
-            })}
-          </div>
-        )}
       </div>
       {/* 执行/演练/执行历史 已移至精简下拉后面 */}
       {!previewMode && (
@@ -2449,9 +3727,9 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
           <button
             onClick={() => { setToolsOpen(!toolsOpen); setExportOpen(false); setTranslateOpen(false); setSimplifyOpen(false); }}
             data-tip={"更多工具\n上传网站、AI 生成步骤说明、敏感信息脱敏"}
-            style={{ background: "transparent", border: "1px solid #ff6b35", color: "#ff8a5c", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+            style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
           >
-            <Wrench size={14} /> 工具 <ChevronDown size={12} />
+            工具 <ChevronDown size={12} />
           </button>
           {toolsOpen && (
             <div className="export-dropdown" style={{ right: 0, zIndex: 9999 }}>
@@ -2469,8 +3747,20 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                   }
                   setShowPublishDialog(true);
                   setPubStep("pick");
+                  // ★ T9：拉「可发布的团队空间」。取不到**不算错** —— 发布到网站是主线，团队库是附加。
+                  listMyWorkspaces(siteToken)
+                    .then((list) => {
+                      const arr = Array.isArray(list) ? list : [];
+                      setPubWorkspaces(arr);
+                      // 🔴 快照里选过的空间若已不在可发布列表里（被移出空间 / 降成 viewer）⇒
+                      //    回落到「不发布」。否则这次发布会挂到一个已经不存在的目标上，白失败一次。
+                      setPubWorkspaceId((cur) => (cur && !arr.some((w) => w.id === cur) ? "" : cur));
+                    })
+                    .catch(() => setPubWorkspaces([]));
                   // ★ 恢复上次发布填写的表单信息（重发免重填）；无快照时用默认值
                   let pubFormRestored = false;
+                  /** ★ T9：快照里选过的团队空间 */
+                  let pubWsSavedId = "";
                   try {
                     const raw = localStorage.getItem(`flowio_pubform_${recordingId}`);
                     if (raw) {
@@ -2483,6 +3773,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                       setPubSummary(f.scene || "");
                       setPubCoverBase64(f.coverBase64 || null);
                       setPubCoverPreview(f.coverBase64 || null);
+                      pubWsSavedId = typeof f.workspaceId === "string" ? f.workspaceId : "";
                       pubFormRestored = true;
                     }
                   } catch { /* 快照损坏则忽略 */ }
@@ -2498,6 +3789,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                   }
                   setPubAppInput("");
                   setPubTagInput("");
+                  setPubWorkspaceId(pubWsSavedId);
                 }}
                 data-tip={siteToken
                   ? "把这篇教程上传到 flowio.cn\n可先存草稿，也可填写标题/应用/分类后直接发布"
@@ -2507,6 +3799,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                 <span className="export-dropdown-item-label">{siteToken ? "上传网站" : "登录后上传"}</span>
               </button>
               {/* 另存为已移至顶栏按钮，此处不重复 */}
+              {isComplex && (
               <button
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleAiGenerate(); }}
@@ -2528,6 +3821,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                   <option value="terminal">终端</option>
                 </select>
               </button>
+              )}
               <button
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleRedact(); }}
@@ -2537,6 +3831,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                 {redacting ? <Loader2 size={14} className="spinner" /> : <ShieldCheck size={14} className="export-dropdown-item-icon" />}
                 <span className="export-dropdown-item-label">{redacting ? "脱敏中..." : "文本脱敏"}</span>
               </button>
+              {isComplex && (
               <button
                 className="export-dropdown-item"
                 onClick={() => { setToolsOpen(false); handleScanRedact(); }}
@@ -2547,6 +3842,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                 {scanRedacting ? <Loader2 size={14} className="spinner" /> : <ScanSearch size={14} className="export-dropdown-item-icon" />}
                 <span className="export-dropdown-item-label">{scanRedacting ? "扫描中..." : "扫描脱敏"}</span>
               </button>
+              )}
               {/* ★ v310: 脱敏设置入口（与插件端对齐）——跳设置页脱敏 tab */}
               <button
                 className="export-dropdown-item"
@@ -2562,7 +3858,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       )}
 
       {/* 翻译：选择语言直接翻译，完成后同步到编辑器步骤 */}
-      {!previewMode && (
+      {!previewMode && isComplex && (
         <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
           <button
             onClick={() => { setTranslateOpen(!translateOpen); setExportOpen(false); setToolsOpen(false); setSimplifyOpen(false); }}
@@ -2570,9 +3866,9 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
             data-tip={previewMode
               ? "切换预览语言\n在这个下拉里选「原文」或某种译文，预览会立刻跟着换"
               : "翻译\n点语言把标题和每步描述翻译过去；已翻译过的语言点一下立即切换，不用重新翻译\n选「原文」随时切回翻译前的文字\n译文存成副本，也决定导出语言"}
-            style={{ background: "transparent", border: "1px solid #3366CC", color: "#7aa2f7", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4, opacity: translating ? 0.6 : 1 }}
+            style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4, opacity: translating ? 0.6 : 1 }}
           >
-            {translating ? <Loader2 size={14} className="spinner" /> : <Languages size={14} />} 翻译 <ChevronDown size={12} />
+            {translating && <Loader2 size={14} className="spinner" />} 翻译 <ChevronDown size={12} />
           </button>
           {translateOpen && (
             <div className="export-dropdown" style={{ right: 0, zIndex: 9999 }}>
@@ -2621,24 +3917,21 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       )}
 
       <button
-        onClick={() => setPreviewMode(!previewMode)}
-        data-tip={previewMode ? "退出预览，回到编辑" : "预览成品效果\n按读者看到的样子通篇预览（导出/上传前先看一眼）"}
-        style={{ background: "transparent", border: "none", color: "#e6edf3", cursor: "pointer", padding: "4px 6px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
+        onClick={() => {
+          if (previewMode) {
+            // 出预览 = 进编辑；若来自录制着陆（?preview=1）顺带清掉 URL 参数
+            if (previewLanding) exitPreviewLanding();
+            else setPreviewMode(false);
+          } else {
+            setPreviewMode(true);
+          }
+        }}
+        data-tip={previewMode ? "进入编辑\n退出成片预览，回到编辑器" : "预览成品效果\n按读者看到的样子通篇预览（导出/上传前先看一眼）"}
+        style={{ background: "#ff6b35", border: "none", color: "#fff", cursor: "pointer", padding: "4px 12px", borderRadius: 4, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}
       >
-        {previewMode ? <><X size={14} /> 退出预览</> : <><Eye size={14} /> 预览</>}
+        {previewMode ? "编辑" : "预览"}
       </button>
 
-      {/* 全图 / 裁图 统一切换：作用于全部步骤（选择教程主要截图风格） */}
-      <div className="titlebar-view-segmented">
-        <button
-          className={`titlebar-view-segmented-btn${globalView === 'full' ? ' active' : ''}`}
-          onClick={() => applyGlobalView('full')}
-        >全图</button>
-        <button
-          className={`titlebar-view-segmented-btn${globalView === 'crop' ? ' active' : ''}`}
-          onClick={() => applyGlobalView('crop')}
-        >裁图</button>
-      </div>
     </div>
   );
 
@@ -2648,6 +3941,49 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
   const previewStepText = (step: Step): { title: string; description: string } => {
     return { title: step.title, description: step.description || "" };
   };
+  /* ★ v0.65.244 对齐：成片体检汇总（只对真步骤体检；内容块/摘要/简介天然豁免） */
+  const health = useMemo(() => healthSummaryOf(realSteps), [realSteps]);
+  const healthStepIdOf = (n: number): string | null => realSteps.find((s) => s.step_number === n)?.id ?? null;
+  /** 体检条点问题步骤 chip → 滚到该步骤（右侧成片正文） */
+  const jumpToHealthStep = (n: number) => {
+    const id = healthStepIdOf(n);
+    if (!id) return;
+    const el = document.getElementById(`sop-step-${id}`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+    const left = document.getElementById(`step-item-${id}`);
+    if (left) left.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  };
+  const healthChips = useMemo(() => {
+    const chips: { step: number; level: "error" | "warn"; label: string }[] = [];
+    for (const i of health.issues) {
+      if (chips.length > 0 && chips[chips.length - 1].step === i.step) continue;
+      chips.push({ step: i.step, level: i.level, label: healthLabel(i.code) });
+    }
+    return chips;
+  }, [health]);
+
+  /* ── Loading / Error（★ 必须位于所有 hook 之后：提前 return 会跳过下方
+     useMemo，导致渲染轮次间 hook 数量不一致，触发 React #310 白屏） ── */
+
+  if (loading) {
+    return (
+      <div className="editor-loading">
+        <Loader2 size={32} className="spinner" />
+        <p>加载录制数据...</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="editor-loading">
+        <p className="text-red">加载失败：{error}</p>
+        <button className="btn mt-3" onClick={() => navigate("/")} data-tip="返回录制列表">
+          <ArrowLeft size={14} /> 返回 Dashboard
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="editor-layout">
@@ -2814,186 +4150,157 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
         </div>
       )}
 
-      {/* Stage 3：执行审计历史面板 */}
-      {showAudit && (
-        <div
-          style={{ position: "fixed", inset: 0, zIndex: 10003, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
-        >
-          <div
-            style={{ position: "relative", background: "#fff", borderRadius: 10, padding: "20px 22px", width: 520, maxHeight: "80vh", display: "flex", flexDirection: "column", boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <button
-              onClick={() => setShowAudit(false)}
-              data-tip="关闭"
-              aria-label="关闭"
-              style={{ position: "absolute", top: 10, right: 10, width: 26, height: 26, border: "none", borderRadius: 6, background: "transparent", color: "#57606a", fontSize: 14, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
-            >✕</button>
-            <div style={{ fontSize: 15, fontWeight: 600, color: "#24292e" }}>执行历史</div>
-            <div style={{ fontSize: 12.5, color: "#57606a", marginTop: 4 }}>
-              本教程历次重放的审计记录（每次执行都会留痕，含被审批拦截而未下发的记录）。
-            </div>
-            <div style={{ marginTop: 10, overflowY: "auto", flex: 1 }}>
-              {auditLoading ? (
-                <div style={{ fontSize: 13, color: "#57606a", padding: "12px 0" }}>加载中…</div>
-              ) : auditRecords.length === 0 ? (
-                <div style={{ fontSize: 13, color: "#57606a", padding: "12px 0" }}>暂无执行记录</div>
-              ) : (
-                <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 8 }}>
-                  {auditRecords.map((r) => {
-                    const st = r.overallStatus || "no-steps";
-                    const color = st === "success" ? "#3fb950" : st === "failed" ? "#e5484d" : st === "no-steps" ? "#8c959f" : "#d97706";
-                    const label = st === "success" ? "成功" : st === "failed" ? "失败" : st === "no-steps" ? "无步骤" : st === "needs-approval" ? "待批准(未执行)" : "部分成功";
-                    return (
-                      <li key={r.runId} style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: "8px 10px", background: "#f6f8fa", fontSize: 13, color: "#24292e" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                          <span style={{ fontWeight: 600, color }}>{label}</span>
-                          <span style={{ color: "#8c959f" }}>{r.dryRun ? "演练" : "执行"}</span>
-                          <span style={{ marginLeft: "auto", color: "#57606a" }}>{r.startedAt}</span>
-                        </div>
-                        <div style={{ color: "#57606a", marginTop: 4 }}>
-                          共 {r.totalSteps} 步 · 成功 {r.okSteps} · 失败 {r.failedSteps}{r.targetApp ? ` · 目标：${r.targetApp}` : ""}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 14 }}>
-              <button
-                onClick={() => setShowAudit(false)}
-                style={{ padding: "6px 16px", borderRadius: 6, border: "none", background: "#3366CC", color: "#fff", cursor: "pointer", fontSize: 13 }}
-              >关闭</button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* ★ T8 译文可编辑弹窗 */}
 
-      {/* Left: Step List */}
-      <div className="editor-sidebar">
-        <div className="text-sm text-secondary mb-2" style={{ padding: "0 16px", display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ marginRight: "auto" }}>{steps.length} 个步骤</span>
+      {/* 第十九轮：两栏包进 .editor-zoom —— 整页缩放只作用于「页面」本身（目录 + 正文）。
+          弹窗/进度条那些 position:fixed 浮层留在外面，缩放不会把它们的定位算歪。 */}
+      <div className="editor-zoom" style={{ zoom: pageZoom }}>
+      {/* Left: Step List（宽度由分隔条拖拽决定，第十八轮） */}
+      <div className="editor-sidebar" style={{ width: sideWidth, minWidth: 0 }}>
+        {/* 第十九轮：步骤数从右端挪到「目录」后面；右端腾出来的位置放整页缩放
+            （－ 缩小 / ＋ 放大 / ⟲ 比例恢复原样）。 */}
+        {/* 第二十八轮：头部自己带下内边距 + 一条分隔线（见 styles.css
+            「② 目录层次」）—— 原来靠 inline style 给左右内边距，会挡住样式表
+            算不了下边距，所以内边距整块交给 CSS。 */}
+        <div className="text-sm text-secondary dir-head">
+          <span className="dir-title">目录</span>
+          <span className="dir-count">{realSteps.length} 个步骤</span>
+          <div className="dir-zoom">
+            {/* 第二十四轮：目录只有一种形态（大纲列表），缩略图网格整块移除；
+                这里只留「批量删除」入口。放在缩放三键前面，同一排小图标语言。 */}
+            <button
+              type="button"
+              className={`dir-tool-btn${batchMode ? " is-on" : ""}`}
+              onClick={toggleBatchMode}
+              data-tip={batchMode ? "退出批量删除" : "批量删除步骤\n勾选多个步骤一次删掉（标题/摘要不参与）"}
+              aria-label={batchMode ? "退出批量删除" : "批量删除步骤"}
+            >
+              <ListChecks size={13} />
+            </button>
+            <span className="dir-zoom-sep" />
+            <button
+              type="button"
+              className="dir-zoom-btn"
+              disabled={pageZoom <= ZOOM_MIN}
+              onClick={() => nudgePageZoom(-1)}
+              data-tip={`缩小整页比例（当前 ${Math.round(pageZoom * 100)}%）`}
+              aria-label="缩小整页比例"
+            >
+              <ZoomOut size={13} />
+            </button>
+            <button
+              type="button"
+              className="dir-zoom-btn"
+              disabled={pageZoom >= ZOOM_MAX}
+              onClick={() => nudgePageZoom(1)}
+              data-tip={`放大整页比例（当前 ${Math.round(pageZoom * 100)}%）`}
+              aria-label="放大整页比例"
+            >
+              <ZoomIn size={13} />
+            </button>
+            <span className="dir-zoom-sep" />
+            <button
+              type="button"
+              className="dir-zoom-btn is-reset"
+              disabled={pageZoom === ZOOM_DEFAULT && sideWidth === SIDE_W_DEFAULT}
+              onClick={() => { applyPageZoom(ZOOM_DEFAULT); resetSideWidth(); }}
+              data-tip={"比例恢复原样（100%）\n栏宽也一并回到默认"}
+              aria-label="比例与栏宽恢复原样"
+            >
+              <RotateCcw size={13} />
+            </button>
+          </div>
         </div>
 
-        {/* 步骤精简 + 执行 / 演练 / 执行历史（同一行） */}
-        {!previewMode && steps.length > 0 && (
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <div style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-              <button
-                className="step-simplify-btn primary"
-                data-tip={"把啰嗦的步骤合并掉\n录完会自动跑一遍；这里也可以手动重跑或换用 AI"}
-                disabled={simplifying !== null || aiBusy}
-                onClick={() => { setSimplifyOpen(!simplifyOpen); setExportOpen(false); setToolsOpen(false); setTranslateOpen(false); }}
-              >
-                {aiBusy ? <Loader2 size={12} className="spinner" /> : <Sparkles size={12} />}
-                {aiBusy ? "AI 精简中…"
-                  : simplifying === "rules" ? "规则合并中…"
-                  : "精简"}
-                <ChevronDown size={11} style={{ opacity: 0.8 }} />
-              </button>
-              {simplifyOpen && (
-                <div className="export-dropdown step-simplify-menu">
-                  <button
-                    className="export-dropdown-item"
-                    onClick={() => { setSimplifyOpen(false); void handleAiSimplify(); }}
-                    disabled={simplifying !== null || aiBusy}
-                    data-tip={"AI 精简（推荐）\n先跑本地规则，再让 AI 按语义把重复步骤压成一步\n能处理规则看不懂的情况（比如弹框里坐标各异的一串点击），需要几秒到十几秒"}
-                  >
-                    {aiBusy ? <Loader2 size={14} className="spinner" /> : <Sparkles size={14} className="export-dropdown-item-icon" />}
-                    <span className="export-dropdown-item-label">AI 精简（推荐）</span>
-                  </button>
-                  <button
-                    className="export-dropdown-item"
-                    data-tip={"仅规则合并\n只跑本地规则：重复点击→双击、连续输入合并、删掉误点到自己窗口的末步\n不联网、瞬间完成，但看不懂语义上的重复"}
-                    onClick={() => { setSimplifyOpen(false); void handleAutoMerge(); }}
-                    disabled={simplifying !== null}
-                  >
-                    {simplifying === "rules" ? <Loader2 size={14} className="spinner" /> : <Wand2 size={14} className="export-dropdown-item-icon" />}
-                    <span className="export-dropdown-item-label">仅规则合并</span>
-                  </button>
-                </div>
-              )}
+        {/* Step list —— 第二十四轮：目录只有大纲列表一种形态（缩略图网格已整块移除） */}
+        <div className={`step-list${batchMode ? " is-batching" : ""}`}>
+          {/* Insert zone before first step（批量态不显示插入槽） */}
+          {!batchMode && (
+            <div className="step-insert-point">
+              <div className="step-insert-line" />
+              <div className="step-insert-btn" onClick={(e) => openInsertMenu(e, -1)} data-tip="在这里插入：步骤 / 大标题 / 续录">
+                <Plus size={12} />
+              </div>
             </div>
-            {/* 自动化执行面（执行/演练/AI兜底/执行历史）：非自动化构建整体隐藏 */}
-            {AUTOMATION_ENABLED && (
-              <>
-                <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-                  <button
-                    onClick={() => handleExecute(false)}
-                    disabled={executing}
-                    data-tip={"精准执行\n按录制时的屏幕坐标确定性重放（非 AI 猜点），在目标窗口自动点选；每步后截图校验"}
-                    style={{ background: "transparent", border: "1px solid #3fb950", color: "#3fb950", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-                  >
-                    ▶ 执行{executing ? "中…" : ""}
-                  </button>
-                </div>
-                <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-                  <button
-                    onClick={() => handleExecute(true)}
-                    disabled={executing}
-                    data-tip={"演练（dry-run）\n只生成动作序列、不操作桌面，用于验证重放逻辑"}
-                    style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: executing ? "default" : "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-                  >
-                    演练
-                  </button>
-                </div>
-                <label
-                  onMouseDown={(e) => e.stopPropagation()}
-                  data-tip={"AI 兜底（Stage 4）\n默认关闭。勾选后，若某一步按录制坐标没打中（目标窗口没起来 / 画面与录制时不一致），\n会截一张当前屏幕连同该步意图问视觉模型「现在该点哪里」，拿到坐标重发一次。\n单轮最多 3 次，失败静默、不改变其余步骤行为"}
-                  style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: aiFallback ? "#3fb950" : "#9da7b3", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={aiFallback}
-                    onChange={toggleAiFallback}
-                    style={{ width: 12, height: 12, margin: 0, cursor: "pointer", accentColor: "#3fb950" }}
-                  />
-                  AI 兜底
-                </label>
-                <div className="export-dropdown-wrap" style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
-                  <button
-                    onClick={() => { setShowAudit(true); loadAudit(); }}
-                    data-tip={"执行历史\n查看本教程历次重放的审计记录（时间 / 结果 / 步数）"}
-                    style={{ background: "transparent", border: "1px solid #6e7681", color: "#9da7b3", cursor: "pointer", padding: "3px 8px", borderRadius: 4, fontSize: 13, display: "flex", alignItems: "center", gap: 4 }}
-                  >
-                    执行历史
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        )}
+          )}
 
-        {/* Step list */}
-        <div className="step-list">
-          {/* Insert zone before first step */}
-          <div className="step-insert-point">
-            <div className="step-insert-line" />
-            <div className="step-insert-btn" onClick={() => handleInsertStep(-1)} data-tip="在最前面插入一个步骤">
-              <Plus size={12} />
-            </div>
-          </div>
-
-          {steps.map((step, index) => (
+          {dirEntries.map((entry, index) => {
+            const step = entry.step;
+            if (entry.hidden) return null;
+            return (
             <Fragment key={step.id}>
               <div
                 id={`step-item-${step.id}`}
-                className={`step-item group relative${selectedStepId === step.id ? " active" : ""}${previewMode ? " preview-active" : ""}`}
+                /* 流程摘要固定在正文最前，不给拖（拖走了它就不再是"开头那段总览"） */
+                draggable={!isSummaryBlock(step) && !batchMode}
+                onDragStart={(e) => {
+                  setDragStepId(step.id);
+                  // dataTransfer 在合成事件里可能为 null，别让它把拖拽打断
+                  if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+                }}
+                onDragOver={(e) => {
+                  if (!dragStepId || dragStepId === step.id) return;
+                  e.preventDefault();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  const after = e.clientY > r.top + r.height / 2;
+                  setDropAt((prev) =>
+                    prev && prev.id === step.id && prev.after === after
+                      ? prev
+                      : { id: step.id, after }
+                  );
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  void applyReorder();
+                }}
+                onDragEnd={() => {
+                  setDragStepId(null);
+                  setDropAt(null);
+                }}
+                /* 缩进级别交给 CSS 变量（第二十四轮）：整行左缘由样式表统一算 ——
+                   把手 / 折叠箭头 / 序号位三段都锚在这条基准线上，
+                   原来直接在行上写 paddingLeft，样式表没法参与对齐计算。 */
+                style={{ "--nav-indent": entry.indent } as React.CSSProperties}
+                className={`step-item group relative${selectedStepId === step.id ? " active" : ""}${previewMode ? " preview-active" : ""}${dropAt && dropAt.id === step.id ? (dropAt.after ? " is-drop-after" : " is-drop-before") : ""}`}
                 onClick={() => {
+                  // 批量态：点行 = 勾选/取消（文档块不参与）
+                  if (batchMode && !isDocBlock(step)) { toggleBatchCheck(step.id); return; }
                   // ★ 预览模式也要更新选中态：否则橙色高亮停在原步骤（如 23），
                   //   点击 18 只有预览滚动、高亮纹丝不动（用户报：高亮不跟随）。
                   setSelectedStepId(step.id);
                   setLightboxMarked(false);
-                  if (previewMode) {
+                  // 预览态 / 通篇编辑态都是"点目录 → 滚到该步"。
+                  // 平滑滚动期间先锁住滚动联动，免得中途把高亮抢到别的步骤上。
+                  if (previewMode || sopBodyRef.current) {
+                    sopScrollLock.current = Date.now() + 900;
                     const el = document.getElementById(`sop-step-${step.id}`);
-                    if (el) el.scrollIntoView({ behavior: "smooth" });
+                    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
                   }
                 }}
               >
-                {/* Action group – hover reveal (delete only) */}
+                {/* 第二十轮：拖拽把手放在**步骤最前面**（编号左侧那一列），鼠标移到这一行才浮现。
+                    刻意放在这里 —— 它是 .step-item 的第一个子元素，连下面那个 absolute 的
+                    删除按钮组都排在它后面，「移动按钮在步骤前」在 DOM 顺序上也成立。
+                    摘要块不可拖（draggable=false），所以不给它把手。 */}
+                {/* 批量态：把手换成勾选框（第二十三轮 · 设计稿口径）；
+                    非批量维持把手。摘要块两者都没有。 */}
+                {batchMode && !isDocBlock(step) ? (
+                  <span
+                    className={`selbox${batchChecked.has(step.id) ? " on" : ""}`}
+                    onClick={(e) => { e.stopPropagation(); toggleBatchCheck(step.id); }}
+                    aria-label="选中这一步"
+                  >
+                    {batchChecked.has(step.id) && <Check size={11} />}
+                  </span>
+                ) : !isSummaryBlock(step) ? (
+                  <span className="step-item-grip" aria-hidden="true">
+                    <GripVertical size={13} />
+                  </span>
+                ) : null}
+
+                {/* Action group – hover reveal (delete only)
+                    批量态收起单步删除（删步统一走目录底部操作条，免得两套删除打架） */}
+                {!batchMode && (
                 <div className="step-action-group">
                   <button
                     onClick={(e) => { e.stopPropagation(); setDeleteTarget(step.id); }}
@@ -3003,6 +4310,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                     <Trash2 className="step-action-icon" />
                   </button>
                 </div>
+                )}
 
                 {/* Delete overlay */}
                 {deleteTarget === step.id && (
@@ -3011,8 +4319,22 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                       <div className="step-delete-icon-wrap">
                         <Trash2 />
                       </div>
-                      <p className="step-delete-title">删除步骤 {index + 1}</p>
-                      <p className="step-delete-subtitle">{step.title || "(无标题)"}</p>
+                      <p className="step-delete-title">
+                        {isSummaryBlock(step)
+                          ? "删除流程摘要"
+                          : isIntroBlock(step)
+                            ? "删除简介"
+                            : isHeadingBlock(step)
+                              ? "删除标题"
+                              : `删除步骤 ${entry.num}`}
+                      </p>
+                      <p className="step-delete-subtitle">
+                        {isSummaryBlock(step)
+                          ? "（录制结束时自动生成的那段）"
+                          : isIntroBlock(step)
+                            ? "（你自己写的这段引子）"
+                            : step.title || "(无标题)"}
+                      </p>
                       <div className="step-delete-actions">
                         <button
                           className="step-delete-cancel"
@@ -3024,7 +4346,7 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                         <button
                           className="step-delete-confirm"
                           onClick={(e) => { e.stopPropagation(); handleDeleteStep(step.id); }}
-                          data-tip="删除这一步，后面的步骤序号自动前移"
+                          data-tip={isSummaryBlock(step) ? "删掉这段摘要，正文最前面不再显示" : "删除这一步，后面的步骤序号自动前移"}
                         >
                           删除
                         </button>
@@ -3033,25 +4355,57 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                   </div>
                 )}
 
-                <span className="step-item-number">{index + 1}</span>
+                {isHeadingBlock(step) ? (
+                  /* 大标题行前面挂一个折叠箭头：折起来只在左栏生效，不动右侧文档流 */
+                  <button
+                    type="button"
+                    className={`step-item-caret${entry.collapsed ? " is-collapsed" : ""}`}
+                    onClick={(e) => { e.stopPropagation(); toggleHeadingCollapse(step.id); }}
+                    data-tip={entry.collapsed ? "展开这一节" : "折起这一节"}
+                    aria-label={entry.collapsed ? "展开这一节" : "折起这一节"}
+                  >
+                    <ChevronDown size={12} />
+                  </button>
+                ) : entry.indent > 0 ? (
+                  <span className="step-item-dot" />
+                ) : null}
+                {isSummaryBlock(step) ? (
+                  /* 文档块不占编号：序号位放一枚标签 —— 大标题是 H1~H4 的**边框小标**，
+                     摘要 / 简介是「摘 / 介」的裸小字，与步骤数字同一列右对齐。
+                     （设计稿 .nrow.is-h .nn / .nrow.is-doc 的口径） */
+                  <span className="step-item-slot is-doc">摘</span>
+                ) : isHeadingBlock(step) ? (
+                  <span className="step-item-slot is-h">H{entry.level}</span>
+                ) : isIntroBlock(step) ? (
+                  <span className="step-item-slot is-doc">介</span>
+                ) : (
+                  <span className="step-item-number">{String(entry.num).padStart(2, "0")}</span>
+                )}
                 <div className="step-item-body">
-                  <div className="step-item-title">
+                  <div className={`step-item-title${isHeadingBlock(step) ? " is-heading" : isSummaryBlock(step) ? " is-summary" : isIntroBlock(step) ? " is-intro" : ""}`}>
                     {/* 预览模式跟随所选语言显示译文标题（缺步骤回退原文），与右侧预览一致；查找时命中片段高亮 */}
                     {(() => {
-                      const t = previewMode ? (previewStepText(step).title || "(无标题)") : (step.title || "(无标题)");
+                      if (isSummaryBlock(step)) return "流程摘要";
+                      if (isIntroBlock(step)) return "简介";
+                      const empty = isHeadingBlock(step) ? "(空标题)" : "(无标题)";
+                      const t = previewMode ? (previewStepText(step).title || empty) : (step.title || empty);
                       return findOpen ? renderFindHighlight(t, committedQuery.trim()) : t;
                     })()}
                   </div>
-                  <div className="step-item-type">{step.action_type}</div>
+                  {/* 第十五轮：条目压成一行 —— 步骤不再显示 CLICK / TYPE 小字。
+                      第二十四轮：大标题的 H{n} 徽标上移到序号位（.step-item-slot），
+                      这里不再挂第二枚标记。 */}
                 </div>
                 {(() => {
                   // 缩略图跟随主截图（裁剪图优先，无则全图）
                   const src = getStepMainSrc(step);
+                  // 大标题 / 流程摘要块没有截图，别渲染空缩略图占位
+                  if (isDocBlock(step)) return null;
                   return src ? (
                     <div className="step-item-thumb">
                       <img
                         src={`data:image/jpeg;base64,${src}`}
-                        alt={`步骤 ${index + 1}`}
+                        alt={`步骤 ${entry.num}`}
                       />
                     </div>
                   ) : (
@@ -3060,52 +4414,230 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                     </div>
                   );
                 })()}
+                {/* 第十七轮：目录行里那组 H1~H4 切级键去掉了 —— 正文里大标题自己的
+                    工具条（.sop-bar-btn.is-lv）和它一模一样，同一个操作在两处出现容易被
+                    误当成两个功能；切级统一走正文工具条。层级仍由上面的 H{n} 小徽标标示。 */}
               </div>
-              {/* Insert zone after this step */}
+              {/* Insert zone after this step —— 与首插槽一致：批量态不显示 */}
+              {!batchMode && (
               <div className="step-insert-point">
                 <div className="step-insert-line" />
-                <div className="step-insert-btn" onClick={() => handleInsertStep(index)} data-tip={`在步骤 ${index + 1} 后面插入一个步骤`}>
+                <div className="step-insert-btn" onClick={(e) => openInsertMenu(e, index)} data-tip="在这里插入：步骤 / 大标题 / 续录">
                   <Plus size={12} />
                 </div>
               </div>
+              )}
             </Fragment>
-          ))}
+            );
+          })}
           <div />
         </div>
+
+        {/* 第二十三轮：目录底部批量操作条（仅批量态出现；0 选中禁用删除） */}
+        {batchMode && (
+          <div className="sb-batchbar">
+            <span className="sb-batchbar-n">已选 {batchChecked.size} 步</span>
+            <button
+              type="button"
+              className="sb-batchbar-del"
+              disabled={batchChecked.size === 0 || batchBusy}
+              onClick={(e) => { e.stopPropagation(); void handleBatchDelete(); }}
+              data-tip={batchBusy ? "删除中…" : "删除勾选的步骤，序号自动前移"}
+            >
+              <Trash2 size={12} /> {batchBusy ? "删除中…" : "删除"}
+            </button>
+            <button
+              type="button"
+              className="sb-batchbar-cancel"
+              onClick={(e) => { e.stopPropagation(); toggleBatchMode(); }}
+            >
+              取消
+            </button>
+          </div>
+        )}
       </div>
+
+      {/* 第十八轮：两栏之间的可拖拽分隔条 —— 拖它 = 整体调节左右宽度 */}
+      <div
+        className={`editor-split${splitDragging ? " is-dragging" : ""}`}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="拖动调节左右两栏宽度"
+        data-tip="拖动调节左右宽度 · 双击恢复默认"
+        onMouseDown={(e) => {
+          e.preventDefault();
+          splitDragRef.current = { startX: e.clientX, startW: sideWidth, w: sideWidth, zoom: pageZoom };
+          setSplitDragging(true);
+        }}
+        /* 第十九轮：双击 = 栏宽恢复原样（拖动是隐式的，得有颗复位键） */
+        onDoubleClick={resetSideWidth}
+      />
 
       {/* Right: Step Detail / SOP Preview */}
       <div className={`editor-preview${previewMode ? " preview-active" : ""}`}>
-        <div className="editor-preview-body">
+        <div
+          className="editor-preview-body"
+          ref={sopBodyRef}
+          onScroll={onSopScroll}
+        >
           {previewMode ? (
             <div className="sop-preview">
+              {/* ★ v0.65.244 对齐：成片体检条（sticky 悬浮在成片正文顶部；无问题 → 通过态） */}
+              {health.ok ? (
+                <div className="health-bar is-ok">
+                  <span className="health-bar-badge">
+                    <CheckCircle2 size={14} />
+                  </span>
+                  <span className="health-bar-text">成片没问题，可以直接导出 / 发布</span>
+                </div>
+              ) : (
+                <div className={`health-bar${health.errorCount > 0 ? " has-errors" : " has-warns"}`}>
+                  <span className="health-bar-badge">
+                    {health.errorCount > 0 ? <XCircle size={14} /> : <AlertTriangle size={14} />}
+                  </span>
+                  <span className="health-bar-text">
+                    {health.errorCount > 0
+                      ? `${health.errorCount} 处问题会让成片断掉，先修再导出吧`
+                      : `${health.warnCount} 处建议优化，不影响复现`}
+                  </span>
+                  <span className="health-bar-chips">
+                    {healthChips.map((c) => (
+                      <button
+                        key={`${c.step}-${c.label}`}
+                        type="button"
+                        className={`health-chip is-${c.level}`}
+                        onClick={() => jumpToHealthStep(c.step)}
+                        data-tip={`跳到第 ${c.step} 步：${c.label}`}
+                      >
+                        第{c.step}步 · {c.label}
+                      </button>
+                    ))}
+                  </span>
+                </div>
+              )}
               {/* Full manual */}
               <div className="sop-preview-body">
-                {steps.map((step, idx) => (
-                  <div key={step.id} id={`sop-step-${step.id}`} className="sop-preview-step">
+                {previewBlocks.map((b, idx) => {
+                  const step = b.step;
+                  /* 大标题块：按 H1~H4 成行渲染（字号与导出 HTML 的 .doc-heading 一致） */
+                  if (b.isHeading) {
+                    const pt = previewStepText(step);
+                    // 切了译文就按译文走（译文没有富文本），否则用标题自己的富文本
+                    const html =
+                      pt.title === (step.title ?? "")
+                        ? headingInitialHtml(step)
+                        : escapeText(pt.title);
+                    return (
+                      <div
+                        key={step.id}
+                        id={`sop-step-${step.id}`}
+                        data-step-id={step.id}
+                        className="sop-preview-step sop-preview-heading-wrap"
+                      >
+                        <div
+                          className={`sop-preview-heading h${b.level}`}
+                          dangerouslySetInnerHTML={{ __html: html || escapeText("(空标题)") }}
+                        />
+                        {idx < previewBlocks.length - 1 && <hr className="sop-step-divider" />}
+                      </div>
+                    );
+                  }
+                  /* 流程摘要块：录制结束自动生成，固定在正文最前。
+                     版式与导出 HTML 的 .doc-summary 逐值一致（浅灰圆角卡 + 要点列表），
+                     不占编号、不出「N 步骤」那一行。 */
+                  if (b.isSummary) {
+                    const sum = parseSummary(step.description ?? "");
+                    return (
+                      <div
+                        key={step.id}
+                        id={`sop-step-${step.id}`}
+                        data-step-id={step.id}
+                        className="sop-preview-step sop-preview-summary-wrap"
+                      >
+                        <div className="sop-preview-summary">
+                          {sum.intro && <p>{sum.intro}</p>}
+                          {sum.bullets.length > 0 && (
+                            <ul>
+                              {sum.bullets.map((bl, i) => (
+                                <li key={i}>
+                                  {bl.name ? (
+                                    <><b>{bl.name}</b>：{bl.detail}</>
+                                  ) : (
+                                    bl.detail
+                                  )}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                        {idx < previewBlocks.length - 1 && <hr className="sop-step-divider" />}
+                      </div>
+                    );
+                  }
+                  /* 简介块（第十九轮）：用户自己写的一段引子，排在它被插入的位置上。
+                     版式与导出 HTML 的 .doc-intro 一致（不占编号、不出「N 步骤」行）。 */
+                  if (b.isIntro) {
+                    const text = (previewMode ? previewStepText(step).description : step.description) ?? "";
+                    if (!text.trim()) return null;
+                    return (
+                      <div
+                        key={step.id}
+                        id={`sop-step-${step.id}`}
+                        data-step-id={step.id}
+                        className="sop-preview-step sop-preview-intro-wrap"
+                      >
+                        <div className="sop-preview-intro">{text.trim()}</div>
+                        {idx < previewBlocks.length - 1 && <hr className="sop-step-divider" />}
+                      </div>
+                    );
+                  }
+                  return (
+                  <div key={step.id} id={`sop-step-${step.id}`} data-step-id={step.id} className="sop-preview-step">
                     {/* Step header */}
                     <div className="sop-preview-step-header">
-                      <span className="sop-preview-step-num"><span className="step-num-circle">{idx + 1}</span>步骤</span>
+                      <span className="sop-preview-step-num"><span className="step-num-circle">{b.num}</span>步骤</span>
                     </div>
                     <h3 className="sop-preview-step-title">{previewStepText(step).title || "(无标题)"}</h3>
 
                     {/* Screenshot */}
                     {(() => {
-                      // 预览跟随步骤选中截图：该步骤 stepViewCropped=true 且有裁剪图缓存时用裁剪图，否则用全图
+                      // 预览的截图与编辑态同一张（重点图的倍率在下面按步套用）
                       const src = getStepMainSrc(step);
-                      return src ? (
-                        <div className="sop-preview-image">
+                      const disp = shotDispOf(step.id);
+                      const fracPct = perShotPcts[step.id] ?? 100;
+                      const showBefore = disp <= 100.001 || disp > fracPct + 0.5;
+                      const shownSrc = showBefore ? step.before_screenshot_base64 || src : src;
+                      return shownSrc ? (
+                        <div className="sop-preview-image sop-edit-shot">
                           <img
-                            src={`data:image/jpeg;base64,${src}`}
-                            alt={`步骤 ${idx + 1} 截图`}
+                            src={`data:image/jpeg;base64,${shownSrc}`}
+                            alt={`步骤 ${b.num} 截图`}
+                            onLoad={(e) => rememberShotNat(step.id, e.currentTarget)}
+                            style={{
+                              transform: `scale(${(() => {
+                                if (Math.abs(disp - 100) < 0.001) return 1;
+                                // 顶栏全局比例态：主图裁剪图按真实比例放大填满框（与编辑态一致）
+                                if (disp < 100) return Math.round((100 / disp) * 100) / 100;
+                                return shotZoomOf(step.id);
+                              })()})`,
+                              transformOrigin: Math.abs(disp - 100) < 0.001 ? "50% 50%" : shotOriginOf(step),
+                            }}
                           />
                         </div>
                       ) : null;
                     })()}
 
+                    {/* 图片描述：紧贴截图下方一行小灰字（与导出 .step-caption 同值） */}
+                    {step.image_caption?.trim() && (
+                      <div className="sop-preview-caption">{step.image_caption.trim()}</div>
+                    )}
+
                     {/* Description */}
                     {previewStepText(step).description && (
-                      <div className="sop-preview-desc">{previewStepText(step).description}</div>
+                      /* 标注 / 警告按类型上色（与导出 HTML 的 .step-desc.is-mark/.is-warn 同值） */
+                      <div className={`sop-preview-desc is-${noteKindOf(step) || "desc"}`}>
+                        {previewStepText(step).description}
+                      </div>
                     )}
 
                     {/* Tip */}
@@ -3116,242 +4648,870 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                     )}
 
                     {/* Divider */}
-                    {idx < steps.length - 1 && <hr className="sop-step-divider" />}
+                    {idx < previewBlocks.length - 1 && <hr className="sop-step-divider" />}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
-          ) : selectedStep ? (
-            <>
-              {/* ── Screenshot ──── */}
-              {(() => {
-                const _src = getStepMainSrc(selectedStep) || "";
-                const _noImage = !_src || (selectedStep?.action_type === 'COPY') || (selectedStep?.action_type === 'HOTKEY');
-                /* 渲染期同步：显示的图变了就立即重置容器几何（重置为 null → 回落 CSS
-                   默认比例，新图 onLoad/effect 兜底马上写入新比例）。没有这一步，
-                   上一张图的 inline 比例会残留，contain 在新图周围留下灰色占位区。 */
-                if (detailImgBox.src !== _src) {
-                  setDetailImgBox({ src: _src, box: detailBoxMemo.current.get(_src) ?? null });
-                }
-                if (_noImage) {
+          ) : (
+            /* ── 通篇滚动编辑：所有步骤排成一条可滚动的文档流，滑到哪改到哪 ──
+               结构沿用预览（.sop-preview-* / .step-num-circle），标题与描述换成
+               就地可编辑的输入控件；删除这一步的 ✕ 挂在「步骤」这一行，
+               图片上的功能键（编辑图片 / 删除截图 / 倍率）鼠标移到图片上才浮出。 */
+            <div className="sop-preview sop-edit">
+              {/* ── 文档头（第二十六轮 · 设计稿 .doc-head）────────────────
+                  正文最前面那一块：大标题 + 元信息行。它是「文档」的开头，
+                  不是某个步骤，所以不进「52px 序号列 + 内容列」那套栅格。
+                  标题就地可编辑 —— 与顶栏那颗是同一个 recordings.title。 */}
+              <div className="sop-doc-head">
+                <textarea
+                  className="sop-doc-h1"
+                  rows={1}
+                  value={docTitle}
+                  placeholder="未命名教程"
+                  onChange={(e) => {
+                    autoGrow(e.currentTarget);
+                    setDocTitleDraft(e.target.value);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); }
+                    if (e.key === "Escape") setDocTitleDraft(null);
+                  }}
+                  onBlur={() => void commitDocTitle()}
+                  data-tip="教程标题（与顶栏那个名字同一个）"
+                />
+                <div className="sop-doc-meta">
+                  <span>{realSteps.length} 个步骤</span>
+                  <span className="sop-doc-dot" />
+                  <span>{realSteps.filter((s) => !!getStepMainSrc(s)).length} 张截图</span>
+                  <span className="sop-doc-dot" />
+                  <span>自动生成 · 可编辑</span>
+                  <span className="sop-doc-pill">未发布</span>
+                </div>
+              </div>
+              <div className="sop-preview-body">
+                {steps.map((step, idx) => {
+                  const d = draftOf(step);
+                  const src = getStepMainSrc(step);
+                  const isSel = selectedStepId === step.id;
+                  const focusShot = isFocusShot(step.id);
+                  const kind = noteKindOf(step);
+                  if (isHeadingBlock(step)) {
+                    /* ── 大标题块：一行可编辑大标题（富文本）──
+                       正文是 contenteditable —— 不受控，React 不去改它的 innerHTML，
+                       否则每敲一个字都会被"受控值"把光标顶回开头。
+                       聚焦时标题上方浮出工具条：I U S ｜ A 字色 ｜ 高亮 ｜ H1~H4。 */
+                    const lv = Math.min(4, Math.max(1, step.block_level || 1));
+                    return (
+                      <div
+                        key={step.id}
+                        id={`sop-step-${step.id}`}
+                        data-step-id={step.id}
+                        className="sop-edit-step sop-edit-heading"
+                        /* 层级交给 CSS：序号位那枚 H1~H4 小标签的内容由它拼出来 */
+                        data-lv={lv}
+                        onMouseDown={() => {
+                          if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                        }}
+                        /* 工具条淡出后，悬着的取色面板要一起收掉（否则再悬浮会莫名弹出来） */
+                        onMouseLeave={() => setColorMenu(null)}
+                      >
+                        {/* 工具条常驻 DOM，靠 .sop-edit-heading:hover / :focus-within 淡入。
+                            以前是聚焦才插入节点、并 absolute 到 top:-42px —— 会压住上一条
+                            步骤的说明文字；现在大标题块自己留出一条 38px 的槽位，工具条落在槽里。 */}
+                        <div
+                          className="sop-heading-bar"
+                          onMouseDown={(e) => e.preventDefault()}
+                        >
+                            <button
+                              type="button"
+                              className="sop-bar-btn is-italic"
+                              onClick={() => execRich("italic")}
+                              data-tip="斜体"
+                              aria-label="斜体"
+                            >I</button>
+                            <button
+                              type="button"
+                              className="sop-bar-btn is-underline"
+                              onClick={() => execRich("underline")}
+                              data-tip="下划线"
+                              aria-label="下划线"
+                            >U</button>
+                            <button
+                              type="button"
+                              className="sop-bar-btn is-strike"
+                              onClick={() => execRich("strikeThrough")}
+                              data-tip="删除线"
+                              aria-label="删除线"
+                            >S</button>
+                            <span className="sop-bar-sep" />
+                            <div className="sop-bar-pop-wrap">
+                              <button
+                                type="button"
+                                className="sop-bar-btn is-more"
+                                onClick={() => setColorMenu(colorMenu === "text" ? null : "text")}
+                                data-tip="文字颜色"
+                                aria-label="文字颜色"
+                              >A<ChevronDown size={9} /></button>
+                              {colorMenu === "text" && (
+                                <div className="sop-bar-pop">
+                                  <button
+                                    type="button"
+                                    className="sop-bar-swatch is-none"
+                                    onClick={() => execRich("removeFormat")}
+                                    data-tip="默认"
+                                    aria-label="默认颜色"
+                                  />
+                                  {RICH_TEXT_COLORS.map((c) => (
+                                    <button
+                                      key={c.value}
+                                      type="button"
+                                      className="sop-bar-swatch"
+                                      style={{ background: c.value }}
+                                      onClick={() => execRich("foreColor", c.value)}
+                                      data-tip={c.label}
+                                      aria-label={c.label}
+                                    />
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                            <div className="sop-bar-pop-wrap">
+                              <button
+                                type="button"
+                                className="sop-bar-btn is-more"
+                                onClick={() => setColorMenu(colorMenu === "hl" ? null : "hl")}
+                                data-tip="高亮"
+                                aria-label="高亮"
+                              ><Highlighter size={12} /><ChevronDown size={9} /></button>
+                              {colorMenu === "hl" && (
+                                <div className="sop-bar-pop">
+                                  <button
+                                    type="button"
+                                    className="sop-bar-swatch is-none"
+                                    onClick={() => execRich("hiliteColor", "#ffffff")}
+                                    data-tip="无高亮"
+                                    aria-label="无高亮"
+                                  />
+                                  {RICH_HIGHLIGHTS.map((c) => (
+                                    <button
+                                      key={c.value}
+                                      type="button"
+                                      className="sop-bar-swatch"
+                                      style={{ background: c.value }}
+                                      onClick={() => execRich("hiliteColor", c.value)}
+                                      data-tip={c.label}
+                                      aria-label={c.label}
+                                    />
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                            <span className="sop-bar-sep" />
+                            {HEADING_LEVELS.map((l) => (
+                              <button
+                                key={l}
+                                type="button"
+                                className={`sop-bar-btn is-lv${lv === l ? " is-on" : ""}`}
+                                onClick={() => void handleSetBlockLevel(step.id, l)}
+                                data-tip={`设为 ${l} 级标题`}
+                                aria-label={`设为 ${l} 级标题`}
+                              >H{l}</button>
+                            ))}
+                        </div>
+                        <div className="sop-heading-row">
+                          <span className="sop-heading-hash"><Hash size={15} /></span>
+                          <div
+                            ref={(el) => {
+                              headingEls.current[step.id] = el;
+                              // 不受控：只在挂载时灌一次初始 HTML，之后完全交给浏览器
+                              if (el && el.dataset.hydrated !== "1") {
+                                el.innerHTML = headingInitialHtml(step);
+                                el.dataset.hydrated = "1";
+                              }
+                            }}
+                            className={`sop-edit-rich sop-heading-t${lv}`}
+                            contentEditable
+                            suppressContentEditableWarning
+                            role="textbox"
+                            aria-label="大标题"
+                            data-placeholder="大标题"
+                            spellCheck={false}
+                            onFocus={(e) => {
+                              if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                              setActiveHeadingId(step.id);
+                              setColorMenu(null);
+                            }}
+                            onBlur={() => {
+                              if (activeHeadingId === step.id) setActiveHeadingId(null);
+                              setColorMenu(null);
+                            }}
+                            onInput={(e) => {
+                              const el = e.currentTarget;
+                              const html = normalizeInlineHtml(el);
+                              setDraftHeadingHtml(step.id, html, htmlToPlainText(html));
+                            }}
+                            onPaste={(e) => {
+                              // 只吃纯文本：粘进来的样式一律不进白名单
+                              e.preventDefault();
+                              const text = e.clipboardData
+                                .getData("text/plain")
+                                .replace(/\s*\n\s*/g, " ");
+                              document.execCommand("insertText", false, text);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") e.preventDefault(); // 大标题只有一行
+                            }}
+                          />
+                          <div className="sop-heading-ops">
+                            <button
+                              type="button"
+                              className="sop-step-del"
+                              onClick={(e) => { e.stopPropagation(); setDeleteTarget(step.id); }}
+                              data-tip="删除这个标题"
+                              aria-label="删除这个标题"
+                            >
+                              <X size={13} />
+                            </button>
+                          </div>
+                        </div>
+                        {idx < steps.length - 1 && <hr className="sop-step-divider" />}
+                      </div>
+                    );
+                  }
+                  if (isSummaryBlock(step)) {
+                    /* ── 流程摘要块（录制结束时自动生成，固定在正文最前）──
+                       默认渲染**排版好的卡片**（与预览/导出同一版式）；
+                       点「编辑」切到原文输入框（首行概述、下面每行 `- **要点**：说明`），
+                       改完 800ms 防抖落库，和编辑器里其它就地可编辑的地方同一套。 */
+                    const sum = parseSummary(d.description ?? "");
+                    const editing = summaryEditId === step.id;
+                    return (
+                      <div
+                        key={step.id}
+                        id={`sop-step-${step.id}`}
+                        data-step-id={step.id}
+                        className="sop-edit-step sop-edit-summary"
+                        onMouseDown={() => {
+                          if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                        }}
+                      >
+                        <div className="sop-summary-card">
+                          <div className="sop-summary-head">
+                            <Sparkles size={13} className="sop-summary-spark" />
+                            <span className="sop-summary-title">流程摘要</span>
+                            <span className="sop-summary-badge">自动生成</span>
+                            <div className="sop-summary-ops">
+                              <button
+                                type="button"
+                                className="sop-summary-op"
+                                onClick={(e) => { e.stopPropagation(); setSummaryEditId(editing ? null : step.id); }}
+                                data-tip={editing ? "看排版后的样子" : "直接改摘要文字"}
+                              >
+                                {editing ? "预览" : "编辑"}
+                              </button>
+              {isComplex && (
+              <button
+                type="button"
+                className="sop-summary-op"
+                disabled={summaryBusy === step.id}
+                onClick={(e) => { e.stopPropagation(); void regenerateSummary(step.id); }}
+                data-tip="按当前步骤重新生成一遍（AI 不可用时保留现在这份）"
+              >
+                {summaryBusy === step.id
+                  ? <><Loader2 size={12} className="spinner" /> 生成中</>
+                  : "重新生成"}
+              </button>
+              )}
+                              <button
+                                type="button"
+                                className="sop-summary-del"
+                                onClick={(e) => { e.stopPropagation(); setDeleteTarget(step.id); }}
+                                data-tip="删除这段摘要"
+                                aria-label="删除这段摘要"
+                              >
+                                <X size={13} />
+                              </button>
+                            </div>
+                          </div>
+                          {editing ? (
+                            <textarea
+                              className="sop-edit-desc sop-summary-input"
+                              rows={4}
+                              value={d.description}
+                              placeholder={"第一行写整篇的概述；下面每行一条要点，格式：- **要点名**：说明"}
+                              onChange={(e) => {
+                                autoGrow(e.currentTarget);
+                                setDraftField(step.id, "description", e.target.value);
+                              }}
+                              onFocus={(e) => {
+                                autoGrow(e.currentTarget);
+                                if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                              }}
+                            />
+                          ) : (
+                            <div
+                              className="sop-summary-body"
+                              onClick={(e) => { e.stopPropagation(); setSummaryEditId(step.id); }}
+                            >
+                              {sum.intro && <p>{sum.intro}</p>}
+                              {sum.bullets.length > 0 && (
+                                <ul>
+                                  {sum.bullets.map((bl, i) => (
+                                    <li key={i}>
+                                      {bl.name ? (<><b>{bl.name}</b>：{bl.detail}</>) : (bl.detail)}
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                              {!sum.intro && sum.bullets.length === 0 && (
+                                <p className="sop-summary-empty">（还没有摘要，点「重新生成」再试一次）</p>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        {idx < steps.length - 1 && <hr className="sop-step-divider" />}
+                      </div>
+                    );
+                  }
+                  if (isIntroBlock(step)) {
+                    /* ── 简介块（第十九轮）──
+                       自己在正文里写的引子。一个多行输入框，随内容长高，
+                       改完 800ms 防抖落库（与「补充说明」同一套）。 */
+                    return (
+                      <div
+                        key={step.id}
+                        id={`sop-step-${step.id}`}
+                        data-step-id={step.id}
+                        className="sop-edit-step sop-edit-intro"
+                        onMouseDown={() => {
+                          if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                        }}
+                      >
+                        <div className="sop-intro-card">
+                          <div className="sop-intro-head">
+                            <AlignLeft size={13} className="sop-intro-mark" />
+                            <span className="sop-intro-title">简介</span>
+                            <span className="sop-intro-badge">自定</span>
+                            <button
+                              type="button"
+                              className="sop-intro-del"
+                              onClick={(e) => { e.stopPropagation(); setDeleteTarget(step.id); }}
+                              data-tip="删除这段简介"
+                              aria-label="删除这段简介"
+                            >
+                              <X size={13} />
+                            </button>
+                          </div>
+                          <textarea
+                            className="sop-edit-desc sop-intro-input"
+                            rows={3}
+                            value={d.description}
+                            placeholder="写一句整篇的简介：这份教程适合谁看、跟着做完能学会什么"
+                            onChange={(e) => {
+                              autoGrow(e.currentTarget);
+                              setDraftField(step.id, "description", e.target.value);
+                            }}
+                            onFocus={(e) => {
+                              autoGrow(e.currentTarget);
+                              if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                            }}
+                          />
+                        </div>
+                        {idx < steps.length - 1 && <hr className="sop-step-divider" />}
+                      </div>
+                    );
+                  }
                   return (
-                    <div className="step-detail-image step-detail-image--empty" style={{ backgroundColor: '#f5f6f7' }}>
-                      <div className="step-detail-no-image step-detail-no-image-compact"
-                        onClick={pickFileForUpload} onContextMenu={pasteScreenshot}
-                        style={{ position: 'relative', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
-                        <div className="upload-hint" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', color: '#9aa0a6' }}>
-                          <span className="no-image-action-type" style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '1px', color: '#c0c4cc', textTransform: 'uppercase' }}>
-                            {selectedStep?.action_type?.toUpperCase() || ''}
-                          </span>
-                          <span className="no-image-title" style={{ fontSize: '18px', fontWeight: 600, color: '#24292e', marginTop: '2px' }}>
-                            {selectedStep?.title || '(无标题)'}
-                          </span>
-                          <span className="no-image-hint" style={{ fontSize: '12px', color: '#9aa0a6' }}>点击或右键粘贴上传截图</span>
+                    <div
+                      key={step.id}
+                      id={`sop-step-${step.id}`}
+                      data-step-id={step.id}
+                      /* 第二十三轮：is-sel = 选中卡（徽章橙 + 微暖边 + 阴影升档）；
+                          hasmedia = 有媒体的步骤卡，宽档切「媒体左 + 描述侧栏右」双栏 */
+                      className={
+                        "sop-edit-step" +
+                        (isSel ? " is-sel" : "") +
+                        (isVideoStep(step) || src ? " hasmedia" : "")
+                      }
+                      onMouseDown={() => {
+                        if (selectedStepId !== step.id) {
+                          setSelectedStepId(step.id);
+                          setLightboxMarked(false);
+                        }
+                      }}
+                    >
+                      {/* 头部一行：圆徽 + 就地可编辑的标题 + 最右的删除键。
+                          标题自 2026-09-19 起不再单独占一行（每步省一整行高度）。 */}
+                      <div className="sop-preview-step-header sop-edit-head">
+                        <span className={"step-num-circle" + (isSel ? " is-sel" : "")}>{String(step.step_number || idx + 1).padStart(2, "0")}</span>
+                        {/* 标题这一行右侧还挂着两枚元信息（第二十六轮 · 设计稿 .btitle 行）：
+                            动作类型来自 step.action_type；「易错」= 这一步的 note_kind 是 warn。
+                            删除键排在它们右边，整串都在这条 wrap 里靠右。 */}
+                        <div className="sop-edit-titlewrap">
+                        <textarea
+                          className="sop-edit-title"
+                          rows={1}
+                          value={d.title}
+                          placeholder="这一步做什么"
+                          onChange={(e) => {
+                            autoGrow(e.currentTarget);
+                            setDraftField(step.id, "title", e.target.value);
+                          }}
+                          onFocus={(e) => {
+                            autoGrow(e.currentTarget);
+                            if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                          }}
+                        />
+                        {/* 弹性空档：标题左边、标签与工具键右边（第二十九轮）——
+                            动作类型标不再紧跟标题文字，和「插入 / ✕」聚成行尾一组。 */}
+                        <span className="sop-edit-spacer" aria-hidden="true" />
+                        {step.action_type ? <span className="sop-act-tag">{step.action_type}</span> : null}
+                        {kind === "warn" ? <span className="sop-warn-chip">易错</span> : null}
+                        {/* 块的「插入」（设计稿 .btools）：鼠标进块或它是当前步时才浮出，
+                            点开的就是左栏那套插入菜单（步骤 / 大标题 / 简介 / 导入 / 续录）。 */}
+                        <button
+                          type="button"
+                          className="sop-block-insert"
+                          onClick={(e) => { e.stopPropagation(); openInsertMenu(e, idx); }}
+                          data-tip="在这一步后面插入：步骤 / 大标题 / 简介"
+                        >
+                          插入
+                        </button>
+                        <button
+                          type="button"
+                          className="sop-step-del"
+                          onClick={(e) => { e.stopPropagation(); setDeleteTarget(step.id); }}
+                          data-tip="删除这一步，后面的步骤序号自动前移"
+                          aria-label="删除这一步"
+                        >
+                          <X size={13} />
+                        </button>
                         </div>
                       </div>
+
+                      {/* 媒体：视频 → 原生播放器；图片（含 GIF 动图）→ 可缩放/裁切的截图 */}
+                      {isVideoStep(step) ? (
+                        <div className="sop-preview-image sop-edit-shot sop-shot-video">
+                          <video
+                            src={stepVideoSrc(step)}
+                            poster={src ? `data:image/jpeg;base64,${src}` : undefined}
+                            playsInline
+                            preload="metadata"
+                            ref={(el) => { videoEls.current[step.id] = el; }}
+                            onLoadedMetadata={(e) => {
+                              const v = e.currentTarget;
+                              setVideoDur((prev) => ({ ...prev, [step.id]: v.duration || 0 }));
+                              v.playbackRate = videoRateOf(step.id);
+                            }}
+                            onTimeUpdate={(e) => {
+                              const v = e.currentTarget;
+                              setVideoTime((prev) => ({ ...prev, [step.id]: v.currentTime }));
+                            }}
+                            onPlay={() => setVideoPlaying((prev) => ({ ...prev, [step.id]: true }))}
+                            onPause={() => setVideoPlaying((prev) => ({ ...prev, [step.id]: false }))}
+                            onEnded={() => setVideoPlaying((prev) => ({ ...prev, [step.id]: false }))}
+                          />
+                          {/* 自绘控制条：播放/暂停 + 倍速 −/+（档位 0.5~2）+ 进度 + 时间 + 全屏。
+                              替代原生 controls —— 原生 −/+ 倍速步进不可控（会变成 0.21x 之类）。 */}
+                          <div className="sop-video-controls">
+                            <button
+                              type="button"
+                              className="sop-video-btn"
+                              onClick={(e) => { e.stopPropagation(); toggleVideoPlay(step.id); }}
+                              aria-label={videoPlaying[step.id] ? "暂停" : "播放"}
+                            >
+                              {videoPlaying[step.id] ? <Pause size={13} /> : <Play size={13} />}
+                            </button>
+                            <button
+                              type="button"
+                              className="sop-video-btn"
+                              onClick={(e) => { e.stopPropagation(); nudgeVideoRate(step.id, -1); }}
+                              aria-label="放慢"
+                            >
+                              <Minus size={13} />
+                            </button>
+                            <span className="sop-video-rate">{videoRateOf(step.id).toFixed(2)}x</span>
+                            <button
+                              type="button"
+                              className="sop-video-btn"
+                              onClick={(e) => { e.stopPropagation(); nudgeVideoRate(step.id, 1); }}
+                              aria-label="加快"
+                            >
+                              <Plus size={13} />
+                            </button>
+                            <input
+                              type="range"
+                              className="sop-video-seek"
+                              min={0}
+                              max={videoDur[step.id] || 0}
+                              step={0.01}
+                              value={Math.min(videoTime[step.id] || 0, videoDur[step.id] || 0)}
+                              onChange={(e) => seekVideoTo(step.id, Number(e.target.value))}
+                              aria-label="播放进度"
+                            />
+                            <span className="sop-video-time">
+                              {fmtTime(videoTime[step.id] ?? 0)} / {fmtTime(videoDur[step.id] ?? 0)}
+                            </span>
+                            <button
+                              type="button"
+                              className="sop-video-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const el = videoEls.current[step.id];
+                                if (el) void el.requestFullscreen?.().catch(() => { /* 不支持则忽略 */ });
+                              }}
+                              aria-label="全屏"
+                            >
+                              <Maximize2 size={13} />
+                            </button>
+                          </div>
+                          {/* 视频只有「删除」—— 裁图 / 标注那套是给静态截图用的，
+                              对视频没有意义，不渲染那颗铅笔键。 */}
+                          <button
+                            type="button"
+                            className="sop-shot-del"
+                            onClick={(e) => { e.stopPropagation(); deleteScreenshotFor(step); }}
+                            aria-label="删除这段视频"
+                          >
+                            <X size={13} />
+                          </button>
+                        </div>
+                      ) : src ? (
+                        <div className="sop-preview-image sop-edit-shot">
+                          <img
+                            src={`data:image/jpeg;base64,${(() => {
+                              const disp = shotDispOf(step.id);
+                              const fracPct = perShotPcts[step.id] ?? 100;
+                              // 100% 全图态 / 放大倍率态：整图全貌或倍率放大都以 before 整图为底；
+                              // 顶栏全局比例态（disp<100）：显示主图（裁剪图）原样放大填满框
+                              return shotAtGlobalPct[step.id]
+                                ? src
+                                : disp <= 100.001 || disp > fracPct + 0.5
+                                  ? step.before_screenshot_base64 || src
+                                  : src;
+                            })()}`}
+                            alt={`步骤 ${step.step_number || idx + 1} 截图`}
+                            onClick={() => openLightbox(realSteps.findIndex((s) => s.id === step.id))}
+                            onLoad={(e) => rememberShotNat(step.id, e.currentTarget)}
+                            style={{
+                              cursor: "zoom-in",
+                              transform: `scale(${(() => {
+                                const disp = shotDispOf(step.id);
+                                if (Math.abs(disp - 100) < 0.001) return 1;
+                                // 顶栏全局比例态：主图裁剪图按真实比例放大填满框（如 50% → scale 2）
+                                if (disp < 100) return Math.round((100 / disp) * 100) / 100;
+                                return shotZoomOf(step.id);
+                              })()})`,
+                              transformOrigin: (() => {
+                                const disp = shotDispOf(step.id);
+                                if (Math.abs(disp - 100) < 0.001) return "50% 50%";
+                                return shotOriginOf(step);
+                              })(),
+                            }}
+                          />
+                          {/* 悬浮在图片上的功能键（鼠标移到图片上才浮现）：
+                              「编辑图片」在左、删除截图的 ✕ 在最右。
+                              第十九轮按用户要求去掉「图片描述」那颗键 —— 两个键同为 24px
+                              高，圆心落在同一条水平线上（之前铅笔是 19px 的胶囊，中心偏高）。 */}
+                          <button
+                            type="button"
+                            className="sop-shot-annotate"
+                            onClick={(e) => { e.stopPropagation(); openAnnotate(step.id); }}
+                            aria-label="编辑图片"
+                          >
+                            <PencilLine size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="sop-shot-del"
+                            onClick={(e) => { e.stopPropagation(); deleteScreenshotFor(step); }}
+                            aria-label="删除这张截图"
+                          >
+                            <X size={13} />
+                          </button>
+                          {/* 图片右下角：−/+ 微调倍率 + 定位圆钮
+                              （准星=放大至点击位置，四角向内=还原原图）
+                              ⚠️ 第十五轮：图片上的浮层一律不再挂 data-tip —— 鼠标扫过
+                              截图时一直被气泡追着跑，视觉很吵（用户直接点名去掉）。 */}
+                          <div className="sop-shot-tools">
+                            <div className="sop-shot-zoom">
+                              <button
+                                type="button"
+                                className="step-detail-view-segmented-btn"
+                                onClick={(e) => { e.stopPropagation(); nudgeShotZoom(step.id, -1); }}
+                                aria-label="缩小"
+                              >
+                                <Minus size={13} />
+                              </button>
+                              <button
+                                type="button"
+                                className="step-detail-view-segmented-btn"
+                                onClick={(e) => { e.stopPropagation(); nudgeShotZoom(step.id, 1); }}
+                                aria-label="放大"
+                              >
+                                <Plus size={13} />
+                              </button>
+                            </div>
+                            <button
+                              type="button"
+                              className="sop-shot-zoomtoggle"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isShotVisFull(step.id)) {
+                                  // 100% 整图 → 顶栏全局比例态：显示当前主图
+                                  // （真实比例裁剪图）原样填满框，缩放原点取操作落点
+                                  setShowFullShot((prev) => ({ ...prev, [step.id]: false }));
+                                  setShotAtGlobalPct((prev) => ({ ...prev, [step.id]: true }));
+                                  setShotZoom((prev) => ({ ...prev, [step.id]: 1 }));
+                                  setShotZoomCenter((prev) => ({ ...prev, [step.id]: false }));
+                                } else {
+                                  // 顶栏态/微调态 → 100% 整图：复位倍率与缩放原点，显示 before 原图
+                                  setShotAtGlobalPct((prev) => ({ ...prev, [step.id]: false }));
+                                  setShowFullShot((prev) => ({ ...prev, [step.id]: true }));
+                                  setShotZoom((prev) => ({ ...prev, [step.id]: 1 }));
+                                  setShotZoomCenter((prev) => ({ ...prev, [step.id]: false }));
+                                }
+                              }}
+                              aria-label={isShotVisFull(step.id) ? "还原当前图片比例" : "查看全图（100%）"}
+                            >
+                              {isShotVisFull(step.id) ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div
+                          className="sop-edit-shot sop-edit-shot--empty"
+                          onClick={() => {
+                            if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                            pickMediaForStep(step.id);
+                          }}
+                          onContextMenu={(e) => pasteForStep(e, step.id)}
+                          onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
+                          onDrop={(e) => { e.preventDefault(); dropMediaForStep(step.id, e.dataTransfer); }}
+                        >
+                          <span className="sop-edit-shot-type">{step.action_type || ""}</span>
+                          <span className="sop-edit-shot-hint">点击或拖拽上传 · 截图 / 视频 / 动图 · 右键粘贴 Ctrl+V</span>
+                        </div>
+                      )}
+
+                      {/* 图注行（第二十六轮 · 设计稿的 .shot figcaption）——————
+                          截图正下方那一行 11px 小灰字：左边是图注（老数据照常显示，
+                          没图注就退回窗口标题），右边是原图尺寸 + 「点开看大图」。
+                          图注不再是可点入口（编辑入口第十九轮就撤了）。 */}
+                      {(src || isVideoStep(step)) && (
+                        <div className="sop-edit-caption">
+                          <span className="sop-cap-text">
+                            {step.image_caption?.trim() || step.window_title?.trim() || ""}
+                          </span>
+                          <span className="sop-cap-dim">
+                            {(() => {
+                              const nat = shotNat[step.id];
+                              const dim = nat ? `${nat.w} × ${nat.h}` : "";
+                              const tail = isVideoStep(step) ? "" : "点开看大图";
+                              return dim && tail ? `${dim} · ${tail}` : (dim || tail);
+                            })()}
+                          </span>
+                        </div>
+                      )}
+
+                      {/* 补充说明：就地可编辑。第十六轮（对标参考产品）：
+                          类型 chip「描述 / 标注 / 警告」挪到**输入框同一行的右侧**（原来压在输入框上面占一整行），
+                          正文是一圈浅边框的圆角输入框，选 标注 / 警告 时整框换成对应色。 */}
+                      <div className={`sop-edit-note is-${kind || "desc"}`}>
+                        <textarea
+                          className="sop-edit-desc"
+                          rows={1}
+                          value={d.description}
+                          placeholder={NOTE_PLACEHOLDER[kind]}
+                          onChange={(e) => {
+                            autoGrow(e.currentTarget);
+                            setDraftField(step.id, "description", e.target.value);
+                          }}
+                          onFocus={(e) => {
+                            autoGrow(e.currentTarget);
+                            if (selectedStepId !== step.id) setSelectedStepId(step.id);
+                          }}
+                        />
+                        {/* 类型 chip 排在行尾（DOM 放在输入框之后，Tab 顺序与视觉一致） */}
+                        <div className="sop-note-kinds">
+                          {NOTE_KINDS.map(({ id: k, label, tip }) => (
+                            <button
+                              key={k || "desc"}
+                              type="button"
+                              className={`sop-note-kind${kind === k ? " is-on" : ""}`}
+                              onClick={(e) => { e.stopPropagation(); void setNoteKindFor(step, k); }}
+                              data-tip={tip}
+                              aria-label={tip}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* 提示（AI 给的补充说明，默认收起）。
+                          ⚠️「变量」控件已于第十三轮按要求**整体移除**：所有步骤都不再显示
+                          那颗 ✓变量 + 参数名输入框。数据层 is_variable / param_name 保留不动，
+                          导出 SKILL.md 的既有行为不变，只是编辑器里不再暴露这个入口。 */}
+                      {step.tip && (
+                        <div className="sop-edit-meta">
+                          <button
+                            type="button"
+                            className="sop-edit-tip-toggle"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setOpenTips((p) => ({ ...p, [step.id]: !p[step.id] }));
+                            }}
+                            data-tip={openTips[step.id] ? "收起 AI 给的补充说明" : "展开 AI 给的补充说明"}
+                          >
+                            {openTips[step.id] ? <ChevronDown size={13} /> : <ChevronRight size={13} />} 提示
+                          </button>
+                        </div>
+                      )}
+                      {step.tip && openTips[step.id] && (
+                        <div className="sop-preview-tip"><strong>提示：</strong>{step.tip}</div>
+                      )}
+
+                      <div className="sop-edit-foot">
+                        {isSel && autoSaved && (
+                          <span className="sop-edit-saved"><Check size={12} /> 已自动保存</span>
+                        )}
+                      </div>
+
+                      {idx < steps.length - 1 && <hr className="sop-step-divider" />}
                     </div>
                   );
-                }
-
-                // ── 有截图：图片 + 切换 + 标注 + 删除 ──
-                return (
-                  <div
-                    className="step-detail-image"
-                    style={
-                      detailImgBox.box
-                        ? ({
-                            "--step-img-aspect": `${detailImgBox.box.aspect}`,
-                            maxWidth: `${detailImgBox.box.maxWidth}px`,
-                            minHeight: `${detailImgBox.box.minHeight}px`,
-                          } as React.CSSProperties)
-                        : undefined
-                    }
-                  >
-                    {/* 全图 / 裁图 切换（仅当前步骤，悬浮截图时显示在右下角） */}
-                    <div className="step-detail-view-segmented">
-                      <button
-                        className={`step-detail-view-segmented-btn${!getViewCropped(selectedStep?.id ?? '') ? ' active' : ''}`}
-                        onClick={() => setViewCropped(selectedStep?.id ?? '', false)}
-                      >全图</button>
-                      <button
-                        className={`step-detail-view-segmented-btn${getViewCropped(selectedStep?.id ?? '') ? ' active' : ''}`}
-                        onClick={() => setViewCropped(selectedStep?.id ?? '', true)}
-                      >裁图</button>
-                    </div>
-                    <img
-                      ref={detailImgRef}
-                      src={`data:image/jpeg;base64,${_src}`}
-                      alt={`步骤 ${selectedIndex + 1} 截图`}
-                      onClick={() => openLightbox(selectedIndex)}
-                      onLoad={(e) => {
-                        const box = previewBox(e.currentTarget.naturalWidth, e.currentTarget.naturalHeight);
-                        if (!box) return;
-                        detailBoxMemo.current.set(_src, box);
-                        setDetailImgBox((prev) => ({ ...prev, box }));
-                      }}
-                      style={{ cursor: "pointer" }}
-                    />
-                    <button
-                      className="screenshot-annotate-btn"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        openAnnotate(selectedStep.id);
-                      }}
-                    >
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-                        <path d="M8 2v12M2 8h12" />
-                        <circle cx="8" cy="8" r="5.5" />
-                      </svg>
-                      标注
-                    </button>
-                    <button
-                      className="screenshot-delete-btn"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        const isCropView = getViewCropped(selectedStep?.id ?? '');
-                        if (isCropView) {
-                          if (confirm("确定删除裁剪图？")) {
-                            setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: true }));
-                          }
-                        } else {
-                          if (confirm("确定删除截图？")) {
-                            invoke('delete_step_screenshot', {
-                              stepId: selectedStep.id,
-                              isAfter: true,
-                            });
-                            const updated = [...steps];
-                            updated[selectedIndex] = { ...updated[selectedIndex], screenshot_base64: null };
-                            setSteps(updated);
-                            setDeletedCrop(prev => ({ ...prev, [selectedStep.id]: false }));
-                            setViewCropped(selectedStep.id, false);
-                          }
-                        }
-                      }}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                );
-              })()}
-
-              {/* ── Scrollable form ──── */}
-              <div className="step-detail-scroll">
-
-              {/* Title */}
-              <div className="form-group">
-                <label>标题</label>
-                <input
-                  type="text"
-                  ref={titleInputRef}
-                  value={editTitle}
-                  onChange={(e) => setEditTitle(e.target.value)}
-                />
+                })}
               </div>
-
-              {/* Description */}
-              <div className="form-group">
-                <label>描述</label>
-                <textarea
-                  ref={descInputRef}
-                  value={editDescription}
-                  onChange={(e) => setEditDescription(e.target.value)}
-                  rows={4}
-                />
-              </div>
-
-              {/* 变量标记（仅输入类步骤）：SKILL.md 自动化导出用 */}
-              {(selectedStep.action_type === "type" || selectedStep.action_type === "paste") && (
-                <div className="form-group">
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <button
-                      type="button"
-                      onClick={toggleVariable}
-                      data-tip="标记为变量后，导出的 SKILL.md 会把该输入变成可填参数，AI 助手执行时按需填入"
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 4,
-                        padding: "3px 10px",
-                        fontSize: 12,
-                        borderRadius: 999,
-                        border: "1px solid " + (editIsVar ? "#f59e0b" : "var(--border, #d4d4d8)"),
-                        background: editIsVar ? "#fef3c7" : "transparent",
-                        color: editIsVar ? "#92400e" : "inherit",
-                        cursor: "pointer",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {editIsVar ? <Check size={12} /> : null} 变量
-                    </button>
-                    <span style={{ fontSize: 12, color: "var(--text-secondary, #71717a)" }}>
-                      {editIsVar ? "此输入在每次运行时会变化" : "把输入值标记为可变参数"}
-                    </span>
-                  </div>
-                  {editIsVar && (
-                    <input
-                      type="text"
-                      value={editParamName}
-                      onChange={(e) => setEditParamName(e.target.value)}
-                      onBlur={() => {
-                        const name = editParamName.trim();
-                        if (name !== editParamName || name !== selectedStep.param_name) {
-                          setEditParamName(name);
-                          void persistVariable(true, name);
-                        }
-                      }}
-                      placeholder="参数名，如 order_id"
-                      style={{ marginTop: 6 }}
-                    />
-                  )}
-                </div>
-              )}
-
-              {/* Tip (expandable) */}
-              {selectedStep.tip && (
-                <div className="form-group">
-                  <button
-                    className="tip-toggle"
-                    onClick={() => setTipExpanded(!tipExpanded)}
-                    data-tip={tipExpanded ? "收起 AI 给出的补充说明" : "展开 AI 给出的补充说明"}
-                  >
-                    {tipExpanded ? (
-                      <ChevronDown size={14} />
-                    ) : (
-                      <ChevronRight size={14} />
-                    )}{" "}
-                    提示
-                  </button>
-                  {tipExpanded && (
-                    <div className="step-detail-tip">{selectedStep.tip}</div>
-                  )}
-                </div>
-              )}
-
-              {/* Auto-save indicator */}
-              <div className="step-detail-actions" style={{ justifyContent: 'flex-start' }}>
-                {autoSaved && (
-                  <span style={{ color: '#22c55e', fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
-                    <Check size={12} /> 已自动保存
-                  </span>
-                )}
-              </div>
-              </div>
-            </>
-          ) : (
-            <p className="text-secondary">选择左侧步骤以编辑</p>
+            </div>
           )}
         </div>
       </div>
+      </div>
+      {/* ↑ 收 .editor-zoom（两栏缩放区） */}
+
+      {/* ── 左栏颗粒 ＋ 的插入菜单（第十三轮）────────────────────
+          步骤 / 大标题 / 简介 / 导入已有教程 / 续录；点空白处关掉。 */}
+      {insertMenu &&
+        createPortal(
+          <>
+            <div className="insert-menu-backdrop" onMouseDown={() => setInsertMenu(null)} />
+            <div
+              className="insert-menu"
+              style={{ left: insertMenu.x, top: insertMenu.y }}
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                className="insert-menu-item"
+                onClick={() => {
+                  const i = insertMenu.index;
+                  setInsertMenu(null);
+                  void handleInsertStep(i);
+                }}
+              >
+                <Plus size={14} /> 添加步骤
+              </button>
+              <button
+                type="button"
+                className="insert-menu-item"
+                onClick={() => {
+                  const i = insertMenu.index;
+                  setInsertMenu(null);
+                  void handleAddHeading(i + 1);
+                }}
+              >
+                <Hash size={14} /> 添加大标题
+              </button>
+              <button
+                type="button"
+                className="insert-menu-item"
+                onClick={() => {
+                  const i = insertMenu.index;
+                  setInsertMenu(null);
+                  void handleAddIntro(i + 1);
+                }}
+              >
+                <AlignLeft size={14} /> 添加简介
+              </button>
+              <button
+                type="button"
+                className="insert-menu-item"
+                onClick={() => {
+                  const i = insertMenu.index;
+                  setInsertMenu(null);
+                  void openImportPicker(i);
+                }}
+              >
+                <FolderInput size={14} /> 导入已有教程
+              </button>
+              <div className="insert-menu-sep" />
+              <button
+                type="button"
+                className="insert-menu-item"
+                onClick={() => {
+                  const i = insertMenu.index;
+                  setInsertMenu(null);
+                  if (onResumeInto) onResumeInto(recordingId, i);
+                }}
+              >
+                <Camera size={14} />
+                <span className="insert-menu-label">
+                  续录
+                  <span className="insert-menu-hint">从这里开始接着录</span>
+                </span>
+              </button>
+            </div>
+          </>,
+          document.body
+        )}
+
+      {/* ── 导入已有教程：选一份别的教程，把它的步骤搬到当前位置之后 ── */}
+      {importFor && (
+        <div className="import-backdrop" onMouseDown={() => setImportFor(null)}>
+          <div className="import-modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="import-head">
+              <strong>导入已有教程</strong>
+              <button
+                type="button"
+                className="import-close"
+                onClick={() => setImportFor(null)}
+                aria-label="关闭"
+              >
+                <X size={15} />
+              </button>
+            </div>
+            <p className="import-sub">把它的步骤搬到当前位置之后（大标题不带过来）</p>
+            <div className="import-list">
+              {importList.length === 0 && <div className="import-empty">没有其它教程可导入</div>}
+              {importList.map((r) => (
+                <button
+                  key={r.id}
+                  type="button"
+                  className="import-row"
+                  disabled={importBusy}
+                  onClick={() => void doImport(r.id)}
+                >
+                  <span className="import-row-title">{r.title || "未命名教程"}</span>
+                  <span className="import-row-meta">{r.total_steps} 步</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Lightbox ──────────────────────────────────────── */}
       {lightboxOpen && (
         <Lightbox
-          steps={steps}
+          steps={realSteps}
           currentIndex={lightboxIndex}
           onClose={() => setLightboxOpen(false)}
           onPrev={lightboxPrev}
           onNext={lightboxNext}
-          getMainSrc={getStepMainSrc}
+          getMainSrc={lightboxSrcOf}
           showMarked={lightboxMarked}
           onToggleMarked={() => setLightboxMarked(!lightboxMarked)}
         />
@@ -3364,41 +5524,35 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
         // 标注固定使用 after 全图（screenshot_base64）
         const base64 = targetStep.screenshot_base64;
         if (!base64) return null;
-        // 若当前处于裁图视图，把现有裁图框作为初始选区传入，方便在现有裁图上继续微调
+        // 若当前处于裁图视图，把现有裁图锚点作为初始选区传入，方便在现有裁图上继续微调。
+        // 5b 修复：x/y 是锚点**中心**，不能当矩形左上角直接传给 initialCropRect
+        // （旧代码偏移半个框）；改传 initialAnchor，由 AnnotationsOverlay 用
+        // cropBoxFromAnchor 换算成恒 50% 窗口（左上角 + 贴边夹回）。
         const hasAnchor = (targetStep.crop_w ?? 0) > 0 && (targetStep.crop_h ?? 0) > 0;
-        const initialCropRect = hasAnchor
-          ? { x: targetStep.x ?? 0, y: targetStep.y ?? 0, width: targetStep.crop_w ?? 0, height: targetStep.crop_h ?? 0 }
+        const initialAnchor = hasAnchor
+          ? { x: targetStep.x ?? 0, y: targetStep.y ?? 0, cropW: targetStep.crop_w ?? 0, cropH: targetStep.crop_h ?? 0 }
           : null;
         return (
           <AnnotationsOverlay
             imageUrl={`data:image/jpeg;base64,${base64}`}
             annotations={[]}
             actionType={targetStep.action_type}
-            initialCropRect={initialCropRect}
+            initialAnchor={initialAnchor}
             onSave={handleAnnotateSave}
             onClose={() => setAnnotateOpen(false)}
           />
         );
       })()}
 
-      {/* Custom Save Dialog */}
-      {showSaveDialog && (() => {
-        const fmt = showSaveDialog;
-        const formatExt: Record<string, string> = { html: "html", markdown: "md", txt: "txt", pdf: "pdf", long: "png", skill: "md" };
-        const defaultName = (recording?.title || "recording")
-          .replace(/[\\/:*?"<>|]/g, "_")
-          .substring(0, 120) + "." + (formatExt[fmt] || fmt);
-        return (
-          <FileSaveDialog
-            isOpen={true}
-            title="导出录制"
-            defaultName={defaultName}
-            filters={[{ name: fmt.toUpperCase(), extensions: [formatExt[fmt] || fmt] }]}
-            onClose={() => setShowSaveDialog(null)}
-            onSave={handleSaveConfirm}
-          />
-        );
-      })()}
+      {/* Export format picker dialog —— 选完格式/选项直接导出到固定目录「文档\录步导出」 */}
+      {exportOpen && (
+        <ExportDialog
+          isOpen={exportOpen}
+          onClose={() => setExportOpen(false)}
+          onSelect={(format, options) => handleExport(format, options)}
+          steps={steps}
+        />
+      )}
 
       {/* Toast */}
       {toast && createPortal(
@@ -3559,6 +5713,9 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
       {showPublishDialog && createPortal(
         (() => {
           const closePub = () => { setShowPublishDialog(false); setPubStep("pick"); };
+          // ★ 端云一体化 v247 回流：本地已记云端 slug ⇒ 弹窗里直接亮出链接（刷新后依然在）
+          let cloudUrl = "";
+          try { const slug = localStorage.getItem(webSlugKey(recordingId)) || ""; cloudUrl = webEditUrl(slug); } catch { /* 配额忽略 */ }
           const addApp = () => {
             const v = pubAppInput.trim();
             if (v && !pubApplications.includes(v)) setPubApplications([...pubApplications, v]);
@@ -3600,6 +5757,19 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                   <div>
                     <div style={{ fontSize: 13, color: "#8b949e", marginBottom: 16, lineHeight: 1.6 }}>
                       将当前录屏教程上传到 flowio.cn。可直接发布，或先存为草稿稍后再发布。
+                      {cloudUrl && (
+                        <span style={{ display: "block", marginTop: 8, fontSize: 12.5 }}>
+                          <CheckCircle2 size={12} style={{ verticalAlign: "-2px", marginRight: 4, color: "#3fb950" }} />
+                          云端已保存：
+                          <a
+                            href={cloudUrl}
+                            onClick={(e) => { e.preventDefault(); void invoke("open_external_url", { url: cloudUrl }); }}
+                            style={{ color: "#58a6ff", textDecoration: "underline", cursor: "pointer" }}
+                          >
+                            {cloudUrl}
+                          </a>
+                        </span>
+                      )}
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                       <button
@@ -3627,6 +5797,20 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                       >
                         {publishing ? "保存中..." : "存草稿"}
                         <div style={{ fontSize: 12, fontWeight: 400, opacity: 0.7, marginTop: 2 }}>用录制信息兜底，先保存到网站草稿箱</div>
+                      </button>
+                      {/* ★ r65「在网页编辑」（对齐 Scribe）：端内只负责录，排版 / 团队库 / 分享去网页 */}
+                      <button
+                        onClick={openInWebEditor}
+                        disabled={publishing}
+                        data-tip="到 flowio.cn 网页里排版、发布到团队库、生成分享链接"
+                        style={{
+                          padding: "12px 16px", borderRadius: 8,
+                          border: "1px solid #30363d", background: "transparent", color: "#e6edf3",
+                          cursor: publishing ? "default" : "pointer", fontSize: 15, fontWeight: 600, textAlign: "left",
+                        }}
+                      >
+                        {WEB_EDIT_BUTTON}
+                        <div style={{ fontSize: 12, fontWeight: 400, opacity: 0.7, marginTop: 2 }}>{WEB_EDIT_HINT}</div>
                       </button>
                     </div>
                   </div>
@@ -3702,6 +5886,27 @@ const handlePublish = useCallback(async (targetStatus: "draft" | "published" = "
                       <option value="">请选择分类</option>
                       {categories.map((c) => (
                         <option key={c.id} value={c.id}>{c.name}</option>
+                      ))}
+                    </select>
+
+                    {/* T9：发布到团队库（可选）。列表与「可发布」判定都来自服务端。 */}
+                    <label style={pubDialogStyles.label}>
+                      {TEAM_PUBLISH_LABEL}
+                      <span style={{ marginLeft: 6, fontSize: 12, color: "#6e7681" }}>
+                        {pubWorkspaces.length === 0
+                          ? TEAM_PUBLISH_EMPTY_HINT
+                          : "团队成员可在团队库里检索到这篇教程"}
+                      </span>
+                    </label>
+                    <select
+                      style={pubDialogStyles.input}
+                      value={pubWorkspaceId}
+                      onChange={(e) => setPubWorkspaceId(e.target.value)}
+                      disabled={pubWorkspaces.length === 0}
+                    >
+                      <option value={TEAM_PUBLISH_NONE}>{TEAM_PUBLISH_NONE_LABEL}</option>
+                      {pubWorkspaces.map((w) => (
+                        <option key={w.id} value={w.id}>{teamWorkspaceLabel(w)}</option>
                       ))}
                     </select>
 

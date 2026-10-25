@@ -42,10 +42,15 @@ interface Filter {
 interface FileSaveDialogProps {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (filePath: string) => void;
+  /** 第二十一轮：第二参是「保存类型」下拉的下标，批量导出据此决定导出格式 */
+  onSave: (filePath: string, formatIdx: number) => void;
   title: string;
   defaultName: string;
   filters: Filter[];
+  /** "file"（默认）= 存单个文件，行为与旧版完全一致；
+      "folder" = 只取「新建的文件夹名 + 保存类型」，由调用方在它们之上做批量导出。
+      批量导出弹窗复用本组件（同一套目录浏览 + 保存类型下拉），见 Dashboard。 */
+  mode?: "file" | "folder";
 }
 
 /* ================================================================
@@ -98,7 +103,9 @@ export default function FileSaveDialog({
   title,
   defaultName,
   filters,
+  mode = "file",
 }: FileSaveDialogProps) {
+  const isFolder = mode === "folder";
   const [knownFolders, setKnownFolders] = useState<KnownFolder[]>([]);
   const [drives, setDrives] = useState<DriveInfo[]>([]);
   const [currentDir, setCurrentDir] = useState("");
@@ -203,6 +210,13 @@ export default function FileSaveDialog({
     const ext = filters[formatIdx]?.extensions?.[0] || "";
     let finalName = fileName.trim();
     if (!finalName) return;
+    if (isFolder) {
+      // 文件夹模式：不追加扩展名、不做覆盖检查（往里放文件是安全的），
+      // 直接把「当前目录 + 文件夹名」交给调用方；父目录由导出侧 create_dir_all 建。
+      const dir0 = currentDir.endsWith("\\") ? currentDir : currentDir + "\\";
+      onSave(dir0 + finalName, formatIdx);
+      return;
+    }
     // Auto-append extension if missing
     if (ext && !finalName.toLowerCase().endsWith("." + ext)) {
       finalName += "." + ext;
@@ -219,15 +233,15 @@ export default function FileSaveDialog({
       return;
     }
 
-    onSave(fullPath);
-  }, [fileName, currentDir, formatIdx, filters, entries, onSave]);
+    onSave(fullPath, formatIdx);
+  }, [fileName, currentDir, formatIdx, filters, entries, onSave, isFolder]);
 
   const confirmOverwrite = useCallback(() => {
     if (overwriteTarget) {
-      onSave(overwriteTarget);
+      onSave(overwriteTarget, formatIdx);
       setOverwriteTarget(null);
     }
-  }, [overwriteTarget, onSave]);
+  }, [overwriteTarget, onSave, formatIdx]);
 
   const cancelOverwrite = useCallback(() => {
     setOverwriteTarget(null);
@@ -604,14 +618,14 @@ export default function FileSaveDialog({
         <div style={s.footer}>
           <div style={s.footerLeft}>
             <div style={s.footerRow}>
-              <span style={s.label}>文件名(N):</span>
+              <span style={s.label}>{isFolder ? "文件夹名(N):" : "文件名(N):"}</span>
               <input
                 ref={inputRef}
                 style={s.input}
                 value={fileName}
                 onChange={(e) => setFileName(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="输入文件名"
+                placeholder={isFolder ? "输入文件夹名" : "输入文件名"}
               />
             </div>
             <div style={s.footerRow}>
@@ -634,7 +648,7 @@ export default function FileSaveDialog({
               style={{ ...s.btn, ...s.btnPrimary, width: 80 }}
               onClick={handleSave}
               disabled={!fileName.trim()}
-              data-tip="保存到当前文件夹"
+              data-tip={isFolder ? "在这个位置新建文件夹，导出的文件都放进去" : "保存到当前文件夹"}
             >
               保存(S)
             </button>

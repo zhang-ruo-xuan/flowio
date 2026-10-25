@@ -6,15 +6,6 @@ use crate::ai::prompt;
 use crate::ai::sanitize;
 use crate::ai::types::{AiConfig, AiJob, AiResult, StepInput, StepOutput};
 
-/// Padding (px) added around the focused element rect before cropping.
-const CROP_PAD: i32 = 24;
-/// Minimum crop region side (px); smaller rects are expanded around their center.
-const CROP_MIN_SIZE: i32 = 280;
-/// Crop region must not exceed this fraction of the screenshot width/height.
-const CROP_MAX_SCREEN_RATIO: f32 = 0.9;
-/// Fallback crop size when no element rect but click point exists: fraction of screen.
-const CROP_FALLBACK_RATIO: f32 = 0.4;
-
 /// JPEG quality for cropped screenshots (85 = good balance of size and fidelity).
 const CROP_JPEG_QUALITY: u8 = 85;
 
@@ -324,12 +315,11 @@ fn detect_window_change(before_b64: &str, after_b64: &str) -> bool {
 
 /// Crop the screenshot adaptively around the focused element rect, encoding as JPEG.
 ///
-/// Precedence:
-/// 1. Element rect (crop_w/crop_h, center x/y): rect expanded by CROP_PAD,
-///    enlarged to CROP_MIN_SIZE around the center if smaller, scaled down to fit
-///    within CROP_MAX_SCREEN_RATIO of the screenshot while keeping aspect ratio;
-/// 2. Click point only: fallback square of CROP_FALLBACK_RATIO × screen size;
-/// 3. Otherwise: full image.
+/// 5b 对齐插件 `computeCropRect`（中心 + 恒 50% 窗口 + 贴边平移夹回），
+/// 与导出端 / 前端同一套几何（见 `ai_crop_region` 与 `crop_region_50`）。
+/// 优先级：
+/// 1. 元素矩形或点击点：恒 50% 窗口；
+/// 2. 无可用锚点：整图。
 /// Region is clamped to image bounds; encoded at JPEG quality 85.
 fn crop_and_encode(
     base64_str: &str,
@@ -347,6 +337,7 @@ fn crop_and_encode(
 /// - `Outside`：锚点完全落在图外，历史行为是**原样返回原始 base64**（连重编码都不做）。
 ///   这条是防 panic 的既有约定——锚点在图外时裁出来的图没有意义，见
 ///   `crop_and_encode_out_of_bounds_coords_no_panic`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AiCropRegion {
     Rect(i32, i32, i32, i32),
     Full,
@@ -355,11 +346,15 @@ pub(crate) enum AiCropRegion {
 
 /// AI 裁图区域的纯几何（不碰图片字节）。
 ///
-/// ⚠️ 本文件的常量（PAD=24 / MIN=280 / 缩到屏幕 90%）与导出端、前端**刻意不同**——
-/// 喂给 AI 的图需要更大上下文和最小尺寸保证。但 type 步骤「左扩 1/3 宽」的
-/// 几何推导是同一套，**左移量必须是 extra/2 而不是 extra**，否则右侧留白变成
-/// `PAD - extra/2`，元素宽 > 144px 时右边缘被切。
-/// 详见 `export/commands.rs::export_crop_box` 的注释与前端 `src/lib/cropAnchor.ts`。
+/// 5b 对齐插件 `flowio-extension/src/shared/cropRegion.ts::computeCropRect`：
+/// **中心 + 恒 50% 窗口（FOCUS_VISIBLE_FRAC=0.5，倍率 2×）+ 贴边平移夹回**。
+/// 实现委托给 `export/commands.rs::crop_region_50` —— 三端唯一纯几何：
+///   1. `src/lib/cropAnchor.ts::cropBoxFromAnchor`（前端）
+///   2. `src-tauri/src/export/commands.rs::export_crop_box`（导出 docx/html/pdf）
+///   3. 本函数（AI 管线）
+/// 旧的 PAD=24 / MIN=280 / 缩到 90% / type 左扩 1/3 / drag extraH 体系已随 5b 废弃，
+/// 与前端、导出端一样不再因元素尺寸改变窗口；元素矩形仅作「有元素」标志。
+/// 一致性由 `npm run check:crop`（第 6 段黄金值）与 cargo 侧 `both_consumers_*` 测试兜底。
 pub(crate) fn ai_crop_region(
     img_w: i32,
     img_h: i32,
@@ -372,77 +367,19 @@ pub(crate) fn ai_crop_region(
     if img_w <= 0 || img_h <= 0 {
         return AiCropRegion::Outside;
     }
-    let raw = match (click_x, click_y, crop_w, crop_h) {
-        // 1. Element rect anchored adaptive crop
-        (Some(x), Some(y), Some(cw), Some(ch))
-            if x >= 0 && y >= 0 && cw > 0 && ch > 0 =>
-        {
-            let mut rw = (cw + CROP_PAD * 2).max(CROP_MIN_SIZE);
-            let mut rh = (ch + CROP_PAD * 2).max(CROP_MIN_SIZE);
-            // Scale down (never up) to fit within 90% of screen, keep aspect ratio.
-            //
-            // ⚠️ 缩放的**下限是元素本身**，不是 90% 屏幕：元素大到超过 90% 屏幕时，
-            // 无条件缩到 90% 会把元素边缘切掉——AI 就拿着一张被截断的图写描述
-            // （修复前实测：4K 全屏元素左右各切 164px、上下各切 78px）。
-            // 故缩放上限取 `max(90% 屏幕, 落库值)`：小元素照旧缩，大元素不缩。
-            let max_w = (img_w as f32 * CROP_MAX_SCREEN_RATIO).max(cw as f32);
-            let max_h = (img_h as f32 * CROP_MAX_SCREEN_RATIO).max(ch as f32);
-            let scale = (1.0f32).min(max_w / rw as f32).min(max_h / rh as f32);
-            rw = (rw as f32 * scale).round().max(1.0) as i32;
-            rh = (rh as f32 * scale).round().max(1.0) as i32;
-            // ⚠️ 等比缩放会**连累**另一个方向：scale 取两方向的最小值，限制更紧的
-            // 那一方会把另一方也拉到比元素还小（实测 1920 宽的框被拉成 1884，
-            // 反而切掉 1900 宽的元素 16px）。所以缩放后再分别抬回元素尺寸。
-            // 「不切元素」优先级高于「保持宽高比」——裁图框的宽高比本来就不影响
-            // 输出是否变形（裁多大就是多大，不拉伸）。
-            // `cw/ch` 是落库值，已被 `.min(图宽/高)` 截过，故抬回去也不会越界。
-            rw = rw.max(cw);
-            rh = rh.max(ch);
-            // 见测试 `both_consumers_must_contain_the_visible_element_rect`。
-            // Stage C: type 步骤左侧多留原始矩形宽的 1/3，把左侧 label 带进裁图。
-            // ⚠️ 是 `- extra / 2` 而不是 `- extra`：框宽 rw 本身已含 extra，居中项
-            // `x - rw/2` 天然在左右各分到 extra/2。多减一个 extra/2 会过冲，
-            // 使右侧留白变成 PAD - extra/2（cw=300 时切掉 26px 右边缘）。
-            // Stage C: drag 步骤高度方向多留上下文（与前端 cropAdaptiveBase64 一致）。
-            if action_type == "type" {
-                let extra = ((cw as f64) / 3.0).round();
-                rw += extra as i32;
-                let left = (x as f64 - (rw as f64) / 2.0 - extra / 2.0).round() as i32;
-                (left, y - rh / 2, rw, rh)
-            } else if action_type == "drag" {
-                let extra_h = ((ch as f64) * 0.6).round().max(100.0);
-                rh += extra_h as i32;
-                (x - rw / 2, y - rh / 2, rw, rh)
-            } else {
-                (x - rw / 2, y - rh / 2, rw, rh)
-            }
-        }
-        // 2. Click point only: fallback ~40% of screen
-        (Some(x), Some(y), _, _) if x >= 0 && y >= 0 => {
-            let rw = ((img_w as f32) * CROP_FALLBACK_RATIO).round().max(1.0) as i32;
-            let rh = ((img_h as f32) * CROP_FALLBACK_RATIO).round().max(1.0) as i32;
-            (x - rw / 2, y - rh / 2, rw, rh)
-        }
-        // 3. No usable anchor: full image (still re-encoded)
-        _ => return AiCropRegion::Full,
-    };
-
-    let (l, t, w, h) = raw;
-    let left = l.max(0);
-    let top = t.max(0);
-    let w = w.min(img_w - left);
-    let h = h.min(img_h - top);
-    if w <= 0 || h <= 0 {
-        // 锚点完全在图外：调用方应原样返回原始 base64
-        return AiCropRegion::Outside;
+    match crate::export::commands::crop_region_50(
+        img_w, img_h, click_x, click_y, crop_w, crop_h, action_type,
+    ) {
+        Some((l, t, w, h)) => AiCropRegion::Rect(l, t, w, h),
+        None => AiCropRegion::Full,
     }
-    AiCropRegion::Rect(left, top, w, h)
 }
 
 /// Stage C: 按 action_type 差异化裁剪策略。
 /// - scroll / nav / screenshot：整窗截图（不裁，原样返回，保留上下文）
-/// - type：输入框 + 左侧 label 区（元素矩形左扩 1/3 宽，让"用户名/密码"等 label 进图）
-/// - 其他（click/copy/paste/hotkey/key/shortcut 等）：元素矩形自适应（同 A+B）
+/// - 其他（type/click/copy/paste/drag/hotkey/key/shortcut 等）：恒 50% 窗口
+///   （5b 对齐插件 computeCropRect；type/drag 不再做左扩 / extraH 差异化，
+///   与前端 cropBoxFromAnchor、导出 export_crop_box 同几何）
 pub(crate) fn crop_and_encode_typed(
     base64_str: &str,
     click_x: Option<i32>,
@@ -836,65 +773,51 @@ mod pipeline_tests {
     }
 
     #[test]
-    fn crop_and_encode_click_only_fallback_40pct() {
-        // 无元素矩形：以点击点为中心裁屏幕约 40%（1000*0.4=400）
+    fn crop_and_encode_click_only_fallback_50pct() {
+        // 无元素矩形：以点击点为中心裁屏幕约 50%（1000*0.5=500，插件 FOCUS_VISIBLE_FRAC）
         let png = solid_png(1000, 1000, [50, 60, 70]);
         let out = crop_and_encode(&b64(&png), Some(500), Some(500), None, None);
         let img = image::load_from_memory(&decode(&out)).unwrap();
-        assert_eq!((img.width(), img.height()), (400, 400));
+        assert_eq!((img.width(), img.height()), (500, 500));
     }
 
     #[test]
-    fn crop_and_encode_rect_adaptive_min_size() {
-        // 小矩形 (200x100) + padding → 补足到最小 280×280（保持中心）
+    fn crop_and_encode_rect_fixed_50pct_window() {
+        // 元素矩形不再影响几何：恒 50% 窗口（5b 对齐插件 computeCropRect）。
+        // 旧的 MIN=280 放大 / 缩到 90% 等比缩放体系已废弃。
         let png = solid_png(1000, 1000, [50, 60, 70]);
         let out = crop_and_encode(&b64(&png), Some(500), Some(500), Some(200), Some(100));
         let img = image::load_from_memory(&decode(&out)).unwrap();
-        assert_eq!((img.width(), img.height()), (280, 280));
+        assert_eq!((img.width(), img.height()), (500, 500));
+        // 大元素同样只裁 50% 窗口（不再尝试缩到 90% 屏幕）
+        let out2 = crop_and_encode(&b64(&png), Some(500), Some(500), Some(870), Some(400));
+        let img2 = image::load_from_memory(&decode(&out2)).unwrap();
+        assert_eq!((img2.width(), img2.height()), (500, 500));
     }
 
     #[test]
-    fn crop_and_encode_rect_scales_down_keeps_ratio() {
-        // 大矩形超出屏幕 90% → 等比缩放保留宽高比。
-        //
-        // ⚠️ 用例必须是**元素仍在屏幕内**的场景（870 < 1000）：等比缩放的约束
-        // 只在「元素放得下」时才有意义。元素大到超出屏幕时走另一条规则
-        // ——不缩、不切，见 `crop_and_encode_rect_larger_than_screen_not_cropped`。
-        let png = solid_png(1000, 1000, [3, 4, 5]);
-        let out = crop_and_encode(&b64(&png), Some(500), Some(500), Some(870), Some(400));
-        let img = image::load_from_memory(&decode(&out)).unwrap();
-        // rw=918 rh=448 → scale=min(1, 900/918, 900/448)=0.98039… → 900×439
-        // 比例 918:448 ≈ 2.05 与 900:439 ≈ 2.05 一致（等比）
-        assert_eq!((img.width(), img.height()), (900, 439));
-    }
-
-    #[test]
-    fn crop_and_encode_rect_larger_than_screen_not_cropped() {
-        // 元素比屏幕还大（500x300 落在 400x300 的图里）：可见部分就是整张图，
-        // 此时「缩到 90% 保持聚焦」没有意义——缩了只会把元素切掉，AI 会拿着
-        // 一张被截断的图写描述。修复前这里裁出 360×229（左右各丢 20px）。
+    fn crop_and_encode_rect_larger_than_screen_fixed_window() {
+        // 元素比屏幕还大（500x300 落在 400x300 的图里）：5b 后几何与元素无关，
+        // 仍取恒 50% 窗口（200x150），不再尝试缩到 90% 或整图保元素。
         let png = solid_png(400, 300, [3, 4, 5]);
         let out = crop_and_encode(&b64(&png), Some(200), Some(150), Some(500), Some(300));
         let img = image::load_from_memory(&decode(&out)).unwrap();
-        assert_eq!(
-            (img.width(), img.height()),
-            (400, 300),
-            "元素超出屏幕时应裁整图，不能缩到把元素切掉"
-        );
+        assert_eq!((img.width(), img.height()), (200, 150));
     }
 
     #[test]
     fn crop_and_encode_coords_clamped_at_edge() {
-        // 点击 (0,0) 无矩形：fallback 300*0.4=120 → 120×120，以 (0,0) 为左上
+        // 点击 (0,0) 无矩形：fallback 300*0.5=150 → 150×150，贴边夹回以 (0,0) 为左上
         let png = solid_png(300, 300, [1, 2, 3]);
         let out = crop_and_encode(&b64(&png), Some(0), Some(0), None, None);
         let img = image::load_from_memory(&decode(&out)).unwrap();
-        assert_eq!((img.width(), img.height()), (120, 120));
+        assert_eq!((img.width(), img.height()), (150, 150));
     }
 
     #[test]
     fn crop_and_encode_partial_negative_coord_falls_back_full() {
-        // x 有效但 y 为负 → 走全图分支
+        // x 有效但 y 为负 → 无合法锚点，走全图分支（与插件 computeCropRect 一致：
+        // 坐标非负才可定位）
         let png = solid_png(100, 100, [7, 8, 9]);
         let out = crop_and_encode(&b64(&png), Some(50), Some(-1), None, None);
         let img = image::load_from_memory(&decode(&out)).unwrap();
@@ -904,29 +827,35 @@ mod pipeline_tests {
     #[test]
     fn crop_and_encode_out_of_bounds_coords_no_panic() {
         // 修复前：x=5000 超出 100x100 图片 → left=4800 > img_w → w 为负 → crop_imm panic
+        // 5b 后：crop_region_50 贴边平移夹回 → 裁图内 50×50（不再原样返回）
         let png = solid_png(100, 100, [9, 9, 9]);
         let out = crop_and_encode(&b64(&png), Some(5000), Some(5000), None, None);
-        // 修复后：裁剪区域完全在图片外 → 原样返回
-        assert_eq!(out, b64(&png));
+        let img = image::load_from_memory(&decode(&out)).unwrap();
+        assert_eq!((img.width(), img.height()), (50, 50));
     }
 
     #[test]
     fn crop_and_encode_one_axis_out_of_bounds_no_panic() {
         let png = solid_png(100, 100, [11, 12, 13]);
         let out = crop_and_encode(&b64(&png), Some(5000), Some(50), None, None);
-        // x 方向完全出界 → 修复后原样返回
-        assert_eq!(out, b64(&png));
+        // x 方向出界 → clamp 到贴边，仍裁 50×50
+        let img = image::load_from_memory(&decode(&out)).unwrap();
+        assert_eq!((img.width(), img.height()), (50, 50));
     }
 
     #[test]
-    fn crop_and_encode_typed_type_expands_left_label_zone() {
-        // type 步骤：矩形左扩 cw/3=33px → 比 click 更宽（不裁剪时左侧多出 label 区）
+    fn crop_and_encode_typed_type_click_same_window() {
+        // 5b：type 左扩 1/3 已废弃，type 与 click 输出相同 50% 窗口
         let png = solid_png(800, 600, [9, 8, 7]);
         let base = crop_and_encode_typed(&b64(&png), Some(400), Some(300), Some(100), Some(40), "click");
         let typed = crop_and_encode_typed(&b64(&png), Some(400), Some(300), Some(100), Some(40), "type");
         let base_img = image::load_from_memory(&decode(&base)).unwrap();
         let typed_img = image::load_from_memory(&decode(&typed)).unwrap();
-        assert!(typed_img.width() > base_img.width());
+        assert_eq!(
+            (typed_img.width(), typed_img.height()),
+            (base_img.width(), base_img.height())
+        );
+        assert_eq!((typed_img.width(), typed_img.height()), (400, 300));
     }
 
     /// 空白裁剪守卫（2026-09-05）：裁剪区域几乎纯色时回退整图 ——
@@ -969,16 +898,13 @@ mod pipeline_tests {
     }
 
     /* ── 裁图几何（ai_crop_region）───────────────────────────────
-     * 本端常量（PAD=24 / MIN=280 / 缩到 90%）与导出端、前端**刻意不同**，
-     * 但 type 步骤「左扩 1/3 宽」的几何推导是同一套 —— 左移量必须是 extra/2。
-     * 旧写法 `- extra` 的过冲阈值更高（PAD=24 → 元素宽 > 144px 才被切），
-     * 所以下面用 cw=300 这种常见输入框宽度来锁定。
+     * 5b 对齐插件 computeCropRect：中心 + 恒 50% 窗口 + 贴边平移夹回。
+     * 旧的 PAD=24 / MIN=280 / 缩到 90% / type 左扩 1/3 / drag extraH 已废弃，
+     * 本端与前端 cropBoxFromAnchor、导出 export_crop_box 共用 crop_region_50。
      *
-     * 场景：800x600 截图，元素矩形中心 (400,300)、尺寸 300x40
-     *   rw = (300+48).max(280) = 348, rh = (40+48).max(280) = 280
-     *   scale = min(1.0, 720/348, 540/280) = 1.0（不缩）
-     *   type : extra = 100, rw = 448, left = 400-224-50 = 126, top = 300-140 = 160
-     *   click: left = 400-174 = 226, top = 160
+     * 场景：800x600 截图，锚点中心 (400,300)
+     *   rw = 800*0.5 = 400, rh = 600*0.5 = 300
+     *   left = 400-200 = 200, top = 300-150 = 150 → (200,150,400,300)
      */
 
     /// 取出 Rect 分支，否则 panic —— 让断言保持简洁
@@ -991,85 +917,50 @@ mod pipeline_tests {
     }
 
     #[test]
-    fn ai_crop_region_golden_type_and_click() {
-        assert_eq!(
-            rect(ai_crop_region(
-                800, 600, Some(400), Some(300), Some(300), Some(40), "type"
-            )),
-            (126, 160, 448, 280)
-        );
-        assert_eq!(
-            rect(ai_crop_region(
-                800, 600, Some(400), Some(300), Some(300), Some(40), "click"
-            )),
-            (226, 160, 348, 280)
-        );
-    }
-
-    #[test]
-    fn ai_crop_region_drag_gets_extra_vertical_context() {
-        // DRAG 步骤比等价 click 步骤在高度方向多留上下文（extraH = max(ch*0.6, 100)）。
-        // 不硬编码缩放后的精确值，只断言 drag 更高且含基础 padding。
-        let (_, _, _, h_drag) = rect(ai_crop_region(
-            800, 600, Some(400), Some(300), Some(400), Some(30), "drag"
-        ));
-        let (_, _, _, h_click) = rect(ai_crop_region(
-            800, 600, Some(400), Some(300), Some(400), Some(30), "click"
-        ));
-        assert!(h_drag > h_click, "drag 应比 click 高（多留上下文），实际 drag={} click={}", h_drag, h_click);
-        assert!(h_drag >= 30 + CROP_PAD * 2);
-    }
-
-    #[test]
-    fn ai_crop_region_type_never_clips_element_right_edge() {
-        // 核心防线：元素矩形须完整落在框内，四边留白 >= CROP_PAD。
-        // 旧写法 `- extra` 在 cw=300 时会把右边缘切掉 26px。
-        for cw in [24, 60, 100, 150, 200, 300, 480, 600, 900] {
-            for ch in [24, 40, 80, 200] {
-                for at in ["type", "click"] {
-                    let (l, t, w, h) = rect(ai_crop_region(
-                        1920, 1080, Some(960), Some(540), Some(cw), Some(ch), at,
-                    ));
-                    let (el, et) = (960 - cw / 2, 540 - ch / 2);
-                    let pads = [
-                        ("左", el - l),
-                        ("右", (l + w) - (el + cw)),
-                        ("上", et - t),
-                        ("下", (t + h) - (et + ch)),
-                    ];
-                    for (name, p) in pads {
-                        assert!(
-                            p >= CROP_PAD,
-                            "{at} {cw}x{ch} 元素被切：{name}侧留白 {p}px < CROP_PAD({CROP_PAD})"
-                        );
-                    }
-                }
-            }
+    fn ai_crop_region_golden_type_click_drag_same() {
+        // 元素矩形只作「有元素」标志：type/click/drag 一律恒 50% 窗口
+        for at in ["type", "click", "drag"] {
+            assert_eq!(
+                rect(ai_crop_region(
+                    800, 600, Some(400), Some(300), Some(300), Some(40), at
+                )),
+                (200, 150, 400, 300),
+                "{at} 应为恒 50% 窗口"
+            );
         }
     }
 
     #[test]
-    fn ai_crop_region_type_keeps_label_zone_on_left() {
-        let (l, _t, w, _h) = rect(ai_crop_region(
-            800, 600, Some(400), Some(300), Some(300), Some(40), "type",
-        ));
-        let (elem_left, elem_right) = (250, 550);
-        assert_eq!((l + w) - elem_right, CROP_PAD, "右侧留白应恰为 CROP_PAD");
+    fn ai_crop_region_edge_corner_clamped() {
+        // 贴边 / 负中心：窗口被 clamp 回图内（与前端 cropBoxFromAnchor 同口径）
         assert_eq!(
-            elem_left - l,
-            CROP_PAD + 100,
-            "左侧留白应为 CROP_PAD + extra(100)"
+            rect(ai_crop_region(
+                800, 600, Some(0), Some(0), Some(300), Some(40), "click"
+            )),
+            (0, 0, 400, 300)
+        );
+        assert_eq!(
+            rect(ai_crop_region(
+                800, 600, Some(-50), Some(-50), Some(300), Some(40), "click"
+            )),
+            (0, 0, 400, 300)
+        );
+        assert_eq!(
+            rect(ai_crop_region(
+                800, 600, Some(800), Some(600), Some(300), Some(40), "click"
+            )),
+            (400, 300, 400, 300)
         );
     }
 
     #[test]
     fn ai_crop_region_fallback_and_full_cases() {
-        // 只有点击点：屏幕 40%
+        // 只有点击点：屏幕 50%（插件 FOCUS_VISIBLE_FRAC=0.5）
         assert_eq!(
             rect(ai_crop_region(
                 800, 600, Some(400), Some(300), None, None, "click"
             )),
-            (240, 180, 320, 240)
+            (200, 150, 400, 300)
         );
         // 无坐标 → Full（用全图，但会重编码）
         assert!(
@@ -1079,20 +970,13 @@ mod pipeline_tests {
             ),
             "无锚点应为 Full"
         );
-        // 退化尺寸 / 锚点完全在图外 → Outside（原样返回，不重编码）
+        // 退化图尺寸 → Outside（原样返回，不重编码）
         assert!(
             matches!(
                 ai_crop_region(0, 0, Some(1), Some(1), Some(2), Some(2), "click"),
                 AiCropRegion::Outside
             ),
             "退化图尺寸应为 Outside"
-        );
-        assert!(
-            matches!(
-                ai_crop_region(100, 100, Some(5000), Some(5000), None, None, "click"),
-                AiCropRegion::Outside
-            ),
-            "锚点完全在图外应为 Outside（防 panic 的历史约定）"
         );
     }
 
@@ -1115,14 +999,12 @@ mod pipeline_tests {
     }
 
     #[test]
-    fn ai_crop_region_applies_min_size_for_tiny_elements() {
-        // 极小元素：框被放大到 CROP_MIN_SIZE，元素自然居中
+    fn ai_crop_region_tiny_elements_still_50pct_window() {
+        // 极小元素：5b 后不再放大到 MIN=280，恒 50% 窗口（800x600 → 400x300）
         let (l, t, w, h) = rect(ai_crop_region(
             800, 600, Some(400), Some(300), Some(10), Some(10), "click",
         ));
-        assert_eq!(w, CROP_MIN_SIZE.min(800));
-        assert_eq!(h, CROP_MIN_SIZE.min(600));
-        assert!(l >= 0 && t >= 0 && l + w <= 800 && t + h <= 600);
+        assert_eq!((l, t, w, h), (200, 150, 400, 300));
     }
 
     #[test]
@@ -1136,15 +1018,10 @@ mod pipeline_tests {
     }
 
     /* ── 跨消费端一致性：导出端 vs AI 端 ────────────────────────────
-     * 存库锚点由录制端 recorder/commands.rs 生成（它 bake 了自己的 CROP_PAD=24
-     * 与 CROP_MIN 420x280），之后被两个消费端**各自独立解释**：
-     *   - 导出端 export_crop_box   （PAD=8，贴边平移不缩小）
-     *   - AI 端   ai_crop_region   （PAD=24 / MIN=280 / 缩到屏幕 90%）
-     *
-     * AI 端的常量差异是**刻意**的，声明的意图见 ai_crop_region 的注释：
-     * 「喂给 AI 的图需要更大上下文和最小尺寸保证」。这句话可证伪，它蕴含
-     * 一条不变式：**AI 看到的区域不该比用户/导出看到的更小**。
-     * 若某场景下 AI 框反而更小，AI 就是拿着一张比用户所见更窄的图在写描述。
+     * 存库锚点由录制端 recorder/commands.rs 生成（bake CROP_PAD=24 / MIN 420x280），
+     * 5b 后导出端与 AI 端都委托 `export/commands.rs::crop_region_50`——
+     * 同一份存库锚点得到**完全相同**的裁图矩形（中心 + 恒 50% 窗口 + 贴边夹回）。
+     * 旧的「导出 PAD=8 / AI PAD=24 刻意不同」体系已废弃。
      */
 
     /// 复刻录制端存库逻辑（recorder/commands.rs：CROP_PAD=24 / CROP_MIN_W=420 / CROP_MIN_H=280）。
@@ -1168,7 +1045,7 @@ mod pipeline_tests {
     }
 
     #[test]
-    fn both_consumers_must_contain_the_visible_element_rect() {
+    fn both_consumers_must_agree_on_crop_region() {
         use crate::export::commands::export_crop_box;
 
         let cases = vec![
@@ -1183,11 +1060,12 @@ mod pipeline_tests {
             (3840, 2160, 600, 80, "click", "4K 输入框"),
             (3840, 2160, 3600, 2100, "click", "4K 接近全屏"),
             (1366, 768, 300, 40, "click", "低分辨率输入框"),
+            (1366, 768, 300, 40, "drag", "低分辨率输入框(drag)"),
         ];
 
         println!(
-            "\n{:<16} {:<6} {:>9} {:>10} | {:>11} {:>11} | {:>7} {:>8} {:>8}",
-            "场景", "type", "元素", "落库值", "导出框", "AI 框", "AI/导出", "导出切掉", "AI 切掉"
+            "\n{:<16} {:<6} {:>9} {:>10} | {:>11} {:>11} | {:>8}",
+            "场景", "type", "元素", "落库值", "导出框", "AI 框", "一致性"
         );
         let mut violations: Vec<String> = Vec::new();
 
@@ -1195,100 +1073,46 @@ mod pipeline_tests {
             let (cx, cy) = (iw / 2, ih / 2);
             let (sx, sy, sw, sh) = stored_anchor(iw, ih, ew, eh, cx, cy);
 
-            // 元素在图内的**可见**范围（元素可能比屏幕还大，超出部分不算被切）
-            let vis_l = (cx - ew / 2).max(0);
-            let vis_r = (cx + ew / 2).min(iw);
-            let vis_t = (cy - eh / 2).max(0);
-            let vis_b = (cy + eh / 2).min(ih);
-
-            let (ex, ey, ew2, eh2) =
-                match export_crop_box(iw, ih, Some(sx), Some(sy), Some(sw), Some(sh), at) {
-                    Some(v) => v,
-                    None => {
-                        println!("{name}: 导出端不裁剪（整窗类型）");
-                        continue;
-                    }
-                };
-            let (ax, ay, aw, ah) =
-                match ai_crop_region(iw, ih, Some(sx), Some(sy), Some(sw), Some(sh), at) {
-                    AiCropRegion::Rect(l, t, w, h) => (l, t, w, h),
-                    _ => {
-                        println!("{name}: AI 端 Full/Outside");
-                        continue;
-                    }
-                };
-
-            // 某条边被切掉多少像素（0 = 完整包含）。
-            // 方向：框界**越过了**元素界才算切 —— 框比元素大（有余量）不算。
-            let cut = |l: i32, t: i32, w: i32, h: i32| -> i32 {
-                let cut_left = (l - vis_l).max(0); // 框左界在元素左界右侧
-                let cut_right = (vis_r - (l + w)).max(0); // 框右界在元素右界左侧
-                let cut_top = (t - vis_t).max(0);
-                let cut_bottom = (vis_b - (t + h)).max(0);
-                cut_left + cut_right + cut_top + cut_bottom
+            let export = match export_crop_box(iw, ih, Some(sx), Some(sy), Some(sw), Some(sh), at) {
+                Some(v) => v,
+                None => {
+                    println!("{name}: 导出端不裁剪（整窗类型）");
+                    continue;
+                }
             };
-            let cut_export = cut(ex, ey, ew2, eh2);
-            let cut_ai = cut(ax, ay, aw, ah);
-
-            let ratio = (aw as f64 * ah as f64) / (ew2 as f64 * eh2 as f64);
-            println!(
-                "{:<16} {:<6} {:>9} {:>10} | {:>11} {:>11} | {:>6.2}x {:>8} {:>8}",
-                name,
-                at,
-                format!("{ew}x{eh}"),
-                format!("{sw}x{sh}"),
-                format!("{ew2}x{eh2}"),
-                format!("{aw}x{ah}"),
-                ratio,
-                if cut_export > 0 {
-                    format!("{cut_export}px")
-                } else {
-                    "—".to_string()
-                },
-                if cut_ai > 0 {
-                    format!("{cut_ai}px")
-                } else {
-                    "—".to_string()
-                }
-            );
-
-            if cut_export > 0 {
-                violations.push(format!(
-                    "{name}（{iw}x{ih} {at}，元素 {ew}x{eh}）：导出框 {ew2}x{eh2}@({ex},{ey}) 切掉元素可见部分 {cut_export}px"
-                ));
-            }
-            if cut_ai > 0 {
-                violations.push(format!(
-                    "{name}（{iw}x{ih} {at}，元素 {ew}x{eh}）：AI 框 {aw}x{ah}@({ax},{ay}) 切掉元素可见部分 {cut_ai}px —— AI 会拿着被截断的图写描述"
-                ));
-            }
-
-            // 缩放必须保持宽高比（ai_crop_region 的注释承诺 keep aspect ratio）。
-            // 只对「框没被 clamp 到图边界」且非 type 的场景断言：
-            //   - 触界意味着尺寸已被图截断，比例本来就不由缩放决定；
-            //   - type 步骤还要左扩 extra，宽高比必然改变。
-            // ⚠️ 这条断言是 `max_w/max_h` 里 `.max(cw/ch)` 的专属防线：
-            //    只靠缩放后的 `rw.max(cw)` 虽能避免切元素，却会让比例失真
-            //    （实测 1848×299，比例偏离 7%）。
-            let touched_edge = ax <= 0 || ay <= 0 || ax + aw >= iw || ay + ah >= ih;
-            if at != "type" && !touched_edge {
-                let rw0 = (sw + CROP_PAD * 2).max(CROP_MIN_SIZE) as f64;
-                let rh0 = (sh + CROP_PAD * 2).max(CROP_MIN_SIZE) as f64;
-                let want = rw0 / rh0;
-                let got = aw as f64 / ah as f64;
-                let dev = (got - want).abs() / want;
-                if dev > 0.02 {
+            let ai = match ai_crop_region(iw, ih, Some(sx), Some(sy), Some(sw), Some(sh), at) {
+                AiCropRegion::Rect(l, t, w, h) => (l, t, w, h),
+                other => {
                     violations.push(format!(
-                        "{name}（{iw}x{ih} {at}）：AI 框 {aw}x{ah} 宽高比 {got:.3} 偏离缩放前 {want:.3} 达 {:.1}% —— 缩放没保持等比",
-                        dev * 100.0
+                        "{name}（{iw}x{ih} {at}，元素 {ew}x{eh}）：AI 端应为 Rect，实际 {:?}",
+                        other
                     ));
+                    continue;
                 }
+            };
+
+            // 5b 口径：两端同一纯几何，输出必须逐字段一致
+            if export != ai {
+                violations.push(format!(
+                    "{name}（{iw}x{ih} {at}，元素 {ew}x{eh}，落库 {sw}x{sh}）：导出 {export:?} ≠ AI {ai:?}"
+                ));
             }
+
+            // 且必须是「中心 + 恒 50% 窗口 + 贴边夹回」
+            let (l, t, w, h) = ai;
+            let want_w = (iw as f32 * 0.5).round() as i32;
+            let want_h = (ih as f32 * 0.5).round() as i32;
+            assert_eq!(
+                (w, h),
+                (want_w, want_h),
+                "{name}（{iw}x{ih} {at}）：窗口应为恒 50% ({want_w}x{want_h})，实际 {w}x{h}"
+            );
+            assert!(l >= 0 && t >= 0 && l + w <= iw && t + h <= ih);
         }
 
         assert!(
             violations.is_empty(),
-            "裁图框没盖住元素的可见部分：\n  - {}",
+            "导出端与 AI 端裁图不一致：\n  - {}",
             violations.join("\n  - ")
         );
     }
