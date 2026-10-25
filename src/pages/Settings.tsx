@@ -1044,7 +1044,7 @@ export default function SettingsPage({ darkMode, onToggleDark }: SettingsPagePro
                   {voiceEnabled ? "开启" : "关闭"}
                 </span>
               </div>
-              <p className="hint">开启后，录制时会同步收录麦克风语音；停止录制后自动识别，并把说的话作为步骤说明写入对应步骤。也可在录制窗口顶栏随时开/关麦克风。需要 AI 设置使用智谱通道（默认免费通道已支持）。</p>
+              <p className="hint">开启后，录制时会同步收录麦克风语音；停止录制后自动识别，并把说的话作为步骤说明写入对应步骤。也可在录制窗口顶栏随时开/关麦克风。</p>
             </div>
 
             <div className="form-group">
